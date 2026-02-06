@@ -78,7 +78,7 @@ static volatile int signal_handler_lock_initialized = 0;
 /* Forward declarations */
 int bugReportStart(void);
 void printCrashReport(void);
-void bugReportEnd(int killViaSignal, int sig);
+void bugReportEnd(int killViaSignal, int sig, int si_code);
 void logStackTrace(void *eip, int uplevel, int current_thread);
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret);
 
@@ -1080,7 +1080,7 @@ __attribute__((noinline, weak)) void _serverAssert(const char *estr, const char 
 
     // remove the signal handler so on abort() we will output the crash report.
     removeSigSegvHandlers();
-    bugReportEnd(0, 0);
+    bugReportEnd(0, 0, 0);
 }
 
 /* Returns the argv argument in binary representation, limited to length 128. */
@@ -1194,7 +1194,7 @@ __attribute__((noinline)) void _serverPanic(const char *file, int line, const ch
 
     // remove the signal handler so on abort() we will output the crash report.
     removeSigSegvHandlers();
-    bugReportEnd(0, 0);
+    bugReportEnd(0, 0, 0);
 }
 
 /* Start a bug report, returning 1 if this is the first time this function was called, 0 otherwise. */
@@ -2126,7 +2126,6 @@ typedef void (*invalidFunctionWasCalledType)(void);
 
 __attribute__((noinline)) static void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     UNUSED(secret);
-    UNUSED(info);
     int print_full_crash_info = 1;
     /* Check if it is safe to enter the signal handler. second thread crashing at the same time will deadlock. */
     if (pthread_mutex_lock(&signal_handler_lock) == EDEADLK) {
@@ -2183,7 +2182,7 @@ __attribute__((noinline)) static void sigsegvHandler(int sig, siginfo_t *info, v
     if (eip != NULL) dumpCodeAroundEIP(eip);
 #endif
 
-    bugReportEnd(1, sig);
+    bugReportEnd(1, sig, info->si_code);
 }
 
 void setupDebugSigHandlers(void) {
@@ -2217,7 +2216,10 @@ void setupSigSegvHandler(void) {
      * calling process on entry to the signal handler unless it is included in the sa_mask field. */
     /* SA_SIGINFO flag is set to raise the function defined in sa_sigaction.
      * Otherwise, sa_handler is used. */
-    act.sa_flags = SA_NODEFER | SA_SIGINFO;
+    /* SA_RESETHAND resets the handler to SIG_DFL on entry, so that if the signal
+     * was caused by a real fault, returning from the handler re-executes the
+     * faulting instruction and produces a coredump with the correct frame. */
+    act.sa_flags = SA_NODEFER | SA_SIGINFO | SA_RESETHAND;
     act.sa_sigaction = sigsegvHandler;
     if (server.crashlog_enabled) {
         sigaction(SIGSEGV, &act, NULL);
@@ -2260,7 +2262,7 @@ void printCrashReport(void) {
     // doFastMemoryTest();
 }
 
-void bugReportEnd(int killViaSignal, int sig) {
+void bugReportEnd(int killViaSignal, int sig, int si_code) {
     struct sigaction act;
 
     serverLogFromHandler(LL_WARNING | LL_RAW,
@@ -2286,7 +2288,23 @@ void bugReportEnd(int killViaSignal, int sig) {
     }
 
     /* Make sure we exit with the right signal at the end. So for instance
-     * the core will be dumped if enabled. */
+     * the core will be dumped if enabled.
+     *
+     * If the signal was triggered by a real fault (not sent via kill/sigqueue/tkill),
+     * the handler was installed with SA_RESETHAND, so it's already reset to SIG_DFL.
+     * Just return to re-execute the faulting instruction — this produces a coredump
+     * with the correct faulting frame instead of pointing into the signal handler. */
+    if (si_code != SI_USER && si_code != SI_QUEUE
+#ifdef SI_TKILL
+        && si_code != SI_TKILL
+#endif
+    ) {
+        /* Real fault: handler already reset via SA_RESETHAND, returning will
+         * re-trigger the fault and produce a coredump at the right instruction. */
+        return;
+    }
+    /* Signal was sent artificially (kill, sigqueue, tkill). We need to
+     * explicitly re-raise it since returning won't re-trigger anything. */
     sigemptyset(&act.sa_mask);
     act.sa_flags = 0;
     act.sa_handler = SIG_DFL;
