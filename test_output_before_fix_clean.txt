@@ -1,0 +1,20 @@
+Cleanup: may take some time... OK
+Starting test server at port 21079
+[ready]: 16451
+Testing unit/moduleapi/module-loadorder
+[err]: modules config rewrite preserves load order in tests/unit/moduleapi/module-loadorder.tcl
+Expected 'infotest' to be equal to 'fork' (context: type eval line 40 cmd {assert_equal [lindex $loadmodule_order 1] "fork"} proc ::start_server)
+[1/1 done]: unit/moduleapi/module-loadorder (0 seconds)
+
+                   The End
+
+Execution time of different units:
+  0 seconds - unit/moduleapi/module-loadorder
+
+Test Summary: 0 passed, 1 failed
+
+!!! WARNING The following tests failed:
+
+*** [err]: modules config rewrite preserves load order in tests/unit/moduleapi/module-loadorder.tcl
+Expected 'infotest' to be equal to 'fork' (context: type eval line 40 cmd {assert_equal [lindex $loadmodule_order 1] "fork"} proc ::start_server)
+Cleanup: may take some time... OK

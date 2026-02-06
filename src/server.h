@@ -2810,6 +2810,7 @@ extern dictType modulesDictType;
 extern hashtableType sdsReplyHashtableType;
 extern dictType keylistDictType;
 extern dict *modules;
+extern list *module_order;
 
 /*-----------------------------------------------------------------------------
  * Functions prototypes

@@ -1602,14 +1602,14 @@ static void rewriteConfigSocketBindOption(standardConfig *config, const char *na
 void rewriteConfigLoadmoduleOption(struct rewriteConfigState *state) {
     sds line;
 
-    dictIterator *di = dictGetIterator(modules);
-    dictEntry *de;
-    while ((de = dictNext(di)) != NULL) {
-        struct ValkeyModule *module = dictGetVal(de);
+    listIter li;
+    listNode *ln;
+    listRewind(module_order, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        struct ValkeyModule *module = ln->value;
         line = moduleLoadQueueEntryToLoadmoduleOptionStr(module, "loadmodule");
         rewriteConfigRewriteLine(state, "loadmodule", line, 1);
     }
-    dictReleaseIterator(di);
     /* Mark "loadmodule" as processed in case modules is empty. */
     rewriteConfigMarkAsProcessed(state, "loadmodule");
 }

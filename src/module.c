@@ -107,7 +107,8 @@ struct ValkeyModuleSharedAPI {
 };
 typedef struct ValkeyModuleSharedAPI ValkeyModuleSharedAPI;
 
-dict *modules; /* Hash table of modules. SDS -> ValkeyModule ptr.*/
+dict *modules;      /* Hash table of modules. SDS -> ValkeyModule ptr.*/
+list *module_order; /* List preserving module load order for config rewrite. */
 
 /* Entries in the context->amqueue array, representing objects to free
  * when the callback returns. */
@@ -12489,6 +12490,7 @@ void moduleInitModulesSystem(void) {
     server.module_configs_queue = dictCreate(&sdsKeyValueHashDictType);
     server.module_gil_acquiring = 0;
     modules = dictCreate(&modulesDictType);
+    module_order = listCreate();
     moduleAuthCallbacks = listCreate();
 
     /* Set up the keyspace notification subscriber list and static client */
@@ -12857,6 +12859,7 @@ int moduleLoad(const char *path, void **module_argv, int module_argc, int is_loa
 
     /* Module loaded! Register it. */
     dictAdd(modules, ctx.module->name, ctx.module);
+    listAddNodeTail(module_order, ctx.module);
     ctx.module->blocked_clients = 0;
     ctx.module->handle = handle;
     ctx.module->loadmod = zmalloc(sizeof(struct moduleLoadQueueEntry));
@@ -12961,6 +12964,8 @@ static int moduleUnloadInternal(struct ValkeyModule *module, const char **errmsg
 
     /* Remove from list of modules. */
     serverLog(LL_NOTICE, "Module %s unloaded", module->name);
+    listNode *ln = listSearchKey(module_order, module);
+    if (ln) listDelNode(module_order, ln);
     dictDelete(modules, module->name);
     module->name = NULL; /* The name was already freed by dictDelete(). */
     moduleFreeModuleStructure(module);

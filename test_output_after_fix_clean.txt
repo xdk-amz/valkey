@@ -1,0 +1,17 @@
+Cleanup: may take some time... OK
+Starting test server at port 21079
+[ready]: 19003
+Testing unit/moduleapi/module-loadorder
+[ok]: modules config rewrite preserves load order (227 ms)
+[1/1 done]: unit/moduleapi/module-loadorder (0 seconds)
+
+                   The End
+
+Execution time of different units:
+  0 seconds - unit/moduleapi/module-loadorder
+
+Test Summary: 1 passed, 0 failed
+
+\o/ All tests passed without errors!
+
+Cleanup: may take some time... OK
