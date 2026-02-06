@@ -11,7 +11,7 @@ static _Atomic size_t lazyfreed_objects = 0;
 
 /* Release objects from the lazyfree thread. It's just decrRefCount()
  * updating the count of objects to release. */
-void lazyfreeFreeObject(void *args[]) {
+static void lazyfreeFreeObject(void *args[]) {
     robj *o = (robj *)args[0];
     decrRefCount(o);
     atomic_fetch_sub_explicit(&lazyfree_objects, 1, memory_order_relaxed);
@@ -21,7 +21,7 @@ void lazyfreeFreeObject(void *args[]) {
 /* Release a database from the lazyfree thread. The 'db' pointer is the
  * database which was substituted with a fresh one in the main thread
  * when the database was logically deleted. */
-void lazyfreeFreeDatabase(void *args[]) {
+static void lazyfreeFreeDatabase(void *args[]) {
     kvstore *da1 = args[0];
     kvstore *da2 = args[1];
     kvstore *da3 = args[2];
@@ -35,7 +35,7 @@ void lazyfreeFreeDatabase(void *args[]) {
 }
 
 /* Release the key tracking table. */
-void lazyFreeTrackingTable(void *args[]) {
+static void lazyFreeTrackingTable(void *args[]) {
     rax *rt = args[0];
     size_t len = rt->numele;
     freeTrackingRadixTree(rt);
@@ -44,7 +44,7 @@ void lazyFreeTrackingTable(void *args[]) {
 }
 
 /* Release the error stats rax tree. */
-void lazyFreeErrors(void *args[]) {
+static void lazyFreeErrors(void *args[]) {
     rax *errors = args[0];
     size_t len = errors->numele;
     raxFreeWithCallback(errors, zfree);
@@ -53,7 +53,7 @@ void lazyFreeErrors(void *args[]) {
 }
 
 /* Release the eval scripts data structures. */
-void lazyFreeEvalScripts(void *args[]) {
+static void lazyFreeEvalScripts(void *args[]) {
     dict *scripts = args[0];
     list *scripts_lru_list = args[1];
     list *engine_callbacks = args[2];
@@ -64,7 +64,7 @@ void lazyFreeEvalScripts(void *args[]) {
 }
 
 /* Release the functions ctx. */
-void lazyFreeFunctionsCtx(void *args[]) {
+static void lazyFreeFunctionsCtx(void *args[]) {
     functionsLibCtx *functions_lib_ctx = args[0];
     list *engine_callbacks = args[1];
     size_t len = functionsLibCtxFunctionsLen(functions_lib_ctx);
@@ -74,7 +74,7 @@ void lazyFreeFunctionsCtx(void *args[]) {
 }
 
 /* Release replication backlog referencing memory. */
-void lazyFreeReplicationBacklogRefMem(void *args[]) {
+static void lazyFreeReplicationBacklogRefMem(void *args[]) {
     list *blocks = args[0];
     rax *index = args[1];
     long long len = listLength(blocks);
@@ -86,7 +86,7 @@ void lazyFreeReplicationBacklogRefMem(void *args[]) {
 }
 
 /* Release the replicaKeysWithExpire dict. */
-void lazyFreeReplicaKeysWithExpire(void *args[]) {
+static void lazyFreeReplicaKeysWithExpire(void *args[]) {
     dict *replica_keys_with_expire = args[0];
     size_t len = dictSize(replica_keys_with_expire);
     dictRelease(replica_keys_with_expire);
@@ -95,7 +95,7 @@ void lazyFreeReplicaKeysWithExpire(void *args[]) {
 }
 
 /* Release the pending_repl_data.blocks list. */
-void lazyfreePendingReplDataBuf(void *args[]) {
+static void lazyfreePendingReplDataBuf(void *args[]) {
     list *pending_repl_data_blocks = args[0];
     size_t len = listLength(pending_repl_data_blocks);
     listRelease(pending_repl_data_blocks);
@@ -134,7 +134,7 @@ void lazyfreeResetStats(void) {
  *
  * For lists the function returns the number of elements in the quicklist
  * representing the list. */
-size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
+static size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
     if (obj->type == OBJ_LIST && obj->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklist *ql = objectGetVal(obj);
         return ql->len;

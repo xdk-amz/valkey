@@ -37,11 +37,11 @@
 #include "hdr_histogram.h"
 
 /* Dictionary type for latency events. */
-int dictStringKeyCompare(const void *key1, const void *key2) {
+static int dictStringKeyCompare(const void *key1, const void *key2) {
     return strcmp(key1, key2) == 0;
 }
 
-uint64_t dictStringHash(const void *key) {
+static uint64_t dictStringHash(const void *key) {
     return dictGenHashFunction(key, strlen(key));
 }
 
@@ -59,7 +59,7 @@ dictType latencyTimeSeriesDictType = {
 /* Report the amount of AnonHugePages in smap, in bytes. If the return
  * value of the function is non-zero, the process is being targeted by
  * THP support, and is likely to have memory usage / latency issues. */
-int THPGetAnonHugePagesSize(void) {
+static int THPGetAnonHugePagesSize(void) {
     return zmalloc_get_smap_bytes_by_field("AnonHugePages:", -1);
 }
 
@@ -117,7 +117,7 @@ void latencyAddSample(const char *event, ustime_t latency_us) {
  *
  * Note: this is O(N) even when event_to_reset is not NULL because makes
  * the code simpler and we have a small fixed max number of events. */
-int latencyResetEvent(char *event_to_reset) {
+static int latencyResetEvent(char *event_to_reset) {
     dictIterator *di;
     dictEntry *de;
     int resets = 0;
@@ -142,7 +142,7 @@ int latencyResetEvent(char *event_to_reset) {
  * Check latency.h definition of struct latencyStats for more info.
  * If the specified event has no elements the structure is populate with
  * zero values. */
-void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
+static void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events, event);
     int j;
     uint64_t sum;
@@ -196,7 +196,7 @@ void analyzeLatencyForEvent(char *event, struct latencyStats *ls) {
 }
 
 /* Create a human readable report of latency events for this instance. */
-sds createLatencyReport(void) {
+static sds createLatencyReport(void) {
     sds report = sdsempty();
     int advise_better_vm = 0;          /* Better virtual machines. */
     int advise_slowlog_enabled = 0;    /* Enable slowlog. */
@@ -506,7 +506,7 @@ sds createLatencyReport(void) {
  * Empty buckets are not printed.
  * Everything above 1 sec is considered +Inf.
  * At max there will be log2(1000000000)=30 buckets */
-void fillCommandCDF(client *c, struct hdr_histogram *histogram) {
+static void fillCommandCDF(client *c, struct hdr_histogram *histogram) {
     addReplyMapLen(c, 2);
     addReplyBulkCString(c, "calls");
     addReplyLongLong(c, (long long)histogram->total_count);
@@ -531,7 +531,7 @@ void fillCommandCDF(client *c, struct hdr_histogram *histogram) {
 
 /* latencyCommand() helper to produce for all commands,
  * a per command cumulative distribution of latencies. */
-void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with_data) {
+static void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with_data) {
     hashtableIterator iter;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
     void *next;
@@ -552,7 +552,7 @@ void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with
 
 /* latencyCommand() helper to produce for a specific command set,
  * a per command cumulative distribution of latencies. */
-void latencySpecificCommandsFillCDF(client *c) {
+static void latencySpecificCommandsFillCDF(client *c) {
     void *replylen = addReplyDeferredLen(c);
     int command_with_data = 0;
     for (int j = 2; j < c->argc; j++) {
@@ -588,7 +588,7 @@ void latencySpecificCommandsFillCDF(client *c) {
 
 /* latencyCommand() helper to produce a time-delay reply for all the samples
  * in memory for the specified time series. */
-void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
+static void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
     void *replylen = addReplyDeferredLen(c);
     int samples = 0, j;
 
@@ -606,7 +606,7 @@ void latencyCommandReplyWithSamples(client *c, struct latencyTimeSeries *ts) {
 
 /* latencyCommand() helper to produce the reply for the LATEST subcommand,
  * listing the last latency sample for every event type registered so far. */
-void latencyCommandReplyWithLatestEvents(client *c) {
+static void latencyCommandReplyWithLatestEvents(client *c) {
     dictIterator *di;
     dictEntry *de;
 
@@ -629,7 +629,7 @@ void latencyCommandReplyWithLatestEvents(client *c) {
 }
 
 #define LATENCY_GRAPH_COLS 80
-sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
+static sds latencyCommandGenSparkeline(char *event, struct latencyTimeSeries *ts) {
     int j;
     struct sequence *seq = createSparklineSequence();
     sds graph = sdsempty();

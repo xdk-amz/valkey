@@ -51,14 +51,14 @@ int zslValueLteMax(double value, zrangespec *spec);
  * ==================================================================== */
 
 /* Init a new array of geoPoints. */
-void geoArrayInit(geoArray *ga) {
+static void geoArrayInit(geoArray *ga) {
     ga->buckets = MAX_GEO_ARRAY_BUFFER;
     ga->used = 0;
     ga->array = ga->arraybuf;
 }
 
 /* Add and populate with data a new entry to the geoArray. */
-geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist, double score, char *member) {
+static geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist, double score, char *member) {
     if (ga->used == ga->buckets) {
         ga->buckets = ga->buckets * 2;
         if (ga->array == ga->arraybuf) {
@@ -79,7 +79,7 @@ geoPoint *geoArrayAppend(geoArray *ga, double *xy, double dist, double score, ch
 }
 
 /* Clean a geoArray inited with geoArrayInit(). */
-void geoArrayCleanup(geoArray *ga) {
+static void geoArrayCleanup(geoArray *ga) {
     size_t i;
     for (i = 0; i < ga->used; i++) sdsfree(ga->array[i].member);
     if (ga->array != ga->arraybuf) {
@@ -88,7 +88,7 @@ void geoArrayCleanup(geoArray *ga) {
 }
 
 /* Free the GEO BYPOLYGON array created with georadiusGeneric(). */
-void geoPolygonPointsFree(GeoShape *shape) {
+static void geoPolygonPointsFree(GeoShape *shape) {
     if (shape->type == POLYGON_TYPE && shape->t.polygon.points != NULL) {
         zfree(shape->t.polygon.points);
     }
@@ -97,7 +97,7 @@ void geoPolygonPointsFree(GeoShape *shape) {
 /* ====================================================================
  * Helpers
  * ==================================================================== */
-int decodeGeohash(double bits, double *xy) {
+static int decodeGeohash(double bits, double *xy) {
     GeoHashBits hash = {.bits = (uint64_t)bits, .step = GEO_STEP_MAX};
     return geohashDecodeToLongLatWGS84(hash, xy);
 }
@@ -105,7 +105,7 @@ int decodeGeohash(double bits, double *xy) {
 /* Input Argument Helper */
 /* Take a pointer to the latitude arg then use the next arg for longitude.
  * On parse error C_ERR is returned, otherwise C_OK. */
-int extractLongLatOrReply(client *c, robj **argv, double *xy) {
+static int extractLongLatOrReply(client *c, robj **argv, double *xy) {
     int i;
     for (i = 0; i < 2; i++) {
         if (getDoubleFromObjectOrReply(c, argv[i], xy + i, NULL) != C_OK) {
@@ -122,7 +122,7 @@ int extractLongLatOrReply(client *c, robj **argv, double *xy) {
 /* Input Argument Helper */
 /* Decode lat/long from a zset member's score.
  * Returns C_OK on successful decoding, otherwise C_ERR is returned. */
-int longLatFromMemberOrReply(client *c, robj *zobj, robj *member, double *xy) {
+static int longLatFromMemberOrReply(client *c, robj *zobj, robj *member, double *xy) {
     double score = 0;
 
     if (zsetScore(zobj, objectGetVal(member), &score) == C_ERR) {
@@ -142,7 +142,7 @@ int longLatFromMemberOrReply(client *c, robj *zobj, robj *member, double *xy) {
  *
  * If the unit is not valid, an error is reported to the client, and a value
  * less than zero is returned. */
-double extractUnitOrReply(client *c, robj *unit) {
+static double extractUnitOrReply(client *c, robj *unit) {
     char *u = objectGetVal(unit);
 
     if (!strcasecmp(u, "m")) {
@@ -163,7 +163,7 @@ double extractUnitOrReply(client *c, robj *unit) {
  * Extract the distance from the specified two arguments starting at 'argv'
  * that should be in the form: <number> <unit>, and return C_OK or C_ERR means success or failure
  * *conversions is populated with the coefficient to use in order to convert meters to the unit.*/
-int extractDistanceOrReply(client *c, robj **argv, double *conversion, double *radius) {
+static int extractDistanceOrReply(client *c, robj **argv, double *conversion, double *radius) {
     double distance;
     if (getDoubleFromObjectOrReply(c, argv[0], &distance, "need numeric radius") != C_OK) {
         return C_ERR;
@@ -188,7 +188,7 @@ int extractDistanceOrReply(client *c, robj **argv, double *conversion, double *r
  * Extract height and width from the specified three arguments starting at 'argv'
  * that should be in the form: <number> <number> <unit>, and return C_OK or C_ERR means success or failure
  * *conversions is populated with the coefficient to use in order to convert meters to the unit.*/
-int extractBoxOrReply(client *c, robj **argv, double *conversion, double *width, double *height) {
+static int extractBoxOrReply(client *c, robj **argv, double *conversion, double *width, double *height) {
     double h, w;
     if ((getDoubleFromObjectOrReply(c, argv[0], &w, "need numeric width") != C_OK) ||
         (getDoubleFromObjectOrReply(c, argv[1], &h, "need numeric height") != C_OK)) {
@@ -216,7 +216,7 @@ int extractBoxOrReply(client *c, robj **argv, double *conversion, double *width,
  * than "5.2144992818115 meters away." We provide 4 digits after the dot
  * so that the returned value is decently accurate even when the unit is
  * the kilometer. */
-void addReplyDoubleDistance(client *c, double d) {
+static void addReplyDoubleDistance(client *c, double d) {
     char dbuf[128];
     const int dlen = fixedpoint_d2string(dbuf, sizeof(dbuf), d, 4);
     addReplyBulkCBuffer(c, dbuf, dlen);
@@ -236,7 +236,7 @@ void addReplyDoubleDistance(client *c, double d) {
  * "*xy" is populated with the decoded lat,long.
  * "*distance" is populated with the distance between the center of the shape and the point.
  */
-int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) {
+static int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) {
     if (!decodeGeohash(score, xy)) return C_ERR; /* Can't decode. */
     /* Note that geohashGetDistanceIfInRadiusWGS84() takes arguments in
      * reverse order: longitude first, latitude later. */
@@ -269,7 +269,7 @@ int geoWithinShape(GeoShape *shape, double score, double *xy, double *distance) 
  * using multiple queries to the sorted set, that we later need to sort
  * via qsort. Similarly we need to be able to reject points outside the search
  * radius area ASAP in order to allocate and process more points than needed. */
-int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geoArray *ga, unsigned long limit) {
+static int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geoArray *ga, unsigned long limit) {
     /* minex 0 = include min in range; maxex 1 = exclude max in range */
     /* That's: min <= val < max */
     zrangespec range = {.min = min, .max = max, .minex = 0, .maxex = 1};
@@ -335,7 +335,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
 /* Compute the sorted set scores min (inclusive), max (exclusive) we should
  * query in order to retrieve all the elements inside the specified area
  * 'hash'. The two scores are returned by reference in *min and *max. */
-void scoresOfGeoHashBox(GeoHashBits hash, GeoHashFix52Bits *min, GeoHashFix52Bits *max) {
+static void scoresOfGeoHashBox(GeoHashBits hash, GeoHashFix52Bits *min, GeoHashFix52Bits *max) {
     /* We want to compute the sorted set scores that will include all the
      * elements inside the specified Geohash 'hash', which has as many
      * bits as specified by hash.step * 2.
@@ -364,7 +364,7 @@ void scoresOfGeoHashBox(GeoHashBits hash, GeoHashFix52Bits *min, GeoHashFix52Bit
 /* Obtain all members between the min/max of this geohash bounding box.
  * Populate a geoArray of GeoPoints by calling geoGetPointsInRange().
  * Return the number of points added to the array. */
-int membersOfGeoHashBox(robj *zobj, GeoHashBits hash, geoArray *ga, GeoShape *shape, unsigned long limit) {
+static int membersOfGeoHashBox(robj *zobj, GeoHashBits hash, geoArray *ga, GeoShape *shape, unsigned long limit) {
     GeoHashFix52Bits min, max;
 
     scoresOfGeoHashBox(hash, &min, &max);
@@ -372,7 +372,7 @@ int membersOfGeoHashBox(robj *zobj, GeoHashBits hash, geoArray *ga, GeoShape *sh
 }
 
 /* Search all eight neighbors + self geohash box */
-int membersOfAllNeighbors(robj *zobj, const GeoHashRadius *n, GeoShape *shape, geoArray *ga, unsigned long limit) {
+static int membersOfAllNeighbors(robj *zobj, const GeoHashRadius *n, GeoShape *shape, geoArray *ga, unsigned long limit) {
     GeoHashBits neighbors[9];
     unsigned int i, count = 0, last_processed = 0;
     int debugmsg = 0;
@@ -530,7 +530,7 @@ void geoaddCommand(client *c) {
  * GEOSEARCHSTORE dest_key src_key [FROMMEMBER member] [FROMLONLAT long lat] [BYRADIUS radius unit]
  *               [BYBOX width height unit] [COUNT count [ANY]] [ASC|DESC] [STOREDIST]
  *  */
-void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
+static void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     robj *storekey = NULL;
     int storedist = 0; /* 0 for STORE, 1 for STOREDIST. */
 
