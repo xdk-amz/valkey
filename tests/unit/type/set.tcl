@@ -825,6 +825,9 @@ foreach type {single multiple single_multiple} {
     test "SRANDMEMBER count overflow" {
         r sadd myset a
         assert_error {*value is out of range*} {r srandmember myset -9223372036854775808}
+        # -LONG_MAX should also be rejected (issue #844)
+        assert_error {*value is out of range*} {r srandmember myset -9223372036854775807}
+        assert_error {*value is out of range*} {r srandmember myset -9223372036854770000}
     } {}
 
     # Make sure we can distinguish between an empty array and a null response

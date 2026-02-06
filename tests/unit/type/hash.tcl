@@ -76,6 +76,9 @@ start_server {tags {"hash"}} {
         assert_error {*value is out of range*} {r hrandfield myhash -9223372036854770000 withvalues}
         assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808 withvalues}
         assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775808}
+        # -LONG_MAX without WITHVALUES should also be rejected (issue #844)
+        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854775807}
+        assert_error {*value is out of range*} {r hrandfield myhash -9223372036854770000}
     } {}
 
     test "HRANDFIELD with <count> against non existing key" {

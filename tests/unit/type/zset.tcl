@@ -2461,6 +2461,9 @@ start_server {tags {"zset"}} {
         assert_error {*value is out of range*} {r zrandmember myzset -9223372036854770000 withscores}
         assert_error {*value is out of range*} {r zrandmember myzset -9223372036854775808 withscores}
         assert_error {*value is out of range*} {r zrandmember myzset -9223372036854775808}
+        # -LONG_MAX without WITHSCORES should also be rejected (issue #844)
+        assert_error {*value is out of range*} {r zrandmember myzset -9223372036854775807}
+        assert_error {*value is out of range*} {r zrandmember myzset -9223372036854770000}
     } {}
 
     # Make sure we can distinguish between an empty array and a null response
