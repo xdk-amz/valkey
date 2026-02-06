@@ -4493,6 +4493,10 @@ void replicationUnsetPrimary(void) {
 
     /* Cancel any ongoing atomic slot migrations */
     clusterCleanSlotImportsOnPromotion();
+
+    /* Clear the dict of replica keys with expire. As a primary, we no longer
+     * need to track these keys and failing to clean this up leaks memory. */
+    flushReplicaKeysWithExpireList(1);
 }
 
 /* This function is called when the replica lose the connection with the
