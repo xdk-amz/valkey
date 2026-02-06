@@ -38,7 +38,7 @@
 
 zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
-serverSortOperation *createSortOperation(int type, robj *pattern) {
+static serverSortOperation *createSortOperation(int type, robj *pattern) {
     serverSortOperation *so = zmalloc(sizeof(*so));
     so->type = type;
     so->pattern = pattern;
@@ -66,7 +66,7 @@ static int isReturnSubstPattern(sds pattern) {
  *
  * The returned object will always have its refcount increased by 1
  * when it is non-NULL. */
-robj *lookupKeyByPattern(serverDb *db, robj *pattern, robj *subst) {
+static robj *lookupKeyByPattern(serverDb *db, robj *pattern, robj *subst) {
     char *p, *f, *k;
     sds spat, ssub;
     robj *keyobj, *fieldobj = NULL, *o;
@@ -194,7 +194,7 @@ int sortCompare(const void *s1, const void *s2) {
 
 /* The SORT command is the most complex command in Valkey. Warning: this code
  * is optimized for speed and a bit less for readability */
-void sortCommandGeneric(client *c, int readonly) {
+static void sortCommandGeneric(client *c, int readonly) {
     list *operations;
     unsigned int outputlen = 0;
     int desc = 0, alpha = 0;

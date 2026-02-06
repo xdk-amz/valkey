@@ -55,7 +55,7 @@ static const unsigned char bitsinbyte[256] = {
 /* The SIMD version of popcount enhances performance through parallel lookup tables which is based on the following article:
  * https://arxiv.org/pdf/1611.07612 */
 ATTRIBUTE_TARGET_AVX2
-long long popcountAVX2(void *s, long count) {
+static long long popcountAVX2(void *s, long count) {
     long i = 0;
     unsigned char *p = (unsigned char *)s;
     long long bits = 0;
@@ -138,7 +138,7 @@ long long popcountAVX2(void *s, long count) {
 #endif
 
 /* The scalar version of popcount based on lookup tables. */
-long long popcountScalar(void *s, long count) {
+static long long popcountScalar(void *s, long count) {
     long long bits = 0;
     unsigned char *p = s;
     uint32_t *p4;
@@ -195,7 +195,7 @@ long long popcountScalar(void *s, long count) {
 
 /*  SIMD version of popcount for ARM NEON.
  *  Processes data in 64-byte NEON batches, falls back to scalar for tail. */
-long long popcountNEON(void *s, long n) {
+static long long popcountNEON(void *s, long n) {
     long long t = 0;
     uint8_t *p = (uint8_t *)s;
     ;
@@ -262,7 +262,7 @@ long long serverPopcount(void *s, long count) {
  * no zero bit is found, it returns count*8 assuming the string is zero
  * padded on the right. However if 'bit' is 1 it is possible that there is
  * not a single set bit in the bitmap. In this special case -1 is returned. */
-long long serverBitpos(void *s, unsigned long count, int bit) {
+static long long serverBitpos(void *s, unsigned long count, int bit) {
     unsigned long *l;
     unsigned char *c;
     unsigned long skipval, word = 0, one;
@@ -370,7 +370,7 @@ long long serverBitpos(void *s, unsigned long count, int bit) {
  * commands.
  */
 
-void setUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint64_t value) {
+static void setUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint64_t value) {
     uint64_t byte, bit, byteval, bitval, j;
 
     for (j = 0; j < bits; j++) {
@@ -385,12 +385,12 @@ void setUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, uint6
     }
 }
 
-void setSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, int64_t value) {
+static void setSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits, int64_t value) {
     uint64_t uv = value; /* Casting will add UINT64_MAX + 1 if v is negative. */
     setUnsignedBitfield(p, offset, bits, uv);
 }
 
-uint64_t getUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
+static uint64_t getUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
     uint64_t byte, bit, byteval, bitval, j, value = 0;
 
     for (j = 0; j < bits; j++) {
@@ -404,7 +404,7 @@ uint64_t getUnsignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
     return value;
 }
 
-int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
+static int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
     int64_t value;
     union {
         uint64_t u;
@@ -451,7 +451,7 @@ int64_t getSignedBitfield(unsigned char *p, uint64_t offset, uint64_t bits) {
 #define BFOVERFLOW_SAT 1
 #define BFOVERFLOW_FAIL 2 /* Used by the BITFIELD command implementation. */
 
-int checkUnsignedBitfieldOverflow(uint64_t value, int64_t incr, uint64_t bits, int owtype, uint64_t *limit) {
+static int checkUnsignedBitfieldOverflow(uint64_t value, int64_t incr, uint64_t bits, int owtype, uint64_t *limit) {
     uint64_t max = (bits == 64) ? UINT64_MAX : (((uint64_t)1 << bits) - 1);
     int64_t maxincr = max - value;
     int64_t minincr = -value;
@@ -487,7 +487,7 @@ handle_wrap: {
     return 1;
 }
 
-int checkSignedBitfieldOverflow(int64_t value, int64_t incr, uint64_t bits, int owtype, int64_t *limit) {
+static int checkSignedBitfieldOverflow(int64_t value, int64_t incr, uint64_t bits, int owtype, int64_t *limit) {
     int64_t max = (bits == 64) ? INT64_MAX : (((int64_t)1 << (bits - 1)) - 1);
     int64_t min = (-max) - 1;
 
@@ -540,7 +540,7 @@ handle_wrap: {
 
 /* Debugging function. Just show bits in the specified bitmap. Not used
  * but here for not having to rewrite it when debugging is needed. */
-void printBits(unsigned char *p, unsigned long count) {
+static void printBits(unsigned char *p, unsigned long count) {
     unsigned long j, i, byte;
 
     for (j = 0; j < count; j++) {
@@ -571,7 +571,7 @@ void printBits(unsigned char *p, unsigned long count) {
  * If the 'hash' argument is true, and 'bits is positive, then the command
  * will also parse bit offsets prefixed by "#". In such a case the offset
  * is multiplied by 'bits'. This is useful for the BITFIELD command. */
-int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int bits) {
+static int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int bits) {
     long long loffset;
     char *err = "bit offset is not an integer or out of range";
     sds p = objectGetVal(o);
@@ -606,7 +606,7 @@ int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int
  * to return unsigned integer values greater than INT64_MAX.
  *
  * On error C_ERR is returned and an error is sent to the client. */
-int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
+static int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
     sds p = objectGetVal(o);
     size_t plen = sdslen(p);
     char *err = "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.";
@@ -635,7 +635,7 @@ int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
  * so that the 'maxbit' bit can be addressed. The object is finally
  * returned. Otherwise if the key holds a wrong type NULL is returned and
  * an error is sent to the client. */
-robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
+static robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
     size_t byte = maxbit >> 3;
     robj *o = lookupKeyWrite(c->db, c->argv[1]);
     if (checkType(c, o, OBJ_STRING)) return NULL;
@@ -667,7 +667,7 @@ robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
  *
  * If the source object is NULL the function is guaranteed to return NULL
  * and set 'len' to 0. */
-unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
+static unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
     serverAssert(!o || o->type == OBJ_STRING);
     unsigned char *p = NULL;
 
@@ -1205,7 +1205,7 @@ struct bitfieldOp {
 /* This implements both the BITFIELD command and the BITFIELD_RO command
  * when flags is set to BITFIELD_FLAG_READONLY: in this case only the
  * GET subcommand is allowed, other subcommands will return an error. */
-void bitfieldGeneric(client *c, int flags) {
+static void bitfieldGeneric(client *c, int flags) {
     robj *o;
     uint64_t bitoffset;
     int j, numops = 0, changes = 0, dirty = 0;
