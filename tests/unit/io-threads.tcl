@@ -61,6 +61,101 @@ proc activate_io_threads_and_wait {} {
 start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {enable-debug-command {yes} io-threads 5}} {
     # Skip if non io-threads mode - as it is relevant only for io-threads mode
     assert_equal {io-threads 5} [r config get io-threads]
+    test {Data correctness with concurrent clients under io-threads} {
+        if {$::valgrind} {
+            skip "Too slow with Valgrind"
+        }
+        r flushall
+
+        # Spawn multiple clients writing different key ranges concurrently
+        set num_clients 10
+        set ops_per_client 100
+        for {set i 0} {$i < $num_clients} {incr i} {
+            set rd($i) [valkey_deferring_client]
+        }
+
+        # Each client writes to its own key range
+        for {set i 0} {$i < $num_clients} {incr i} {
+            for {set j 0} {$j < $ops_per_client} {incr j} {
+                $rd($i) set "key:$i:$j" "val:$i:$j"
+            }
+            $rd($i) flush
+        }
+
+        # Read all responses
+        for {set i 0} {$i < $num_clients} {incr i} {
+            for {set j 0} {$j < $ops_per_client} {incr j} {
+                $rd($i) read
+            }
+        }
+
+        # Verify all values are correct
+        for {set i 0} {$i < $num_clients} {incr i} {
+            for {set j 0} {$j < $ops_per_client} {incr j} {
+                assert_equal [r get "key:$i:$j"] "val:$i:$j"
+            }
+            $rd($i) close
+        }
+        unset rd
+    }
+
+    test {Pipeline correctness under io-threads} {
+        if {$::valgrind} {
+            skip "Too slow with Valgrind"
+        }
+        r flushall
+
+        set rd [valkey_deferring_client]
+        set pipeline_size 200
+
+        # Send a pipeline of mixed commands
+        for {set i 0} {$i < $pipeline_size} {incr i} {
+            $rd set "pipe:$i" $i
+        }
+        $rd flush
+        for {set i 0} {$i < $pipeline_size} {incr i} {
+            assert_equal [$rd read] OK
+        }
+
+        # Read them all back in a pipeline
+        for {set i 0} {$i < $pipeline_size} {incr i} {
+            $rd get "pipe:$i"
+        }
+        $rd flush
+        for {set i 0} {$i < $pipeline_size} {incr i} {
+            assert_equal [$rd read] $i
+        }
+        $rd close
+    }
+
+    test {Dynamic io-threads scale down and back up preserves correctness} {
+        if {$::valgrind} {
+            skip "Too slow with Valgrind"
+        }
+        r flushall
+        r set testkey "before_scale"
+
+        # Scale down to 1 (effectively disabling io-threads)
+        assert_equal {OK} [r config set io-threads 1]
+        wait_for_condition 1000 50 {
+            [getInfoProperty [r info server] io_threads_active] eq 0
+        } else {
+            fail "io_threads did not deactivate"
+        }
+
+        assert_equal [r get testkey] "before_scale"
+        r set testkey "during_scale_down"
+        assert_equal [r get testkey] "during_scale_down"
+
+        # Scale back up
+        assert_equal {OK} [r config set io-threads 5]
+        activate_io_threads_and_wait
+
+        assert_equal [r get testkey] "during_scale_down"
+        r set testkey "after_scale_up"
+        assert_equal [r get testkey] "after_scale_up"
+    }
+
     test {Force the use of IO threads and assert active IO thread usage} {
         # Ensure all configured IO threads activate on any event, bypassing CPU-based ignition thresholds.
         r config set io-threads-always-active yes
