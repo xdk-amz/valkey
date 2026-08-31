@@ -1990,6 +1990,26 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
     }
 }
 
+/* Design C spike: worker-side bucket-line prefetch. Computes the top-level
+ * bucket address(es) for `hash` exactly as findBucket() selects them, then
+ * issues a cache-line prefetch -- no entry walk, no state, no behavior change.
+ * Safe to call from any thread: prefetch is a hint and never faults, even if
+ * ht->tables is being reallocated concurrently. */
+void hashtablePrefetchBucket(hashtable *ht, uint64_t hash) {
+    if (hashtableSize(ht) == 0) return;
+    if (ht->used[0]) {
+        size_t mask = expToMask(ht->bucket_exp[0]);
+        size_t bucket_idx = hash & mask;
+        if (!(ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx))
+            valkey_prefetch(&ht->tables[0][bucket_idx]);
+    }
+    if (ht->rehash_idx >= 0 && ht->used[1]) {
+        size_t mask = expToMask(ht->bucket_exp[1]);
+        size_t bucket_idx = hash & mask;
+        valkey_prefetch(&ht->tables[1][bucket_idx]);
+    }
+}
+
 /* --- Scan --- */
 
 /* Scan is a stateless iterator. It works with a cursor that is returned to the

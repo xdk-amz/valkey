@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "designc.h"
 #include "ordered_index.h"
 #include "connection.h"
 #include "monotonic.h"
@@ -1879,6 +1880,14 @@ extern int ProcessingEventsWhileBlocked;
  * call some other low-risk functions. */
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
+
+    /* Design C spike: drain worker op queues into the incremental-find applier
+     * every iteration, and keep main from blocking so it busy-polls (the
+     * certified Design C operating mode). */
+    if (server.designc_enabled) {
+        designcApplierTick();
+        aeSetDontWait(server.el, 1);
+    }
 
     /* When I/O threads are enabled and there are pending I/O jobs, the poll is offloaded to one of the I/O threads. */
     trySendPollJobToIOThreads();
@@ -4824,6 +4833,9 @@ void closeListeningSockets(int unlink_unix_socket) {
 int prepareForShutdown(client *c, int flags) {
     if (isShutdownInitiated()) return C_ERR;
 
+    /* Design C spike: stop and join io workers before teardown. */
+    designcShutdown();
+
     /* When SHUTDOWN is called while the server is loading a dataset in
      * memory we need to make sure no attempt is performed to save
      * the dataset on shutdown (otherwise it could overwrite the current DB
@@ -6827,6 +6839,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (server.cluster_enabled) info = genClusterInfoString(info);
     }
 
+    /* Design C spike stats */
+    if (server.designc_enabled && (all_sections || (dictFind(section_dict, "designc") != NULL))) {
+        if (sections++) info = sdscat(info, "\r\n");
+        designcInfoAppend(&info);
+    }
+
     /* Scripting engines */
     if (all_sections || (dictFind(section_dict, "scriptingengines") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
@@ -7821,6 +7839,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     }
     ACLLoadUsersAtStartup();
     initListeners();
+    designcInit();
     if (server.cluster_enabled) {
         clusterInitLast();
     }

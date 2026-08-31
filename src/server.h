@@ -1998,6 +1998,8 @@ struct valkeyServer {
     int config_databases;                        /* Total number of configured DBs in standalone */
     int config_databases_cluster;                /* Total number of configured DBs in cluster mode */
     int dbnum;                                   /* Total number of initialized DBs */
+    int designc_enabled;                         /* Design C worker-ownership GET fast path (spike, immutable) */
+    int designc_workers;                         /* Number of designc io workers */
     int supervised;                              /* 1 if supervised, 0 otherwise. */
     int supervised_mode;                         /* See SUPERVISED_* */
     int daemonize;                               /* True if running as a daemon */

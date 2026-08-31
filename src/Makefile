@@ -529,6 +529,7 @@ ENGINE_SERVER_OBJ = \
     lzf_c.o \
     lzf_d.o \
     memory_prefetch.o \
+    designc.o \
     memtest.o \
     module.o \
     monotonic.o \

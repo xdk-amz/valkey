@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "designc.h"
 #include "connhelpers.h"
 #include "io_threads.h"
 
@@ -330,6 +331,9 @@ static void connSocketAcceptHandler(aeEventLoop *el, int fd, void *privdata, int
         serverLog(LL_VERBOSE, "Accepted %s:%d", cip, cport);
 
         if (server.tcpkeepalive) anetKeepAlive(NULL, cfd, server.tcpkeepalive);
+        /* Design C spike: hand the raw fd to an io worker permanently; main
+         * never creates a client for it and never sees the fd again. */
+        if (designcHandoffFd(cfd)) continue;
         acceptCommonHandler(connCreateAcceptedSocket(cfd, NULL), flags, cip);
     }
 }
