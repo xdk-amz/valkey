@@ -428,7 +428,16 @@ static void dc_drain_replies(dc_worker *w) {
             for (int k = 0; k < nt; k++) if (touched[k] == r->conn) { seen = 1; break; }
             if (!seen && nt < 256) touched[nt++] = r->conn;
         }
-        for (int k = 0; k < nt; k++) { dc_flush_pending(w, touched[k]); dc_try_write(w, touched[k]); }
+        for (int k = 0; k < nt; k++) {
+            dc_flush_pending(w, touched[k]);
+            dc_try_write(w, touched[k]);
+            /* Backpressure in dc_process_input() can pause parsing with input
+             * still buffered when the reorder window fills. Advancing flush_seq
+             * above frees window; re-drive parsing now, since no new EPOLLIN
+             * edge will arrive for already-buffered bytes. */
+            dc_conn *c = &w->conns[touched[k]];
+            if (c->active && c->rlen > 0) dc_process_input(w, touched[k]);
+        }
     } while (got == 256);
 }
 
@@ -659,7 +668,9 @@ void designcShutdown(void) {
         uint64_t one = 1; ssize_t rc = write(g_workers[i].evfd, &one, sizeof(one)); (void)rc;
     }
     for (int i = 0; i < g_nworkers; i++) pthread_join(g_workers[i].th, NULL);
-    serverLog(LL_NOTICE, "designc: workers joined; ops=%llu",
-              (unsigned long long)atomic_load_explicit(&g_ops, memory_order_relaxed));
+    sds stats = sdsempty();
+    designcInfoAppend(&stats);
+    serverLog(LL_NOTICE, "designc: workers joined. stats:\n%s", stats);
+    sdsfree(stats);
     g_nworkers = 0;
 }
