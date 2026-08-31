@@ -1928,6 +1928,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData();
 
+    /* Design C spike: main is the applier and must busy-poll the per-worker op
+     * queues (it holds no client fds, so nothing would ever wake it). The
+     * aeSetDontWait(1) at the top of beforeSleep is otherwise overwritten by the
+     * aeSetDontWait(dont_sleep) below, letting main block. Force no-sleep. */
+    if (server.designc_enabled) dont_sleep = 1;
+
     /* Call the Cluster before sleep function. Note that this function
      * may change the state of Cluster (from ok to fail or vice versa),
      * so it's a good idea to call it before serving the unblocked clients
