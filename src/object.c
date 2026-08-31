@@ -38,6 +38,7 @@
 #include "vset.h"
 #include "zmalloc.h"
 #include "sds.h"
+#include "lsa.h"
 #include "module.h"
 #include <math.h>
 #include <ctype.h>
@@ -394,10 +395,13 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
 
     /* Create a new object with embedded key. Reuse ptr if possible. */
     void *ptr;
+    int val_in_log = 0;
     if (objectGetRefcount(o) == 1) {
         /* Reuse the ptr. There are no other references to o. */
         ptr = o->val_ptr;
         o->val_ptr = NULL;
+        if (lsaEnabled() && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW && ptr)
+            val_in_log = lsaIsLogSds(ptr);
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
@@ -410,10 +414,34 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
          * can be duplicated, but for a module type is not always possible. */
         serverPanic("Not implemented");
     }
+    /* LSA admission seam: unembedded raw string values with no TTL move
+     * into the log as an sds-layout copy. TTL'd values stay on the heap.
+     * NOTE: between taking a log-resident ptr above and lsaSetOwner below,
+     * no lsaAdmitSds runs on that path, so the cleaner cannot observe the
+     * stale owner slot. */
+    if (lsaEnabled() && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW && ptr) {
+        if (val_in_log) {
+            if (expire != EXPIRY_NONE) {
+                /* TTL attached to a log value: escape to the heap. */
+                sds heapval = sdsdup(ptr);
+                sdsfree(ptr); /* tombstones the log entry */
+                ptr = heapval;
+                val_in_log = 0;
+            }
+        } else if (expire == EXPIRY_NONE) {
+            sds logval = lsaAdmitSds(ptr);
+            if (logval) {
+                sdsfree(ptr); /* transient jemalloc sds */
+                ptr = logval;
+                val_in_log = 1;
+            }
+        }
+    }
     robj *new = createUnembeddedObjectWithKeyAndExpire(objectGetType(o), ptr, key, expire);
     objectSetEncoding(new, objectGetEncoding(o));
     objectSetLRU(new, objectGetLRU(o));
     decrRefCount(o);
+    if (val_in_log) lsaSetOwner(ptr, &new->val_ptr);
     return new;
 }
 

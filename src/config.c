@@ -2447,6 +2447,11 @@ static void numericConfigRewrite(standardConfig *config, const char *name, struc
      embedCommonConfig(name, alias, modifiable) embedConfigInterface(NULL, setfn, getfn, rewritefn, applyfn)}
 
 static int isValidActiveDefrag(int val, const char **err) {
+    if (val && server.lsa_enabled) {
+        *err = "activedefrag cannot be enabled while lsa-enabled is set: "
+               "defrag would relocate objects and stale LSA owner pointers";
+        return 0;
+    }
 #ifndef HAVE_DEFRAG
     if (val) {
         *err = "Active defragmentation cannot be enabled: it "
@@ -2459,6 +2464,15 @@ static int isValidActiveDefrag(int val, const char **err) {
     UNUSED(val);
     UNUSED(err);
 #endif
+    return 1;
+}
+
+static int isValidLsaEnabled(int val, const char **err) {
+    if (val && server.active_defrag_enabled) {
+        *err = "lsa-enabled cannot be set while activedefrag is enabled: "
+               "defrag would relocate objects and stale LSA owner pointers";
+        return 0;
+    }
     return 1;
 }
 
@@ -3381,6 +3395,7 @@ standardConfig static_configs[] = {
     createBoolConfig("replica-ignore-maxmemory", "slave-ignore-maxmemory", MODIFIABLE_CONFIG, server.repl_replica_ignore_maxmemory, 1, NULL, NULL),
     createBoolConfig("jemalloc-bg-thread", NULL, MODIFIABLE_CONFIG, server.jemalloc_bg_thread, 1, NULL, updateJemallocBgThread),
     createBoolConfig("activedefrag", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.active_defrag_enabled, CONFIG_ACTIVE_DEFRAG_DEFAULT, isValidActiveDefrag, NULL),
+    createBoolConfig("lsa-enabled", NULL, IMMUTABLE_CONFIG, server.lsa_enabled, 0, isValidLsaEnabled, NULL),
     createBoolConfig("syslog-enabled", NULL, IMMUTABLE_CONFIG, server.syslog_enabled, 0, NULL, NULL),
     createBoolConfig("cluster-enabled", NULL, IMMUTABLE_CONFIG, server.cluster_enabled, 0, NULL, NULL),
     createBoolConfig("appendonly", NULL, MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, server.aof_enabled, 0, NULL, updateAppendOnly),
@@ -3464,6 +3479,7 @@ standardConfig static_configs[] = {
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("lsa-size-mb", NULL, IMMUTABLE_CONFIG, 16, INT_MAX, server.lsa_size_mb, 1024, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases_cluster, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort),                                               /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1, IO_THREADS_MAX_NUM, server.io_threads_num, 1, INTEGER_CONFIG, NULL, updateIOThreads), /* Single threaded by default */

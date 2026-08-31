@@ -190,10 +190,23 @@ sds sdsdup(const_sds s) {
     return sdsnewlen(s, sdslen(s));
 }
 
+/* LSA hooks: NULL unless the server enables the log allocator. */
+int (*sdsLsaIsLog)(const void *allocptr) = NULL;
+void (*sdsLsaFreeLog)(void *allocptr) = NULL;
+void (*sdsLsaEscapeLog)(void *allocptr) = NULL;
+
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
-    s_free_with_size(sdsAllocPtr(s), sdsAllocSize(s));
+    void *allocptr = sdsAllocPtr(s);
+    if (sdsLsaIsLog && sdsLsaIsLog(allocptr)) {
+        /* Tombstone the log entry. Runs BEFORE the owning robj is freed
+         * (freeStringObject frees the value first), which is what makes
+         * the cleaner's owner deref safe on non-tombstoned entries. */
+        sdsLsaFreeLog(allocptr);
+        return;
+    }
+    s_free_with_size(allocptr, sdsAllocSize(s));
 }
 
 /* This variant of sdsfree() gets its argument as void, and is useful
@@ -276,7 +289,18 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
     hdrlen = sdsHdrSize(type);
     assert(hdrlen + newlen + 1 > reqlen); /* Catch size_t overflow */
     use_realloc = (oldtype == type);
-    if (use_realloc) {
+    if (sdsLsaIsLog && sdsLsaIsLog(sh)) {
+        /* Log-resident sds: growth escapes to the heap, log entry is
+         * tombstoned. Log entries are never realloc'd in place. */
+        newsh = s_malloc_usable(hdrlen + newlen + 1, &bufsize);
+        if (newsh == NULL) return NULL;
+        adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+        memcpy((char *)newsh + hdrlen, s, len + 1);
+        sdsLsaEscapeLog(sh);
+        s = (char *)newsh + hdrlen;
+        s[-1] = type;
+        sdssetlen(s, len);
+    } else if (use_realloc) {
         newsh = s_realloc_usable(sh, hdrlen + newlen + 1, &bufsize);
         if (newsh == NULL) return NULL;
         s = (char *)newsh + hdrlen;
@@ -352,6 +376,25 @@ sds sdsResize(sds s, size_t size, int would_regrow) {
         if (type == SDS_TYPE_5) type = SDS_TYPE_8;
     }
     hdrlen = sdsHdrSize(type);
+
+    if (sdsLsaIsLog && sdsLsaIsLog(sh)) {
+        /* Log-resident sds: resize escapes to the heap, log entry is
+         * tombstoned. Log entries are never realloc'd in place. */
+        size_t bufsize;
+        newsh = s_malloc_usable(hdrlen + size + 1, &bufsize);
+        if (newsh == NULL) return NULL;
+        adjustTypeIfNeeded(&type, &hdrlen, bufsize);
+        memcpy((char *)newsh + hdrlen, s, len);
+        sdsLsaEscapeLog(sh);
+        s = (char *)newsh + hdrlen;
+        s[-1] = type;
+        size_t newsize = bufsize - hdrlen - 1;
+        assert(type == SDS_TYPE_5 || newsize <= sdsTypeMaxSize(type));
+        s[len] = '\0';
+        sdssetlen(s, len);
+        sdssetalloc(s, newsize);
+        return s;
+    }
 
     /* If the type is the same, or can hold the size in it with low overhead
      * (larger than SDS_TYPE_8), we just realloc(), letting the allocator

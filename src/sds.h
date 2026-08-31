@@ -282,6 +282,15 @@ sds sdsResize(sds s, size_t size, int would_regrow);
 size_t sdsAllocSize(const_sds s);
 void *sdsAllocPtr(const_sds s);
 
+/* LSA (log-structured allocator) hooks. NULL unless the server installs
+ * them at startup (lsa-enabled yes). sds.c is linked into non-server
+ * binaries, so the log branches sit behind these pointers instead of a
+ * direct dependency on lsa.c. Arguments are allocation base pointers
+ * (sdsAllocPtr), not sds handles. */
+extern int (*sdsLsaIsLog)(const void *allocptr);
+extern void (*sdsLsaFreeLog)(void *allocptr);   /* tombstone on sdsfree */
+extern void (*sdsLsaEscapeLog)(void *allocptr); /* tombstone on realloc escape */
+
 /* Returns the minimum required size to store an sds string of the given length
  * and type. */
 static inline size_t sdsReqSize(size_t len, char type) {

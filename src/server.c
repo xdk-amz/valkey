@@ -50,6 +50,7 @@
 #include "io_threads.h"
 #include "tls.h"
 #include "sds.h"
+#include "lsa.h"
 #include "module.h"
 #include "scripting_engine.h"
 #include "util.h"
@@ -1350,6 +1351,9 @@ void databasesCron(void) {
 
     /* Start active defrag cycle or adjust defrag CPU if needed. */
     monitorActiveDefrag();
+
+    /* LSA band cleaner slice. Skip while a child is active (COW). */
+    if (server.lsa_enabled && !hasActiveChildProcess()) lsaCleanerCron();
 
     /* Perform hash tables rehashing if needed, but only if there are no
      * other processes saving the DB on disk. Otherwise, rehashing is bad
@@ -2973,6 +2977,13 @@ void initServer(void) {
     }
 
     /* Initialization after setting defaults from the config system. */
+    if (server.lsa_enabled) {
+        if (!lsaInit((size_t)server.lsa_size_mb)) {
+            serverLog(LL_WARNING, "Fatal: failed to reserve %d MB LSA region.", server.lsa_size_mb);
+            exit(1);
+        }
+        serverLog(LL_NOTICE, "LSA enabled: %d MB log region reserved.", server.lsa_size_mb);
+    }
     server.aof_state = server.aof_enabled ? AOF_ON : AOF_OFF;
     server.fsynced_reploff = server.aof_enabled ? 0 : -1;
     server.in_fork_child = CHILD_TYPE_NONE;
@@ -6831,6 +6842,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "scriptingengines") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = genValkeyInfoStringScriptingEngines(info);
+    }
+
+    /* LSA (log-structured allocator) */
+    if (all_sections || (dictFind(section_dict, "lsa") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscatprintf(info, "# LSA\r\n");
+        info = lsaInfoAppend(info);
     }
 
     /* Key space */

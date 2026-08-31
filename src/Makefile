@@ -526,6 +526,7 @@ ENGINE_SERVER_OBJ = \
     lolwut6.o \
     lolwut9.o \
     lrulfu.o \
+    lsa.o \
     lzf_c.o \
     lzf_d.o \
     memory_prefetch.o \
