@@ -1984,6 +1984,8 @@ struct valkeyServer {
     int active_defrag_enabled;
     int lsa_enabled; /* Log-structured allocator for raw string values (spike). */
     int lsa_size_mb; /* LSA pool reservation in MB. */
+    int lsa_band_lo; /* Cleaner trigger: live below this % of used. */
+    int lsa_band_hi; /* Cleaner target: clean until live at/above this % of used. */
     int skip_checksum_validation;                /* Disable checksum validation for RDB and RESTORE payload. */
     int rdb_version_check;                       /* Try to load RDB produced by a future version. */
     int jemalloc_bg_thread;                      /* Enable jemalloc background thread */

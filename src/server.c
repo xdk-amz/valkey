@@ -2978,7 +2978,7 @@ void initServer(void) {
 
     /* Initialization after setting defaults from the config system. */
     if (server.lsa_enabled) {
-        if (!lsaInit((size_t)server.lsa_size_mb)) {
+        if (!lsaInit((size_t)server.lsa_size_mb, server.lsa_band_lo, server.lsa_band_hi)) {
             serverLog(LL_WARNING, "Fatal: failed to reserve %d MB LSA region.", server.lsa_size_mb);
             exit(1);
         }

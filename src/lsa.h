@@ -12,8 +12,10 @@
 #define LSA_EMAX (1ULL * 1024 * 1024)         /* value admission cap */
 
 /* Lifecycle. lsaInit reserves size_mb of VA (commit on touch) and installs
- * the sds.c hooks. Returns 1 on success, 0 on failure. */
-int lsaInit(size_t size_mb);
+ * the sds.c hooks. band_lo/band_hi are the cleaner band percentages:
+ * trigger when live < band_lo% of used, clean until live >= band_hi%.
+ * Returns 1 on success, 0 on failure. */
+int lsaInit(size_t size_mb, int band_lo, int band_hi);
 int lsaEnabled(void);
 
 /* Admission: copy the content of 'src' into a log entry laid out as a

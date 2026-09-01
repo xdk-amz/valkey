@@ -39,6 +39,7 @@
 #include "vector.h"
 #include "expire.h"
 #include "crc16_slottable.h"
+#include "lsa.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -350,6 +351,21 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
 
     if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
+        /* LSA admission seam (overwrite ptr-swap path): this path bypasses
+         * objectSetKeyAndExpire, so admit here. The retained robj is 'old'
+         * (keeps its key and expire); admission requires no TTL and an
+         * unembedded raw string value. */
+        if (lsaEnabled() && val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && !val->hasembval &&
+            objectGetExpire(old) == EXPIRY_NONE) {
+            sds vptr = objectGetVal(val);
+            if (!lsaIsLogSds(vptr)) {
+                sds logval = lsaAdmitSds(vptr);
+                if (logval) {
+                    sdsfree(vptr); /* transient jemalloc sds */
+                    objectSetVal(val, logval);
+                }
+            }
+        }
         /* Keep old object in the database. Just swap it's ptr, type and
          * encoding with the content of val. */
         int tmp_type = old->type;
@@ -364,6 +380,12 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         new = old;
         old = val;
+        /* Re-register the owner slot for a log-resident value now living in
+         * 'new' (the displaced value in 'old' is freed below in the same
+         * command execution; the cleaner cannot run in between). */
+        if (lsaEnabled() && new->type == OBJ_STRING && new->encoding == OBJ_ENCODING_RAW && !new->hasembval &&
+            lsaIsLogSds(objectGetVal(new)))
+            lsaSetOwner(objectGetVal(new), &new->val_ptr);
     } else {
         /* Replace the old value at its location in the key space. */
         objectSetLRU(val, objectGetLRU(old));
