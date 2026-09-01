@@ -169,6 +169,10 @@ static atomic_uint_least64_t g_busy_ns;
 static atomic_uint_least64_t g_cyc_hist[DC_HIST_N];
 static atomic_uint_least64_t g_depth_hist[DC_HIST_N];
 static atomic_uint_least64_t g_tick_calls;
+/* stage-1b: find-batches executed per applier tick (drain-to-exhaustion loop).
+ * buckets: 1 / 2-4 / 5-16 / 17-64 / 65+  */
+#define DC_BATCH_HIST_N 5
+static atomic_uint_least64_t g_batches_hist[DC_BATCH_HIST_N];
 
 static inline int dc_hist_bucket(uint32_t n) {
     if (n <= 1) return 0;
@@ -177,6 +181,13 @@ static inline int dc_hist_bucket(uint32_t n) {
     if (n <= 15) return 3;
     if (n <= 31) return 4;
     return 5;
+}
+static inline int dc_batch_bucket(uint64_t n) {
+    if (n <= 1) return 0;
+    if (n <= 4) return 1;
+    if (n <= 16) return 2;
+    if (n <= 64) return 3;
+    return 4;
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,13 +506,77 @@ static int dc_extract_value(robj *val, char *out) {
     return (int)l;
 }
 
+/* Execute one find-batch of `bs` ops (all from worker `w`) against db0 and push
+ * replies back to that worker's reply queue. `keypool` holds DC_FIND_BATCH
+ * reusable search-key sds buffers. Advances *ops by bs. */
+static void dc_exec_find_batch(dc_worker *w, dc_oprec *stage, uint32_t bs,
+                               hashtable *ht, int expires_present,
+                               sds *keypool, uint64_t *ops) {
+    hashtableIncrementalFindState st[DC_FIND_BATCH];
+    dc_oprec *bo[DC_FIND_BATCH];
+    atomic_fetch_add_explicit(&g_depth_hist[dc_hist_bucket(bs)], 1, memory_order_relaxed);
+    for (uint32_t b = 0; b < bs; b++) {
+        bo[b] = &stage[b];
+        sds k = keypool[b];
+        memcpy(k, bo[b]->key, bo[b]->klen);
+        sdssetlen(k, bo[b]->klen);
+        k[bo[b]->klen] = '\0';
+        hashtableIncrementalFindInit(&st[b], ht, k);
+    }
+    uint32_t remaining = bs;
+    char done[DC_FIND_BATCH]; memset(done, 0, bs);
+    while (remaining) {
+        for (uint32_t b = 0; b < bs; b++)
+            if (!done[b] && !hashtableIncrementalFindStep(&st[b])) { done[b] = 1; remaining--; }
+    }
+    for (uint32_t b = 0; b < bs; b++) {
+        dc_replyrec r;
+        r.conn = bo[b]->conn; r.seq = bo[b]->seq;
+        void *entry = NULL;
+        int hit = hashtableIncrementalFindGetResult(&st[b], &entry) && entry;
+        if (hit && expires_present) {
+            /* Rare TTL path: defer to the real read path for authoritative
+             * expiry + propagation semantics (main is the expiry thread). */
+            robj *keyobj = createStringObject(bo[b]->key, bo[b]->klen);
+            robj *val = lookupKeyReadWithFlags(server.db[0], keyobj, LOOKUP_NONE);
+            decrRefCount(keyobj);
+            if (!val) { r.kind = DC_R_NIL; r.vlen = -1; }
+            else {
+                int vl = dc_extract_value(val, r.val);
+                if (vl == -1) { const char *e = "-ERR DESIGNC stage1 value too large\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
+                else if (vl == -2) { const char *e = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
+                else { r.kind = DC_R_BULK; r.vlen = vl; }
+            }
+        } else if (hit) {
+            robj *val = entry;
+            int vl = dc_extract_value(val, r.val);
+            if (vl == -1) { const char *e = "-ERR DESIGNC stage1 value too large\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
+            else if (vl == -2) { const char *e = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
+            else { r.kind = DC_R_BULK; r.vlen = vl; }
+        } else {
+            r.kind = DC_R_NIL; r.vlen = -1;
+        }
+        while (!dc_spsc_push(&w->rpq, &r)) { /* worker drains each loop */ }
+    }
+    *ops += bs;
+}
+
 void designcApplierTick(void) {
     if (!server.designc_enabled || g_nworkers == 0) return;
     atomic_fetch_add_explicit(&g_tick_calls, 1, memory_order_relaxed);
 
-    static dc_oprec stage[128];
-    hashtableIncrementalFindState st[DC_FIND_BATCH];
-    dc_oprec *bo[DC_FIND_BATCH];
+    /* Stage-1b: drain ALL worker op queues to exhaustion within one tick.
+     * We round-robin across workers, pulling up to DC_FIND_BATCH (31) ops from
+     * each into a find-batch and executing it, and keep sweeping until a full
+     * pass over every worker reads empty. Per-connection FIFO is preserved
+     * because each worker's SPSC queue is consumed in order; interleaving
+     * batches across workers gives key-independent MLP. Replies are enqueued
+     * per batch (not buffered across the loop) so workers start writing while
+     * main is still draining. The only bound is queue-empty: ae events (incl.
+     * accept) may be starved under sustained load -- accepted for this GET-only
+     * spike (accept latency may grow; not fixed here). aeSetDontWait forcing
+     * (100a940) still guarantees we are re-entered promptly. */
+    static dc_oprec stage[DC_FIND_BATCH];
     /* pooled search-key sds buffers (reused across ops; no per-op malloc) */
     static sds keypool[DC_FIND_BATCH];
     static int keypool_init = 0;
@@ -513,66 +588,31 @@ void designcApplierTick(void) {
     uint64_t ops = atomic_load_explicit(&g_ops, memory_order_relaxed);
     uint64_t busy_ns = atomic_load_explicit(&g_busy_ns, memory_order_relaxed);
     struct timespec ta, tb;
+    int timed = 0;
+    uint64_t batches = 0;
 
-    for (int wi = 0; wi < g_nworkers; wi++) {
-        dc_worker *w = &g_workers[wi];
-        uint32_t got = dc_spsc_pop_batch(&w->opq, stage, 128);
-        if (!got) continue;
-        atomic_fetch_add_explicit(&g_cyc_hist[dc_hist_bucket(got)], 1, memory_order_relaxed);
-        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ta);
-        for (uint32_t base = 0; base < got; base += DC_FIND_BATCH) {
-            uint32_t bs = got - base; if (bs > DC_FIND_BATCH) bs = DC_FIND_BATCH;
-            atomic_fetch_add_explicit(&g_depth_hist[dc_hist_bucket(bs)], 1, memory_order_relaxed);
-            for (uint32_t b = 0; b < bs; b++) {
-                bo[b] = &stage[base + b];
-                sds k = keypool[b];
-                memcpy(k, bo[b]->key, bo[b]->klen);
-                sdssetlen(k, bo[b]->klen);
-                k[bo[b]->klen] = '\0';
-                hashtableIncrementalFindInit(&st[b], ht, k);
-            }
-            uint32_t remaining = bs;
-            char done[DC_FIND_BATCH]; memset(done, 0, bs);
-            while (remaining) {
-                for (uint32_t b = 0; b < bs; b++)
-                    if (!done[b] && !hashtableIncrementalFindStep(&st[b])) { done[b] = 1; remaining--; }
-            }
-            for (uint32_t b = 0; b < bs; b++) {
-                dc_replyrec r;
-                r.conn = bo[b]->conn; r.seq = bo[b]->seq;
-                void *entry = NULL;
-                int hit = hashtableIncrementalFindGetResult(&st[b], &entry) && entry;
-                if (hit && expires_present) {
-                    /* Rare TTL path: defer to the real read path for authoritative
-                     * expiry + propagation semantics (main is the expiry thread). */
-                    robj *keyobj = createStringObject(bo[b]->key, bo[b]->klen);
-                    robj *val = lookupKeyReadWithFlags(server.db[0], keyobj, LOOKUP_NONE);
-                    decrRefCount(keyobj);
-                    if (!val) { r.kind = DC_R_NIL; r.vlen = -1; }
-                    else {
-                        int vl = dc_extract_value(val, r.val);
-                        if (vl == -1) { const char *e = "-ERR DESIGNC stage1 value too large\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
-                        else if (vl == -2) { const char *e = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
-                        else { r.kind = DC_R_BULK; r.vlen = vl; }
-                    }
-                } else if (hit) {
-                    robj *val = entry;
-                    int vl = dc_extract_value(val, r.val);
-                    if (vl == -1) { const char *e = "-ERR DESIGNC stage1 value too large\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
-                    else if (vl == -2) { const char *e = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"; r.kind = DC_R_ERR; r.vlen = (int)strlen(e); memcpy(r.val, e, r.vlen); }
-                    else { r.kind = DC_R_BULK; r.vlen = vl; }
-                } else {
-                    r.kind = DC_R_NIL; r.vlen = -1;
-                }
-                while (!dc_spsc_push(&w->rpq, &r)) { /* worker drains each loop */ }
-            }
-            ops += bs;
+    int any;
+    do {
+        any = 0;
+        for (int wi = 0; wi < g_nworkers; wi++) {
+            dc_worker *w = &g_workers[wi];
+            uint32_t got = dc_spsc_pop_batch(&w->opq, stage, DC_FIND_BATCH);
+            if (!got) continue;
+            any = 1;
+            if (!timed) { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ta); timed = 1; }
+            atomic_fetch_add_explicit(&g_cyc_hist[dc_hist_bucket(got)], 1, memory_order_relaxed);
+            dc_exec_find_batch(w, stage, got, ht, expires_present, keypool, &ops);
+            batches++;
         }
+    } while (any);
+
+    if (timed) {
         clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tb);
         busy_ns += (uint64_t)(tb.tv_sec - ta.tv_sec) * 1000000000ull + (uint64_t)(tb.tv_nsec - ta.tv_nsec);
+        atomic_fetch_add_explicit(&g_batches_hist[dc_batch_bucket(batches)], 1, memory_order_relaxed);
+        atomic_store_explicit(&g_ops, ops, memory_order_relaxed);
+        atomic_store_explicit(&g_busy_ns, busy_ns, memory_order_relaxed);
     }
-    atomic_store_explicit(&g_ops, ops, memory_order_relaxed);
-    atomic_store_explicit(&g_busy_ns, busy_ns, memory_order_relaxed);
 }
 
 /* ------------------------------------------------------------------ */
@@ -612,6 +652,9 @@ void designcInfoAppend(sds *info) {
     *info = sdscat(*info, "\r\ndesignc_cycle_hist:");
     for (int i = 0; i < DC_HIST_N; i++)
         *info = sdscatprintf(*info, "%s%llu", i ? "," : "", (unsigned long long)atomic_load_explicit(&g_cyc_hist[i], memory_order_relaxed));
+    *info = sdscat(*info, "\r\ndesignc_batches_per_tick:");
+    for (int i = 0; i < DC_BATCH_HIST_N; i++)
+        *info = sdscatprintf(*info, "%s%llu", i ? "," : "", (unsigned long long)atomic_load_explicit(&g_batches_hist[i], memory_order_relaxed));
     *info = sdscat(*info, "\r\n");
 }
 
