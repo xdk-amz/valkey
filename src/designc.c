@@ -460,7 +460,7 @@ static void *dc_worker_main(void *arg) {
     char nm[16]; snprintf(nm, sizeof(nm), "dc-wrk%d", w->idx);
     pthread_setname_np(pthread_self(), nm);
     /* workers on cores 1..N, main stays on 0 (best effort) */
-    dc_pin_core(1 + (w->idx % 14));
+    { int nc = (int)sysconf(_SC_NPROCESSORS_ONLN); int span = nc > 2 ? nc - 2 : 1; dc_pin_core(1 + (w->idx % span)); }
 
     struct epoll_event evs[256];
     while (g_run) {
