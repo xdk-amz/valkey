@@ -349,23 +349,19 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = *oldref;
     }
 
-    if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
+    /* LSA whole-object overwrite: no in-place val_ptr swap for log
+     * residents. If the old object is log-resident, or the new value is
+     * admissible (raw unembedded string, key has no TTL), take the rebuild
+     * branch below: objectSetKeyAndExpire constructs a new whole-object
+     * entry (or heap object), the bucket slot is repointed via *oldref, and
+     * the old object's free tombstones its entry. */
+    int lsa_rebuild =
+        lsaEnabled() && (lsaIsLogPtr(old) || (val->refcount == 1 && val->type == OBJ_STRING &&
+                                              val->encoding == OBJ_ENCODING_RAW && !val->hasembval &&
+                                              objectGetExpire(old) == EXPIRY_NONE));
+
+    if (!lsa_rebuild && (old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
-        /* LSA admission seam (overwrite ptr-swap path): this path bypasses
-         * objectSetKeyAndExpire, so admit here. The retained robj is 'old'
-         * (keeps its key and expire); admission requires no TTL and an
-         * unembedded raw string value. */
-        if (lsaEnabled() && val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && !val->hasembval &&
-            objectGetExpire(old) == EXPIRY_NONE) {
-            sds vptr = objectGetVal(val);
-            if (!lsaIsLogSds(vptr)) {
-                sds logval = lsaAdmitSds(vptr);
-                if (logval) {
-                    sdsfree(vptr); /* transient jemalloc sds */
-                    objectSetVal(val, logval);
-                }
-            }
-        }
         /* Keep old object in the database. Just swap it's ptr, type and
          * encoding with the content of val. */
         int tmp_type = old->type;
@@ -380,12 +376,6 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         new = old;
         old = val;
-        /* Re-register the owner slot for a log-resident value now living in
-         * 'new' (the displaced value in 'old' is freed below in the same
-         * command execution; the cleaner cannot run in between). */
-        if (lsaEnabled() && new->type == OBJ_STRING && new->encoding == OBJ_ENCODING_RAW && !new->hasembval &&
-            lsaIsLogSds(objectGetVal(new)))
-            lsaSetOwner(objectGetVal(new), &new->val_ptr);
     } else {
         /* Replace the old value at its location in the key space. */
         objectSetLRU(val, objectGetLRU(old));
@@ -426,6 +416,65 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
  * emit any events */
 void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
     dbSetValue(db, key, valref, 0, NULL);
+}
+
+/* ----------------- LSA whole-object cleaner hooks ------------------------
+ * Liveness for a log entry = look its embedded key up in the keyspace
+ * hashtable and pointer-compare the stored object. Bucket slot addresses
+ * are NEVER stored (they move on resize/rehash); every relocation performs
+ * a fresh lookup. The entry stores no db index either: SWAPDB/MOVE would
+ * stale a stored index, so the lookup scans all DBs - pointer equality
+ * makes cross-db false positives impossible, and in practice the first
+ * (usually only) DB hits. */
+
+static hashtable *lsaKeyspaceTableFor(serverDb *db, sds key) {
+    int didx = server.cluster_enabled ? (int)keyHashSlot(key, (int)sdslen(key)) : 0;
+    return kvstoreGetHashtable(db->keys, didx);
+}
+
+static void **lsaKeyspaceFindRef(void *payload) {
+    robj *o = payload;
+    sds key = objectGetKey(o);
+    if (key == NULL) return NULL;
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL || kvstoreSize(db->keys) == 0) continue;
+        int didx = server.cluster_enabled ? (int)keyHashSlot(key, (int)sdslen(key)) : 0;
+        void **ref = kvstoreHashtableFindRef(db->keys, didx, key);
+        if (ref && *ref == o) return ref;
+    }
+    return NULL;
+}
+
+/* Repoint after a cleaner copy via the same seam activedefrag uses to
+ * relocate objects and rewrite bucket references: find + replace-in-place,
+ * preserving the bucket's cached hash bits. */
+static int lsaKeyspaceReplaceRef(void *old_payload, void *new_payload) {
+    robj *o = old_payload;
+    sds key = objectGetKey((robj *)new_payload);
+    if (key == NULL) return 0;
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL || kvstoreSize(db->keys) == 0) continue;
+        hashtable *ht = lsaKeyspaceTableFor(db, key);
+        if (ht == NULL) continue;
+        if (hashtableReplaceReallocatedEntry(ht, o, new_payload)) return 1;
+    }
+    return 0;
+}
+
+/* Implemented in object.c (robj layout knowledge). */
+int lsaWholeObjRefcountIsOne(void *payload);
+void lsaWholeObjFixInterior(void *new_payload, const char *old_lo, const char *old_hi, ptrdiff_t delta);
+
+void lsaInstallWholeOps(void) {
+    lsaWholeOps ops = {
+        .refcount_is_one = lsaWholeObjRefcountIsOne,
+        .find_ref = lsaKeyspaceFindRef,
+        .replace_ref = lsaKeyspaceReplaceRef,
+        .fix_interior = lsaWholeObjFixInterior,
+    };
+    lsaSetWholeOps(&ops);
 }
 
 /* High level Set operation. This function can be used in order to set

@@ -1,7 +1,9 @@
-/* lsa.c - log-structured bump allocator for unembedded raw string values.
+/* lsa.c - log-structured bump allocator, whole-object admission.
  * Segment pool + bump alloc + tombstone free + band cleaner.
  * Standalone: no server.h dependency, so sds.c stays linkable into the
- * cli/benchmark binaries (they never install the hooks). */
+ * cli/benchmark binaries (they never install the hooks). Keyspace
+ * knowledge (liveness lookup, bucket repoint, val_ptr fixup) is injected
+ * via lsaWholeOps. */
 #define _GNU_SOURCE
 #include "lsa.h"
 #include <stdlib.h>
@@ -10,35 +12,27 @@
 #include <time.h>
 #include <sys/mman.h>
 
-/* Entries are 4-byte aligned: the header's widest hard-alignment member is
- * the packed uint32 meta word, and the sds payload is byte-oriented. The
- * owner pointer sits at offset 4 inside a packed struct; the compiler emits
- * alignment-safe accesses for it (aarch64 handles these natively). */
-#define LSA_ALIGN 4u
+/* Whole-object entries hold a robj (pointer fields) and an embedded expire
+ * long long is never present (admission forces hasexpire=0), so 8-byte
+ * alignment of the payload is required and sufficient. The 8-byte header
+ * keeps successive payloads 8-aligned. */
+#define LSA_ALIGN 8u
 
 /* meta word packing: bits 0-23 total_size (max 16MB >> 1MB e_max),
- * bits 24-28 sds_off (max sds hdr is 17B), bit 31 tombstone. */
+ * bit 31 tombstone. */
 #define LSA_META_SIZE_MASK 0x00FFFFFFu
-#define LSA_META_OFF_SHIFT 24
-#define LSA_META_OFF_MASK 0x1Fu
 #define LSA_META_TOMB 0x80000000u
 
-/* Entry header, 12 bytes packed. data[] holds an sds buffer
- * (sdshdr + string + NUL); the sds base is data + sds_off. */
-typedef struct __attribute__((packed)) lsaEntry {
+/* Entry header, 8 bytes. data[] is the payload: the robj itself, with its
+ * embedded key and the value sds laid out behind it. */
+typedef struct lsaEntry {
     uint32_t meta;
-    void *owner; /* address of owning robj's val_ptr field.
-                  * Valid iff not tombstoned: sdsfree tombstones
-                  * BEFORE the owning robj is freed, so a live
-                  * (non-tombstoned) entry implies a live owner. */
+    uint32_t spare; /* reserved; keeps data[] 8-aligned */
     char data[];
 } lsaEntry;
 
 static inline uint32_t entrySize(const lsaEntry *e) {
     return e->meta & LSA_META_SIZE_MASK;
-}
-static inline uint32_t entrySdsOff(const lsaEntry *e) {
-    return (e->meta >> LSA_META_OFF_SHIFT) & LSA_META_OFF_MASK;
 }
 static inline int entryTombstoned(const lsaEntry *e) {
     return (e->meta & LSA_META_TOMB) != 0;
@@ -66,25 +60,40 @@ static struct {
     lsaSegment *free_list; /* LIFO */
     uint32_t free_count;
     int band_lo, band_hi; /* trigger below lo% live, clean to hi% live */
+    lsaWholeOps ops;
+    int ops_set;
     /* accounting */
     uint64_t used_bytes; /* sum of bump over non-free segments */
     uint64_t live_bytes; /* logical live bytes */
     /* stats */
     uint64_t admissions, tombstones, escapes;
+    uint64_t interior_frees; /* sdsfree on an interior value: no-op */
     uint64_t alloc_bytes, copied_bytes;
-    uint64_t clean_passes, emergency_cleans, heap_fallbacks;
-    uint64_t owner_mismatch_dead;
-    uint64_t dead_fastpath_reclaims;
-    uint64_t clean_us; /* wall time spent inside cleaner work */
+    uint64_t clean_passes, heap_fallbacks;
+    uint64_t owner_mismatch_dead;    /* live-looking entry not found in any keyspace */
+    uint64_t skipped_relocations;    /* refcount>1 at relocation time */
+    uint64_t dead_fastpath_reclaims; /* fully-dead segments recycled without a walk */
+    uint64_t clean_us;               /* wall time spent inside cleaner work */
 } L;
 
-/* Hooks installed into sds.c (declared in sds.h, defined in sds.c). */
+/* Hooks installed into sds.c (declared in sds.h, defined in sds.c).
+ * With whole-object admission every log-resident sds is the INTERIOR value
+ * of a whole entry: freeing it is a no-op (the entry is tombstoned when the
+ * owning robj is freed via lsaFreeWhole) and escape-to-heap just counts
+ * (the entry keeps its size until the robj dies; the value bytes become
+ * internal dead weight, reported honestly). */
 static int hookIsLog(const void *allocptr) {
     return (const char *)allocptr >= L.region && (const char *)allocptr < L.region + L.region_size;
 }
 
-static inline lsaEntry *entryFromAlloc(void *allocptr) {
-    return (lsaEntry *)((char *)allocptr - offsetof(lsaEntry, data));
+static void hookFreeLog(void *allocptr) {
+    (void)allocptr;
+    L.interior_frees++;
+}
+
+static void hookEscapeLog(void *allocptr) {
+    (void)allocptr;
+    L.escapes++;
 }
 
 static inline lsaSegment *segOf(const void *p) {
@@ -97,15 +106,6 @@ static void tombstone(lsaEntry *e) {
     segOf(e)->live_bytes -= entrySize(e);
     L.live_bytes -= entrySize(e);
     L.tombstones++;
-}
-
-static void hookFreeLog(void *allocptr) {
-    tombstone(entryFromAlloc(allocptr));
-}
-
-static void hookEscapeLog(void *allocptr) {
-    tombstone(entryFromAlloc(allocptr));
-    L.escapes++;
 }
 
 static inline uint32_t alignUp(uint32_t n) {
@@ -156,9 +156,13 @@ static lsaEntry *rawBump(uint32_t need) {
 }
 
 /* Clean one victim: the most-dead non-active used segment. Live entries are
- * copied to the bump head and their owner slot rewritten; the victim is
- * wholesale-recycled. Fully-dead segments are reclaimed without a walk
- * (zero copy). Returns 1 if a segment was reclaimed. */
+ * relocated: liveness is a keyspace lookup of the embedded key with pointer
+ * equality (never a stored slot address - bucket slots move on resize), the
+ * repoint is the defrag find+replace-in-place seam, and interior val_ptr is
+ * fixed up in the copy. Entries whose robj has refcount > 1 cannot be moved
+ * (other holders have the raw pointer); the victim is left in place for a
+ * later pass. Fully-dead segments are reclaimed without a walk.
+ * Returns 1 if a segment was reclaimed. */
 static int cleanOneVictim(void) {
     lsaSegment *victim = NULL;
     uint64_t best_dead = 0;
@@ -180,6 +184,7 @@ static int cleanOneVictim(void) {
         }
     }
     if (!victim) return 0;
+    if (!L.ops_set) return 0;
 
     /* Destination capacity: active remainder + free segments. Copying pops
      * from the free list; the victim is only recycled after the walk, so the
@@ -189,33 +194,43 @@ static int cleanOneVictim(void) {
     if (cap < victim->live_bytes) return 0;
 
     uint32_t off = 0;
+    uint32_t skipped = 0;
     while (off < victim->bump) {
         lsaEntry *e = (lsaEntry *)(victim->payload + off);
         uint32_t esize = entrySize(e);
         if (esize == 0) abort(); /* corrupt walk guard */
         if (!entryTombstoned(e)) {
-            /* Owner is alive (tombstone-before-robj-free invariant), so the
-             * deref is safe. Pointer equality = liveness. */
-            char *sds_base = e->data + entrySdsOff(e);
-            void **owner = e->owner;
-            if (owner && *owner == sds_base) {
-                lsaEntry *ne = rawBump(esize);
-                if (!ne) abort(); /* capacity was pre-checked */
-                memcpy(ne, e, esize);
-                *owner = ne->data + entrySdsOff(ne);
-                L.copied_bytes += esize;
-                /* victim's live accounting drops with the victim below */
-                L.live_bytes -= esize; /* rawBump double-counted */
-                victim->live_bytes -= esize;
-            } else {
-                /* Slot points elsewhere: value was replaced without a free.
-                 * Treated as dead. Should not happen with the sdsfree seam. */
+            void *payload = e->data;
+            if (!L.ops.refcount_is_one(payload)) {
+                /* Another holder has the raw robj pointer: unmovable now. */
+                skipped++;
+            } else if (L.ops.find_ref(payload) == NULL) {
+                /* refcount==1 and no keyspace slot points here: the sole
+                 * reference is not the keyspace, which cannot happen for a
+                 * live admitted object (frees are synchronous and on-main).
+                 * Treat as dead. Must stay 0 in a correct run. */
                 L.owner_mismatch_dead++;
                 tombstone(e);
                 L.tombstones--; /* not a client-visible free */
+            } else {
+                lsaEntry *ne = rawBump(esize);
+                if (!ne) abort(); /* capacity was pre-checked */
+                memcpy(ne, e, esize);
+                L.ops.fix_interior(ne->data, (const char *)e, (const char *)e + esize,
+                                   (char *)ne - (char *)e);
+                if (!L.ops.replace_ref(payload, ne->data)) abort(); /* found a moment ago */
+                L.copied_bytes += esize;
+                /* rawBump double-counted the live bytes; drop the old copy. */
+                L.live_bytes -= esize;
+                victim->live_bytes -= esize;
+                e->meta |= LSA_META_TOMB; /* moved out; accounting already adjusted */
             }
         }
         off += esize;
+    }
+    if (skipped) {
+        L.skipped_relocations += skipped;
+        return 0; /* victim still holds unmovable entries; retry next cron */
     }
     pushFree(victim);
     L.clean_passes++;
@@ -266,45 +281,48 @@ int lsaInit(size_t size_mb, int band_lo, int band_hi) {
     return 1;
 }
 
+void lsaSetWholeOps(const lsaWholeOps *ops) {
+    L.ops = *ops;
+    L.ops_set = 1;
+}
+
 int lsaEnabled(void) {
     return L.inited;
 }
 
-sds lsaAdmitSds(const_sds src) {
+void *lsaAdmitWhole(size_t size) {
     if (!L.inited) return NULL;
-    size_t len = sdslen(src);
-    if (len > LSA_EMAX) return NULL;
-    char type = sdsReqType(len);
-    /* TYPE_5 has no alloc field and sdsAllocSize() would call
-     * malloc_usable_size on a log pointer. Force TYPE_8 minimum. */
-    if (type == SDS_TYPE_5) type = SDS_TYPE_8;
-    size_t hdrlen = sdsHdrSize(type);
-    size_t bufsize = hdrlen + len + 1;
-    uint32_t need = alignUp((uint32_t)(sizeof(lsaEntry) + bufsize));
+    if (size > LSA_SEGMENT_SIZE - sizeof(lsaEntry)) return NULL;
+    uint32_t need = alignUp((uint32_t)(sizeof(lsaEntry) + size));
     lsaEntry *e = rawBump(need);
     if (!e) {
-        /* Emergency inline clean, then retry once. */
-        L.emergency_cleans++;
-        if (cleanOneVictim()) e = rawBump(need);
-        if (!e) {
-            L.heap_fallbacks++;
-            return NULL;
-        }
+        /* No inline emergency clean: relocation mid-command would stale the
+         * raw robj pointers the executing command holds. Fall back to heap;
+         * the cron cleaner recovers the pool. */
+        L.heap_fallbacks++;
+        return NULL;
     }
-    e->meta = (need & LSA_META_SIZE_MASK) | ((uint32_t)hdrlen << LSA_META_OFF_SHIFT);
-    e->owner = NULL; /* set by lsaSetOwner right after the robj exists */
-    sds s = sdswrite(e->data, bufsize, type, src, len);
+    e->meta = need & LSA_META_SIZE_MASK;
+    e->spare = 0;
     L.admissions++;
     L.alloc_bytes += need;
-    return s;
+    return e->data;
 }
 
-int lsaIsLogSds(const_sds s) {
-    return L.inited && hookIsLog(sdsAllocPtr(s));
+int lsaIsLogPtr(const void *p) {
+    return L.inited && hookIsLog(p);
 }
 
-void lsaSetOwner(sds s, void **owner) {
-    entryFromAlloc(sdsAllocPtr(s))->owner = owner;
+static inline lsaEntry *entryOfPayload(const void *payload) {
+    return (lsaEntry *)((char *)payload - offsetof(lsaEntry, data));
+}
+
+void lsaFreeWhole(void *payload) {
+    tombstone(entryOfPayload(payload));
+}
+
+size_t lsaWholePayloadSize(const void *payload) {
+    return entrySize(entryOfPayload(payload)) - sizeof(lsaEntry);
 }
 
 /* Band cleaner: trigger when live < band_lo% of used, clean until
@@ -355,6 +373,7 @@ sds lsaInfoAppend(sds info) {
     double write_amp = L.alloc_bytes ? (double)(L.alloc_bytes + L.copied_bytes) / (double)L.alloc_bytes : 1.0;
     return sdscatprintf(info,
                         "lsa_enabled:%d\r\n"
+                        "lsa_whole_object:1\r\n"
                         "lsa_band_lo:%d\r\n"
                         "lsa_band_hi:%d\r\n"
                         "lsa_committed_bytes:%llu\r\n"
@@ -366,22 +385,23 @@ sds lsaInfoAppend(sds info) {
                         "lsa_admissions:%llu\r\n"
                         "lsa_tombstones:%llu\r\n"
                         "lsa_escapes:%llu\r\n"
+                        "lsa_interior_frees:%llu\r\n"
                         "lsa_alloc_bytes:%llu\r\n"
                         "lsa_copied_bytes:%llu\r\n"
                         "lsa_write_amp:%.4f\r\n"
                         "lsa_clean_passes:%llu\r\n"
                         "lsa_dead_fastpath_reclaims:%llu\r\n"
                         "lsa_clean_us:%llu\r\n"
-                        "lsa_emergency_cleans:%llu\r\n"
                         "lsa_heap_fallbacks:%llu\r\n"
-                        "lsa_owner_mismatch_dead:%llu\r\n",
+                        "lsa_owner_mismatch_dead:%llu\r\n"
+                        "lsa_skipped_relocations:%llu\r\n",
                         L.inited, L.band_lo, L.band_hi, (unsigned long long)L.used_bytes,
                         (unsigned long long)L.live_bytes, (unsigned long long)(L.used_bytes - L.live_bytes),
                         (unsigned long long)touched, L.nsegments, L.free_count,
                         (unsigned long long)L.admissions, (unsigned long long)L.tombstones,
-                        (unsigned long long)L.escapes, (unsigned long long)L.alloc_bytes,
-                        (unsigned long long)L.copied_bytes, write_amp, (unsigned long long)L.clean_passes,
-                        (unsigned long long)L.dead_fastpath_reclaims, (unsigned long long)L.clean_us,
-                        (unsigned long long)L.emergency_cleans, (unsigned long long)L.heap_fallbacks,
-                        (unsigned long long)L.owner_mismatch_dead);
+                        (unsigned long long)L.escapes, (unsigned long long)L.interior_frees,
+                        (unsigned long long)L.alloc_bytes, (unsigned long long)L.copied_bytes, write_amp,
+                        (unsigned long long)L.clean_passes, (unsigned long long)L.dead_fastpath_reclaims,
+                        (unsigned long long)L.clean_us, (unsigned long long)L.heap_fallbacks,
+                        (unsigned long long)L.owner_mismatch_dead, (unsigned long long)L.skipped_relocations);
 }

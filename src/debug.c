@@ -39,6 +39,7 @@
 #include "threads_mngr.h"
 #include "io_threads.h"
 #include "sds.h"
+#include "lsa.h"
 #include "module.h"
 
 #include "tls.h"
@@ -737,9 +738,13 @@ void debugCommand(client *c) {
             addReplyError(c, "Not an sds encoded string.");
         } else {
             /* Report the complete robj allocation size as the key's allocation
-             * size. Report 0 as allocation size for embedded values. */
-            size_t obj_alloc = zmalloc_usable_size(val);
-            size_t val_alloc = val->encoding == OBJ_ENCODING_RAW ? sdsAllocSize(objectGetVal(val)) : 0;
+             * size. Report 0 as allocation size for embedded values. For LSA
+             * log residents report the whole entry payload (robj+key+value). */
+            int val_in_log = lsaEnabled() && lsaIsLogPtr(val);
+            size_t obj_alloc = val_in_log ? lsaWholePayloadSize(val) : zmalloc_usable_size(val);
+            size_t val_alloc = 0;
+            if (val->encoding == OBJ_ENCODING_RAW && !(val_in_log && lsaIsLogPtr(objectGetVal(val))))
+                val_alloc = sdsAllocSize(objectGetVal(val));
             addReplyStatusFormat(c,
                                  "key_sds_len:%lld key_sds_avail:%lld obj_alloc:%lld "
                                  "val_sds_len:%lld val_sds_avail:%lld val_alloc:%lld",

@@ -34,6 +34,7 @@
 #include "script.h"
 #include "intset.h"
 #include "sds.h"
+#include "lsa.h"
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
@@ -291,6 +292,10 @@ static int shouldDeferPushMessage(client *c) {
  * that use _writeToClient handler to write replies to client connection */
 static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
+    /* LSA: copy-avoid replies keep raw pointers into object memory until
+     * the reply is flushed; a slow client could hold a pointer into a log
+     * entry across a cleaner pass that recycles the segment. Always copy. */
+    if (server.lsa_enabled) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 

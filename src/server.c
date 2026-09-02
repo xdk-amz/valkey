@@ -2982,7 +2982,8 @@ void initServer(void) {
             serverLog(LL_WARNING, "Fatal: failed to reserve %d MB LSA region.", server.lsa_size_mb);
             exit(1);
         }
-        serverLog(LL_NOTICE, "LSA enabled: %d MB log region reserved.", server.lsa_size_mb);
+        lsaInstallWholeOps();
+        serverLog(LL_NOTICE, "LSA enabled (whole-object): %d MB log region reserved.", server.lsa_size_mb);
     }
     server.aof_state = server.aof_enabled ? AOF_ON : AOF_OFF;
     server.fsynced_reploff = server.aof_enabled ? 0 : -1;

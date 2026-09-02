@@ -9,6 +9,7 @@
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
+#include "lsa.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -703,6 +704,10 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
     if (server.active_io_threads_num <= 1) {
         return C_ERR;
     }
+
+    /* LSA log residents must be tombstoned on the main thread (the cleaner
+     * and all log accounting are main-thread-only). */
+    if (lsaEnabled() && lsaIsLogPtr(obj)) return C_ERR;
 
     if (obj->refcount > 1) return C_ERR;
 

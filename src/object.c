@@ -382,6 +382,58 @@ void objectUnembedVal(robj *o) {
     o->val_ptr = new_val;
 }
 
+/* LSA whole-object admission: build the ENTIRE keyspace object as one log
+ * entry laid out exactly like createUnembeddedObjectWithKeyAndExpire's
+ * output: [robj word + val_ptr | key hdr byte | key sds | value sds], with
+ * val_ptr pointing at the interior value sds. Standard object layout is
+ * preserved so all reader code works unchanged. hasexpire is forced to 0
+ * (no reserved expire slack): attaching a TTL later goes through
+ * objectSetKeyAndExpire which rebuilds on the heap (the scope excludes
+ * TTL'd keys). Admission only for type==STRING, encoding==RAW (unembedded),
+ * expire==EXPIRY_NONE. Embedded key+value objects never reach this path.
+ * Returns NULL when not admitted (value too big, pool exhausted). */
+static robj *lsaCreateWholeStringObject(const_sds key, const_sds val) {
+    size_t val_len = sdslen(val);
+    if (val_len > LSA_EMAX) return NULL;
+    char val_type = sdsReqType(val_len);
+    /* TYPE_5 has no alloc field and sdsAllocSize() would call
+     * malloc_usable_size on a log pointer. Force TYPE_8 minimum. */
+    if (val_type == SDS_TYPE_5) val_type = SDS_TYPE_8;
+    size_t val_hdr = sdsHdrSize(val_type);
+    size_t val_size = val_hdr + val_len + 1;
+    size_t key_len = sdslen(key);
+    char key_type = sdsReqType(key_len);
+    size_t key_size = sdsReqSize(key_len, key_type);
+    /* robj (16B incl. val_ptr) + key hdr-size byte + key sds + value sds. */
+    size_t payload = sizeof(robj) + 1 + key_size + val_size;
+    robj *o = lsaAdmitWhole(payload);
+    if (o == NULL) return NULL;
+    objectSetType(o, OBJ_STRING);
+    objectSetEncoding(o, OBJ_ENCODING_RAW);
+    o->refcount = 1; /* admission at construction: refcount==1 by construction */
+    objectSetLRU(o, 0);
+    o->hasexpire = 0;
+    o->hasembkey = 1;
+    o->hasembval = 0;
+    char *data = (void *)(o + 1);
+    *data++ = sdsHdrSize(key_type);
+    sdswrite(data, key_size, key_type, key, key_len);
+    data += key_size;
+    o->val_ptr = sdswrite(data, val_size, val_type, val, val_len);
+    return o;
+}
+
+/* Cleaner callbacks with robj knowledge (see lsaWholeOps in lsa.h). */
+int lsaWholeObjRefcountIsOne(void *payload) {
+    return objectGetRefcount((robj *)payload) == 1;
+}
+
+void lsaWholeObjFixInterior(void *new_payload, const char *old_lo, const char *old_hi, ptrdiff_t delta) {
+    robj *n = new_payload;
+    if (!n->hasembval && n->val_ptr && (char *)n->val_ptr >= old_lo && (char *)n->val_ptr < old_hi)
+        n->val_ptr = (char *)n->val_ptr + delta;
+}
+
 /* This functions may reallocate the value. The new allocation is returned and
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
@@ -395,13 +447,10 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
 
     /* Create a new object with embedded key. Reuse ptr if possible. */
     void *ptr;
-    int val_in_log = 0;
     if (objectGetRefcount(o) == 1) {
         /* Reuse the ptr. There are no other references to o. */
         ptr = o->val_ptr;
         o->val_ptr = NULL;
-        if (lsaEnabled() && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW && ptr)
-            val_in_log = lsaIsLogSds(ptr);
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
@@ -414,34 +463,32 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
          * can be duplicated, but for a module type is not always possible. */
         serverPanic("Not implemented");
     }
-    /* LSA admission seam: unembedded raw string values with no TTL move
-     * into the log as an sds-layout copy. TTL'd values stay on the heap.
-     * NOTE: between taking a log-resident ptr above and lsaSetOwner below,
-     * no lsaAdmitSds runs on that path, so the cleaner cannot observe the
-     * stale owner slot. */
+    /* LSA whole-object admission seam: unembedded raw string values with no
+     * TTL become one log entry holding robj+key+value. TTL'd values (and
+     * declined admissions) stay on the heap; if the value sds was the
+     * interior of a log entry (re-keying/TTL-attach on an admitted object),
+     * it must be pulled to the heap first - the old entry is tombstoned when
+     * 'o' is freed below and must not be referenced afterwards. */
     if (lsaEnabled() && objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW && ptr) {
-        if (val_in_log) {
-            if (expire != EXPIRY_NONE) {
-                /* TTL attached to a log value: escape to the heap. */
-                sds heapval = sdsdup(ptr);
-                sdsfree(ptr); /* tombstones the log entry */
-                ptr = heapval;
-                val_in_log = 0;
+        if (expire == EXPIRY_NONE && key != NULL) {
+            robj *ln = lsaCreateWholeStringObject(key, ptr);
+            if (ln) {
+                objectSetLRU(ln, objectGetLRU(o));
+                sdsfree(ptr);    /* heap sds: freed; interior sds: no-op */
+                decrRefCount(o); /* log robj: tombstones the old entry */
+                return ln;
             }
-        } else if (expire == EXPIRY_NONE) {
-            sds logval = lsaAdmitSds(ptr);
-            if (logval) {
-                sdsfree(ptr); /* transient jemalloc sds */
-                ptr = logval;
-                val_in_log = 1;
-            }
+        }
+        if (lsaIsLogPtr(ptr)) {
+            sds heapval = sdsdup(ptr);
+            sdsfree(ptr); /* interior: no-op */
+            ptr = heapval;
         }
     }
     robj *new = createUnembeddedObjectWithKeyAndExpire(objectGetType(o), ptr, key, expire);
     objectSetEncoding(new, objectGetEncoding(o));
     objectSetLRU(new, objectGetLRU(o));
     decrRefCount(o);
-    if (val_in_log) lsaSetOwner(ptr, &new->val_ptr);
     return new;
 }
 
@@ -698,7 +745,14 @@ void decrRefCount(robj *o) {
             default: serverPanic("Unknown object type"); break;
             }
         }
-        zfree(o);
+        /* LSA whole-object free: the robj IS the log entry payload; the
+         * whole entry (robj + embedded key + interior value) is tombstoned
+         * instead of a jemalloc free. Must run on the main thread (IO-thread
+         * offload and lazyfree bypass log residents). */
+        if (lsaEnabled() && lsaIsLogPtr(o))
+            lsaFreeWhole(o);
+        else
+            zfree(o);
     } else {
         if (objectGetRefcount(o) <= 0) serverPanic("decrRefCount against refcount <= 0");
         if (objectGetRefcount(o) != OBJ_SHARED_REFCOUNT) o->refcount--;
@@ -1248,11 +1302,15 @@ char *strEncoding(int encoding) {
 #define OBJ_COMPUTE_SIZE_DEF_SAMPLES 5 /* Default sample size. */
 size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     size_t elesize = 0, samples = 0;
-    size_t asize = zmalloc_size((void *)o);
+    /* Log-resident whole objects: the entry payload covers robj + embedded
+     * key + interior value; zmalloc_size on a log pointer would be UB. */
+    int o_in_log = lsaEnabled() && lsaIsLogPtr(o);
+    size_t asize = o_in_log ? lsaWholePayloadSize(o) : zmalloc_size((void *)o);
 
     if (objectGetType(o) == OBJ_STRING) {
         if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
-            asize += sdsAllocSize(objectGetVal(o));
+            /* An interior value is already included in the entry payload. */
+            if (!(o_in_log && lsaIsLogPtr(objectGetVal(o)))) asize += sdsAllocSize(objectGetVal(o));
         } else if (objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetEncoding(o) != OBJ_ENCODING_EMBSTR) {
             serverPanic("Unknown string encoding");
         }
