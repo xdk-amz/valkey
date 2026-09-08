@@ -594,7 +594,12 @@ ENGINE_SERVER_OBJ = \
     throttle_token_bucket.o \
     stat_calc.o \
     throttle_repl.o \
-    throttle.o
+    throttle.o \
+    chrome_trace.o
+# chrome_trace requires pthreads
+ifneq ($(findstring pthread,$(FINAL_LIBS)),pthread)
+    FINAL_LIBS+=-lpthread
+endif
 ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 ENGINE_CLI_NAME=$(ENGINE_NAME)-cli$(PROG_SUFFIX)
 ENGINE_CLI_OBJ = \
