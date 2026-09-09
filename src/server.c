@@ -34,6 +34,7 @@
 #include "server.h"
 #include "ordered_index.h"
 #include "connection.h"
+#include "intern.h"
 #include "monotonic.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
@@ -6364,6 +6365,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         bytesToHuman(used_memory_rss_hmem, sizeof(used_memory_rss_hmem), server.cron_malloc_stats.process_rss);
         bytesToHuman(maxmemory_hmem, sizeof(maxmemory_hmem), server.maxmemory);
 
+        internStats intern_stats;
+        internGetStats(&intern_stats);
+
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
             info,
@@ -6427,7 +6431,12 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "mem_overhead_db_hashtable_rehashing:%zu\r\n", mh->overhead_db_hashtable_rehashing,
                 "active_defrag_running:%d\r\n", server.active_defrag_cpu_percent,
                 "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
-                "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
+                "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount(),
+                "intern_slots:%zu\r\n", intern_stats.slots,
+                "intern_sso_slots:%zu\r\n", intern_stats.sso_slots,
+                "intern_long_slots:%zu\r\n", intern_stats.long_slots,
+                "intern_bytes_saved:%zu\r\n", intern_stats.bytes_saved,
+                "intern_index_mem:%zu\r\n", intern_stats.index_mem));
         freeMemoryOverheadData(mh);
     }
 

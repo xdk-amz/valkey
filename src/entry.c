@@ -1,6 +1,7 @@
 #include "server.h"
 #include "serverassert.h"
 #include "entry.h"
+#include "intern.h"
 
 /*-----------------------------------------------------------------------------
  * Entry Implementation
@@ -96,6 +97,11 @@ enum {
      * entry destruction. The primary usecase is to avoid memory duplication
      * between the core and a module. */
     FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF = 2,
+    /* SDS aux flag. If set (alongside HAS_VALUE_PTR and HAS_STRING_REF), the
+     * value pointer is an internSlot* owned by the intern subsystem. The entry
+     * releases the slot (refcount--) instead of freeing the pointer on
+     * destruction or overwrite. All read paths treat it as a Type-4 stringRef. */
+    FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE = 3,
     FIELD_SDS_AUX_BIT_MAX
 };
 static_assert(FIELD_SDS_AUX_BIT_MAX < sizeof(char) - SDS_TYPE_BITS, "too many sds bits are used for entry metadata");
@@ -111,6 +117,8 @@ static bool entryHasValuePtr(const entry *entry) {
     return sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR);
 }
 
+static void **entryGetValueRef(const entry *entry);
+
 /* Returns true in case the entry's value is embedded in the entry.
  * Returns false otherwise. */
 bool entryHasEmbeddedValue(const entry *entry) {
@@ -123,6 +131,17 @@ bool entryHasStringRef(const entry *entry) {
     return entryHasValuePtr(entry) && sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF);
 }
 
+/* Returns true in case the entry's value pointer is an intern slot.
+ * Returns false otherwise. An interned value is always also a stringRef. */
+bool entryHasInternHandle(const entry *entry) {
+    return entryHasValuePtr(entry) && sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE);
+}
+
+/* Returns the intern slot pointer of an interned value. */
+static struct internSlot *entryGetInternSlot(const entry *entry) {
+    serverAssert(entryHasInternHandle(entry));
+    return (struct internSlot *)*entryGetValueRef(entry);
+}
 /* Returns true in case the entry has expiration timestamp.
  * Returns false otherwise. */
 bool entryHasExpiry(const entry *entry) {
@@ -174,7 +193,9 @@ char *entryGetValue(const entry *entry, size_t *len) {
 static void entryFreeValuePtr(entry *entry) {
     serverAssert(entryHasValuePtr(entry));
     void **value_ref = entryGetValueRef(entry);
-    if (entryHasStringRef(entry)) {
+    if (entryHasInternHandle(entry)) {
+        internRelease((struct internSlot *)*value_ref);
+    } else if (entryHasStringRef(entry)) {
         zfree(*value_ref);
     } else {
         sdsfree(*value_ref);
@@ -185,6 +206,7 @@ static void entryFreeValuePtr(entry *entry) {
 static void entrySetValueSds(entry *e, sds value) {
     serverAssert(entryHasValuePtr(e));
     entryFreeValuePtr(e);
+    if (entryHasInternHandle(e)) sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 0);
     if (entryHasStringRef(e)) sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 0);
     sds *value_ref = entryGetSdsValueRef(e);
     *value_ref = value;
@@ -218,6 +240,9 @@ entry *entrySetExpiry(entry *e, mstime_t expiry) {
     if (expiry != EXPIRY_NONE && entryHasExpiry(e)) {
         *entryGetExpiryRef(e) = expiry;
         return e;
+    }
+    if (entryHasInternHandle(e)) {
+        return entryUpdateAsInternHandle(e, entryGetInternSlot(e), expiry);
     }
     if (entryHasStringRef(e)) {
         stringRef *value = entryGetStringRefRef(e);
@@ -398,6 +423,58 @@ entry *entryUpdateAsStringRef(entry *e, const char *buf, size_t len, mstime_t ex
     return new_entry;
 }
 
+/* Sets the entry's value to reference an intern slot. The slot pointer is stored
+ * where the value pointer lives; the slot is prefix-compatible with stringRef so
+ * all read paths see a Type-4 {buf,len} value. The entry does not own the slot's
+ * bytes and releases it via internRelease on destruction/overwrite.
+ *
+ * The caller passes a slot it already holds a reference on (from internAcquire).
+ * If the entry currently references a DIFFERENT interned slot, that old slot is
+ * released. Cloned from entryUpdateAsStringRef. */
+entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t expiry) {
+    mstime_t entry_expiry = entryGetExpiry(e);
+    bool expiry_add_remove = (expiry != entry_expiry) && (entry_expiry == EXPIRY_NONE || expiry == EXPIRY_NONE);
+    if (entryHasValuePtr(e) && !expiry_add_remove) {
+        /* In-place: overwrite the value pointer with the slot. */
+        void **value_ref = entryGetValueRef(e);
+        if (entryHasInternHandle(e)) {
+            struct internSlot *old = (struct internSlot *)*value_ref;
+            if (old != slot) internRelease(old);
+        } else if (entryHasStringRef(e)) {
+            zfree(*value_ref);
+            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
+        } else {
+            sdsfree(*value_ref);
+            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
+            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
+        }
+        *value_ref = slot;
+        if (expiry != EXPIRY_NONE) *entryGetExpiryRef(e) = expiry;
+        return e;
+    }
+
+    /* Rebuild: expiry is being toggled on/off, so the entry allocation changes.
+     * Guard the slot across entryFree (which releases the old value: the same
+     * slot when the entry was already interned) so a transient refcount 0 never
+     * frees the slot we are about to store. Net refcount is unchanged. */
+    slot->refcount++;
+    sds field = entryGetField(e);
+    size_t field_size = sdsReqSize(sdslen(field), SDS_TYPE_8);
+    size_t alloc_size = field_size + sizeof(void *);
+    size_t expiry_size = 0;
+    if (expiry != EXPIRY_NONE) {
+        alloc_size += sizeof(expiry);
+        expiry_size = sizeof(expiry);
+    }
+    entry *new_entry = entryConstruct(alloc_size, field, NULL, (stringRef *)slot, expiry, false, SDS_TYPE_8, expiry_size, sizeof(void *), field_size);
+    entryFree(e);
+    slot->refcount--;
+
+    sdsSetAuxBit(entryGetField(new_entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
+    sdsSetAuxBit(entryGetField(new_entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
+    return new_entry;
+}
+
 /* Modify the entry's value and/or expiration time.
  * In case the provided value is NULL, will use the existing value.
  * Note that the value ownership is moved to this function and the caller should assume the
@@ -408,6 +485,9 @@ entry *entryUpdate(entry *e, sds value, mstime_t expiry) {
 
     /* Update just the expiry field, no value change, of a string ref entry */
     if (entryHasStringRef(e) && !value) {
+        if (entryHasInternHandle(e)) {
+            return entryUpdateAsInternHandle(e, entryGetInternSlot(e), expiry);
+        }
         stringRef *value = entryGetStringRefRef(e);
         return entryUpdateAsStringRef(e, value->buf, value->len, expiry);
     }
@@ -503,7 +583,10 @@ size_t entryMemUsage(entry *entry) {
          * header could be too small for holding the real allocation size. */
         mem += zmalloc_usable_size(entryGetAllocPtr(entry));
     }
-    if (entryHasStringRef(entry)) {
+    if (entryHasInternHandle(entry)) {
+        struct internSlot *slot = entryGetInternSlot(entry);
+        mem += sizeof(void *) + internSlotAllocSize(slot) / internSlotRefcount(slot);
+    } else if (entryHasStringRef(entry)) {
         mem += zmalloc_usable_size(entryGetStringRefRef(entry));
     } else {
         mem += sdsAllocSize((sds)entryGetValue(entry, NULL));
@@ -519,7 +602,9 @@ size_t entryMemUsage(entry *entry) {
  * If the location of the entry changed we return the new location,
  * otherwise we return NULL. */
 entry *entryDefrag(entry *e, void *(*defragfn)(void *), sds (*sdsdefragfn)(sds)) {
-    if (entryHasStringRef(e)) {
+    if (entryHasInternHandle(e)) {
+        /* The intern slot never moves; leave the value pointer untouched. */
+    } else if (entryHasStringRef(e)) {
         stringRef **value_ref = (stringRef **)entryGetValueRef(e);
         stringRef *new_value = defragfn(*value_ref);
         if (new_value) *value_ref = new_value;

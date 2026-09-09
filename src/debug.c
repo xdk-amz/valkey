@@ -40,6 +40,8 @@
 #include "io_threads.h"
 #include "sds.h"
 #include "module.h"
+#include "intern.h"
+#include "entry.h"
 
 #include "tls.h"
 
@@ -402,6 +404,191 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+/*-----------------------------------------------------------------------------
+ * DEBUG INTERN (spike S1) -- hash-value interning driver.
+ *----------------------------------------------------------------------------*/
+
+#define DEBUG_INTERN_MIN_LEN 4
+#define DEBUG_INTERN_MAX_LEN 256
+
+/* Temporary counting map entry: a private copy of content + a sighting count.
+ * Prefix layout {buf,len,...,hash} matches internSlot so we can reuse content
+ * hash/compare callbacks with a probe key. */
+typedef struct debugInternCount {
+    const char *buf;
+    size_t len;
+    uint32_t count;
+    uint32_t hash;
+    char bytes[]; /* content copy, NUL terminated */
+} debugInternCount;
+
+static uint64_t debugInternCountHash(const void *key) {
+    return ((const debugInternCount *)key)->hash;
+}
+
+static int debugInternCountCompare(const void *k1, const void *k2) {
+    const debugInternCount *a = k1, *b = k2;
+    if (a->len != b->len) return 0;
+    return memcmp(a->buf, b->buf, a->len) == 0;
+}
+
+static void debugInternCountFree(void *e) {
+    zfree(e);
+}
+
+static hashtableType debugInternCountType = {
+    .hashFunction = debugInternCountHash,
+    .keyCompare = debugInternCountCompare,
+    .entryDestructor = debugInternCountFree,
+    .instant_rehashing = 1,
+};
+
+/* True if a hash entry's value is a candidate for interning: length in band,
+ * not already interned, and not volatile (avoids volatile-set pointer tracking
+ * complications in the spike). */
+static bool debugInternEligible(entry *e, const char **buf, size_t *len) {
+    if (entryHasInternHandle(e)) return false;
+    if (entryHasExpiry(e)) return false;
+    size_t vlen;
+    const char *vbuf = entryGetValue(e, &vlen);
+    if (vlen < DEBUG_INTERN_MIN_LEN || vlen > DEBUG_INTERN_MAX_LEN) return false;
+    *buf = vbuf;
+    *len = vlen;
+    return true;
+}
+
+/* DEBUG INTERN SCAN: synchronous one-shot pass over the whole keyspace,
+ * interning every hash value seen >= 2 times. */
+static void debugInternScanCommand(client *c) {
+    monotime start = getMonotonicUs();
+    long long entries_scanned = 0, values_interned = 0;
+
+    hashtable *counts = hashtableCreate(&debugInternCountType);
+
+    /* Pass 1: count content sightings across all hashtable-encoded hashes. */
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL || kvstoreSize(db->keys) == 0) continue;
+        kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys, HASHTABLE_ITER_SAFE);
+        void *next;
+        while (kvstoreIteratorNext(kvs_it, &next)) {
+            robj *o = next;
+            if (objectGetType(o) != OBJ_HASH || objectGetEncoding(o) != OBJ_ENCODING_HASHTABLE) continue;
+            hashtable *ht = objectGetVal(o);
+            hashtableIterator hi;
+            hashtableInitIterator(&hi, ht, 0);
+            void *elem;
+            while (hashtableNext(&hi, &elem)) {
+                entry *e = elem;
+                entries_scanned++;
+                const char *buf;
+                size_t len;
+                if (!debugInternEligible(e, &buf, &len)) continue;
+                debugInternCount probe;
+                probe.buf = buf;
+                probe.len = len;
+                probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+                void *found;
+                if (hashtableFind(counts, &probe, &found)) {
+                    ((debugInternCount *)found)->count++;
+                } else {
+                    debugInternCount *cnt = zmalloc(sizeof(*cnt) + len + 1);
+                    memcpy(cnt->bytes, buf, len);
+                    cnt->bytes[len] = '\0';
+                    cnt->buf = cnt->bytes;
+                    cnt->len = len;
+                    cnt->hash = probe.hash;
+                    cnt->count = 1;
+                    hashtableAdd(counts, cnt);
+                }
+            }
+            hashtableCleanupIterator(&hi);
+        }
+        kvstoreIteratorRelease(kvs_it);
+    }
+
+    /* Pass 2: intern values whose content was seen >= 2 times. Snapshot each
+     * hash's entry pointers first so pointer replacement during interning does
+     * not disturb iteration. */
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL || kvstoreSize(db->keys) == 0) continue;
+        kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys, HASHTABLE_ITER_SAFE);
+        void *next;
+        while (kvstoreIteratorNext(kvs_it, &next)) {
+            robj *o = next;
+            if (objectGetType(o) != OBJ_HASH || objectGetEncoding(o) != OBJ_ENCODING_HASHTABLE) continue;
+            hashtable *ht = objectGetVal(o);
+            size_t n = hashtableSize(ht);
+            if (n == 0) continue;
+            entry **snapshot = zmalloc(sizeof(entry *) * n);
+            size_t si = 0;
+            hashtableIterator hi;
+            hashtableInitIterator(&hi, ht, 0);
+            void *elem;
+            while (hashtableNext(&hi, &elem) && si < n) snapshot[si++] = elem;
+            hashtableCleanupIterator(&hi);
+
+            for (size_t i = 0; i < si; i++) {
+                entry *e = snapshot[i];
+                const char *buf;
+                size_t len;
+                if (!debugInternEligible(e, &buf, &len)) continue;
+                debugInternCount probe;
+                probe.buf = buf;
+                probe.len = len;
+                probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+                void *found;
+                if (!hashtableFind(counts, &probe, &found)) continue;
+                if (((debugInternCount *)found)->count < 2) continue;
+
+                internSlot *slot = internAcquire(buf, len);
+                mstime_t expiry = entryGetExpiry(e);
+                entry *new_entry = entryUpdateAsInternHandle(e, slot, expiry);
+                bool replaced = hashtableReplaceReallocatedEntry(ht, e, new_entry);
+                serverAssert(replaced);
+                values_interned++;
+            }
+            zfree(snapshot);
+        }
+        kvstoreIteratorRelease(kvs_it);
+    }
+
+    hashtableRelease(counts);
+
+    internStats stats;
+    internGetStats(&stats);
+    uint64_t scan_us = getMonotonicUs() - start;
+
+    addReplyMapLen(c, 5);
+    addReplyBulkCString(c, "entries_scanned");
+    addReplyLongLong(c, entries_scanned);
+    addReplyBulkCString(c, "values_interned");
+    addReplyLongLong(c, values_interned);
+    addReplyBulkCString(c, "slots");
+    addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "bytes_saved");
+    addReplyLongLong(c, stats.bytes_saved);
+    addReplyBulkCString(c, "scan_ms");
+    addReplyLongLong(c, scan_us / 1000);
+}
+
+static void debugInternStatsCommand(client *c) {
+    internStats stats;
+    internGetStats(&stats);
+    addReplyMapLen(c, 5);
+    addReplyBulkCString(c, "slots");
+    addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "sso_slots");
+    addReplyLongLong(c, stats.sso_slots);
+    addReplyBulkCString(c, "long_slots");
+    addReplyLongLong(c, stats.long_slots);
+    addReplyBulkCString(c, "bytes_saved");
+    addReplyLongLong(c, stats.bytes_saved);
+    addReplyBulkCString(c, "index_mem");
+    addReplyLongLong(c, stats.index_mem);
+}
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
@@ -430,6 +617,9 @@ void debugCommand(client *c) {
             "    Write <message> to the server log.",
             "HTSTATS <dbid> [full]",
             "    Return hash table statistics of the specified database.",
+            "INTERN <SCAN|STATS>",
+            "    SCAN: intern hash values seen >= 2 times across the keyspace.",
+            "    STATS: report intern subsystem slot counts and bytes saved.",
             "HTSTATS-KEY <key> [full]",
             "    Like HTSTATS but for the hash table stored at <key>'s value.",
             "LOADAOF",
@@ -577,6 +767,14 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && c->argc == 3) {
+        if (!strcasecmp(objectGetVal(c->argv[2]), "scan")) {
+            debugInternScanCommand(c);
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "stats")) {
+            debugInternStatsCommand(c);
+        } else {
+            addReplyError(c, "DEBUG INTERN supports the SCAN and STATS subcommands.");
+        }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "reload")) {
         int flush = 1, save = 1;
         int flags = RDBFLAGS_NONE;

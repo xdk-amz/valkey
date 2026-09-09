@@ -20,6 +20,8 @@
 
 typedef struct _entry entry;
 
+struct internSlot;
+
 /* The maximum allocation size we want to use for entries with embedded
  * values. */
 #define EMBED_VALUE_MAX_ALLOC_SIZE 128
@@ -39,6 +41,10 @@ bool entryHasExpiry(const entry *entry);
 /* Returns true if the entry value is externalized. */
 bool entryHasStringRef(const entry *entry);
 
+/* Returns true if the entry value points at an intern slot (owned by the intern
+ * subsystem, released rather than freed on entry destruction). */
+bool entryHasInternHandle(const entry *entry);
+
 /* Sets the expiration timestamp. */
 entry *entrySetExpiry(entry *entry, mstime_t expiry);
 
@@ -54,6 +60,12 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry);
  * The reference points to the provided `buf` but does not assume ownership.
  * An external mechanism must handle the eventual memory deallocation of `buf`. */
 entry *entryUpdateAsStringRef(entry *entry, const char *buf, size_t len, mstime_t expiry);
+
+/* Sets the entry's value to reference an intern slot. The entry does not own the
+ * slot's bytes; on destruction it calls internRelease instead of freeing. The
+ * slot pointer is stored where a stringRef pointer would be, and the value reads
+ * as a Type-4 stringRef ({buf,len} prefix), so all read paths are unchanged. */
+entry *entryUpdateAsInternHandle(entry *entry, struct internSlot *slot, mstime_t expiry);
 
 /* Updates the value and/or expiry of an existing entry.
  * In case value is NULL, will use the existing entry value.
