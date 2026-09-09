@@ -6433,8 +6433,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
                 "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount(),
                 "intern_slots:%zu\r\n", intern_stats.slots,
+                "intern_value_slots:%zu\r\n", intern_stats.value_slots,
+                "intern_field_slots:%zu\r\n", intern_stats.field_slots,
                 "intern_sso_slots:%zu\r\n", intern_stats.sso_slots,
                 "intern_long_slots:%zu\r\n", intern_stats.long_slots,
+                "intern_dup_refs:%zu\r\n", intern_stats.dup_refs,
                 "intern_bytes_saved:%zu\r\n", intern_stats.bytes_saved,
                 "intern_index_mem:%zu\r\n", intern_stats.index_mem));
         freeMemoryOverheadData(mh);

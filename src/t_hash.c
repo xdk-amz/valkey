@@ -146,6 +146,21 @@ static void hashTypeTrackUpdateEntry(robj *o, entry *old_entry, entry *new_entry
     }
 }
 
+/* Replaces a hash entry pointer that has been reallocated in place (same field
+ * name, same expiry) in the hash's hashtable and, if the entry is volatile, in
+ * the volatile set. Used by the DEBUG INTERN SCAN to swap an entry for its
+ * Type-5 interned-field rebuild. The field content and expiry are unchanged, so
+ * the hashtable bucket and the volatile-set ordering stay valid. */
+void hashTypeReplaceReallocatedEntry(robj *o, entry *old_entry, entry *new_entry) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+    hashtable *ht = objectGetVal(o);
+    serverAssert(hashtableReplaceReallocatedEntry(ht, old_entry, new_entry));
+    mstime_t expiry = entryGetExpiry(new_entry);
+    if (expiry != EXPIRY_NONE) {
+        /* Update the pointer the volatile set holds for this (unchanged) expiry. */
+        hashTypeTrackUpdateEntry(o, old_entry, new_entry, expiry, expiry);
+    }
+}
 // This is a hashtableType validateEntry callback
 bool hashHashtableTypeValidate(hashtable *ht, void *entryptr) {
     UNUSED(ht);

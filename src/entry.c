@@ -81,7 +81,33 @@
  *                             +----------------+---------------+
  *
  *     Identified by: Does not have embedded value, value is a stringRef, referenced by pointer.
+ *
+ *
+ * Type 5: Interned field name (spike S2)
+ *     The field name is NOT embedded; it is a shared, refcounted intern slot laid
+ *     out as a genuine sdshdr8, referenced by pointer. The value is ALWAYS by
+ *     pointer (stringRef, possibly also an intern handle) so the layout is finite.
+ *     The entry* points just past a 1-byte entry FLAGS byte (so entry[-1] is the
+ *     flags byte and entry[0] is a NUL). The flags byte's low 3 bits are
+ *     SDS_TYPE_INTERN_FIELD (5); its high 5 bits carry the entry's own aux bits
+ *     (expiry, value-ptr, string-ref, intern-handle) at the same shift the sds
+ *     header uses, so entryGetAuxBit/entrySetAuxBit read the flags byte directly.
+ *
+ *                          entry
+ *                            |
+ *     +------+-------+--------+-------+----V--+
+ *     | Exp? | value | field  | flags | \0    |
+ *     |      | ptr   | slot   | byte  |       |
+ *     +------+-------+--------+-------+-------+
+ *                       |
+ *                       +-> internSlot (sdshdr8 body is a genuine sds field name)
+ *
+ *     Identified by: (entry[-1] & SDS_TYPE_MASK) == SDS_TYPE_INTERN_FIELD.
  */
+
+/* SDS types 0-4 are used by sds.h; 5-7 are free. We reuse type value 5 as the
+ * discriminator in the Type-5 entry flags byte. */
+#define SDS_TYPE_INTERN_FIELD 5
 
 enum {
     /* SDS aux flag. If set, it indicates that the entry has TTL metadata set. */
@@ -106,15 +132,57 @@ enum {
 };
 static_assert(FIELD_SDS_AUX_BIT_MAX < sizeof(char) - SDS_TYPE_BITS, "too many sds bits are used for entry metadata");
 
-/* The entry pointer is the field sds, but that's an implementation detail. */
+/* Type-5 discriminator: the entry's flags byte lives at entry[-1]; its low 3
+ * bits equal SDS_TYPE_INTERN_FIELD for an interned-field entry. For every other
+ * entry type, entry[-1] is a real sds flags byte whose type is 0-4. */
+bool entryFieldIsInterned(const entry *entry) {
+    return (((const unsigned char *)entry)[-1] & SDS_TYPE_MASK) == SDS_TYPE_INTERN_FIELD;
+}
+
+/* Reads one of the entry's aux bits. For a Type-5 entry the bits live in the
+ * entry flags byte (entry[-1]) at the same shift the sds header uses; otherwise
+ * they live in the embedded field sds header. */
+static int entryGetAuxBit(const entry *entry, int bit) {
+    if (entryFieldIsInterned(entry)) {
+        unsigned char flags = ((const unsigned char *)entry)[-1];
+        return (flags >> (SDS_TYPE_BITS + bit)) & 1U;
+    }
+    return sdsGetAuxBit((sds)entry, bit);
+}
+
+/* Sets one of the entry's aux bits (see entryGetAuxBit). */
+static void entrySetAuxBit(entry *entry, int bit, int value) {
+    if (entryFieldIsInterned(entry)) {
+        unsigned char *fb = &((unsigned char *)entry)[-1];
+        if (value) {
+            *fb |= (unsigned char)(1 << (SDS_TYPE_BITS + bit));
+        } else {
+            *fb &= (unsigned char)~(1 << (SDS_TYPE_BITS + bit));
+        }
+        return;
+    }
+    sdsSetAuxBit((sds)entry, bit, value);
+}
+
+/* Returns the field slot pointer of a Type-5 entry. Located just before the
+ * flags byte: entry[-1] is flags, then a field-slot pointer, then a value ptr. */
+static struct internSlot *entryGetFieldSlot(const entry *entry) {
+    serverAssert(entryFieldIsInterned(entry));
+    char *p = (char *)entry - 1 - sizeof(void *);
+    return *(struct internSlot **)p;
+}
+
+/* The entry pointer is the field sds, except for a Type-5 entry, whose field is
+ * a shared intern slot laid out as a genuine sdshdr8. */
 sds entryGetField(const entry *entry) {
+    if (entryFieldIsInterned(entry)) return internSlotFieldSds(entryGetFieldSlot(entry));
     return (sds)entry;
 }
 
 /* Returns true in case the entry's value is not embedded in the entry.
  * Returns false otherwise. */
 static bool entryHasValuePtr(const entry *entry) {
-    return sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR);
+    return entryGetAuxBit(entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR);
 }
 
 static void **entryGetValueRef(const entry *entry);
@@ -128,13 +196,13 @@ bool entryHasEmbeddedValue(const entry *entry) {
 /* Returns true in case the entry holds a stringRef reference of the value.
  * Returns false otherwise. */
 bool entryHasStringRef(const entry *entry) {
-    return entryHasValuePtr(entry) && sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF);
+    return entryHasValuePtr(entry) && entryGetAuxBit(entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF);
 }
 
 /* Returns true in case the entry's value pointer is an intern slot.
  * Returns false otherwise. An interned value is always also a stringRef. */
 bool entryHasInternHandle(const entry *entry) {
-    return entryHasValuePtr(entry) && sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE);
+    return entryHasValuePtr(entry) && entryGetAuxBit(entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE);
 }
 
 /* Returns the intern slot pointer of an interned value. */
@@ -145,13 +213,19 @@ static struct internSlot *entryGetInternSlot(const entry *entry) {
 /* Returns true in case the entry has expiration timestamp.
  * Returns false otherwise. */
 bool entryHasExpiry(const entry *entry) {
-    return sdsGetAuxBit(entryGetField(entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_EXPIRY);
+    return entryGetAuxBit(entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_EXPIRY);
 }
 
 /* Returns the location of a pointer to a separately allocated value. Only for
  * an entry without an embedded value. */
 static void **entryGetValueRef(const entry *entry) {
     serverAssert(entryHasValuePtr(entry));
+    if (entryFieldIsInterned(entry)) {
+        /* Type-5: [expiry?][value ptr][field slot ptr][flags]<-entry. The value
+         * pointer sits two words before the flags byte. */
+        char *p = (char *)entry - 1 - 2 * sizeof(void *);
+        return (void **)p;
+    }
     char *field_data = sdsAllocPtr(entryGetField(entry));
     field_data -= sizeof(void *);
     return (void **)field_data;
@@ -206,14 +280,21 @@ static void entryFreeValuePtr(entry *entry) {
 static void entrySetValueSds(entry *e, sds value) {
     serverAssert(entryHasValuePtr(e));
     entryFreeValuePtr(e);
-    if (entryHasInternHandle(e)) sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 0);
-    if (entryHasStringRef(e)) sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 0);
+    if (entryHasInternHandle(e)) entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 0);
+    if (entryHasStringRef(e)) entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 0);
     sds *value_ref = entryGetSdsValueRef(e);
     *value_ref = value;
 }
 
 /* Returns the address of the entry allocation. */
 static void *entryGetAllocPtr(const entry *entry) {
+    if (entryFieldIsInterned(entry)) {
+        /* Type-5: [expiry?][value ptr][field slot ptr][flags]<-entry. Back up the
+         * flags byte, both pointers, and the optional expiry. */
+        char *buf = (char *)entry - 1 - 2 * sizeof(void *);
+        if (entryHasExpiry(entry)) buf -= sizeof(mstime_t);
+        return buf;
+    }
     char *buf = sdsAllocPtr(entryGetField(entry));
     if (entryHasValuePtr(entry)) buf -= sizeof(void *);
     if (entryHasExpiry(entry)) buf -= sizeof(mstime_t);
@@ -242,7 +323,9 @@ entry *entrySetExpiry(entry *e, mstime_t expiry) {
         return e;
     }
     if (entryHasInternHandle(e)) {
-        return entryUpdateAsInternHandle(e, entryGetInternSlot(e), expiry);
+        struct internSlot *own = entryGetInternSlot(e);
+        internRetain(own); /* entryUpdateAsInternHandle consumes one reference */
+        return entryUpdateAsInternHandle(e, own, expiry);
     }
     if (entryHasStringRef(e)) {
         stringRef *value = entryGetStringRefRef(e);
@@ -262,6 +345,7 @@ bool entryIsExpired(entry *entry) {
 
 void entryFree(entry *entry) {
     if (entryHasValuePtr(entry)) entryFreeValuePtr(entry);
+    if (entryFieldIsInterned(entry)) internReleaseField(entryGetFieldSlot(entry));
     zfree(entryGetAllocPtr(entry));
 }
 
@@ -381,6 +465,107 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry) {
     return entryConstruct(alloc_size, field, value, NULL, expiry, embed_value, embedded_field_sds_type, expiry_size, embedded_value_sds_size, embedded_field_sds_size);
 }
 
+/* Value kinds a Type-5 entry can carry (it is always value-by-pointer). */
+typedef enum { ENTRY_VAL_SDS, ENTRY_VAL_STRINGREF, ENTRY_VAL_INTERN } entryValueKind;
+
+/* Builds a Type-5 interned-field entry. Layout, low address to high:
+ *   [expiry (opt, 8)] [value ptr (8)] [field slot ptr (8)] [flags byte (1)] [NUL (1)]
+ * The returned entry* points at the NUL byte; entry[-1] is the flags byte whose
+ * low 3 bits are SDS_TYPE_INTERN_FIELD and whose high bits carry the aux bits.
+ * `value` is stored by pointer as-is: an owned sds, a stringRef, or an internSlot
+ * per `kind`. The entry takes ownership of the field slot reference the caller
+ * passes (refcount is not bumped here). */
+static entry *entryConstructInternField(struct internSlot *fieldSlot, void *value, entryValueKind kind, mstime_t expiry) {
+    size_t expiry_size = (expiry == EXPIRY_NONE) ? 0 : sizeof(mstime_t);
+    size_t alloc_size = expiry_size + 2 * sizeof(void *) + 1 /* flags */ + 1 /* NUL */;
+    char *buf = zmalloc(alloc_size);
+    char *p = buf;
+    if (expiry_size) {
+        *(mstime_t *)p = expiry;
+        p += expiry_size;
+    }
+    *(void **)p = value; /* value pointer (owned sds, stringRef, or internSlot) */
+    p += sizeof(void *);
+    *(struct internSlot **)p = fieldSlot; /* field slot pointer */
+    p += sizeof(void *);
+    /* Flags byte: type = SDS_TYPE_INTERN_FIELD, aux bits set below. */
+    *(unsigned char *)p = SDS_TYPE_INTERN_FIELD;
+    p += 1;
+    *p = '\0'; /* NUL at entry[0] so an accidental %s prints empty */
+    entry *new_entry = (entry *)p;
+
+    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR, 1);
+    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, kind != ENTRY_VAL_SDS ? 1 : 0);
+    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, kind == ENTRY_VAL_INTERN ? 1 : 0);
+    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_EXPIRY, expiry_size ? 1 : 0);
+    return new_entry;
+}
+
+/* Converts an existing (non-Type-5) entry to a Type-5 interned-field entry. See
+ * the header comment. The field slot's content must equal the entry's field. */
+entry *entryConvertToInternField(entry *e, struct internSlot *fieldSlot) {
+    serverAssert(!entryFieldIsInterned(e));
+    mstime_t expiry = entryGetExpiry(e);
+
+    /* Determine the value to carry. Type-5 is always value-by-pointer. */
+    void *value_ptr;
+    entryValueKind kind;
+    if (entryHasInternHandle(e)) {
+        /* Keep the same value slot: bump so entryFree(e) below does not free it. */
+        struct internSlot *vslot = entryGetInternSlot(e);
+        vslot->refcount++;
+        value_ptr = vslot;
+        kind = ENTRY_VAL_INTERN;
+    } else {
+        /* Copy the value bytes into an owned sds so the new entry owns a
+         * value-by-pointer independent of the old entry (freed via sdsfree). */
+        size_t vlen;
+        const char *vbuf = entryGetValue(e, &vlen);
+        value_ptr = sdsnewlen(vbuf, vlen);
+        kind = ENTRY_VAL_SDS;
+    }
+
+    entry *new_entry = entryConstructInternField(fieldSlot, value_ptr, kind, expiry);
+    entryFree(e);
+    return new_entry;
+}
+
+/* Rebuilds a Type-5 entry into a fresh Type-5 entry with the given value and
+ * expiry (used when expiry toggles on/off, which changes the allocation size).
+ * The field slot and its refcount are carried across unchanged; the value is
+ * taken over (an owned sds `new_value`, or the entry's existing value when
+ * new_value is NULL). Frees the old entry. */
+static entry *entryRebuildInternField(entry *e, sds new_value, mstime_t expiry) {
+    serverAssert(entryFieldIsInterned(e));
+    struct internSlot *fieldSlot = entryGetFieldSlot(e);
+    /* Guard the field slot across entryFree(e) so a transient refcount 0 cannot
+     * free it. Net refcount unchanged. */
+    fieldSlot->refcount++;
+
+    void *value_ptr;
+    entryValueKind kind;
+    if (new_value != NULL) {
+        value_ptr = new_value; /* owned sds, take ownership */
+        kind = ENTRY_VAL_SDS;
+    } else if (entryHasInternHandle(e)) {
+        struct internSlot *vslot = entryGetInternSlot(e);
+        vslot->refcount++; /* guard across entryFree(e) */
+        value_ptr = vslot;
+        kind = ENTRY_VAL_INTERN;
+    } else {
+        /* Copy the current value into a fresh owned sds. */
+        size_t vlen;
+        const char *vbuf = entryGetValue(e, &vlen);
+        value_ptr = sdsnewlen(vbuf, vlen);
+        kind = ENTRY_VAL_SDS;
+    }
+
+    entry *new_entry = entryConstructInternField(fieldSlot, value_ptr, kind, expiry);
+    entryFree(e);
+    /* no refcount--: the guard reference is now owned by new_entry (entryFree released e's). */
+    return new_entry;
+}
+
 /* Sets the entry's value to a string reference object.
  * The reference points to the provided `buf` but does not assume ownership.
  * It is assumed that an external mechanism will handle releasing any memory which
@@ -401,10 +586,22 @@ entry *entryUpdateAsStringRef(entry *e, const char *buf, size_t len, mstime_t ex
             sds *value_ref = entryGetSdsValueRef(e);
             sdsfree(*value_ref);
             *value_ref = (sds)value;
-            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
+            entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
         }
         if (expiry != EXPIRY_NONE) *entryGetExpiryRef(e) = expiry;
         return e;
+    }
+    /* Rebuild needed (expiry toggles). A Type-5 entry stays Type-5. */
+    if (entryFieldIsInterned(e)) {
+        stringRef *value = zmalloc(sizeof(stringRef));
+        value->buf = buf;
+        value->len = len;
+        struct internSlot *fieldSlot = entryGetFieldSlot(e);
+        fieldSlot->refcount++;
+        entry *new_entry = entryConstructInternField(fieldSlot, value, ENTRY_VAL_STRINGREF, expiry);
+        entryFree(e);
+        /* no refcount--: the guard reference is now owned by new_entry (entryFree released e's). */
+        return new_entry;
     }
     stringRef *value = zmalloc(sizeof(stringRef));
     value->buf = buf;
@@ -428,9 +625,11 @@ entry *entryUpdateAsStringRef(entry *e, const char *buf, size_t len, mstime_t ex
  * all read paths see a Type-4 {buf,len} value. The entry does not own the slot's
  * bytes and releases it via internRelease on destruction/overwrite.
  *
- * The caller passes a slot it already holds a reference on (from internAcquire).
- * If the entry currently references a DIFFERENT interned slot, that old slot is
- * released. Cloned from entryUpdateAsStringRef. */
+ * CONTRACT: the caller transfers exactly ONE reference on `slot` (from
+ * internAcquire or internRetain) to the entry. Whatever value reference the
+ * entry held before is released -- including a reference on the same slot, in
+ * which case the caller's reference is the surplus. Cloned from
+ * entryUpdateAsStringRef. */
 entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t expiry) {
     mstime_t entry_expiry = entryGetExpiry(e);
     bool expiry_add_remove = (expiry != entry_expiry) && (entry_expiry == EXPIRY_NONE || expiry == EXPIRY_NONE);
@@ -438,15 +637,16 @@ entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t exp
         /* In-place: overwrite the value pointer with the slot. */
         void **value_ref = entryGetValueRef(e);
         if (entryHasInternHandle(e)) {
-            struct internSlot *old = (struct internSlot *)*value_ref;
-            if (old != slot) internRelease(old);
+            /* Release the reference the entry held: either a different slot,
+             * or the same slot (then the caller's reference is the surplus). */
+            internRelease((struct internSlot *)*value_ref);
         } else if (entryHasStringRef(e)) {
             zfree(*value_ref);
-            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
+            entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
         } else {
             sdsfree(*value_ref);
-            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
-            sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
+            entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
+            entrySetAuxBit(e, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
         }
         *value_ref = slot;
         if (expiry != EXPIRY_NONE) *entryGetExpiryRef(e) = expiry;
@@ -454,10 +654,17 @@ entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t exp
     }
 
     /* Rebuild: expiry is being toggled on/off, so the entry allocation changes.
-     * Guard the slot across entryFree (which releases the old value: the same
-     * slot when the entry was already interned) so a transient refcount 0 never
-     * frees the slot we are about to store. Net refcount is unchanged. */
-    slot->refcount++;
+     * A Type-5 entry stays Type-5. Guard the value slot across entryFree (which
+     * releases the old value: the same slot when the entry was already interned)
+     * so a transient refcount 0 never frees the slot we are about to store. */
+    if (entryFieldIsInterned(e)) {
+        struct internSlot *fieldSlot = entryGetFieldSlot(e);
+        fieldSlot->refcount++; /* new_entry's reference; entryFree(e) below releases e's */
+        entry *new_entry = entryConstructInternField(fieldSlot, slot, ENTRY_VAL_INTERN, expiry);
+        entryFree(e); /* releases e's value reference; the caller's keeps slot alive */
+        /* no refcount--: the guard reference is now owned by new_entry (entryFree released e's). */
+        return new_entry;
+    }
     sds field = entryGetField(e);
     size_t field_size = sdsReqSize(sdslen(field), SDS_TYPE_8);
     size_t alloc_size = field_size + sizeof(void *);
@@ -467,8 +674,7 @@ entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t exp
         expiry_size = sizeof(expiry);
     }
     entry *new_entry = entryConstruct(alloc_size, field, NULL, (stringRef *)slot, expiry, false, SDS_TYPE_8, expiry_size, sizeof(void *), field_size);
-    entryFree(e);
-    slot->refcount--;
+    entryFree(e); /* releases e's value reference; the caller's keeps slot alive */
 
     sdsSetAuxBit(entryGetField(new_entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 1);
     sdsSetAuxBit(entryGetField(new_entry), FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, 1);
@@ -483,10 +689,30 @@ entry *entryUpdate(entry *e, sds value, mstime_t expiry) {
     sds field = entryGetField(e);
     entry *new_entry = NULL;
 
+    /* Type-5 interned-field entry: keep it Type-5 across value/expiry updates.
+     * The value is always by pointer, so no embedding decision applies. */
+    if (entryFieldIsInterned(e)) {
+        mstime_t curr_expiry = entryGetExpiry(e);
+        bool update_value = value != NULL;
+        bool update_expiry = expiry != curr_expiry;
+        bool expiry_add_remove = update_expiry && (curr_expiry == EXPIRY_NONE || expiry == EXPIRY_NONE);
+        if (!update_value && !update_expiry) return e;
+        if (expiry_add_remove) {
+            /* Reallocate (expiry toggles). Carry the new value if any. */
+            return entryRebuildInternField(e, update_value ? value : NULL, expiry);
+        }
+        /* In place: set expiry (already present) and/or overwrite the value. */
+        if (update_expiry) *entryGetExpiryRef(e) = expiry;
+        if (update_value) entrySetValueSds(e, value); /* takes ownership, value-by-ptr */
+        return e;
+    }
+
     /* Update just the expiry field, no value change, of a string ref entry */
     if (entryHasStringRef(e) && !value) {
         if (entryHasInternHandle(e)) {
-            return entryUpdateAsInternHandle(e, entryGetInternSlot(e), expiry);
+            struct internSlot *own = entryGetInternSlot(e);
+        internRetain(own); /* entryUpdateAsInternHandle consumes one reference */
+        return entryUpdateAsInternHandle(e, own, expiry);
         }
         stringRef *value = entryGetStringRefRef(e);
         return entryUpdateAsStringRef(e, value->buf, value->len, expiry);
@@ -590,6 +816,12 @@ size_t entryMemUsage(entry *entry) {
         mem += zmalloc_usable_size(entryGetStringRefRef(entry));
     } else {
         mem += sdsAllocSize((sds)entryGetValue(entry, NULL));
+    }
+    /* Type-5: add the amortized share of the shared field slot (the honest
+     * per-key number: one pointer in the entry + slot bytes / references). */
+    if (entryFieldIsInterned(entry)) {
+        struct internSlot *fslot = entryGetFieldSlot(entry);
+        mem += sizeof(void *) + internSlotFieldAllocSize(fslot) / internSlotRefcount(fslot);
     }
     return mem;
 }

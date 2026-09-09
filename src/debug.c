@@ -405,7 +405,7 @@ void mallctl_string(client *c, robj **argv, int argc) {
 #endif
 
 /*-----------------------------------------------------------------------------
- * DEBUG INTERN (spike S1) -- hash-value interning driver.
+ * DEBUG INTERN (spike S1 values + S2 hash field names) -- interning driver.
  *----------------------------------------------------------------------------*/
 
 #define DEBUG_INTERN_MIN_LEN 4
@@ -443,10 +443,46 @@ static hashtableType debugInternCountType = {
     .instant_rehashing = 1,
 };
 
-/* True if a hash entry's value is a candidate for interning: length in band,
- * not already interned, and not volatile (avoids volatile-set pointer tracking
- * complications in the spike). */
-static bool debugInternEligible(entry *e, const char **buf, size_t *len) {
+/* Last DEBUG INTERN SCAN's measured used_memory delta (before - after). */
+static size_t debug_intern_last_bytes_saved = 0;
+
+/* Records a content sighting in the counting map. */
+static void debugInternCount1(hashtable *counts, const char *buf, size_t len) {
+    debugInternCount probe;
+    probe.buf = buf;
+    probe.len = len;
+    probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+    void *found;
+    if (hashtableFind(counts, &probe, &found)) {
+        ((debugInternCount *)found)->count++;
+    } else {
+        debugInternCount *cnt = zmalloc(sizeof(*cnt) + len + 1);
+        memcpy(cnt->bytes, buf, len);
+        cnt->bytes[len] = '\0';
+        cnt->buf = cnt->bytes;
+        cnt->len = len;
+        cnt->hash = probe.hash;
+        cnt->count = 1;
+        hashtableAdd(counts, cnt);
+    }
+}
+
+/* Returns the sighting count for content, or 0 if unseen. */
+static uint32_t debugInternCountGet(hashtable *counts, const char *buf, size_t len) {
+    debugInternCount probe;
+    probe.buf = buf;
+    probe.len = len;
+    probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+    void *found;
+    if (!hashtableFind(counts, &probe, &found)) return 0;
+    return ((debugInternCount *)found)->count;
+}
+
+/* True if a hash entry's value is a candidate for value-interning: length in
+ * band, not already interned, and not volatile (values in the volatile set are
+ * left for the field-side path; value interning of volatile entries is an S1
+ * scope choice preserved here). */
+static bool debugInternValueEligible(entry *e, const char **buf, size_t *len) {
     if (entryHasInternHandle(e)) return false;
     if (entryHasExpiry(e)) return false;
     size_t vlen;
@@ -457,15 +493,29 @@ static bool debugInternEligible(entry *e, const char **buf, size_t *len) {
     return true;
 }
 
+/* True if a hash entry's FIELD name is a candidate for interning: length in
+ * band and the entry is not already a Type-5 interned-field entry. Volatile
+ * entries are eligible (the replace path updates the volatile set too). */
+static bool debugInternFieldEligible(entry *e, const char **buf, size_t *len) {
+    if (entryFieldIsInterned(e)) return false;
+    sds field = entryGetField(e);
+    size_t flen = sdslen(field);
+    if (flen < DEBUG_INTERN_MIN_LEN || flen > DEBUG_INTERN_MAX_LEN) return false;
+    *buf = field;
+    *len = flen;
+    return true;
+}
+
 /* DEBUG INTERN SCAN: synchronous one-shot pass over the whole keyspace,
- * interning every hash value seen >= 2 times. */
+ * interning every hash value AND field name seen >= 2 times. */
 static void debugInternScanCommand(client *c) {
     monotime start = getMonotonicUs();
-    long long entries_scanned = 0, values_interned = 0;
+    long long entries_scanned = 0, values_interned = 0, fields_interned = 0;
 
-    hashtable *counts = hashtableCreate(&debugInternCountType);
+    hashtable *vcounts = hashtableCreate(&debugInternCountType);
+    hashtable *fcounts = hashtableCreate(&debugInternCountType);
 
-    /* Pass 1: count content sightings across all hashtable-encoded hashes. */
+    /* Pass 1: count value and field-name sightings across all hashtable hashes. */
     for (int j = 0; j < server.dbnum; j++) {
         serverDb *db = server.db[j];
         if (db == NULL || kvstoreSize(db->keys) == 0) continue;
@@ -483,33 +533,22 @@ static void debugInternScanCommand(client *c) {
                 entries_scanned++;
                 const char *buf;
                 size_t len;
-                if (!debugInternEligible(e, &buf, &len)) continue;
-                debugInternCount probe;
-                probe.buf = buf;
-                probe.len = len;
-                probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
-                void *found;
-                if (hashtableFind(counts, &probe, &found)) {
-                    ((debugInternCount *)found)->count++;
-                } else {
-                    debugInternCount *cnt = zmalloc(sizeof(*cnt) + len + 1);
-                    memcpy(cnt->bytes, buf, len);
-                    cnt->bytes[len] = '\0';
-                    cnt->buf = cnt->bytes;
-                    cnt->len = len;
-                    cnt->hash = probe.hash;
-                    cnt->count = 1;
-                    hashtableAdd(counts, cnt);
-                }
+                if (debugInternValueEligible(e, &buf, &len)) debugInternCount1(vcounts, buf, len);
+                if (debugInternFieldEligible(e, &buf, &len)) debugInternCount1(fcounts, buf, len);
             }
             hashtableCleanupIterator(&hi);
         }
         kvstoreIteratorRelease(kvs_it);
     }
 
-    /* Pass 2: intern values whose content was seen >= 2 times. Snapshot each
-     * hash's entry pointers first so pointer replacement during interning does
-     * not disturb iteration. */
+    /* Measure the memory delta the interning itself produces. */
+    size_t used_before = zmalloc_used_memory();
+
+    /* Pass 2: intern values and field names whose content was seen >= 2 times.
+     * Snapshot each hash's entry pointers first so pointer replacement during
+     * interning does not disturb iteration. Field interning must come after
+     * value interning per entry so the value slot is carried across the Type-5
+     * conversion. We process each entry: value first, then field. */
     for (int j = 0; j < server.dbnum; j++) {
         serverDb *db = server.db[j];
         if (db == NULL || kvstoreSize(db->keys) == 0) continue;
@@ -533,60 +572,96 @@ static void debugInternScanCommand(client *c) {
                 entry *e = snapshot[i];
                 const char *buf;
                 size_t len;
-                if (!debugInternEligible(e, &buf, &len)) continue;
-                debugInternCount probe;
-                probe.buf = buf;
-                probe.len = len;
-                probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
-                void *found;
-                if (!hashtableFind(counts, &probe, &found)) continue;
-                if (((debugInternCount *)found)->count < 2) continue;
 
-                internSlot *slot = internAcquire(buf, len);
-                mstime_t expiry = entryGetExpiry(e);
-                entry *new_entry = entryUpdateAsInternHandle(e, slot, expiry);
-                bool replaced = hashtableReplaceReallocatedEntry(ht, e, new_entry);
-                serverAssert(replaced);
-                values_interned++;
+                /* Value interning (S1): only for non-volatile, uninterned values. */
+                if (debugInternValueEligible(e, &buf, &len) && debugInternCountGet(vcounts, buf, len) >= 2) {
+                    internSlot *slot = internAcquire(buf, len);
+                    mstime_t expiry = entryGetExpiry(e);
+                    entry *ne = entryUpdateAsInternHandle(e, slot, expiry);
+                    if (ne != e) {
+                        serverAssert(hashtableReplaceReallocatedEntry(ht, e, ne));
+                        e = ne;
+                        snapshot[i] = ne;
+                    }
+                    values_interned++;
+                }
+
+                /* Field-name interning (S2): rebuild as a Type-5 entry, then
+                 * replace the pointer in the hashtable and volatile set. */
+                if (debugInternFieldEligible(e, &buf, &len) && debugInternCountGet(fcounts, buf, len) >= 2) {
+                    internSlot *fslot = internAcquireField(buf, len);
+                    entry *ne = entryConvertToInternField(e, fslot);
+                    hashTypeReplaceReallocatedEntry(o, e, ne);
+                    e = ne;
+                    snapshot[i] = ne;
+                    fields_interned++;
+                }
             }
             zfree(snapshot);
         }
         kvstoreIteratorRelease(kvs_it);
     }
 
-    hashtableRelease(counts);
+    size_t used_after = zmalloc_used_memory();
+    /* Measured saving: memory dropped by the interning pass (guard against a
+     * transient increase, which would only happen on a degenerate keyspace). */
+    debug_intern_last_bytes_saved = (used_before > used_after) ? (used_before - used_after) : 0;
+
+    hashtableRelease(vcounts);
+    hashtableRelease(fcounts);
 
     internStats stats;
     internGetStats(&stats);
     uint64_t scan_us = getMonotonicUs() - start;
 
-    addReplyMapLen(c, 5);
+    addReplyMapLen(c, 8);
     addReplyBulkCString(c, "entries_scanned");
     addReplyLongLong(c, entries_scanned);
     addReplyBulkCString(c, "values_interned");
     addReplyLongLong(c, values_interned);
-    addReplyBulkCString(c, "slots");
-    addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "fields_interned");
+    addReplyLongLong(c, fields_interned);
+    addReplyBulkCString(c, "value_slots");
+    addReplyLongLong(c, stats.value_slots);
+    addReplyBulkCString(c, "field_slots");
+    addReplyLongLong(c, stats.field_slots);
+    addReplyBulkCString(c, "dup_refs");
+    addReplyLongLong(c, stats.dup_refs);
     addReplyBulkCString(c, "bytes_saved");
-    addReplyLongLong(c, stats.bytes_saved);
+    addReplyLongLong(c, debug_intern_last_bytes_saved);
     addReplyBulkCString(c, "scan_ms");
     addReplyLongLong(c, scan_us / 1000);
 }
 
+static const char *debug_intern_hist_labels[INTERN_HIST_BUCKETS] = {
+    "len_le_8", "len_9_16", "len_17_20", "len_21_23", "len_24_32", "len_33_64", "len_gt_64"};
+
 static void debugInternStatsCommand(client *c) {
     internStats stats;
     internGetStats(&stats);
-    addReplyMapLen(c, 5);
+    addReplyMapLen(c, 9 + INTERN_HIST_BUCKETS);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "value_slots");
+    addReplyLongLong(c, stats.value_slots);
+    addReplyBulkCString(c, "field_slots");
+    addReplyLongLong(c, stats.field_slots);
     addReplyBulkCString(c, "sso_slots");
     addReplyLongLong(c, stats.sso_slots);
     addReplyBulkCString(c, "long_slots");
     addReplyLongLong(c, stats.long_slots);
+    addReplyBulkCString(c, "dup_refs");
+    addReplyLongLong(c, stats.dup_refs);
     addReplyBulkCString(c, "bytes_saved");
     addReplyLongLong(c, stats.bytes_saved);
+    addReplyBulkCString(c, "bytes_saved_measured");
+    addReplyLongLong(c, debug_intern_last_bytes_saved);
     addReplyBulkCString(c, "index_mem");
     addReplyLongLong(c, stats.index_mem);
+    for (int b = 0; b < INTERN_HIST_BUCKETS; b++) {
+        addReplyBulkCString(c, debug_intern_hist_labels[b]);
+        addReplyLongLong(c, stats.hist[b]);
+    }
 }
 
 void debugCommand(client *c) {
@@ -618,8 +693,8 @@ void debugCommand(client *c) {
             "HTSTATS <dbid> [full]",
             "    Return hash table statistics of the specified database.",
             "INTERN <SCAN|STATS>",
-            "    SCAN: intern hash values seen >= 2 times across the keyspace.",
-            "    STATS: report intern subsystem slot counts and bytes saved.",
+            "    SCAN: intern hash values and field names seen >= 2 times across the keyspace.",
+            "    STATS: report intern subsystem slot counts, bytes saved, and length histogram.",
             "HTSTATS-KEY <key> [full]",
             "    Like HTSTATS but for the hash table stored at <key>'s value.",
             "LOADAOF",

@@ -45,6 +45,20 @@ bool entryHasStringRef(const entry *entry);
  * subsystem, released rather than freed on entry destruction). */
 bool entryHasInternHandle(const entry *entry);
 
+/* Returns true if this is a Type-5 "interned field" entry: the field name is a
+ * shared intern slot (referenced by pointer) rather than embedded in the entry.
+ * A Type-5 entry always stores its value by pointer (never embedded). */
+bool entryFieldIsInterned(const entry *entry);
+
+/* Converts an existing (non-Type-5) entry to a Type-5 interned-field entry that
+ * references `fieldSlot` for its field name. The caller must pass a fieldSlot it
+ * already holds a reference on (from internAcquireField), with content equal to
+ * the entry's current field. The value is preserved (an embedded value is copied
+ * out to a value-by-pointer; an interned value keeps its slot). The old entry is
+ * freed and the new Type-5 entry pointer is returned; the caller must replace the
+ * pointer in the hash's hashtable (and volatile set, if any). */
+entry *entryConvertToInternField(entry *entry, struct internSlot *fieldSlot);
+
 /* Sets the expiration timestamp. */
 entry *entrySetExpiry(entry *entry, mstime_t expiry);
 
