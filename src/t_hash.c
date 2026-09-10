@@ -2431,7 +2431,7 @@ static int hashTypeExpireEntry(void *entry, void *c) {
     serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && hashtableSize(objectGetVal(o)) > 0);
     hashtable *ht = objectGetVal(o);
     void *entry_ptr = NULL;
-    bool deleted = hashtablePop(ht, entry, &entry_ptr);
+    bool deleted = hashtablePop(ht, entryGetField(entry), &entry_ptr);
     if (deleted) {
         if (ctx->fields)
             ctx->fields[ctx->n_fields++] = createStringObjectFromSds(entryGetField(entry));
