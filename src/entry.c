@@ -243,9 +243,15 @@ static stringRef *entryGetStringRefRef(const entry *entry) {
 /* Returns the entry's value. */
 char *entryGetValue(const entry *entry, size_t *len) {
     if (entryHasEmbeddedValue(entry)) {
-        /* Skip field content, field null terminator and value sds8 hdr. */
-        size_t offset = sdslen(entryGetField(entry)) + 1 + sdsHdrSize(SDS_TYPE_8);
-        sds value = (char *)entry + offset;
+        sds value;
+        if (entryFieldIsInterned(entry)) {
+            /* Type-5 embedded: the value sdshdr8 starts at entry[0]. */
+            value = (char *)entry + sdsHdrSize(SDS_TYPE_8);
+        } else {
+            /* Skip field content, field null terminator and value sds8 hdr. */
+            size_t offset = sdslen(entryGetField(entry)) + 1 + sdsHdrSize(SDS_TYPE_8);
+            value = (char *)entry + offset;
+        }
         if (len) *len = sdslen(value);
         return value;
     }
@@ -291,7 +297,8 @@ static void *entryGetAllocPtr(const entry *entry) {
     if (entryFieldIsInterned(entry)) {
         /* Type-5: [expiry?][value ptr][field slot ptr][flags]<-entry. Back up the
          * flags byte, both pointers, and the optional expiry. */
-        char *buf = (char *)entry - 1 - 2 * sizeof(void *);
+        char *buf = (char *)entry - 1 - sizeof(void *); /* field slot ptr */
+        if (entryHasValuePtr(entry)) buf -= sizeof(void *);   /* value ptr */
         if (entryHasExpiry(entry)) buf -= sizeof(mstime_t);
         return buf;
     }
@@ -465,8 +472,15 @@ entry *entryCreate(const_sds field, sds value, mstime_t expiry) {
     return entryConstruct(alloc_size, field, value, NULL, expiry, embed_value, embedded_field_sds_type, expiry_size, embedded_value_sds_size, embedded_field_sds_size);
 }
 
-/* Value kinds a Type-5 entry can carry (it is always value-by-pointer). */
+/* Value kinds a Type-5 entry can carry. ENTRY_VAL_SDS is embedded after the
+ * flags byte when the whole entry fits EMBED_VALUE_MAX_ALLOC_SIZE, else by pointer. */
 typedef enum { ENTRY_VAL_SDS, ENTRY_VAL_STRINGREF, ENTRY_VAL_INTERN } entryValueKind;
+
+/* True if a Type-5 entry with an owned sds value of this length embeds it. */
+static bool entryInternFieldEmbeds(size_t value_len, mstime_t expiry) {
+    size_t expiry_size = (expiry == EXPIRY_NONE) ? 0 : sizeof(mstime_t);
+    return expiry_size + sizeof(void *) + 1 + sdsReqSize(value_len, SDS_TYPE_8) <= EMBED_VALUE_MAX_ALLOC_SIZE;
+}
 
 /* Builds a Type-5 interned-field entry. Layout, low address to high:
  *   [expiry (opt, 8)] [value ptr (8)] [field slot ptr (8)] [flags byte (1)] [NUL (1)]
@@ -477,24 +491,36 @@ typedef enum { ENTRY_VAL_SDS, ENTRY_VAL_STRINGREF, ENTRY_VAL_INTERN } entryValue
  * passes (refcount is not bumped here). */
 static entry *entryConstructInternField(struct internSlot *fieldSlot, void *value, entryValueKind kind, mstime_t expiry) {
     size_t expiry_size = (expiry == EXPIRY_NONE) ? 0 : sizeof(mstime_t);
-    size_t alloc_size = expiry_size + 2 * sizeof(void *) + 1 /* flags */ + 1 /* NUL */;
-    char *buf = zmalloc(alloc_size);
+    bool embed = (kind == ENTRY_VAL_SDS) && entryInternFieldEmbeds(sdslen((sds)value), expiry);
+    size_t head_size = expiry_size + (embed ? 1 : 2) * sizeof(void *) + 1 /* flags */;
+    size_t alloc_size = head_size + (embed ? sdsReqSize(sdslen((sds)value), SDS_TYPE_8) : 1 /* NUL */);
+    size_t buf_size;
+    char *buf = zmalloc_usable(alloc_size, &buf_size);
     char *p = buf;
     if (expiry_size) {
         *(mstime_t *)p = expiry;
         p += expiry_size;
     }
-    *(void **)p = value; /* value pointer (owned sds, stringRef, or internSlot) */
-    p += sizeof(void *);
+    if (!embed) {
+        *(void **)p = value; /* value pointer (owned sds, stringRef, or internSlot) */
+        p += sizeof(void *);
+    }
     *(struct internSlot **)p = fieldSlot; /* field slot pointer */
     p += sizeof(void *);
     /* Flags byte: type = SDS_TYPE_INTERN_FIELD, aux bits set below. */
     *(unsigned char *)p = SDS_TYPE_INTERN_FIELD;
     p += 1;
-    *p = '\0'; /* NUL at entry[0] so an accidental %s prints empty */
     entry *new_entry = (entry *)p;
+    if (embed) {
+        /* Embedded value: an sdshdr8 starting at entry[0], padded to the block. */
+        sds v = (sds)value;
+        sdswrite(p, buf_size - head_size, SDS_TYPE_8, v, sdslen(v));
+        sdsfree(v);
+    } else {
+        *p = '\0'; /* NUL at entry[0] so an accidental %s prints empty */
+    }
 
-    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR, 1);
+    entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_VALUE_PTR, embed ? 0 : 1);
     entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, kind != ENTRY_VAL_SDS ? 1 : 0);
     entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, kind == ENTRY_VAL_INTERN ? 1 : 0);
     entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_EXPIRY, expiry_size ? 1 : 0);
@@ -701,9 +727,32 @@ entry *entryUpdate(entry *e, sds value, mstime_t expiry) {
             /* Reallocate (expiry toggles). Carry the new value if any. */
             return entryRebuildInternField(e, update_value ? value : NULL, expiry);
         }
-        /* In place: set expiry (already present) and/or overwrite the value. */
-        if (update_expiry) *entryGetExpiryRef(e) = expiry;
-        if (update_value) entrySetValueSds(e, value); /* takes ownership, value-by-ptr */
+        if (update_value) {
+            bool new_embeds = entryInternFieldEmbeds(sdslen(value), expiry);
+            if (entryHasEmbeddedValue(e) && new_embeds) {
+                /* Embedded -> embedded: reuse the allocation when the new value fits
+                 * the space the old one occupied (same rule as entryUpdate below). */
+                char *old_value = entryGetValue(e, NULL);
+                size_t value_space = sdsHdrSize(SDS_TYPE_8) + sdsalloc(old_value) + 1;
+                if (sdsReqSize(sdslen(value), SDS_TYPE_8) <= value_space &&
+                    sdsReqSize(sdslen(value), SDS_TYPE_8) >= value_space * 3 / 4) {
+                    if (update_expiry) *entryGetExpiryRef(e) = expiry;
+                    sdswrite(sdsAllocPtr(old_value), value_space, SDS_TYPE_8, value, sdslen(value));
+                    sdsfree(value);
+                    return e;
+                }
+                return entryRebuildInternField(e, value, expiry);
+            }
+            if (!entryHasEmbeddedValue(e) && !new_embeds) {
+                /* Pointer -> pointer: swap the value pointer in place. */
+                if (update_expiry) *entryGetExpiryRef(e) = expiry;
+                entrySetValueSds(e, value);
+                return e;
+            }
+            return entryRebuildInternField(e, value, expiry); /* encoding changes */
+        }
+        /* Expiry-only update with expiry already present. */
+        *entryGetExpiryRef(e) = expiry;
         return e;
     }
 
@@ -801,7 +850,7 @@ entry *entryUpdate(entry *e, sds value, mstime_t expiry) {
 size_t entryMemUsage(entry *entry) {
     size_t mem = 0;
 
-    if (entryHasEmbeddedValue(entry)) {
+    if (entryHasEmbeddedValue(entry) && !entryFieldIsInterned(entry)) {
         mem += sdsReqSize(sdslen(entryGetField(entry)), sdsType(entryGetField(entry)));
         if (entryHasExpiry(entry)) mem += sizeof(mstime_t);
     } else {
@@ -814,9 +863,9 @@ size_t entryMemUsage(entry *entry) {
         mem += sizeof(void *) + internSlotAllocSize(slot) / internSlotRefcount(slot);
     } else if (entryHasStringRef(entry)) {
         mem += zmalloc_usable_size(entryGetStringRefRef(entry));
-    } else {
+    } else if (entryHasValuePtr(entry) || !entryFieldIsInterned(entry)) {
         mem += sdsAllocSize((sds)entryGetValue(entry, NULL));
-    }
+    } /* else: Type-5 embedded value is inside the entry allocation, counted above */
     /* Type-5: add the amortized share of the shared field slot (the honest
      * per-key number: one pointer in the entry + slot bytes / references). */
     if (entryFieldIsInterned(entry)) {
