@@ -74,6 +74,17 @@ void internReleaseField(internSlot *slot);
  * laid out in the slot). Only valid for slots from internAcquireField. */
 sds internSlotFieldSds(const internSlot *slot);
 
+/* Inverse of internSlotFieldSds: recover the slot from its (always inline) sds. */
+internSlot *internFieldSlotFromSds(const sds s);
+
+/* Value slots use the same inline-sds layout: sds body <-> slot header. */
+sds internSlotSds(const internSlot *slot);
+internSlot *internSlotFromSds(const sds s);
+
+/* Value slots use the same inline-sds layout: sds body <-> slot header. */
+sds internSlotSds(const internSlot *slot);
+internSlot *internSlotFromSds(const sds s);
+
 /* Fills stats from the current dedup index. */
 void internGetStats(internStats *stats);
 

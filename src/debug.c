@@ -508,6 +508,9 @@ static bool debugInternFieldEligible(entry *e, const char **buf, size_t *len) {
 
 /* DEBUG INTERN SCAN: synchronous one-shot pass over the whole keyspace,
  * interning every hash value AND field name seen >= 2 times. */
+/* DEBUG INTERN SCAN [VALUES|FIELDS|ALL] -- ALL is the default. */
+static bool debug_intern_do_values = true, debug_intern_do_fields = true, debug_intern_rebuild_only = false;
+
 static void debugInternScanCommand(client *c) {
     monotime start = getMonotonicUs();
     long long entries_scanned = 0, values_interned = 0, fields_interned = 0;
@@ -574,7 +577,19 @@ static void debugInternScanCommand(client *c) {
                 size_t len;
 
                 /* Value interning (S1): only for non-volatile, uninterned values. */
-                if (debugInternValueEligible(e, &buf, &len) && debugInternCountGet(vcounts, buf, len) >= 2) {
+                if (debug_intern_rebuild_only) {
+                    /* Control experiment: reallocate the entry with identical content
+                     * (no interning) to measure the relocation/locality effect alone. */
+                    size_t vlen;
+                    const char *vbuf = entryGetValue(e, &vlen);
+                    entry *ne = entryCreate(entryGetField(e), sdsnewlen(vbuf, vlen), entryGetExpiry(e));
+                    hashTypeReplaceReallocatedEntry(o, e, ne);
+                    entryFree(e);
+                    snapshot[i] = ne;
+                    values_interned++;
+                    continue;
+                }
+                if (debug_intern_do_values && debugInternValueEligible(e, &buf, &len) && debugInternCountGet(vcounts, buf, len) >= 2) {
                     internSlot *slot = internAcquire(buf, len);
                     mstime_t expiry = entryGetExpiry(e);
                     entry *ne = entryUpdateAsInternHandle(e, slot, expiry);
@@ -588,7 +603,7 @@ static void debugInternScanCommand(client *c) {
 
                 /* Field-name interning (S2): rebuild as a Type-5 entry, then
                  * replace the pointer in the hashtable and volatile set. */
-                if (debugInternFieldEligible(e, &buf, &len) && debugInternCountGet(fcounts, buf, len) >= 2) {
+                if (debug_intern_do_fields && debugInternFieldEligible(e, &buf, &len) && debugInternCountGet(fcounts, buf, len) >= 2) {
                     internSlot *fslot = internAcquireField(buf, len);
                     entry *ne = entryConvertToInternField(e, fslot);
                     hashTypeReplaceReallocatedEntry(o, e, ne);
@@ -842,8 +857,12 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && c->argc == 3) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && (c->argc == 3 || c->argc == 4)) {
         if (!strcasecmp(objectGetVal(c->argv[2]), "scan")) {
+            const char *mode = c->argc == 4 ? objectGetVal(c->argv[3]) : "all";
+            debug_intern_do_values = strcasecmp(mode, "fields") != 0;
+            debug_intern_do_fields = strcasecmp(mode, "values") != 0;
+            debug_intern_rebuild_only = strcasecmp(mode, "rebuild") == 0;
             debugInternScanCommand(c);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "stats")) {
             debugInternStatsCommand(c);

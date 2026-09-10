@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include "server.h"
 #include "serverassert.h"
 #include "intern.h"
@@ -58,26 +59,29 @@ static void internInit(void) {
 }
 
 /* True if the field slot stores its sdshdr8 inline (vs a long allocation). */
+/* Field sds is always inline; "SSO" for stats means it fit the fixed 48 B slot. */
 static inline bool internFieldIsInline(const internSlot *slot) {
-    return (const char *)slot->buf - sdsHdrSize(SDS_TYPE_8) == slot->inline_;
+    return sdsReqSize(slot->len, SDS_TYPE_8) <= sizeof(slot->inline_);
+}
+
+internSlot *internSlotFromSds(const sds s) {
+    return (internSlot *)((char *)s - sdsHdrSize(SDS_TYPE_8) - offsetof(internSlot, inline_));
+}
+
+internSlot *internFieldSlotFromSds(const sds s) {
+    return (internSlot *)((char *)s - sdsHdrSize(SDS_TYPE_8) - offsetof(internSlot, inline_));
 }
 
 size_t internSlotAllocSize(const internSlot *slot) {
     /* VALUE slot: the slot itself, plus a long byte buffer if content did not
      * fit inline. slot->buf == slot->inline_ exactly when stored inline. */
-    size_t size = zmalloc_size((void *)slot);
-    if (slot->buf != slot->inline_) size += zmalloc_size((void *)slot->buf);
-    return size;
+    return zmalloc_size((void *)slot); /* variable-size allocation, sds inside */
 }
 
 size_t internSlotFieldAllocSize(const internSlot *slot) {
     /* FIELD slot: the slot itself, plus a long sdshdr8 allocation if the field
      * did not fit inline. The header base is slot->buf - sdsHdrSize(SDS_TYPE_8). */
-    size_t size = zmalloc_size((void *)slot);
-    if (!internFieldIsInline(slot)) {
-        size += zmalloc_size((void *)((const char *)slot->buf - sdsHdrSize(SDS_TYPE_8)));
-    }
-    return size;
+    return zmalloc_size((void *)slot); /* variable-size allocation, sds inside */
 }
 
 uint32_t internSlotRefcount(const internSlot *slot) {
@@ -85,6 +89,10 @@ uint32_t internSlotRefcount(const internSlot *slot) {
 }
 
 sds internSlotFieldSds(const internSlot *slot) {
+    return (sds)slot->buf;
+}
+
+sds internSlotSds(const internSlot *slot) {
     return (sds)slot->buf;
 }
 
@@ -108,30 +116,20 @@ static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t l
     slot->refcount = 1;
     slot->hash = probe.hash;
 
-    if (!is_field) {
-        /* VALUE: raw bytes, inline or long. */
-        if (len <= INTERN_SSO_MAX) {
-            memcpy(slot->inline_, buf, len);
-            slot->inline_[len] = '\0';
-            slot->buf = slot->inline_;
-        } else {
-            char *bytes = zmalloc(len + 1);
-            memcpy(bytes, buf, len);
-            bytes[len] = '\0';
-            slot->buf = bytes;
-        }
-    } else {
-        /* FIELD: lay out an sdshdr8 so slot->buf is a genuine sds. Use sdswrite,
-         * which writes the header + bytes + NUL and returns the sds body. */
-        size_t need = sdsReqSize(len, SDS_TYPE_8); /* hdr(3) + len + 1 */
-        char *hdr;
-        if (need <= sizeof(slot->inline_)) {
-            hdr = slot->inline_;
-        } else {
-            hdr = zmalloc(need);
-        }
-        slot->buf = sdswrite(hdr, need, SDS_TYPE_8, buf, len);
+    (void)is_field;
+    /* Both kinds: lay out an sdshdr8 INLINE so slot->buf is a genuine sds. The
+     * holder stores that sds pointer directly (read path == plain sds value /
+     * plain sds field: one dependent load) and recovers the slot header at a
+     * fixed negative offset via internSlotFromSds. Variable-size allocation. */
+    size_t need = sdsReqSize(len, SDS_TYPE_8); /* hdr(3) + len + 1 */
+    if (need > sizeof(slot->inline_)) {
+        size_t alloc = offsetof(internSlot, inline_) + need;
+        internSlot *big = zmalloc(alloc);
+        memcpy(big, slot, offsetof(internSlot, inline_));
+        zfree(slot);
+        slot = big;
     }
+    slot->buf = sdswrite(slot->inline_, need, SDS_TYPE_8, buf, len);
     serverAssert(hashtableAdd(index, slot));
     return slot;
 }
@@ -151,12 +149,8 @@ static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field)
     if (--slot->refcount > 0) return;
 
     serverAssert(hashtableDelete(index, slot));
-    if (!is_field) {
-        if (slot->buf != slot->inline_) zfree((void *)slot->buf);
-    } else {
-        if (!internFieldIsInline(slot)) zfree((void *)((const char *)slot->buf - sdsHdrSize(SDS_TYPE_8)));
-    }
-    zfree(slot);
+    (void)is_field;
+    zfree(slot); /* the sds is always inside the slot allocation */
 }
 
 void internRetain(internSlot *slot) {
@@ -202,7 +196,7 @@ static void internAccumulate(hashtable *index, bool is_field, internStats *stats
             if (internFieldIsInline(slot)) stats->sso_slots++; else stats->long_slots++;
         } else {
             stats->value_slots++;
-            if (slot->buf == slot->inline_) stats->sso_slots++; else stats->long_slots++;
+            if (internFieldIsInline(slot)) stats->sso_slots++; else stats->long_slots++;
         }
         stats->hist[internHistBucket(slot->len)]++;
         if (slot->refcount > 1) {
