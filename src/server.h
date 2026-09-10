@@ -510,6 +510,11 @@ typedef enum {
 #define REPL_DISKLESS_LOAD_SWAPDB 2
 #define REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD 3
 
+/* String interning mode (config string-interning). */
+#define INTERN_MODE_NO 0    /* interning off entirely */
+#define INTERN_MODE_SCAN 1  /* DEBUG INTERN SCAN/ADMIT allowed; no write-time probe */
+#define INTERN_MODE_PROBE 2 /* probe active at entry create/update + SCAN/ADMIT allowed */
+
 /* TLS Client Authentication */
 #define TLS_CLIENT_AUTH_NO 0
 #define TLS_CLIENT_AUTH_YES 1
@@ -2352,6 +2357,9 @@ struct valkeyServer {
     int lazyfree_lazy_server_del;
     int lazyfree_lazy_user_del;
     int lazyfree_lazy_user_flush;
+    /* String interning (experimental, P2 S4a) */
+    int string_interning;      /* INTERN_MODE_{NO,SCAN,PROBE} */
+    size_t intern_max_len;     /* length gate for probe/admission eligibility */
     /* Latency monitor */
     long long latency_monitor_threshold;
     dict *latency_events;

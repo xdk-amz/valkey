@@ -648,13 +648,117 @@ static void debugInternScanCommand(client *c) {
     addReplyLongLong(c, scan_us / 1000);
 }
 
+/* DEBUG INTERN ADMIT: pass-1 of the scan only. Count value and field-name
+ * sightings across the keyspace, then insert every string seen >= 2 times into
+ * the corresponding dedup index as an ADMITTED slot (refcount 0). No entry is
+ * touched -- this is admission (which strings are interned), not interning. The
+ * write-time probe (probe mode) and load-time probe (DEBUG RELOAD) then converge
+ * entries onto these slots as they are created. */
+static void debugInternAdmitCommand(client *c) {
+    monotime start = getMonotonicUs();
+    long long entries_scanned = 0, values_admitted = 0, fields_admitted = 0;
+
+    hashtable *vcounts = hashtableCreate(&debugInternCountType);
+    hashtable *fcounts = hashtableCreate(&debugInternCountType);
+
+    /* Pass 1: count value and field-name sightings across all hashtable hashes. */
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (db == NULL || kvstoreSize(db->keys) == 0) continue;
+        kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys, HASHTABLE_ITER_SAFE);
+        void *next;
+        while (kvstoreIteratorNext(kvs_it, &next)) {
+            robj *o = next;
+            if (objectGetType(o) != OBJ_HASH || objectGetEncoding(o) != OBJ_ENCODING_HASHTABLE) continue;
+            hashtable *ht = objectGetVal(o);
+            hashtableIterator hi;
+            hashtableInitIterator(&hi, ht, 0);
+            void *elem;
+            while (hashtableNext(&hi, &elem)) {
+                entry *e = elem;
+                entries_scanned++;
+                const char *buf;
+                size_t len;
+                if (debugInternValueEligible(e, &buf, &len)) debugInternCount1(vcounts, buf, len);
+                if (debugInternFieldEligible(e, &buf, &len)) debugInternCount1(fcounts, buf, len);
+            }
+            hashtableCleanupIterator(&hi);
+        }
+        kvstoreIteratorRelease(kvs_it);
+    }
+
+    /* Admit every string seen >= 2 times. No entry relocation. */
+    {
+        hashtableIterator it;
+        void *elem;
+        hashtableInitIterator(&it, vcounts, 0);
+        while (hashtableNext(&it, &elem)) {
+            debugInternCount *cnt = elem;
+            if (cnt->count >= 2) {
+                internAdmitValue(cnt->buf, cnt->len);
+                values_admitted++;
+            }
+        }
+        hashtableCleanupIterator(&it);
+        hashtableInitIterator(&it, fcounts, 0);
+        while (hashtableNext(&it, &elem)) {
+            debugInternCount *cnt = elem;
+            if (cnt->count >= 2) {
+                internAdmitField(cnt->buf, cnt->len);
+                fields_admitted++;
+            }
+        }
+        hashtableCleanupIterator(&it);
+    }
+
+    hashtableRelease(vcounts);
+    hashtableRelease(fcounts);
+
+    internStats stats;
+    internGetStats(&stats);
+    uint64_t admit_us = getMonotonicUs() - start;
+
+    addReplyMapLen(c, 7);
+    addReplyBulkCString(c, "entries_scanned");
+    addReplyLongLong(c, entries_scanned);
+    addReplyBulkCString(c, "values_admitted");
+    addReplyLongLong(c, values_admitted);
+    addReplyBulkCString(c, "fields_admitted");
+    addReplyLongLong(c, fields_admitted);
+    addReplyBulkCString(c, "admitted_slots");
+    addReplyLongLong(c, stats.admitted_slots);
+    addReplyBulkCString(c, "admitted_unreferenced");
+    addReplyLongLong(c, stats.admitted_unreferenced);
+    addReplyBulkCString(c, "slots");
+    addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "admit_ms");
+    addReplyLongLong(c, admit_us / 1000);
+}
+
+/* DEBUG INTERN EVICT: free every admitted slot currently at refcount 0 (test
+ * helper). Referenced admitted slots stay. */
+static void debugInternEvictCommand(client *c) {
+    internEvictAdmitted();
+    internStats stats;
+    internGetStats(&stats);
+    addReplyMapLen(c, 3);
+    addReplyBulkCString(c, "slots");
+    addReplyLongLong(c, stats.slots);
+    addReplyBulkCString(c, "admitted_slots");
+    addReplyLongLong(c, stats.admitted_slots);
+    addReplyBulkCString(c, "admitted_unreferenced");
+    addReplyLongLong(c, stats.admitted_unreferenced);
+}
+
 static const char *debug_intern_hist_labels[INTERN_HIST_BUCKETS] = {
     "len_le_8", "len_9_16", "len_17_20", "len_21_23", "len_24_32", "len_33_64", "len_gt_64"};
 
 static void debugInternStatsCommand(client *c) {
     internStats stats;
     internGetStats(&stats);
-    addReplyMapLen(c, 9 + INTERN_HIST_BUCKETS);
+    size_t pvh, pvm, pfh, pfm;
+    internGetProbeCounters(&pvh, &pvm, &pfh, &pfm);
+    addReplyMapLen(c, 15 + INTERN_HIST_BUCKETS);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
     addReplyBulkCString(c, "value_slots");
@@ -673,6 +777,18 @@ static void debugInternStatsCommand(client *c) {
     addReplyLongLong(c, debug_intern_last_bytes_saved);
     addReplyBulkCString(c, "index_mem");
     addReplyLongLong(c, stats.index_mem);
+    addReplyBulkCString(c, "admitted_slots");
+    addReplyLongLong(c, stats.admitted_slots);
+    addReplyBulkCString(c, "admitted_unreferenced");
+    addReplyLongLong(c, stats.admitted_unreferenced);
+    addReplyBulkCString(c, "probe_value_hits");
+    addReplyLongLong(c, pvh);
+    addReplyBulkCString(c, "probe_value_misses");
+    addReplyLongLong(c, pvm);
+    addReplyBulkCString(c, "probe_field_hits");
+    addReplyLongLong(c, pfh);
+    addReplyBulkCString(c, "probe_field_misses");
+    addReplyLongLong(c, pfm);
     for (int b = 0; b < INTERN_HIST_BUCKETS; b++) {
         addReplyBulkCString(c, debug_intern_hist_labels[b]);
         addReplyLongLong(c, stats.hist[b]);
@@ -707,9 +823,11 @@ void debugCommand(client *c) {
             "    Write <message> to the server log.",
             "HTSTATS <dbid> [full]",
             "    Return hash table statistics of the specified database.",
-            "INTERN <SCAN|STATS>",
+            "INTERN <SCAN|ADMIT|EVICT|STATS>",
             "    SCAN: intern hash values and field names seen >= 2 times across the keyspace.",
-            "    STATS: report intern subsystem slot counts, bytes saved, and length histogram.",
+            "    ADMIT: insert strings seen >= 2 times into the dedup index as admitted slots (no entry touched).",
+            "    EVICT: free all admitted slots at refcount 0 (test helper).",
+            "    STATS: report intern subsystem slot counts, admitted/probe counters, bytes saved, and length histogram.",
             "HTSTATS-KEY <key> [full]",
             "    Like HTSTATS but for the hash table stored at <key>'s value.",
             "LOADAOF",
@@ -859,15 +977,27 @@ void debugCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && (c->argc == 3 || c->argc == 4)) {
         if (!strcasecmp(objectGetVal(c->argv[2]), "scan")) {
+            if (server.string_interning == INTERN_MODE_NO) {
+                addReplyError(c, "DEBUG INTERN requires string-interning to be enabled (scan or probe).");
+                return;
+            }
             const char *mode = c->argc == 4 ? objectGetVal(c->argv[3]) : "all";
             debug_intern_do_values = strcasecmp(mode, "fields") != 0;
             debug_intern_do_fields = strcasecmp(mode, "values") != 0;
             debug_intern_rebuild_only = strcasecmp(mode, "rebuild") == 0;
             debugInternScanCommand(c);
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "admit")) {
+            if (server.string_interning == INTERN_MODE_NO) {
+                addReplyError(c, "DEBUG INTERN requires string-interning to be enabled (scan or probe).");
+                return;
+            }
+            debugInternAdmitCommand(c);
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "evict")) {
+            debugInternEvictCommand(c);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "stats")) {
             debugInternStatsCommand(c);
         } else {
-            addReplyError(c, "DEBUG INTERN supports the SCAN and STATS subcommands.");
+            addReplyError(c, "DEBUG INTERN supports the SCAN, ADMIT, EVICT and STATS subcommands.");
         }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "reload")) {
         int flush = 1, save = 1;

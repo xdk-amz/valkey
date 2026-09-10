@@ -30,6 +30,9 @@ typedef struct internSlot {
     size_t len;           /* content length (excludes NUL) */
     uint32_t refcount;    /* main thread only, touched on ref create/destroy */
     uint32_t hash;        /* cached content hash for the dedup index */
+    uint8_t admitted;     /* if set, the slot stays in the index at refcount 0
+                           * (an admission decision) rather than being freed;
+                           * see internAdmit / internEvictAdmitted (P2 S4a) */
     char inline_[INTERN_SSO_MAX + 1]; /* SSO storage; sdshdr8+bytes+NUL for fields */
 } internSlot;
 
@@ -46,6 +49,8 @@ typedef struct internStats {
     size_t bytes_saved; /* estimate: sum (refcount-1) * (len + sdshdr8 overhead) */
     size_t dup_refs;    /* sum (refcount-1) over all slots: references deduplicated away */
     size_t index_mem;   /* memory used by both dedup indexes */
+    size_t admitted_slots;        /* slots marked admitted (index-owned) */
+    size_t admitted_unreferenced; /* admitted slots currently at refcount 0 */
     size_t hist[INTERN_HIST_BUCKETS]; /* interned-string length histogram */
 } internStats;
 
@@ -58,6 +63,32 @@ internSlot *internAcquire(const char *buf, size_t len);
  * uses the field dedup index and lays inline_[] (or a long buffer) out as a real
  * sdshdr8 so slot->buf is a valid sds of length len. */
 internSlot *internAcquireField(const char *buf, size_t len);
+
+/* Write-time read-through probe (P2 S4a). Lookup-only on the respective index:
+ * on a hit bump the refcount and return the existing slot; on a miss return NULL
+ * and insert NOTHING. The content length is gated to [4, server.intern_max_len]
+ * inside the probe (out-of-band content returns NULL fast, without hashing).
+ * A hit hands the caller ONE reference which the constructed/updated entry owns.
+ * Probe hit/miss counters are bumped (see internGetProbeCounters). */
+internSlot *internProbeValue(const char *buf, size_t len);
+internSlot *internProbeField(const char *buf, size_t len);
+
+/* Reads the cumulative probe hit/miss counters (each split value/field). */
+void internGetProbeCounters(size_t *value_hits, size_t *value_misses, size_t *field_hits, size_t *field_misses);
+
+/* Admission (P2 S4a). Insert content into the respective index as an "admitted"
+ * slot: refcount 0, admitted flag set. If the content is already present the
+ * existing slot is marked admitted (refcount untouched). Returns the slot.
+ * An admitted slot is NOT freed when its refcount reaches 0 -- it stays in the
+ * index as an admission decision until internEvictAdmitted (or, in production,
+ * a cap/dead-list policy). */
+internSlot *internAdmitValue(const char *buf, size_t len);
+internSlot *internAdmitField(const char *buf, size_t len);
+
+/* Frees all admitted slots that are currently at refcount 0 (removes them from
+ * their index). Referenced admitted slots are left in place. Test helper for
+ * DEBUG INTERN EVICT. */
+void internEvictAdmitted(void);
 
 /* Release a reference to a VALUE slot. At refcount 0, removes it from the value
  * index and frees it inline. */

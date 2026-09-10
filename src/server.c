@@ -6367,6 +6367,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
 
         internStats intern_stats;
         internGetStats(&intern_stats);
+        size_t intern_probe_value_hits, intern_probe_value_misses, intern_probe_field_hits, intern_probe_field_misses;
+        internGetProbeCounters(&intern_probe_value_hits, &intern_probe_value_misses, &intern_probe_field_hits, &intern_probe_field_misses);
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
@@ -6439,6 +6441,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "intern_long_slots:%zu\r\n", intern_stats.long_slots,
                 "intern_dup_refs:%zu\r\n", intern_stats.dup_refs,
                 "intern_bytes_saved:%zu\r\n", intern_stats.bytes_saved,
+                "intern_admitted_slots:%zu\r\n", intern_stats.admitted_slots,
+                "intern_admitted_unreferenced:%zu\r\n", intern_stats.admitted_unreferenced,
+                "intern_probe_hits:%zu\r\n", intern_probe_value_hits + intern_probe_field_hits,
+                "intern_probe_misses:%zu\r\n", intern_probe_value_misses + intern_probe_field_misses,
                 "intern_index_mem:%zu\r\n", intern_stats.index_mem));
         freeMemoryOverheadData(mh);
     }

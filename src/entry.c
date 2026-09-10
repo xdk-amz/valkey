@@ -472,8 +472,21 @@ static entry *entryConstruct(size_t alloc_size,
     return new_entry;
 }
 
+/* Probe path for entryCreate (P2 S4a). Returns a probe-interned entry when
+ * string-interning is in probe mode and the field and/or value hit the dedup
+ * index; otherwise returns NULL and entryCreate builds the stock entry. Takes
+ * ownership of `value` exactly as entryCreate does (freed or embedded here). */
+static entry *entryCreateProbe(const_sds field, sds value, mstime_t expiry);
+
 /* Takes ownership of value. does not take ownership of field */
 entry *entryCreate(const_sds field, sds value, mstime_t expiry) {
+    /* Write-time probe admission (P2 S4a): in probe mode, look the field and
+     * value up in the dedup index (lookup-only) and, on a hit, build an entry
+     * that shares the interned slot(s) instead of a private copy. A probe hit
+     * hands us ONE reference that the constructed entry owns. */
+    entry *pe = entryCreateProbe(field, value, expiry);
+    if (pe != NULL) return pe;
+
     bool embed_value = false;
     int embedded_field_sds_type;
     size_t expiry_size, embedded_value_sds_size, embedded_field_sds_size;
@@ -535,6 +548,47 @@ static entry *entryConstructInternField(struct internSlot *fieldSlot, void *valu
     entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_INTERN_HANDLE, kind == ENTRY_VAL_INTERN ? 1 : 0);
     entrySetAuxBit(new_entry, FIELD_SDS_AUX_BIT_ENTRY_HAS_EXPIRY, expiry_size ? 1 : 0);
     return new_entry;
+}
+
+/* See the forward declaration near entryCreate. */
+static entry *entryCreateProbe(const_sds field, sds value, mstime_t expiry) {
+    if (server.string_interning != INTERN_MODE_PROBE) return NULL;
+
+    struct internSlot *fslot = internProbeField((const char *)field, sdslen(field));
+    struct internSlot *vslot = value ? internProbeValue(value, sdslen(value)) : NULL;
+
+    if (fslot == NULL && vslot == NULL) return NULL; /* miss/miss: stock path */
+
+    if (fslot != NULL && vslot != NULL) {
+        /* hit/hit: Type-5 entry whose value shares the interned value slot. Both
+         * probes handed us one reference; entryConstructInternField takes the
+         * field slot reference, and ENTRY_VAL_INTERN carries the value slot's
+         * sds (its reference owned by the entry). The caller's `value` copy is
+         * now redundant -- entryCreate owns it, so free it. */
+        entry *e = entryConstructInternField(fslot, internSlotSds(vslot), ENTRY_VAL_INTERN, expiry);
+        sdsfree(value);
+        return e;
+    }
+
+    if (fslot != NULL) {
+        /* field-hit only: Type-5 entry with an owned sds value (embedded per
+         * S2e when it fits). entryConstructInternField takes ownership of both
+         * the field slot reference and the owned `value` sds. */
+        return entryConstructInternField(fslot, value, ENTRY_VAL_SDS, expiry);
+    }
+
+    /* value-hit only: a stock (non-Type-5) entry whose value references the
+     * interned value slot. Build the stock entry with the owned value, then let
+     * entryUpdateAsInternHandle swap in the slot (it consumes the probe's one
+     * reference and frees the owned value). */
+    bool embed_value = false;
+    int embedded_field_sds_type;
+    size_t expiry_size, embedded_value_sds_size, embedded_field_sds_size;
+    size_t alloc_size = entryReqSize(sdslen(field), sdslen(value), expiry, &embed_value, &embedded_field_sds_type,
+                                     &embedded_field_sds_size, &expiry_size, &embedded_value_sds_size);
+    entry *e = entryConstruct(alloc_size, field, value, NULL, expiry, embed_value, embedded_field_sds_type,
+                              expiry_size, embedded_value_sds_size, embedded_field_sds_size);
+    return entryUpdateAsInternHandle(e, vslot, expiry);
 }
 
 /* Converts an existing (non-Type-5) entry to a Type-5 interned-field entry. See
@@ -723,6 +777,20 @@ entry *entryUpdateAsInternHandle(entry *e, struct internSlot *slot, mstime_t exp
 entry *entryUpdate(entry *e, sds value, mstime_t expiry) {
     sds field = entryGetField(e);
     entry *new_entry = NULL;
+
+    /* Write-time probe admission (P2 S4a): a value overwrite in probe mode
+     * probes the value dedup index. On a hit, share the interned slot (the probe
+     * hands one reference; entryUpdateAsInternHandle consumes it and handles both
+     * Type-5 and stock entries, in place or by rebuild) and free the caller's
+     * owned value. On a miss, fall through to the stock update. */
+    if (value != NULL && server.string_interning == INTERN_MODE_PROBE) {
+        struct internSlot *vslot = internProbeValue(value, sdslen(value));
+        if (vslot != NULL) {
+            entry *ne = entryUpdateAsInternHandle(e, vslot, expiry);
+            sdsfree(value);
+            return ne;
+        }
+    }
 
     /* Type-5 interned-field entry: keep it Type-5 across value/expiry updates.
      * The value is always by pointer, so no embedding decision applies. */

@@ -115,6 +115,7 @@ static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t l
     slot->len = len;
     slot->refcount = 1;
     slot->hash = probe.hash;
+    slot->admitted = 0;
 
     (void)is_field;
     /* Both kinds: lay out an sdshdr8 INLINE so slot->buf is a genuine sds. The
@@ -144,9 +145,127 @@ internSlot *internAcquireField(const char *buf, size_t len) {
     return internAcquireImpl(intern_index_field, buf, len, true);
 }
 
+/*-----------------------------------------------------------------------------
+ * Write-time probe + admission (P2 S4a).
+ *----------------------------------------------------------------------------*/
+
+/* Cumulative probe counters, main-thread only. */
+static size_t intern_probe_value_hits = 0, intern_probe_value_misses = 0;
+static size_t intern_probe_field_hits = 0, intern_probe_field_misses = 0;
+
+/* Content is probe/admission eligible only within [4, server.intern_max_len].
+ * The length gate bounds the hash cost and is checked before hashing. */
+static inline bool internLenEligible(size_t len) {
+    return len >= 4 && len <= server.intern_max_len;
+}
+
+/* Lookup-only probe on `index`. On hit: refcount++ (a reference handed to the
+ * caller) and return the slot. On miss: return NULL, insert nothing. */
+static internSlot *internProbeImpl(hashtable *index,
+                                   const char *buf,
+                                   size_t len,
+                                   size_t *hits,
+                                   size_t *misses) {
+    if (index == NULL || !internLenEligible(len)) {
+        (*misses)++;
+        return NULL;
+    }
+    internSlot probe;
+    probe.buf = buf;
+    probe.len = len;
+    probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+    void *found;
+    if (hashtableFind(index, &probe, &found)) {
+        internSlot *slot = found;
+        slot->refcount++;
+        (*hits)++;
+        return slot;
+    }
+    (*misses)++;
+    return NULL;
+}
+
+internSlot *internProbeValue(const char *buf, size_t len) {
+    return internProbeImpl(intern_index_value, buf, len, &intern_probe_value_hits, &intern_probe_value_misses);
+}
+
+internSlot *internProbeField(const char *buf, size_t len) {
+    return internProbeImpl(intern_index_field, buf, len, &intern_probe_field_hits, &intern_probe_field_misses);
+}
+
+void internGetProbeCounters(size_t *value_hits, size_t *value_misses, size_t *field_hits, size_t *field_misses) {
+    if (value_hits) *value_hits = intern_probe_value_hits;
+    if (value_misses) *value_misses = intern_probe_value_misses;
+    if (field_hits) *field_hits = intern_probe_field_hits;
+    if (field_misses) *field_misses = intern_probe_field_misses;
+}
+
+/* Insert content as an admitted slot (refcount 0, admitted). If already present,
+ * mark the existing slot admitted without touching its refcount. */
+static internSlot *internAdmitImpl(hashtable *index, const char *buf, size_t len, bool is_field) {
+    internSlot probe;
+    probe.buf = buf;
+    probe.len = len;
+    probe.hash = (uint32_t)hashtableGenHashFunction(buf, len);
+    void *found;
+    if (hashtableFind(index, &probe, &found)) {
+        internSlot *slot = found;
+        slot->admitted = 1;
+        return slot;
+    }
+    /* Build via the acquire path (refcount 1) then hand the reference back:
+     * decrement to 0 and mark admitted so the slot stays index-owned. */
+    internSlot *slot = internAcquireImpl(index, buf, len, is_field);
+    slot->admitted = 1;
+    slot->refcount = 0;
+    return slot;
+}
+
+internSlot *internAdmitValue(const char *buf, size_t len) {
+    internInit();
+    return internAdmitImpl(intern_index_value, buf, len, false);
+}
+
+internSlot *internAdmitField(const char *buf, size_t len) {
+    internInit();
+    return internAdmitImpl(intern_index_field, buf, len, true);
+}
+
+static void internEvictAdmittedIndex(hashtable *index) {
+    if (index == NULL) return;
+    /* Snapshot the refcount-0 admitted slots, then delete them (deleting during
+     * iteration is unsafe). */
+    size_t n = hashtableSize(index);
+    if (n == 0) return;
+    internSlot **dead = zmalloc(sizeof(internSlot *) * n);
+    size_t d = 0;
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, index, 0);
+    void *elem;
+    while (hashtableNext(&iter, &elem) && d < n) {
+        internSlot *slot = elem;
+        if (slot->admitted && slot->refcount == 0) dead[d++] = slot;
+    }
+    hashtableCleanupIterator(&iter);
+    for (size_t i = 0; i < d; i++) {
+        serverAssert(hashtableDelete(index, dead[i]));
+        zfree(dead[i]);
+    }
+    zfree(dead);
+}
+
+void internEvictAdmitted(void) {
+    internEvictAdmittedIndex(intern_index_value);
+    internEvictAdmittedIndex(intern_index_field);
+}
+
 static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field) {
     serverAssert(slot->refcount > 0);
     if (--slot->refcount > 0) return;
+
+    /* An admitted slot stays in the index at refcount 0 (an admission decision);
+     * it is reclaimed only by internEvictAdmitted / cap policy, never inline. */
+    if (slot->admitted) return;
 
     serverAssert(hashtableDelete(index, slot));
     (void)is_field;
@@ -191,6 +310,10 @@ static void internAccumulate(hashtable *index, bool is_field, internStats *stats
     while (hashtableNext(&iter, &elem)) {
         internSlot *slot = elem;
         stats->slots++;
+        if (slot->admitted) {
+            stats->admitted_slots++;
+            if (slot->refcount == 0) stats->admitted_unreferenced++;
+        }
         if (is_field) {
             stats->field_slots++;
             if (internFieldIsInline(slot)) stats->sso_slots++; else stats->long_slots++;
