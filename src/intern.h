@@ -90,6 +90,33 @@ internSlot *internAdmitField(const char *buf, size_t len);
  * DEBUG INTERN EVICT. */
 void internEvictAdmitted(void);
 
+/* Persistence of the admission decision (P2 S4d). The admitted set is written to
+ * the RDB as the aux field "intern-admitted" (no refs, no per-key data) so the
+ * load-time probe hits from the first key after a restart or replica full sync. */
+
+/* Cap on the serialised admitted-set blob. Not a config -- a hard ceiling; if
+ * the encoded set would exceed it, nothing is written (see internEncodeAdmitted). */
+#define INTERN_ADMITTED_MAX_BYTES (16 * 1024 * 1024)
+
+/* Callback for internForEachAdmitted. kind is 0 for a VALUE slot, 1 for a FIELD
+ * slot; buf/len are the slot's content. Invoked once per admitted slot regardless
+ * of refcount. */
+typedef void (*internAdmittedCb)(uint8_t kind, const char *buf, size_t len, void *privdata);
+
+/* Enumerate every admitted slot (both indexes), value slots first then field
+ * slots. Returns the total number of admitted slots visited. */
+size_t internForEachAdmitted(internAdmittedCb cb, void *privdata);
+
+/* Number of admitted slots across both indexes (value + field), any refcount. */
+size_t internAdmittedCount(void);
+
+/* Persist/load counters (P2 S4d), surfaced via INFO memory and DEBUG INTERN STATS.
+ * *_persisted = strings written at the last RDB save; *_loaded = strings admitted
+ * from the aux field at the last RDB load. Set by rdb.c. */
+void internSetAdmittedPersisted(size_t n);
+void internSetAdmittedLoaded(size_t n);
+void internGetPersistCounters(size_t *persisted, size_t *loaded);
+
 /* Release a reference to a VALUE slot. At refcount 0, removes it from the value
  * index and frees it inline. */
 void internRelease(internSlot *slot);

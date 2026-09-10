@@ -758,7 +758,9 @@ static void debugInternStatsCommand(client *c) {
     internGetStats(&stats);
     size_t pvh, pvm, pfh, pfm;
     internGetProbeCounters(&pvh, &pvm, &pfh, &pfm);
-    addReplyMapLen(c, 15 + INTERN_HIST_BUCKETS);
+    size_t intern_persisted, intern_loaded;
+    internGetPersistCounters(&intern_persisted, &intern_loaded);
+    addReplyMapLen(c, 17 + INTERN_HIST_BUCKETS);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
     addReplyBulkCString(c, "value_slots");
@@ -781,6 +783,10 @@ static void debugInternStatsCommand(client *c) {
     addReplyLongLong(c, stats.admitted_slots);
     addReplyBulkCString(c, "admitted_unreferenced");
     addReplyLongLong(c, stats.admitted_unreferenced);
+    addReplyBulkCString(c, "admitted_persisted");
+    addReplyLongLong(c, intern_persisted);
+    addReplyBulkCString(c, "admitted_loaded");
+    addReplyLongLong(c, intern_loaded);
     addReplyBulkCString(c, "probe_value_hits");
     addReplyLongLong(c, pvh);
     addReplyBulkCString(c, "probe_value_misses");

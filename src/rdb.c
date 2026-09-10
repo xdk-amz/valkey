@@ -34,6 +34,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "lzf.h" /* LZF compression library */
 #include "zipmap.h"
@@ -1286,6 +1287,55 @@ ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val) {
     return rdbSaveAuxField(rdb, key, strlen(key), buf, vlen);
 }
 
+/* Encode the admitted intern set (P2 S4d) as one binary blob:
+ *   u32 count, then per string: u8 kind (0=value,1=field), u32 len, bytes.
+ * All integers little-endian. Returns a newly allocated sds, or NULL if the
+ * interning subsystem is off, holds no admitted slot, or the encoded set would
+ * exceed INTERN_ADMITTED_MAX_BYTES (logged once at WARNING). Caller frees. */
+struct internAuxEncodeState {
+    sds blob;
+    uint32_t count;
+    int overflow;
+};
+
+static void rdbInternAdmittedAppend(uint8_t kind, const char *buf, size_t len, void *privdata) {
+    struct internAuxEncodeState *st = privdata;
+    if (st->overflow) return;
+    /* Per-record footprint: 1 (kind) + 4 (len) + len. */
+    if (sdslen(st->blob) + 1 + 4 + len > INTERN_ADMITTED_MAX_BYTES) {
+        st->overflow = 1;
+        return;
+    }
+    uint32_t l = (uint32_t)len;
+    st->blob = sdscatlen(st->blob, &kind, 1);
+    st->blob = sdscatlen(st->blob, &l, 4);
+    st->blob = sdscatlen(st->blob, buf, len);
+    st->count++;
+}
+
+static sds rdbEncodeInternAdmitted(void) {
+    if (server.string_interning == INTERN_MODE_NO) return NULL;
+    if (internAdmittedCount() == 0) return NULL;
+
+    struct internAuxEncodeState st;
+    st.count = 0;
+    st.overflow = 0;
+    /* Reserve the 4-byte count header up front; patched after enumeration. */
+    st.blob = sdsnewlen(NULL, 4);
+    internForEachAdmitted(rdbInternAdmittedAppend, &st);
+
+    if (st.overflow) {
+        serverLog(LL_WARNING,
+                  "intern-admitted: encoded admitted set exceeds %d bytes; not persisting to RDB",
+                  INTERN_ADMITTED_MAX_BYTES);
+        sdsfree(st.blob);
+        return NULL;
+    }
+    /* Patch the little-endian count into the reserved header. */
+    memcpy(st.blob, &st.count, 4);
+    return st.blob;
+}
+
 /* Save a few default AUX fields with information about the RDB generated. */
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void *) == 8) ? 64 : 32;
@@ -1304,6 +1354,26 @@ int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
         if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
     }
     if (rdbSaveAuxFieldStrInt(rdb, "aof-base", aof_base) == -1) return -1;
+
+    /* Persist the admitted intern set (P2 S4d) so the load-time probe hits from
+     * the first key after a restart / replica full sync. No refs, no per-key
+     * data -- only the node-local admission decision (HLD G5/N2). */
+    {
+        sds intern_blob = rdbEncodeInternAdmitted();
+        if (intern_blob != NULL) {
+            ssize_t r = rdbSaveAuxField(rdb, "intern-admitted", 15, intern_blob, sdslen(intern_blob));
+            /* count = written strings: total bytes minus the 4-byte header, but
+             * we tracked it exactly; re-derive from the header for the counter. */
+            uint32_t written = 0;
+            memcpy(&written, intern_blob, 4);
+            sdsfree(intern_blob);
+            if (r == -1) return -1;
+            internSetAdmittedPersisted(written);
+        } else if (server.string_interning != INTERN_MODE_NO) {
+            /* Nothing persisted this save (empty set or overflow). */
+            internSetAdmittedPersisted(0);
+        }
+    }
 
     /* Handle additional dynamic aux fields */
     if (rdbAuxFields != NULL) {
@@ -3525,6 +3595,56 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 if (isbase) serverLog(LL_NOTICE, "RDB is base AOF");
             } else if (!strcasecmp(objectGetVal(auxkey), "redis-bits")) {
                 /* Just ignored. */
+            } else if (!strcasecmp(objectGetVal(auxkey), "intern-admitted")) {
+                /* P2 S4d: the node-local admission decision (no refs, no per-key
+                 * data). Replay it into the dedup index so the load-time probe
+                 * hits from the first key. A node with interning disabled ignores
+                 * it (HLD G5/N2). Parse defensively: bounds-check every length;
+                 * on malformed data log WARNING and stop, never crash or fail the
+                 * load -- the keyspace that follows must still load. */
+                if (server.string_interning == INTERN_MODE_NO) {
+                    serverLog(LL_NOTICE,
+                              "RDB 'intern-admitted' aux field ignored: string-interning is disabled");
+                } else {
+                    sds blob = objectGetVal(auxval);
+                    size_t total = sdslen(blob), off = 0;
+                    size_t loaded = 0;
+                    int malformed = 0;
+                    if (total < 4) {
+                        malformed = 1;
+                    } else {
+                        uint32_t count = 0;
+                        memcpy(&count, blob, 4);
+                        off = 4;
+                        for (uint32_t i = 0; i < count; i++) {
+                            if (off + 1 + 4 > total) { malformed = 1; break; }
+                            uint8_t kind = (uint8_t)blob[off];
+                            off += 1;
+                            uint32_t len = 0;
+                            memcpy(&len, blob + off, 4);
+                            off += 4;
+                            if (len > total || off + len > total) { malformed = 1; break; }
+                            if (kind == 0) {
+                                internAdmitValue(blob + off, len);
+                            } else if (kind == 1) {
+                                internAdmitField(blob + off, len);
+                            } else {
+                                malformed = 1;
+                                break;
+                            }
+                            off += len;
+                            loaded++;
+                        }
+                    }
+                    if (malformed) {
+                        serverLog(LL_WARNING,
+                                  "RDB 'intern-admitted' aux field malformed at byte %zu of %zu; "
+                                  "stopped after %zu strings",
+                                  off, total, loaded);
+                    }
+                    internSetAdmittedLoaded(loaded);
+                    serverLog(LL_NOTICE, "RDB 'intern-admitted': %zu admitted strings loaded", loaded);
+                }
             } else if (!strcasecmp(objectGetVal(auxkey), "slot-info")) {
                 int slot_id;
                 unsigned long slot_size = 0, expires_slot_size = 0, keys_with_volatile_items_slot_size = 0;

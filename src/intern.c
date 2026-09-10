@@ -259,6 +259,56 @@ void internEvictAdmitted(void) {
     internEvictAdmittedIndex(intern_index_field);
 }
 
+/*-----------------------------------------------------------------------------
+ * Persistence of the admission decision (P2 S4d).
+ *----------------------------------------------------------------------------*/
+
+/* Last-save / last-load counters, main-thread only. */
+static size_t intern_admitted_persisted = 0;
+static size_t intern_admitted_loaded = 0;
+
+static size_t internForEachAdmittedIndex(hashtable *index, uint8_t kind, internAdmittedCb cb, void *privdata) {
+    if (index == NULL) return 0;
+    size_t n = 0;
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, index, 0);
+    void *elem;
+    while (hashtableNext(&iter, &elem)) {
+        internSlot *slot = elem;
+        if (!slot->admitted) continue;
+        cb(kind, slot->buf, slot->len, privdata);
+        n++;
+    }
+    hashtableCleanupIterator(&iter);
+    return n;
+}
+
+size_t internForEachAdmitted(internAdmittedCb cb, void *privdata) {
+    size_t n = 0;
+    n += internForEachAdmittedIndex(intern_index_value, 0, cb, privdata);
+    n += internForEachAdmittedIndex(intern_index_field, 1, cb, privdata);
+    return n;
+}
+
+size_t internAdmittedCount(void) {
+    internStats stats;
+    internGetStats(&stats);
+    return stats.admitted_slots;
+}
+
+void internSetAdmittedPersisted(size_t n) {
+    intern_admitted_persisted = n;
+}
+
+void internSetAdmittedLoaded(size_t n) {
+    intern_admitted_loaded = n;
+}
+
+void internGetPersistCounters(size_t *persisted, size_t *loaded) {
+    if (persisted) *persisted = intern_admitted_persisted;
+    if (loaded) *loaded = intern_admitted_loaded;
+}
+
 static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field) {
     serverAssert(slot->refcount > 0);
     if (--slot->refcount > 0) return;
