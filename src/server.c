@@ -1653,6 +1653,21 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* Handle background operations on databases. */
     databasesCron();
 
+    /* P1-2: cold-admitted intern eviction. Bounded batch per tick with a
+     * persistent cursor; referenced slots are never touched. Runs when idle
+     * eviction is enabled (intern-admitted-idle-ms > 0) OR under slab-bytes
+     * pressure (evict cold slots regardless of age to stay under the cap). */
+    if (server.string_interning != INTERN_MODE_NO) {
+        int pressure = (server.intern_max_slab_bytes != 0 &&
+                        internSlabMemory() >= server.intern_max_slab_bytes);
+        if (server.intern_admitted_idle_ms > 0 || pressure) {
+            /* idle_ms -> ticks (seconds); guard the divide and cap to u32. */
+            uint32_t idle_ticks = (uint32_t)(server.intern_admitted_idle_ms / 1000);
+            uint32_t now_tick = (uint32_t)server.unixtime;
+            internEvictIdleBatch(now_tick, idle_ticks, server.intern_evict_batch, pressure);
+        }
+    }
+
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
     if (!hasActiveChildProcess() && server.aof_rewrite_scheduled && !aofRewriteLimited()) {
@@ -6382,6 +6397,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         internGetPersistCounters(&intern_admitted_persisted, &intern_admitted_loaded);
         size_t intern_deferred_msgs, intern_deferred_releases, intern_deferred_pending;
         internGetDeferredCounters(&intern_deferred_msgs, &intern_deferred_releases, &intern_deferred_pending);
+        size_t intern_refusals_total, intern_refusals_slots, intern_refusals_slab_bytes;
+        internGetCapCounters(&intern_refusals_total, &intern_refusals_slots, &intern_refusals_slab_bytes);
+        uint32_t intern_idle_max_ticks = internAdmittedIdleMaxTicks((uint32_t)server.unixtime);
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
@@ -6466,7 +6484,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "intern_slab_live_ratio:%.4f\r\n", internSlabLiveRatio(),
                 "intern_deferred_msgs:%zu\r\n", intern_deferred_msgs,
                 "intern_deferred_releases:%zu\r\n", intern_deferred_releases,
-                "intern_deferred_pending:%zu\r\n", intern_deferred_pending));
+                "intern_deferred_pending:%zu\r\n", intern_deferred_pending,
+                "intern_admission_refusals:%zu\r\n", intern_refusals_total,
+                "intern_admission_refusals_slots:%zu\r\n", intern_refusals_slots,
+                "intern_admission_refusals_slab_bytes:%zu\r\n", intern_refusals_slab_bytes,
+                "intern_evictions:%zu\r\n", internEvictions(),
+                "intern_admitted_idle_max_ms:%llu\r\n", (unsigned long long)intern_idle_max_ticks * 1000ULL,
+                "intern_cap_slots:%zu\r\n", server.intern_max_slots,
+                "intern_cap_slab_bytes:%zu\r\n", server.intern_max_slab_bytes));
         freeMemoryOverheadData(mh);
     }
 

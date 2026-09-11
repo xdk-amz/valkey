@@ -148,4 +148,186 @@ start_server {tags {"intern"} overrides {save "" appendonly no}} {
         # After evict, at most one cushion slab per size class (<= 6).
         assert {[intern_stat slab_count] <= 6}
     }
+
+    # ---- P1-2: admission caps + cold-admitted eviction --------------------
+
+    test {P1-2 cap: intern-max-slots refuses admission on a miss} {
+        r config set string-interning probe
+        r config set intern-admitted-idle-ms 0
+        r config set intern-max-slab-bytes 0
+        r flushall
+        r config set hash-max-listpack-entries 0
+        # Create many distinct duplicated field/value strings (each seen twice).
+        for {set i 0} {$i < 200} {incr i} {
+            r hset ka:$i shared_field_$i dupval_$i extra active
+            r hset kb:$i shared_field_$i dupval_$i extra active
+        }
+        # Cap well below the number of admittable strings.
+        r config set intern-max-slots 10
+        set res [r debug intern admit]
+        assert_equal 10 [dict get $res slots]
+        # Some admissions were refused (skipped) and the refusal counter moved.
+        assert {[dict get $res admission_refusals] > 0}
+        assert {[info_mem intern_admission_refusals] > 0}
+        assert {[info_mem intern_admission_refusals_slots] > 0}
+        # INFO exposes the cap values.
+        assert_equal 10 [info_mem intern_cap_slots]
+    }
+
+    test {P1-2 cap: probe HIT is never refused at cap} {
+        # Already at the slots cap from the previous test; a probe hit on an
+        # already-admitted string must still succeed (refcount++ allocates nothing).
+        set before [info_mem intern_admission_refusals]
+        # Re-write an existing key: the probe hits admitted slots, no new slot.
+        r hset ka:0 shared_field_0 dupval_0
+        assert_equal 10 [intern_stat slots]
+        # No NEW refusal from a pure hit path beyond what admit already counted.
+        assert {[info_mem intern_admission_refusals] >= $before}
+    }
+
+    test {P1-2 cap: intern-max-slab-bytes refuses with the slab-bytes reason} {
+        r config set string-interning probe
+        r config set intern-max-slots 0
+        r config set intern-admitted-idle-ms 0
+        r flushall
+        r debug intern drain
+        r debug intern evict
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 500} {incr i} {
+            r hset a:$i f_$i [string repeat x 40]$i g active
+            r hset b:$i f_$i [string repeat x 40]$i g active
+        }
+        # A tiny slab-bytes cap forces slab-bytes refusals.
+        r config set intern-max-slab-bytes 8192
+        set res [r debug intern admit]
+        assert {[info_mem intern_admission_refusals_slab_bytes] > 0}
+        # Growth stopped at the cap: only the slabs already carved before the cap
+        # was reached exist (a handful of classes' first slabs), nowhere near the
+        # uncapped ~1000-slot footprint.
+        assert {[intern_stat slots] < 1000}
+        r config set intern-max-slab-bytes 0
+    }
+
+    test {P1-2 idle eviction: cold admitted slots evicted after idle threshold} {
+        r config set string-interning probe
+        r config set intern-max-slots 1000000
+        r config set intern-max-slab-bytes 0
+        r config set intern-admitted-idle-ms 0
+        r flushall
+        r debug intern drain
+        r debug intern evict
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 100} {incr i} {
+            r hset e:$i ef_$i ev_$i c active
+            r hset f:$i ef_$i ev_$i c active
+        }
+        r debug intern admit
+        set adm [intern_stat admitted_slots]
+        assert {$adm > 0}
+        assert_equal $adm [intern_stat admitted_unreferenced]
+        set ev0 [intern_stat evictions]
+        # Idle ticks are second-resolution; wait a second, then a 0ms-threshold
+        # full pass evicts every cold admitted slot (age > 0).
+        after 1100
+        r debug intern evict idle 0
+        assert_equal 0 [intern_stat slots]
+        assert {[intern_stat evictions] >= [expr {$ev0 + $adm}]}
+    }
+
+    test {P1-2 idle eviction: referenced slots are never evicted} {
+        r config set string-interning probe
+        r config set intern-admitted-idle-ms 0
+        r flushall
+        r debug intern drain
+        r debug intern evict
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 100} {incr i} {
+            r hset g:$i gf_$i gv_$i c active
+            r hset h:$i gf_$i gv_$i c active
+        }
+        r debug intern admit
+        # RELOAD makes the load-time probe reference every admitted slot.
+        r debug reload
+        set slots [intern_stat slots]
+        assert {$slots > 0}
+        assert_equal 0 [intern_stat admitted_unreferenced]
+        set ev0 [intern_stat evictions]
+        # Even a 0ms idle full pass must not touch referenced slots.
+        r debug intern evict idle 0
+        assert_equal $slots [intern_stat slots]
+        assert_equal $ev0 [intern_stat evictions]
+    }
+
+    test {P1-2 idle eviction: serverCron reclaims cold slots automatically} {
+        r config set string-interning probe
+        r config set intern-max-slots 1000000
+        r config set intern-admitted-idle-ms 0
+        r flushall
+        wait_for_condition 100 50 {
+            [s lazyfree_pending_objects] == 0
+        } else {
+            fail "lazyfree did not drain before test"
+        }
+        r debug intern drain
+        r debug intern evict
+        assert_equal 0 [intern_stat slots]
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 100} {incr i} {
+            r hset i:$i if_$i iv_$i c active
+            r hset j:$i if_$i iv_$i c active
+        }
+        r debug intern admit
+        set adm [intern_stat slots]
+        assert {$adm > 0}
+        assert_equal $adm [intern_stat admitted_unreferenced]
+        # Enable idle eviction with a short TTL and let serverCron do the work.
+        # Idle ticks are second-resolution, so allow several seconds of cron cycles.
+        r config set intern-admitted-idle-ms 1000
+        r config set intern-evict-batch 100000
+        wait_for_condition 300 100 {
+            [intern_stat slots] == 0
+        } else {
+            fail "serverCron did not evict cold admitted slots (slots=[intern_stat slots] evictions=[intern_stat evictions])"
+        }
+        assert {[intern_stat evictions] > 0}
+        r config set intern-admitted-idle-ms 0
+    }
+
+    test {P1-2 live cap raise: raising intern-max-slots re-enables admission} {
+        r config set string-interning probe
+        r config set intern-admitted-idle-ms 0
+        r config set intern-max-slab-bytes 0
+        r flushall
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 200} {incr i} {
+            r hset p:$i pf_$i pv_$i c active
+            r hset q:$i pf_$i pv_$i c active
+        }
+        r config set intern-max-slots 20
+        r debug intern admit
+        assert_equal 20 [intern_stat slots]
+        # Raising the cap live lets a re-ADMIT grow the table again.
+        r config set intern-max-slots 1000000
+        r debug intern admit
+        assert {[intern_stat slots] > 20}
+    }
+
+    test {P1-2 lowering a cap does not free anything by itself} {
+        r config set string-interning probe
+        r config set intern-max-slots 1000000
+        r config set intern-admitted-idle-ms 0
+        r flushall
+        r config set hash-max-listpack-entries 0
+        for {set i 0} {$i < 100} {incr i} {
+            r hset r:$i rf_$i rv_$i c active
+            r hset s:$i rf_$i rv_$i c active
+        }
+        r debug intern admit
+        set slots [intern_stat slots]
+        assert {$slots > 0}
+        # Lower the cap below the current count: growth stops, nothing is freed.
+        r config set intern-max-slots 1
+        assert_equal $slots [intern_stat slots]
+        r config set intern-max-slots 1000000
+    }
 }

@@ -36,6 +36,14 @@ typedef struct internSlot {
     uint8_t slab_class;   /* P1-1: size-class index into the slab table; the
                            * sentinel INTERN_CLASS_LONG marks a long allocation
                            * that is not slab-managed (a raw zmalloc/zfree). */
+    uint32_t idle_since_tick; /* P1-2: serverCron tick at which this slot last
+                           * became cold (refcount 0). Written ONLY when refcount
+                           * transitions to 0 and reset when a probe/acquire hit
+                           * takes it back to >= 1. Meaningful only for admitted
+                           * slots (referenced slots are never evicted); its value
+                           * is ignored while refcount > 0. Cold-admitted eviction
+                           * (internEvictIdle) reclaims a slot idle for longer than
+                           * intern-admitted-idle-ms. See intern.c / HLD §18.2. */
     char inline_[INTERN_SSO_MAX + 1]; /* SSO storage; sdshdr8+bytes+NUL for fields */
 } internSlot;
 
@@ -121,6 +129,64 @@ internSlot *internAdmitField(const char *buf, size_t len);
  * their index). Referenced admitted slots are left in place. Test helper for
  * DEBUG INTERN EVICT. */
 void internEvictAdmitted(void);
+
+/*-----------------------------------------------------------------------------
+ * P1-2: admission caps and cold-admitted eviction.
+ *
+ * Caps bound the table so nothing grows it without limit (R6). Two independent
+ * ceilings, both MODIFIABLE and enforced on a MISS only:
+ *   - intern-max-slots     : total live + admitted slots.
+ *   - intern-max-slab-bytes : sum of slab bytes across all classes (P1-1).
+ * At either cap, internAcquire / internAdmit / internProbe on a MISS return NULL
+ * (the caller stores an owned copy exactly as a probe miss does today). Probe
+ * HITS are never refused -- refcount++ allocates nothing. Lowering a cap at
+ * runtime does not free anything; it only stops growth (eviction reclaims).
+ *
+ * Cold-admitted eviction is the ONLY eviction. A slot admitted with refcount 0
+ * for longer than intern-admitted-idle-ms is de-admitted and freed. Referenced
+ * slots (refcount >= 1) are never evicted -- their holders own them. Eviction
+ * runs from serverCron in bounded batches with a persistent cursor.
+ *----------------------------------------------------------------------------*/
+
+/* Admission-refusal reasons for the per-reason counters. */
+#define INTERN_REFUSE_SLOTS 0
+#define INTERN_REFUSE_SLAB_BYTES 1
+
+/* Cumulative admission-refusal counters: total and per reason (slots / slab
+ * bytes). Bumped whenever a MISS is refused because a cap is hit. */
+void internGetCapCounters(size_t *refusals_total, size_t *refusals_slots, size_t *refusals_slab_bytes);
+
+/* True if a new slot of `content_len` bytes can be admitted without breaching
+ * either cap (0-arg cap values are read from server config: 0 == no cap). Used
+ * by the acquire/admit/probe MISS paths; a HIT never consults it. */
+int internAtCap(size_t content_len, int *reason);
+
+/* Total slots (live + admitted) currently held across both indexes. Cheap:
+ * maintained incrementally, not an O(n) walk. */
+size_t internSlotCount(void);
+
+/* Cold-admitted eviction driven from serverCron.
+ *
+ * internEvictIdleBatch: walk up to `batch` slots from the persistent cursor and
+ * evict every admitted refcount-0 slot whose idle age (current tick - its
+ * idle_since_tick) is > idle_ticks. When `pressure` is non-zero (slab-bytes cap
+ * reached) it also evicts cold admitted slots regardless of idle age, oldest
+ * idle first within the scanned batch. `now_tick` is the current serverCron
+ * tick. Returns the number of slots evicted this call. Persistent cursor state
+ * lives inside intern.c. */
+size_t internEvictIdleBatch(uint32_t now_tick, uint32_t idle_ticks, size_t batch, int pressure);
+
+/* Force one FULL eviction pass (all slots, ignoring the batch/cursor) evicting
+ * every admitted refcount-0 slot idle for > idle_ticks. Test helper behind
+ * DEBUG INTERN EVICT [IDLE ms]. Returns slots evicted. */
+size_t internEvictIdleFull(uint32_t now_tick, uint32_t idle_ticks);
+
+/* Cumulative count of slots reclaimed by cold-admitted eviction. */
+size_t internEvictions(void);
+
+/* Oldest idle admitted slot's age in serverCron ticks (0 if none). For the
+ * intern_admitted_idle_max_ms INFO field. */
+uint32_t internAdmittedIdleMaxTicks(uint32_t now_tick);
 
 /* Persistence of the admission decision (P2 S4d). The admitted set is written to
  * the RDB as the aux field "intern-admitted" (no refs, no per-key data) so the

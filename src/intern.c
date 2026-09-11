@@ -135,6 +135,64 @@ static int intern_classes_ready = 0;
 static size_t intern_slab_total_bytes = 0; /* Σ slab bytes across all classes */
 static size_t intern_long_allocs = 0;      /* live INTERN_CLASS_LONG slots */
 
+/*-----------------------------------------------------------------------------
+ * P1-2: admission caps and cold-admitted eviction state.
+ *----------------------------------------------------------------------------*/
+
+/* Total slots (live + admitted) across both indexes, maintained incrementally
+ * on every slot add / free so internAtCap is O(1) and never walks the index. */
+static size_t intern_slot_count = 0;
+
+/* Cumulative admission-refusal counters (main-thread only). */
+static size_t intern_refusals_total = 0;
+static size_t intern_refusals_slots = 0;
+static size_t intern_refusals_slab_bytes = 0;
+
+/* Cumulative cold-admitted evictions (main-thread only). */
+static size_t intern_evictions = 0;
+
+/* Persistent eviction cursors, one per index, advanced across serverCron ticks
+ * so every slot gets a bounded coverage guarantee (fair, deterministic -- not a
+ * per-pass random offset that resets). See internEvictIdleBatch. */
+static size_t intern_evict_cursor_value = 0;
+static size_t intern_evict_cursor_field = 0;
+
+size_t internSlotCount(void) {
+    return intern_slot_count;
+}
+
+void internGetCapCounters(size_t *refusals_total, size_t *refusals_slots, size_t *refusals_slab_bytes) {
+    if (refusals_total) *refusals_total = intern_refusals_total;
+    if (refusals_slots) *refusals_slots = intern_refusals_slots;
+    if (refusals_slab_bytes) *refusals_slab_bytes = intern_refusals_slab_bytes;
+}
+
+size_t internEvictions(void) {
+    return intern_evictions;
+}
+
+/* Cap check for a MISS that wants to allocate a slot of `content_len` bytes.
+ * Returns non-zero (refused) when either cap would be breached; sets *reason.
+ * A zero cap means "no cap". The slab-bytes cap is checked against the CURRENT
+ * slab bytes: an admit that fits in an existing slab's free list will not push
+ * bytes up, but the conservative check (already at/over the cap) is what the
+ * spec's "at cap" semantics require -- growth stops, existing refs unaffected. */
+int internAtCap(size_t content_len, int *reason) {
+    (void)content_len;
+    size_t max_slots = server.intern_max_slots;
+    size_t max_slab = server.intern_max_slab_bytes;
+    if (max_slots != 0 && intern_slot_count >= max_slots) {
+        if (reason) *reason = INTERN_REFUSE_SLOTS;
+        return 1;
+    }
+    if (max_slab != 0 && intern_slab_total_bytes >= max_slab) {
+        if (reason) *reason = INTERN_REFUSE_SLAB_BYTES;
+        return 1;
+    }
+    return 0;
+}
+
+
 /* Header carved out of the front of each slab allocation. Slot 0 begins at an
  * 8-byte-aligned offset just past the internSlab header. */
 static inline char *internSlabSlot(internSlab *slab, size_t idx, size_t slot_bytes) {
@@ -302,6 +360,8 @@ static void internSlabReturn(internSlot *slot) {
 
 /* Free one slot: return it to its slab, or zfree a long allocation. */
 static void internSlotFree(internSlot *slot) {
+    serverAssert(intern_slot_count > 0);
+    intern_slot_count--;
     if (slot->slab_class == INTERN_CLASS_LONG) {
         serverAssert(intern_long_allocs > 0);
         intern_long_allocs--;
@@ -407,6 +467,20 @@ static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t l
         return slot;
     }
 
+    /* MISS: a new slot would grow the table. Enforce the admission caps here --
+     * a refused miss returns NULL and the caller keeps its owned copy exactly as
+     * a probe miss does (P1-2). Probe/acquire HITS above never reach this and are
+     * never refused. */
+    {
+        int reason = INTERN_REFUSE_SLOTS;
+        if (internAtCap(len, &reason)) {
+            intern_refusals_total++;
+            if (reason == INTERN_REFUSE_SLAB_BYTES) intern_refusals_slab_bytes++;
+            else intern_refusals_slots++;
+            return NULL;
+        }
+    }
+
     (void)is_field;
     /* Both kinds: lay out an sdshdr8 INLINE so slot->buf is a genuine sds. The
      * holder stores that sds pointer directly (read path == plain sds value /
@@ -435,8 +509,10 @@ static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t l
     slot->refcount = 1;
     slot->hash = probe.hash;
     slot->admitted = 0;
+    slot->idle_since_tick = 0; /* referenced (refcount 1); idle tick unused */
     slot->buf = sdswrite(slot->inline_, need, SDS_TYPE_8, buf, len);
     serverAssert(hashtableAdd(index, slot));
+    intern_slot_count++;
     return slot;
 }
 
@@ -509,8 +585,16 @@ void internGetProbeCounters(size_t *value_hits, size_t *value_misses, size_t *fi
     if (field_misses) *field_misses = intern_probe_field_misses;
 }
 
+/* Current idle tick: serverCron uses one-second resolution (server.unixtime),
+ * which is monotonic enough for the idle-eviction policy and free to read. A
+ * freshly cold slot stamped now has age 0. */
+static inline uint32_t internNowTick(void) {
+    return (uint32_t)server.unixtime;
+}
+
 /* Insert content as an admitted slot (refcount 0, admitted). If already present,
- * mark the existing slot admitted without touching its refcount. */
+ * mark the existing slot admitted without touching its refcount. Returns NULL
+ * (nothing admitted) when a MISS would breach an admission cap (P1-2). */
 static internSlot *internAdmitImpl(hashtable *index, const char *buf, size_t len, bool is_field) {
     internSlot probe;
     probe.buf = buf;
@@ -520,12 +604,18 @@ static internSlot *internAdmitImpl(hashtable *index, const char *buf, size_t len
     if (hashtableFind(index, &probe, &found)) {
         internSlot *slot = found;
         slot->admitted = 1;
+        /* An already-present cold slot that was not admitted before is now an
+         * admission decision; stamp it cold-from-now if it is unreferenced. */
+        if (slot->refcount == 0) slot->idle_since_tick = internNowTick();
         return slot;
     }
     /* Build via the acquire path (refcount 1) then hand the reference back:
-     * decrement to 0 and mark admitted so the slot stays index-owned. */
+     * decrement to 0 and mark admitted so the slot stays index-owned. A refused
+     * miss (cap reached) returns NULL from internAcquireImpl -- propagate it. */
     internSlot *slot = internAcquireImpl(index, buf, len, is_field);
+    if (slot == NULL) return NULL;
     slot->admitted = 1;
+    slot->idle_since_tick = internNowTick(); /* admitted cold: age starts now */
     slot->refcount = 0;
     return slot;
 }
@@ -567,6 +657,170 @@ void internEvictAdmitted(void) {
     internEvictAdmittedIndex(intern_index_value);
     internEvictAdmittedIndex(intern_index_field);
 }
+
+/*-----------------------------------------------------------------------------
+ * P1-2: cold-admitted eviction.
+ *
+ * Only admitted refcount-0 slots are eviction candidates -- referenced slots are
+ * never touched (their holders own them; there is no reverse index over holders,
+ * so a referenced slot cannot be reclaimed here -- explicitly out of scope, see
+ * HLD §13 O5). A candidate's idle age is (now_tick - idle_since_tick).
+ *----------------------------------------------------------------------------*/
+
+/* Idle age of an admitted, unreferenced slot in ticks (0 if referenced). */
+static inline uint32_t internSlotIdleAge(const internSlot *slot, uint32_t now_tick) {
+    if (slot->refcount != 0) return 0;
+    /* Unsigned wrap is fine: server.unixtime moves forward; a slot stamped in the
+     * future (clock stepped back) reads age 0, which just defers its eviction. */
+    return now_tick - slot->idle_since_tick;
+}
+
+uint32_t internAdmittedIdleMaxTicks(uint32_t now_tick) {
+    uint32_t maxage = 0;
+    hashtable *idxs[2] = {intern_index_value, intern_index_field};
+    for (int x = 0; x < 2; x++) {
+        if (idxs[x] == NULL) continue;
+        hashtableIterator iter;
+        hashtableInitIterator(&iter, idxs[x], 0);
+        void *elem;
+        while (hashtableNext(&iter, &elem)) {
+            internSlot *slot = elem;
+            if (slot->admitted && slot->refcount == 0) {
+                uint32_t age = internSlotIdleAge(slot, now_tick);
+                if (age > maxage) maxage = age;
+            }
+        }
+        hashtableCleanupIterator(&iter);
+    }
+    return maxage;
+}
+
+/* Delete a batch of candidate slots from `index` and free them, bumping the
+ * eviction counter. */
+static void internEvictDeleteBatch(hashtable *index, internSlot **dead, size_t d) {
+    for (size_t i = 0; i < d; i++) {
+        serverAssert(hashtableDelete(index, dead[i]));
+        internSlotFree(dead[i]);
+        intern_evictions++;
+    }
+}
+
+/* Full pass: evict every admitted refcount-0 slot idle for > idle_ticks. A
+ * idle_ticks of UINT32_MAX means "no eviction" (never); callers gate that. */
+static size_t internEvictIdleFullIndex(hashtable *index, uint32_t now_tick, uint32_t idle_ticks) {
+    if (index == NULL) return 0;
+    size_t n = hashtableSize(index);
+    if (n == 0) return 0;
+    internSlot **dead = zmalloc(sizeof(internSlot *) * n);
+    size_t d = 0;
+    hashtableIterator iter;
+    hashtableInitIterator(&iter, index, 0);
+    void *elem;
+    while (hashtableNext(&iter, &elem) && d < n) {
+        internSlot *slot = elem;
+        if (slot->admitted && slot->refcount == 0 && internSlotIdleAge(slot, now_tick) > idle_ticks)
+            dead[d++] = slot;
+    }
+    hashtableCleanupIterator(&iter);
+    internEvictDeleteBatch(index, dead, d);
+    zfree(dead);
+    return d;
+}
+
+size_t internEvictIdleFull(uint32_t now_tick, uint32_t idle_ticks) {
+    size_t evicted = 0;
+    evicted += internEvictIdleFullIndex(intern_index_value, now_tick, idle_ticks);
+    evicted += internEvictIdleFullIndex(intern_index_field, now_tick, idle_ticks);
+    return evicted;
+}
+
+/* Batch scan state passed through the hashtableScan callback: it only COLLECTS
+ * candidates (deleting inside a scan callback is unsafe); the caller deletes
+ * after the scan returns. */
+typedef struct internEvictScanCtx {
+    uint32_t now_tick;
+    uint32_t idle_ticks;   /* evict when age > this; ignored under pressure */
+    int pressure;          /* evict cold slots regardless of age, oldest first */
+    internSlot **dead;     /* candidate array (capacity == cap) */
+    size_t d;              /* candidates collected */
+    size_t cap;            /* max candidates to collect this batch */
+} internEvictScanCtx;
+
+static void internEvictScanCb(void *privdata, void *entry) {
+    internEvictScanCtx *ctx = privdata;
+    if (ctx->d >= ctx->cap) return;
+    internSlot *slot = entry;
+    if (!slot->admitted || slot->refcount != 0) return;
+    if (!ctx->pressure && internSlotIdleAge(slot, ctx->now_tick) <= ctx->idle_ticks) return;
+    ctx->dead[ctx->d++] = slot;
+}
+
+/* Bounded incremental eviction from one index using a persistent cursor. Scans
+ * buckets until it has looked at ~`budget` candidates or the cursor wraps, then
+ * deletes the collected candidates. Under pressure, collected cold slots are
+ * sorted oldest-idle-first before eviction so the coldest go first. */
+static size_t internEvictIdleBatchIndex(hashtable *index,
+                                        size_t *cursor,
+                                        uint32_t now_tick,
+                                        uint32_t idle_ticks,
+                                        size_t budget,
+                                        int pressure) {
+    if (index == NULL || budget == 0) return 0;
+    size_t n = hashtableSize(index);
+    if (n == 0) { *cursor = 0; return 0; }
+
+    internSlot **dead = zmalloc(sizeof(internSlot *) * budget);
+    internEvictScanCtx ctx = {now_tick, idle_ticks, pressure, dead, 0, budget};
+
+    /* Deleting slots can trigger an auto-shrink, and a shrink is the one thing
+     * that invalidates the reverse-binary scan cursor we persist across ticks
+     * (recorded hashtable.c behaviour). Pause auto-shrink for the batch so the
+     * cursor stays coherent; resume after (a deferred shrink then happens on the
+     * next mutation). */
+    hashtablePauseAutoShrink(index);
+
+    /* Advance the cursor across buckets, collecting up to `budget` candidates.
+     * hashtableScan visits one bucket-run per call and returns the next cursor;
+     * a returned 0 means a full cycle completed. Cap the number of scan calls to
+     * bound work even when the table is huge and sparse in candidates. */
+    size_t scan_calls = 0, max_scan_calls = budget + 16;
+    size_t cur = *cursor;
+    do {
+        cur = hashtableScan(index, cur, internEvictScanCb, &ctx);
+        scan_calls++;
+    } while (cur != 0 && ctx.d < budget && scan_calls < max_scan_calls);
+    *cursor = cur; /* persist for the next tick (0 == wrapped to start) */
+
+    if (pressure && ctx.d > 1) {
+        /* Oldest idle first: simple insertion sort (batch is small, <= budget). */
+        for (size_t i = 1; i < ctx.d; i++) {
+            internSlot *k = dead[i];
+            uint32_t ka = internSlotIdleAge(k, now_tick);
+            size_t j = i;
+            while (j > 0 && internSlotIdleAge(dead[j - 1], now_tick) < ka) {
+                dead[j] = dead[j - 1];
+                j--;
+            }
+            dead[j] = k;
+        }
+    }
+    internEvictDeleteBatch(index, dead, ctx.d);
+    hashtableResumeAutoShrink(index);
+    zfree(dead);
+    return ctx.d;
+}
+
+size_t internEvictIdleBatch(uint32_t now_tick, uint32_t idle_ticks, size_t batch, int pressure) {
+    /* Split the per-tick budget across the two indexes. */
+    size_t half = batch / 2;
+    size_t evicted = 0;
+    evicted += internEvictIdleBatchIndex(intern_index_value, &intern_evict_cursor_value,
+                                         now_tick, idle_ticks, half ? half : 1, pressure);
+    evicted += internEvictIdleBatchIndex(intern_index_field, &intern_evict_cursor_field,
+                                         now_tick, idle_ticks, batch - half ? batch - half : 1, pressure);
+    return evicted;
+}
+
 
 /*-----------------------------------------------------------------------------
  * Persistence of the admission decision (P2 S4d).
@@ -796,8 +1050,14 @@ static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field)
     if (--slot->refcount > 0) return;
 
     /* An admitted slot stays in the index at refcount 0 (an admission decision);
-     * it is reclaimed only by internEvictAdmitted / cap policy, never inline. */
-    if (slot->admitted) return;
+     * it is reclaimed only by cold-admitted eviction (internEvictIdle*) once it
+     * has been idle for longer than intern-admitted-idle-ms, or by the test
+     * helper internEvictAdmitted. Stamp the moment it became cold so the idle
+     * clock starts here (write only on the transition to 0, per the design). */
+    if (slot->admitted) {
+        slot->idle_since_tick = internNowTick();
+        return;
+    }
 
     serverAssert(hashtableDelete(index, slot));
     (void)is_field;

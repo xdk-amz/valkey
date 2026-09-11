@@ -593,25 +593,29 @@ static void debugInternScanCommand(client *c) {
                 }
                 if (debug_intern_do_values && debugInternValueEligible(e, &buf, &len) && debugInternCountGet(vcounts, buf, len) >= 2) {
                     internSlot *slot = internAcquire(buf, len);
-                    mstime_t expiry = entryGetExpiry(e);
-                    entry *ne = entryUpdateAsInternHandle(e, slot, expiry);
-                    if (ne != e) {
-                        serverAssert(hashtableReplaceReallocatedEntry(ht, e, ne));
-                        e = ne;
-                        snapshot[i] = ne;
+                    if (slot != NULL) { /* NULL == admission cap reached (P1-2): keep the owned copy */
+                        mstime_t expiry = entryGetExpiry(e);
+                        entry *ne = entryUpdateAsInternHandle(e, slot, expiry);
+                        if (ne != e) {
+                            serverAssert(hashtableReplaceReallocatedEntry(ht, e, ne));
+                            e = ne;
+                            snapshot[i] = ne;
+                        }
+                        values_interned++;
                     }
-                    values_interned++;
                 }
 
                 /* Field-name interning (S2): rebuild as a Type-5 entry, then
                  * replace the pointer in the hashtable and volatile set. */
                 if (debug_intern_do_fields && debugInternFieldEligible(e, &buf, &len) && debugInternCountGet(fcounts, buf, len) >= 2) {
                     internSlot *fslot = internAcquireField(buf, len);
-                    entry *ne = entryConvertToInternField(e, fslot);
-                    hashTypeReplaceReallocatedEntry(o, e, ne);
-                    e = ne;
-                    snapshot[i] = ne;
-                    fields_interned++;
+                    if (fslot != NULL) { /* NULL == cap reached: leave the plain field */
+                        entry *ne = entryConvertToInternField(e, fslot);
+                        hashTypeReplaceReallocatedEntry(o, e, ne);
+                        e = ne;
+                        snapshot[i] = ne;
+                        fields_interned++;
+                    }
                 }
             }
             zfree(snapshot);
@@ -689,7 +693,9 @@ static void debugInternAdmitCommand(client *c) {
         kvstoreIteratorRelease(kvs_it);
     }
 
-    /* Admit every string seen >= 2 times. No entry relocation. */
+    /* Admit every string seen >= 2 times. No entry relocation. A NULL return
+     * means an admission cap was reached -- count it as skipped (P1-2). */
+    long long values_skipped = 0, fields_skipped = 0;
     {
         hashtableIterator it;
         void *elem;
@@ -697,8 +703,8 @@ static void debugInternAdmitCommand(client *c) {
         while (hashtableNext(&it, &elem)) {
             debugInternCount *cnt = elem;
             if (cnt->count >= 2) {
-                internAdmitValue(cnt->buf, cnt->len);
-                values_admitted++;
+                if (internAdmitValue(cnt->buf, cnt->len) != NULL) values_admitted++;
+                else values_skipped++;
             }
         }
         hashtableCleanupIterator(&it);
@@ -706,8 +712,8 @@ static void debugInternAdmitCommand(client *c) {
         while (hashtableNext(&it, &elem)) {
             debugInternCount *cnt = elem;
             if (cnt->count >= 2) {
-                internAdmitField(cnt->buf, cnt->len);
-                fields_admitted++;
+                if (internAdmitField(cnt->buf, cnt->len) != NULL) fields_admitted++;
+                else fields_skipped++;
             }
         }
         hashtableCleanupIterator(&it);
@@ -718,15 +724,23 @@ static void debugInternAdmitCommand(client *c) {
 
     internStats stats;
     internGetStats(&stats);
+    size_t refusals_total, refusals_slots, refusals_slab;
+    internGetCapCounters(&refusals_total, &refusals_slots, &refusals_slab);
     uint64_t admit_us = getMonotonicUs() - start;
 
-    addReplyMapLen(c, 7);
+    addReplyMapLen(c, 10);
     addReplyBulkCString(c, "entries_scanned");
     addReplyLongLong(c, entries_scanned);
     addReplyBulkCString(c, "values_admitted");
     addReplyLongLong(c, values_admitted);
     addReplyBulkCString(c, "fields_admitted");
     addReplyLongLong(c, fields_admitted);
+    addReplyBulkCString(c, "values_skipped");
+    addReplyLongLong(c, values_skipped);
+    addReplyBulkCString(c, "fields_skipped");
+    addReplyLongLong(c, fields_skipped);
+    addReplyBulkCString(c, "admission_refusals");
+    addReplyLongLong(c, refusals_total);
     addReplyBulkCString(c, "admitted_slots");
     addReplyLongLong(c, stats.admitted_slots);
     addReplyBulkCString(c, "admitted_unreferenced");
@@ -737,19 +751,30 @@ static void debugInternAdmitCommand(client *c) {
     addReplyLongLong(c, admit_us / 1000);
 }
 
-/* DEBUG INTERN EVICT: free every admitted slot currently at refcount 0 (test
- * helper). Referenced admitted slots stay. */
-static void debugInternEvictCommand(client *c) {
-    internEvictAdmitted();
+/* DEBUG INTERN EVICT [IDLE <ms>]: free admitted refcount-0 slots. With no args,
+ * frees every admitted refcount-0 slot (legacy behaviour). With IDLE <ms>, runs
+ * one FULL cold-admitted eviction pass evicting only slots idle for > <ms>
+ * (mirrors the serverCron policy at a caller-chosen threshold -- test helper).
+ * Referenced admitted slots always stay. */
+static void debugInternEvictCommand(client *c, long long idle_ms, int have_idle) {
+    if (have_idle) {
+        uint32_t now_tick = (uint32_t)server.unixtime;
+        uint32_t idle_ticks = (uint32_t)(idle_ms / 1000);
+        internEvictIdleFull(now_tick, idle_ticks);
+    } else {
+        internEvictAdmitted();
+    }
     internStats stats;
     internGetStats(&stats);
-    addReplyMapLen(c, 3);
+    addReplyMapLen(c, 4);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
     addReplyBulkCString(c, "admitted_slots");
     addReplyLongLong(c, stats.admitted_slots);
     addReplyBulkCString(c, "admitted_unreferenced");
     addReplyLongLong(c, stats.admitted_unreferenced);
+    addReplyBulkCString(c, "evictions");
+    addReplyLongLong(c, internEvictions());
 }
 
 static const char *debug_intern_hist_labels[INTERN_HIST_BUCKETS] = {
@@ -765,7 +790,10 @@ static void debugInternStatsCommand(client *c) {
     internClassStats classes[INTERN_NUM_CLASSES];
     size_t long_allocs = 0;
     internGetClassStats(classes, &long_allocs);
-    addReplyMapLen(c, 17 + INTERN_HIST_BUCKETS + 6);
+    size_t refusals_total, refusals_slots, refusals_slab;
+    internGetCapCounters(&refusals_total, &refusals_slots, &refusals_slab);
+    uint32_t idle_max_ticks = internAdmittedIdleMaxTicks((uint32_t)server.unixtime);
+    addReplyMapLen(c, 17 + INTERN_HIST_BUCKETS + 6 + 6);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
     addReplyBulkCString(c, "value_slots");
@@ -804,6 +832,19 @@ static void debugInternStatsCommand(client *c) {
         addReplyBulkCString(c, debug_intern_hist_labels[b]);
         addReplyLongLong(c, stats.hist[b]);
     }
+    /* P1-2 caps + eviction. */
+    addReplyBulkCString(c, "admission_refusals");
+    addReplyLongLong(c, refusals_total);
+    addReplyBulkCString(c, "admission_refusals_slots");
+    addReplyLongLong(c, refusals_slots);
+    addReplyBulkCString(c, "admission_refusals_slab_bytes");
+    addReplyLongLong(c, refusals_slab);
+    addReplyBulkCString(c, "evictions");
+    addReplyLongLong(c, internEvictions());
+    addReplyBulkCString(c, "admitted_idle_max_ms");
+    addReplyLongLong(c, (long long)idle_max_ticks * 1000);
+    addReplyBulkCString(c, "slot_count");
+    addReplyLongLong(c, internSlotCount());
     /* P1-1 slab accounting summary + per-class breakdown. */
     addReplyBulkCString(c, "slab_bytes");
     addReplyLongLong(c, internSlabMemory());
@@ -881,7 +922,7 @@ void debugCommand(client *c) {
             "INTERN <SCAN|ADMIT|EVICT|STATS|DRAIN>",
             "    SCAN: intern hash values and field names seen >= 2 times across the keyspace.",
             "    ADMIT: insert strings seen >= 2 times into the dedup index as admitted slots (no entry touched).",
-            "    EVICT: free all admitted slots at refcount 0 (test helper).",
+            "    EVICT [IDLE <ms>]: free admitted refcount-0 slots. IDLE <ms> runs one full cold-admitted eviction pass evicting only slots idle > <ms>.",
             "    STATS: report intern subsystem slot counts, admitted/probe counters, bytes saved, and length histogram.",
             "HTSTATS-KEY <key> [full]",
             "    Like HTSTATS but for the hash table stored at <key>'s value.",
@@ -1030,7 +1071,7 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));
         addReply(c, shared.ok);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && (c->argc == 3 || c->argc == 4)) {
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "intern") && (c->argc >= 3 && c->argc <= 5)) {
         if (!strcasecmp(objectGetVal(c->argv[2]), "scan")) {
             if (server.string_interning == INTERN_MODE_NO) {
                 addReplyError(c, "DEBUG INTERN requires string-interning to be enabled (scan or probe).");
@@ -1048,7 +1089,17 @@ void debugCommand(client *c) {
             }
             debugInternAdmitCommand(c);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "evict")) {
-            debugInternEvictCommand(c);
+            long long idle_ms = 0;
+            int have_idle = 0;
+            if (c->argc >= 5 && !strcasecmp(objectGetVal(c->argv[3]), "idle")) {
+                if (getLongLongFromObjectOrReply(c, c->argv[4], &idle_ms, NULL) != C_OK) return;
+                if (idle_ms < 0) {
+                    addReplyError(c, "DEBUG INTERN EVICT IDLE <ms> requires a non-negative millisecond value.");
+                    return;
+                }
+                have_idle = 1;
+            }
+            debugInternEvictCommand(c, idle_ms, have_idle);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "stats")) {
             debugInternStatsCommand(c);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "drain")) {

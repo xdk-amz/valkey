@@ -2362,6 +2362,10 @@ struct valkeyServer {
     int string_interning;      /* INTERN_MODE_{NO,SCAN,PROBE} */
     size_t intern_max_len;     /* length gate for probe/admission eligibility */
     size_t intern_slab_bytes;  /* P1-1: byte size of each intern slab (per class) */
+    size_t intern_max_slots;   /* P1-2: cap on total live+admitted slots (0=none) */
+    size_t intern_max_slab_bytes; /* P1-2: cap on Σ slab bytes (0=none) */
+    size_t intern_admitted_idle_ms; /* P1-2: cold-admitted slot idle TTL (0=never) */
+    size_t intern_evict_batch; /* P1-2: max cold-admitted slots evicted per cron tick */
     /* Latency monitor */
     long long latency_monitor_threshold;
     dict *latency_events;
