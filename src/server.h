@@ -1588,6 +1588,7 @@ struct serverMemOverhead {
     size_t aof_buffer;
     size_t lua_caches;
     size_t functions_caches;
+    size_t intern_slab; /* P1-1: intern slab bytes, counted once as overhead */
     size_t overhead_total;
     size_t dataset;
     size_t total_keys;
@@ -2360,6 +2361,7 @@ struct valkeyServer {
     /* String interning (experimental, P2 S4a) */
     int string_interning;      /* INTERN_MODE_{NO,SCAN,PROBE} */
     size_t intern_max_len;     /* length gate for probe/admission eligibility */
+    size_t intern_slab_bytes;  /* P1-1: byte size of each intern slab (per class) */
     /* Latency monitor */
     long long latency_monitor_threshold;
     dict *latency_events;

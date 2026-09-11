@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "serverassert.h"
 #include "functions.h"
@@ -1467,6 +1468,11 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
     mh->functions_caches = functionsMemoryOverhead();
     mem_total += mh->functions_caches;
 
+    /* P1-1: intern slabs are server-level overhead (HLD §5 maxmemory row / R7):
+     * counted once here, not per referencing entry. */
+    mh->intern_slab = internSlabMemory();
+    mem_total += mh->intern_slab;
+
     for (j = 0; j < server.dbnum; j++) {
         serverDb *db = server.db[j];
         if (db == NULL) continue;
@@ -1822,7 +1828,7 @@ void memoryCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "stats") && c->argc == 2) {
         struct serverMemOverhead *mh = getMemoryOverheadData();
 
-        addReplyMapLen(c, 34 + mh->num_dbs);
+        addReplyMapLen(c, 35 + mh->num_dbs);
 
         addReplyBulkCString(c, "peak.allocated");
         addReplyLongLong(c, mh->peak_allocated);
@@ -1862,6 +1868,9 @@ void memoryCommand(client *c) {
 
         addReplyBulkCString(c, "functions.caches");
         addReplyLongLong(c, mh->functions_caches);
+
+        addReplyBulkCString(c, "intern.slab");
+        addReplyLongLong(c, mh->intern_slab);
 
         for (size_t j = 0; j < mh->num_dbs; j++) {
             char dbname[32];

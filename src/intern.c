@@ -55,15 +55,306 @@ static hashtableType internIndexType = {
 static hashtable *intern_index_value = NULL;
 static hashtable *intern_index_field = NULL;
 
+/*-----------------------------------------------------------------------------
+ * Slab allocator (P1-1).
+ *
+ * Slots are carved from per-class slabs instead of an individual zmalloc each.
+ * A class is a fixed slot byte size; a string picks the smallest class whose
+ * inline capacity fits sdsReqSize(len, SDS_TYPE_8) after the fixed header. Slots
+ * never move (a slot address is stable from acquire until its slab is released),
+ * and a slab is released only when no slot in it is live -- so the never-move
+ * guarantee the entry contract depends on (internSlotFromSds recovers the header
+ * at a fixed negative offset) holds unchanged.
+ *
+ * Free slots are threaded on a per-class intrusive free list (the free pointer
+ * overlaps the slot's header bytes -- a free slot carries no live data). Each
+ * slab tracks its live count; at zero live it is released back to jemalloc
+ * unless it is the class's single retained empty "cushion" slab (avoids
+ * alloc/free flapping when a class oscillates around a slab boundary).
+ *
+ * Admitted refcount-0 slots (P2) count as LIVE for slab purposes: they are an
+ * admission decision that must stay resident, so their slab is never released.
+ * Long strings (beyond the biggest class's inline capacity -- only reachable if
+ * intern-max-len is raised well past 256) fall back to a raw zmalloc tagged
+ * INTERN_CLASS_LONG and freed directly; they are not slab-managed and are
+ * counted separately.
+ *----------------------------------------------------------------------------*/
+
+/* Class slot byte sizes. Chosen so the inline capacity
+ * (class_bytes - offsetof(internSlot, inline_) - 8 B owner back-pointer) covers
+ * the sdsReqSize bands. The top class is 296 (not the design-doc's 288): with
+ * the 26 B header and the 8 B trailing owner pointer this allocator adds per
+ * slot, 296 B is the smallest 8-aligned class whose inline capacity (262 B)
+ * holds sdsReqSize(256)=260 -- i.e. it covers intern-max-len 256 as the design
+ * intends. The small classes pack the schema/field-name lengths densely (R5). */
+static const size_t intern_class_bytes[INTERN_NUM_CLASSES] = {48, 64, 96, 128, 192, 296};
+
+/* Max internable content length: the slot stores content as an inline sdshdr8,
+ * whose alloc byte tops out at 255. Longer strings are never interned so that
+ * internSlotFromSds can recover the header at a fixed sdsHdrSize(SDS_TYPE_8)
+ * offset in every size class (the never-move contract). */
+#define INTERN_MAX_INLINE_LEN 255 /* sdsTypeMaxSize(SDS_TYPE_8) */
+
+typedef struct internSlab internSlab;
+
+/* One slab: a single zmalloc of `bytes`, carved into fixed-size slots of one
+ * class. Live slots are those handed out and not yet returned to the free list. */
+struct internSlab {
+    internSlab *next;      /* class slab list link */
+    internSlab *prev;
+    uint32_t live;         /* slots handed out and not on the free list */
+    uint32_t capacity;     /* slots this slab can carve */
+    uint8_t klass;         /* owning class index */
+    char *base;            /* first slot byte (== (char*)(this+1) rounded) */
+    size_t bytes;          /* total zmalloc bytes for this slab */
+};
+
+/* A slot on the free list borrows its first bytes for the link pointer. The
+ * owning slab pointer lives in the LAST sizeof(internSlab*) bytes of every slot
+ * (reserved out of the inline capacity), so it survives both the free and the
+ * live state and owner recovery on return is O(1) -- no slab-list scan. */
+typedef struct internFreeSlot {
+    struct internFreeSlot *next;
+} internFreeSlot;
+
+#define INTERN_SLOT_OWNER_BYTES ((size_t)sizeof(internSlab *))
+
+typedef struct internClass {
+    internSlab *slabs;       /* doubly-linked list of this class's slabs */
+    internFreeSlot *freelist; /* intrusive free list of returned slots */
+    internSlab *cushion;     /* at most one retained empty slab (may be NULL) */
+    size_t slot_bytes;       /* == intern_class_bytes[klass] */
+    size_t slots_total;      /* carved slots currently in existence (any state) */
+    size_t slots_live;       /* live slots (== sum of slab->live) */
+    size_t slab_count;       /* slabs held (including the cushion) */
+    size_t slots_per_slab;   /* capacity per slab at the current config */
+} internClass;
+
+static internClass intern_classes[INTERN_NUM_CLASSES];
+static int intern_classes_ready = 0;
+static size_t intern_slab_total_bytes = 0; /* Σ slab bytes across all classes */
+static size_t intern_long_allocs = 0;      /* live INTERN_CLASS_LONG slots */
+
+/* Header carved out of the front of each slab allocation. Slot 0 begins at an
+ * 8-byte-aligned offset just past the internSlab header. */
+static inline char *internSlabSlot(internSlab *slab, size_t idx, size_t slot_bytes) {
+    return slab->base + idx * slot_bytes;
+}
+
+static void internClassesInit(void) {
+    if (intern_classes_ready) return;
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) {
+        memset(&intern_classes[k], 0, sizeof(intern_classes[k]));
+        intern_classes[k].slot_bytes = intern_class_bytes[k];
+    }
+    intern_classes_ready = 1;
+}
+
+/* Slots that fit a class's inline capacity. The last INTERN_SLOT_OWNER_BYTES of
+ * every slot hold the owning-slab back-pointer, so they are not available to the
+ * sds. */
+static inline size_t internClassInlineCap(size_t slot_bytes) {
+    return slot_bytes - offsetof(internSlot, inline_) - INTERN_SLOT_OWNER_BYTES;
+}
+
+/* Address of a slot's trailing owner back-pointer. */
+static inline internSlab **internSlotOwnerRef(internSlot *slot, size_t slot_bytes) {
+    return (internSlab **)((char *)slot + slot_bytes - INTERN_SLOT_OWNER_BYTES);
+}
+
+/* Smallest class index whose inline capacity fits `need` (sdsReqSize bytes),
+ * or INTERN_CLASS_LONG if none does. */
+static uint8_t internClassFor(size_t need) {
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) {
+        if (need <= internClassInlineCap(intern_class_bytes[k])) return (uint8_t)k;
+    }
+    return INTERN_CLASS_LONG;
+}
+
+/* Number of slots that fit in a slab of `slab_bytes` for a class of `slot_bytes`,
+ * after the slab header. At least 1. */
+static size_t internSlotsPerSlab(size_t slab_bytes, size_t slot_bytes) {
+    size_t hdr = (sizeof(internSlab) + 15) & ~(size_t)15; /* 16-byte aligned base */
+    if (slab_bytes <= hdr + slot_bytes) return 1;
+    return (slab_bytes - hdr) / slot_bytes;
+}
+
+/* Configured slab byte size, clamped to the config bounds. */
+static size_t internSlabBytes(void) {
+    size_t b = server.intern_slab_bytes;
+    if (b < 4096) b = 4096;
+    if (b > (8 * 1024 * 1024)) b = 8 * 1024 * 1024;
+    return b;
+}
+
+/* Allocate one slab for a class, thread all its slots onto the class free list,
+ * and link it into the class slab list. */
+static internSlab *internSlabNew(internClass *cls, uint8_t klass) {
+    size_t slab_bytes = internSlabBytes();
+    size_t slot_bytes = cls->slot_bytes;
+    size_t cap = internSlotsPerSlab(slab_bytes, slot_bytes);
+    internSlab *slab = zmalloc(slab_bytes);
+    slab->next = slab->prev = NULL;
+    slab->live = 0;
+    slab->capacity = (uint32_t)cap;
+    slab->klass = klass;
+    slab->bytes = zmalloc_usable_size(slab);
+    size_t hdr = (sizeof(internSlab) + 15) & ~(size_t)15;
+    slab->base = (char *)slab + hdr;
+
+    /* Thread every slot onto the free list (LIFO) and stamp each slot's trailing
+     * owner back-pointer. */
+    for (size_t i = 0; i < cap; i++) {
+        char *p = internSlabSlot(slab, i, slot_bytes);
+        *(internSlab **)(p + slot_bytes - INTERN_SLOT_OWNER_BYTES) = slab;
+        internFreeSlot *fs = (internFreeSlot *)p;
+        fs->next = cls->freelist;
+        cls->freelist = fs;
+    }
+    /* Link into the class slab list. */
+    slab->next = cls->slabs;
+    if (cls->slabs) cls->slabs->prev = slab;
+    cls->slabs = slab;
+
+    cls->slab_count++;
+    cls->slots_total += cap;
+    cls->slots_per_slab = cap;
+    intern_slab_total_bytes += slab->bytes;
+    return slab;
+}
+
+/* Release an empty slab back to jemalloc, unlinking every one of its slots from
+ * the class free list first. Only called when slab->live == 0. */
+static void internSlabFree(internClass *cls, internSlab *slab) {
+    size_t slot_bytes = cls->slot_bytes;
+    /* Filter the class free list, dropping every slot that belongs to `slab`. */
+    internFreeSlot **pp = &cls->freelist;
+    size_t dropped = 0;
+    while (*pp) {
+        internFreeSlot *fs = *pp;
+        internSlab *owner = *(internSlab **)((char *)fs + slot_bytes - INTERN_SLOT_OWNER_BYTES);
+        if (owner == slab) {
+            *pp = fs->next;
+            dropped++;
+        } else {
+            pp = &fs->next;
+        }
+    }
+    serverAssert(dropped == slab->capacity);
+    /* Unlink from the class slab list. */
+    if (slab->prev) slab->prev->next = slab->next; else cls->slabs = slab->next;
+    if (slab->next) slab->next->prev = slab->prev;
+
+    cls->slab_count--;
+    cls->slots_total -= slab->capacity;
+    intern_slab_total_bytes -= slab->bytes;
+    zfree(slab);
+}
+
+/* Carve a slot of `klass` from the class free list (allocating a slab if the
+ * list is empty). The caller fills the header; the trailing owner pointer is
+ * already stamped and is preserved. */
+static internSlot *internSlabAlloc(uint8_t klass) {
+    internClassesInit();
+    internClass *cls = &intern_classes[klass];
+    if (cls->freelist == NULL) {
+        internSlabNew(cls, klass);
+    }
+    internFreeSlot *fs = cls->freelist;
+    cls->freelist = fs->next;
+    internSlab *slab = *(internSlab **)((char *)fs + cls->slot_bytes - INTERN_SLOT_OWNER_BYTES);
+    slab->live++;
+    cls->slots_live++;
+    /* If this was the cushion (now non-empty), it is no longer the cushion. */
+    if (cls->cushion == slab) cls->cushion = NULL;
+    internSlot *slot = (internSlot *)fs;
+    slot->slab_class = klass;
+    return slot;
+}
+
+/* Return a slab-managed slot to its class free list; release the slab at zero
+ * live unless it becomes the class cushion. */
+static void internSlabReturn(internSlot *slot) {
+    uint8_t klass = slot->slab_class;
+    serverAssert(klass < INTERN_NUM_CLASSES);
+    internClass *cls = &intern_classes[klass];
+    /* Owner recovered O(1) from the slot's trailing back-pointer. */
+    internSlab *owner = *internSlotOwnerRef(slot, cls->slot_bytes);
+    serverAssert(owner != NULL && owner->klass == klass);
+    /* The trailing owner back-pointer is preserved across the union with
+     * internFreeSlot (it lives past the link), so just re-link onto the list. */
+    internFreeSlot *fs = (internFreeSlot *)slot;
+    fs->next = cls->freelist;
+    cls->freelist = fs;
+    serverAssert(owner->live > 0);
+    owner->live--;
+    cls->slots_live--;
+
+    if (owner->live == 0) {
+        /* Keep one empty slab as a cushion; release any further empties. */
+        if (cls->cushion == NULL) {
+            cls->cushion = owner;
+        } else if (cls->cushion != owner) {
+            internSlabFree(cls, owner);
+        }
+    }
+}
+
+/* Free one slot: return it to its slab, or zfree a long allocation. */
+static void internSlotFree(internSlot *slot) {
+    if (slot->slab_class == INTERN_CLASS_LONG) {
+        serverAssert(intern_long_allocs > 0);
+        intern_long_allocs--;
+        zfree(slot);
+    } else {
+        internSlabReturn(slot);
+    }
+}
+
+size_t internSlabMemory(void) {
+    return intern_slab_total_bytes;
+}
+
+size_t internSlabCount(void) {
+    size_t n = 0;
+    if (!intern_classes_ready) return 0;
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) n += intern_classes[k].slab_count;
+    return n;
+}
+
+double internSlabLiveRatio(void) {
+    size_t live = 0, total = 0;
+    if (!intern_classes_ready) return 1.0;
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) {
+        live += intern_classes[k].slots_live;
+        total += intern_classes[k].slots_total;
+    }
+    if (total == 0) return 1.0;
+    return (double)live / (double)total;
+}
+
+void internGetClassStats(internClassStats out[INTERN_NUM_CLASSES], size_t *long_allocs) {
+    internClassesInit();
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) {
+        out[k].slot_bytes = intern_classes[k].slot_bytes;
+        out[k].slots_total = intern_classes[k].slots_total;
+        out[k].slots_live = intern_classes[k].slots_live;
+        out[k].slabs = intern_classes[k].slab_count;
+        out[k].slots_per_slab = intern_classes[k].slots_per_slab;
+    }
+    if (long_allocs) *long_allocs = intern_long_allocs;
+}
+
 static void internInit(void) {
     if (intern_index_value == NULL) intern_index_value = hashtableCreate(&internIndexType);
     if (intern_index_field == NULL) intern_index_field = hashtableCreate(&internIndexType);
+    internClassesInit();
 }
 
-/* True if the field slot stores its sdshdr8 inline (vs a long allocation). */
-/* Field sds is always inline; "SSO" for stats means it fit the fixed 48 B slot. */
+/* True if the slot stores its content in the fixed inline region (slab-managed),
+ * vs a long allocation whose sds lives in a separate zmalloc. */
 static inline bool internFieldIsInline(const internSlot *slot) {
-    return sdsReqSize(slot->len, SDS_TYPE_8) <= sizeof(slot->inline_);
+    return slot->slab_class != INTERN_CLASS_LONG;
 }
 
 internSlot *internSlotFromSds(const sds s) {
@@ -74,16 +365,19 @@ internSlot *internFieldSlotFromSds(const sds s) {
     return (internSlot *)((char *)s - sdsHdrSize(SDS_TYPE_8) - offsetof(internSlot, inline_));
 }
 
+/* Accounting size of a slot. For a slab-managed slot this is the CLASS slot byte
+ * size (its exact share of the slab), NOT zmalloc_size of the whole slab. For a
+ * long allocation it is the raw zmalloc size. Slab bytes are additionally
+ * accounted once as server overhead via internSlabMemory(); this per-slot figure
+ * feeds only the amortised entryMemUsage share. */
 size_t internSlotAllocSize(const internSlot *slot) {
-    /* VALUE slot: the slot itself, plus a long byte buffer if content did not
-     * fit inline. slot->buf == slot->inline_ exactly when stored inline. */
-    return zmalloc_size((void *)slot); /* variable-size allocation, sds inside */
+    if (slot->slab_class == INTERN_CLASS_LONG) return zmalloc_size((void *)slot);
+    return intern_class_bytes[slot->slab_class];
 }
 
 size_t internSlotFieldAllocSize(const internSlot *slot) {
-    /* FIELD slot: the slot itself, plus a long sdshdr8 allocation if the field
-     * did not fit inline. The header base is slot->buf - sdsHdrSize(SDS_TYPE_8). */
-    return zmalloc_size((void *)slot); /* variable-size allocation, sds inside */
+    if (slot->slab_class == INTERN_CLASS_LONG) return zmalloc_size((void *)slot);
+    return intern_class_bytes[slot->slab_class];
 }
 
 uint32_t internSlotRefcount(const internSlot *slot) {
@@ -113,25 +407,34 @@ static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t l
         return slot;
     }
 
-    internSlot *slot = zmalloc(sizeof(internSlot));
-    slot->len = len;
-    slot->refcount = 1;
-    slot->hash = probe.hash;
-    slot->admitted = 0;
-
     (void)is_field;
     /* Both kinds: lay out an sdshdr8 INLINE so slot->buf is a genuine sds. The
      * holder stores that sds pointer directly (read path == plain sds value /
      * plain sds field: one dependent load) and recovers the slot header at a
-     * fixed negative offset via internSlotFromSds. Variable-size allocation. */
+     * fixed negative offset via internSlotFromSds -- class-independent, so slabs
+     * are never-move-safe for that contract. Content is bounded to 255 B (the
+     * sdshdr8 alloc-byte limit); callers gate this via internLenEligible /
+     * DEBUG_INTERN_MAX_LEN. */
+    serverAssert(len <= INTERN_MAX_INLINE_LEN);
     size_t need = sdsReqSize(len, SDS_TYPE_8); /* hdr(3) + len + 1 */
-    if (need > sizeof(slot->inline_)) {
+    uint8_t klass = internClassFor(need);
+
+    internSlot *slot;
+    if (klass != INTERN_CLASS_LONG) {
+        /* Slab-managed: carve a fixed-size slot from the class free list. */
+        slot = internSlabAlloc(klass);
+    } else {
+        /* Long fallback (only reachable if intern-max-len is raised past the
+         * biggest class's inline capacity): a raw zmalloc, not slab-managed. */
         size_t alloc = offsetof(internSlot, inline_) + need;
-        internSlot *big = zmalloc(alloc);
-        memcpy(big, slot, offsetof(internSlot, inline_));
-        zfree(slot);
-        slot = big;
+        slot = zmalloc(alloc);
+        slot->slab_class = INTERN_CLASS_LONG;
+        intern_long_allocs++;
     }
+    slot->len = len;
+    slot->refcount = 1;
+    slot->hash = probe.hash;
+    slot->admitted = 0;
     slot->buf = sdswrite(slot->inline_, need, SDS_TYPE_8, buf, len);
     serverAssert(hashtableAdd(index, slot));
     return slot;
@@ -155,10 +458,14 @@ internSlot *internAcquireField(const char *buf, size_t len) {
 static size_t intern_probe_value_hits = 0, intern_probe_value_misses = 0;
 static size_t intern_probe_field_hits = 0, intern_probe_field_misses = 0;
 
-/* Content is probe/admission eligible only within [4, server.intern_max_len].
- * The length gate bounds the hash cost and is checked before hashing. */
+/* Content is probe/admission eligible only within [4, min(intern_max_len, 255)].
+ * The upper cap is 255 because the slot lays its content out as an inline
+ * sdshdr8 (whose alloc byte tops out at 255) so internSlotFromSds can recover
+ * the header at a fixed sdsHdrSize(SDS_TYPE_8) offset in every size class. The
+ * length gate bounds the hash cost and is checked before hashing. */
 static inline bool internLenEligible(size_t len) {
-    return len >= 4 && len <= server.intern_max_len;
+    size_t hi = server.intern_max_len < INTERN_MAX_INLINE_LEN ? server.intern_max_len : INTERN_MAX_INLINE_LEN;
+    return len >= 4 && len <= hi;
 }
 
 /* Lookup-only probe on `index`. On hit: refcount++ (a reference handed to the
@@ -251,7 +558,7 @@ static void internEvictAdmittedIndex(hashtable *index) {
     hashtableCleanupIterator(&iter);
     for (size_t i = 0; i < d; i++) {
         serverAssert(hashtableDelete(index, dead[i]));
-        zfree(dead[i]);
+        internSlotFree(dead[i]);
     }
     zfree(dead);
 }
@@ -494,7 +801,7 @@ static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field)
 
     serverAssert(hashtableDelete(index, slot));
     (void)is_field;
-    zfree(slot); /* the sds is always inside the slot allocation */
+    internSlotFree(slot); /* return to slab (or zfree a long alloc) */
 }
 
 size_t internDrainDeferred(void) {

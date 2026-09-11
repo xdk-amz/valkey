@@ -409,7 +409,9 @@ void mallctl_string(client *c, robj **argv, int argc) {
  *----------------------------------------------------------------------------*/
 
 #define DEBUG_INTERN_MIN_LEN 4
-#define DEBUG_INTERN_MAX_LEN 256
+/* 255 = sdsTypeMaxSize(SDS_TYPE_8): the intern slot stores content as an inline
+ * sdshdr8, so 255 is the longest internable string (see intern.c). */
+#define DEBUG_INTERN_MAX_LEN 255
 
 /* Temporary counting map entry: a private copy of content + a sighting count.
  * Prefix layout {buf,len,...,hash} matches internSlot so we can reuse content
@@ -760,7 +762,10 @@ static void debugInternStatsCommand(client *c) {
     internGetProbeCounters(&pvh, &pvm, &pfh, &pfm);
     size_t intern_persisted, intern_loaded;
     internGetPersistCounters(&intern_persisted, &intern_loaded);
-    addReplyMapLen(c, 17 + INTERN_HIST_BUCKETS);
+    internClassStats classes[INTERN_NUM_CLASSES];
+    size_t long_allocs = 0;
+    internGetClassStats(classes, &long_allocs);
+    addReplyMapLen(c, 17 + INTERN_HIST_BUCKETS + 6);
     addReplyBulkCString(c, "slots");
     addReplyLongLong(c, stats.slots);
     addReplyBulkCString(c, "value_slots");
@@ -798,6 +803,32 @@ static void debugInternStatsCommand(client *c) {
     for (int b = 0; b < INTERN_HIST_BUCKETS; b++) {
         addReplyBulkCString(c, debug_intern_hist_labels[b]);
         addReplyLongLong(c, stats.hist[b]);
+    }
+    /* P1-1 slab accounting summary + per-class breakdown. */
+    addReplyBulkCString(c, "slab_bytes");
+    addReplyLongLong(c, internSlabMemory());
+    addReplyBulkCString(c, "slab_count");
+    addReplyLongLong(c, internSlabCount());
+    addReplyBulkCString(c, "slab_live_ratio");
+    addReplyHumanLongDouble(c, internSlabLiveRatio());
+    addReplyBulkCString(c, "long_allocs");
+    addReplyLongLong(c, long_allocs);
+    addReplyBulkCString(c, "slab_bytes_config");
+    addReplyLongLong(c, server.intern_slab_bytes);
+    addReplyBulkCString(c, "classes");
+    addReplyArrayLen(c, INTERN_NUM_CLASSES);
+    for (int k = 0; k < INTERN_NUM_CLASSES; k++) {
+        addReplyMapLen(c, 5);
+        addReplyBulkCString(c, "slot_bytes");
+        addReplyLongLong(c, classes[k].slot_bytes);
+        addReplyBulkCString(c, "slots_total");
+        addReplyLongLong(c, classes[k].slots_total);
+        addReplyBulkCString(c, "slots_live");
+        addReplyLongLong(c, classes[k].slots_live);
+        addReplyBulkCString(c, "slabs");
+        addReplyLongLong(c, classes[k].slabs);
+        addReplyBulkCString(c, "slots_per_slab");
+        addReplyLongLong(c, classes[k].slots_per_slab);
     }
 }
 

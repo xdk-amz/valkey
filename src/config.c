@@ -3456,6 +3456,7 @@ standardConfig static_configs[] = {
     createEnumConfig("acl-pubsub-default", NULL, MODIFIABLE_CONFIG, acl_pubsub_default_enum, server.acl_pubsub_default, 0, NULL, NULL),
     createEnumConfig("string-interning", NULL, MODIFIABLE_CONFIG, string_interning_enum, server.string_interning, INTERN_MODE_NO, NULL, NULL),
     createSizeTConfig("intern-max-len", NULL, MODIFIABLE_CONFIG, 4, LONG_MAX, server.intern_max_len, 256, INTEGER_CONFIG, NULL, NULL),
+    createSizeTConfig("intern-slab-bytes", NULL, MODIFIABLE_CONFIG, 4096, 8 * 1024 * 1024, server.intern_slab_bytes, 65536, MEMORY_CONFIG, NULL, NULL),
     createEnumConfig("enable-protected-configs", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_protected_configs, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
     createEnumConfig("enable-debug-command", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_debug_cmd, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),
     createEnumConfig("enable-module-command", NULL, IMMUTABLE_CONFIG, protected_action_enum, server.enable_module_cmd, PROTECTED_ACTION_ALLOWED_NO, NULL, NULL),

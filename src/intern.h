@@ -33,8 +33,40 @@ typedef struct internSlot {
     uint8_t admitted;     /* if set, the slot stays in the index at refcount 0
                            * (an admission decision) rather than being freed;
                            * see internAdmit / internEvictAdmitted (P2 S4a) */
+    uint8_t slab_class;   /* P1-1: size-class index into the slab table; the
+                           * sentinel INTERN_CLASS_LONG marks a long allocation
+                           * that is not slab-managed (a raw zmalloc/zfree). */
     char inline_[INTERN_SSO_MAX + 1]; /* SSO storage; sdshdr8+bytes+NUL for fields */
 } internSlot;
+
+/* P1-1 slab allocator size classes (slot byte sizes). A string picks the
+ * smallest class whose inline capacity fits sdsReqSize(len, SDS_TYPE_8) after
+ * the fixed header (offsetof(internSlot, inline_)). Slots never move; slabs are
+ * released back to jemalloc at zero live count, keeping one empty cushion slab
+ * per class. The header always precedes inline_ at the same offset in every
+ * class, so internSlotFromSds() is class-independent. */
+#define INTERN_NUM_CLASSES 6
+#define INTERN_CLASS_LONG 0xFF /* sentinel: not slab-managed (raw zmalloc) */
+
+/* Per-class slab accounting, exposed for DEBUG INTERN STATS. */
+typedef struct internClassStats {
+    size_t slot_bytes;   /* the class slot byte size */
+    size_t slots_total;  /* live slots carved from this class's slabs */
+    size_t slots_live;   /* slots currently live (refcount>0 or admitted) */
+    size_t slabs;        /* slabs currently held by this class */
+    size_t slots_per_slab;
+} internClassStats;
+
+/* Fills per-class slab stats (INTERN_NUM_CLASSES entries) and, if non-NULL,
+ * the count of long (non-slab) allocations. */
+void internGetClassStats(internClassStats out[INTERN_NUM_CLASSES], size_t *long_allocs);
+
+/* Total bytes held by all slabs (server-level overhead, HLD §5 / R7). */
+size_t internSlabMemory(void);
+/* Number of slabs held across all classes. */
+size_t internSlabCount(void);
+/* Ratio of live slots to carved slots across all slabs, [0,1]; 1.0 when empty. */
+double internSlabLiveRatio(void);
 
 /* Length histogram buckets for interned strings (feeds HLD O1: is SSO_MAX right?). */
 #define INTERN_HIST_BUCKETS 7

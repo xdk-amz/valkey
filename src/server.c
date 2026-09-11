@@ -6461,6 +6461,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "intern_probe_hits:%zu\r\n", intern_probe_value_hits + intern_probe_field_hits,
                 "intern_probe_misses:%zu\r\n", intern_probe_value_misses + intern_probe_field_misses,
                 "intern_index_mem:%zu\r\n", intern_stats.index_mem,
+                "intern_slab_bytes:%zu\r\n", internSlabMemory(),
+                "intern_slab_count:%zu\r\n", internSlabCount(),
+                "intern_slab_live_ratio:%.4f\r\n", internSlabLiveRatio(),
                 "intern_deferred_msgs:%zu\r\n", intern_deferred_msgs,
                 "intern_deferred_releases:%zu\r\n", intern_deferred_releases,
                 "intern_deferred_pending:%zu\r\n", intern_deferred_pending));
