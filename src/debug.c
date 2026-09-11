@@ -801,6 +801,24 @@ static void debugInternStatsCommand(client *c) {
     }
 }
 
+/* DEBUG INTERN DRAIN: force a main-thread drain of the deferred-release stack
+ * (releases recorded by the bio lazy-free thread) and reply with the number of
+ * releases applied plus the cumulative deferred counters. Test helper. */
+static void debugInternDrainCommand(client *c) {
+    size_t applied = internDrainDeferred();
+    size_t msgs, releases, pending;
+    internGetDeferredCounters(&msgs, &releases, &pending);
+    addReplyMapLen(c, 4);
+    addReplyBulkCString(c, "applied");
+    addReplyLongLong(c, applied);
+    addReplyBulkCString(c, "deferred_msgs");
+    addReplyLongLong(c, msgs);
+    addReplyBulkCString(c, "deferred_releases");
+    addReplyLongLong(c, releases);
+    addReplyBulkCString(c, "deferred_pending");
+    addReplyLongLong(c, pending);
+}
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
@@ -829,7 +847,7 @@ void debugCommand(client *c) {
             "    Write <message> to the server log.",
             "HTSTATS <dbid> [full]",
             "    Return hash table statistics of the specified database.",
-            "INTERN <SCAN|ADMIT|EVICT|STATS>",
+            "INTERN <SCAN|ADMIT|EVICT|STATS|DRAIN>",
             "    SCAN: intern hash values and field names seen >= 2 times across the keyspace.",
             "    ADMIT: insert strings seen >= 2 times into the dedup index as admitted slots (no entry touched).",
             "    EVICT: free all admitted slots at refcount 0 (test helper).",
@@ -1002,8 +1020,10 @@ void debugCommand(client *c) {
             debugInternEvictCommand(c);
         } else if (!strcasecmp(objectGetVal(c->argv[2]), "stats")) {
             debugInternStatsCommand(c);
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "drain")) {
+            debugInternDrainCommand(c);
         } else {
-            addReplyError(c, "DEBUG INTERN supports the SCAN, ADMIT, EVICT and STATS subcommands.");
+            addReplyError(c, "DEBUG INTERN supports the SCAN, ADMIT, EVICT, STATS and DRAIN subcommands.");
         }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "reload")) {
         int flush = 1, save = 1;

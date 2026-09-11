@@ -5,6 +5,8 @@
 #include "hashtable.h"
 #include "sds.h"
 #include "zmalloc.h"
+#include <stdatomic.h>
+#include <pthread.h>
 
 /*-----------------------------------------------------------------------------
  * String interning subsystem (spike S1 values, S2 hash field names).
@@ -309,7 +311,180 @@ void internGetPersistCounters(size_t *persisted, size_t *loaded) {
     if (loaded) *loaded = intern_admitted_loaded;
 }
 
+/*-----------------------------------------------------------------------------
+ * Deferred, coalesced release (O8 / S5).
+ *
+ * Bio lazy-free threads never touch refcounts or the index. Between
+ * internDeferBegin() and internDeferPublish() a thread records each release into
+ * a thread-local pointer-keyed coalescing map; publish turns the map into one
+ * message pushed onto a lock-free MPSC stack; main drains and applies.
+ *----------------------------------------------------------------------------*/
+
+/* Main-thread id, captured at initServer, for the debug-build guard. */
+static pthread_t intern_main_thread;
+static int intern_main_thread_set = 0;
+
+void internSetMainThread(void) {
+    intern_main_thread = pthread_self();
+    intern_main_thread_set = 1;
+}
+
+/* True on the main thread (or before capture, e.g. very early init). */
+static inline int internOnMainThread(void) {
+    return !intern_main_thread_set || pthread_equal(pthread_self(), intern_main_thread);
+}
+
+/* One coalescing-map entry: a slot and the number of pending decrements, plus
+ * the kind so the drain calls the right release logic. kind 0 = value, 1 = field. */
+typedef struct internDeferEntry {
+    internSlot *slot; /* NULL == empty bucket */
+    uint32_t count;
+    uint8_t kind;
+} internDeferEntry;
+
+/* Thread-local coalescing map: open addressing, linear probing, pointer-keyed,
+ * doubles at 70% load, starts at 64 buckets. */
+typedef struct internDeferMap {
+    internDeferEntry *tab;
+    size_t cap;   /* power of two, number of buckets */
+    size_t used;  /* occupied buckets */
+} internDeferMap;
+
+static __thread int intern_defer_active = 0;
+static __thread internDeferMap intern_defer_map;
+
+#define INTERN_DEFER_INIT_CAP 64u
+
+/* The published message: one per bio job. */
+typedef struct internDeferMsg {
+    struct internDeferMsg *_Atomic next; /* MPSC stack link */
+    size_t n;
+    internDeferEntry entries[]; /* flexible array */
+} internDeferMsg;
+
+/* MPSC stack head: producers = bio threads, consumer = main. */
+static internDeferMsg *_Atomic intern_defer_head = NULL;
+
+/* Counters. msgs/releases are main-thread-only (written in drain). pending is
+ * atomic (incremented by producers, decremented by main). */
+static size_t intern_deferred_msgs = 0;
+static size_t intern_deferred_releases = 0;
+static _Atomic size_t intern_deferred_pending = 0;
+
+static inline size_t internDeferHash(const internSlot *slot) {
+    /* Pointer-value hash (Fibonacci mix of the pointer bits). */
+    uintptr_t x = (uintptr_t)slot;
+    x ^= x >> 33;
+    x *= (uintptr_t)0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    return (size_t)x;
+}
+
+static void internDeferMapAlloc(internDeferMap *m, size_t cap) {
+    m->tab = zcalloc(cap * sizeof(internDeferEntry));
+    m->cap = cap;
+    m->used = 0;
+}
+
+/* Insert-or-increment slot in the map. Assumes there is room (grown by caller). */
+static void internDeferMapBump(internDeferMap *m, internSlot *slot, uint8_t kind, uint32_t by) {
+    size_t mask = m->cap - 1;
+    size_t i = internDeferHash(slot) & mask;
+    while (m->tab[i].slot != NULL) {
+        if (m->tab[i].slot == slot) {
+            m->tab[i].count += by;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+    m->tab[i].slot = slot;
+    m->tab[i].count = by;
+    m->tab[i].kind = kind;
+    m->used++;
+}
+
+static void internDeferMapGrow(internDeferMap *m) {
+    size_t newcap = m->cap << 1;
+    internDeferMap nm;
+    internDeferMapAlloc(&nm, newcap);
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->tab[i].slot != NULL)
+            internDeferMapBump(&nm, m->tab[i].slot, m->tab[i].kind, m->tab[i].count);
+    }
+    zfree(m->tab);
+    *m = nm;
+}
+
+/* Record one deferred release. Called from internReleaseImpl on the deferring
+ * thread; never reads slot fields other than the pointer identity. */
+static void internDeferRecord(internSlot *slot, uint8_t kind) {
+    internDeferMap *m = &intern_defer_map;
+    if (m->tab == NULL) internDeferMapAlloc(m, INTERN_DEFER_INIT_CAP);
+    /* Grow before insert so a new key always has room (70% load factor). */
+    if ((m->used + 1) * 10 >= m->cap * 7) internDeferMapGrow(m);
+    internDeferMapBump(m, slot, kind, 1);
+}
+
+void internDeferBegin(void) {
+    /* A stray second begin without publish is a no-op: keep accumulating into
+     * the same map. */
+    intern_defer_active = 1;
+}
+
+void internDeferPublish(void) {
+    intern_defer_active = 0;
+    internDeferMap *m = &intern_defer_map;
+    if (m->tab == NULL || m->used == 0) {
+        /* Nothing recorded: free the map (if any) and publish nothing. */
+        if (m->tab != NULL) {
+            zfree(m->tab);
+            m->tab = NULL;
+            m->cap = 0;
+            m->used = 0;
+        }
+        return;
+    }
+
+    size_t n = m->used;
+    internDeferMsg *msg = zmalloc(sizeof(internDeferMsg) + n * sizeof(internDeferEntry));
+    msg->n = n;
+    size_t j = 0;
+    for (size_t i = 0; i < m->cap; i++) {
+        if (m->tab[i].slot != NULL) {
+            msg->entries[j].slot = m->tab[i].slot;
+            msg->entries[j].count = m->tab[i].count;
+            msg->entries[j].kind = m->tab[i].kind;
+            j++;
+        }
+    }
+    serverAssert(j == n);
+
+    /* Reset the thread-local map for the next job. */
+    zfree(m->tab);
+    m->tab = NULL;
+    m->cap = 0;
+    m->used = 0;
+
+    /* Push onto the MPSC stack: load head, store as our next, CAS head to us.
+     * Release semantics so main's acquire-exchange sees the fully-built msg. */
+    internDeferMsg *old = atomic_load_explicit(&intern_defer_head, memory_order_relaxed);
+    do {
+        atomic_store_explicit(&msg->next, old, memory_order_relaxed);
+    } while (!atomic_compare_exchange_weak_explicit(&intern_defer_head, &old, msg,
+                                                    memory_order_release, memory_order_relaxed));
+    atomic_fetch_add_explicit(&intern_deferred_pending, 1, memory_order_relaxed);
+}
+
 static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field) {
+    /* Off-main deferral path: record the decrement and return before touching
+     * refcount / admitted / the index. */
+    if (intern_defer_active) {
+        internDeferRecord(slot, is_field ? 1 : 0);
+        return;
+    }
+
+    /* Immediate path: main thread only (debug-build guard). */
+    serverAssert(internOnMainThread());
     serverAssert(slot->refcount > 0);
     if (--slot->refcount > 0) return;
 
@@ -320,6 +495,39 @@ static void internReleaseImpl(hashtable *index, internSlot *slot, bool is_field)
     serverAssert(hashtableDelete(index, slot));
     (void)is_field;
     zfree(slot); /* the sds is always inside the slot allocation */
+}
+
+size_t internDrainDeferred(void) {
+    serverAssert(internOnMainThread());
+    /* Pop the whole stack with acquire so we see each message fully built. */
+    internDeferMsg *msg = atomic_exchange_explicit(&intern_defer_head, NULL, memory_order_acquire);
+    size_t applied = 0;
+    while (msg != NULL) {
+        internDeferMsg *next = atomic_load_explicit(&msg->next, memory_order_relaxed);
+        for (size_t i = 0; i < msg->n; i++) {
+            internSlot *slot = msg->entries[i].slot;
+            uint32_t count = msg->entries[i].count;
+            hashtable *index = msg->entries[i].kind == 1 ? intern_index_field : intern_index_value;
+            /* Apply all but one decrement as plain subtraction, then run the
+             * at-zero reclamation exactly once via the normal release path. */
+            serverAssert(slot->refcount >= count);
+            slot->refcount -= (count - 1);
+            internReleaseImpl(index, slot, msg->entries[i].kind == 1);
+            applied += count;
+        }
+        intern_deferred_msgs++;
+        atomic_fetch_sub_explicit(&intern_deferred_pending, 1, memory_order_relaxed);
+        zfree(msg);
+        msg = next;
+    }
+    intern_deferred_releases += applied;
+    return applied;
+}
+
+void internGetDeferredCounters(size_t *msgs, size_t *releases, size_t *pending) {
+    if (msgs) *msgs = intern_deferred_msgs;
+    if (releases) *releases = intern_deferred_releases;
+    if (pending) *pending = atomic_load_explicit(&intern_deferred_pending, memory_order_relaxed);
 }
 
 void internRetain(internSlot *slot) {

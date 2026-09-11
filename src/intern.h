@@ -158,4 +158,42 @@ uint32_t internSlotRefcount(const internSlot *slot);
 /* Estimated bytes saved by all interning (headline INFO field). */
 size_t internBytesSaved(void);
 
+/*-----------------------------------------------------------------------------
+ * Deferred, coalesced release for off-main entry destruction (O8 / S5).
+ *
+ * The bio lazy-free thread destroys hash entries that hold interned refs, but
+ * refcounts and the dedup index are main-thread-only. Instead of touching them,
+ * a bio thread runs its job between internDeferBegin() and internDeferPublish():
+ * every internRelease[Field] on that thread is recorded (slot -> pending count)
+ * into a thread-local coalescing map rather than applied. At publish, the map
+ * becomes ONE message pushed onto a lock-free MPSC stack. Main pops the whole
+ * stack in internDrainDeferred() (beforeSleep + serverCron backstop) and applies
+ * the counts through the normal release path -- plain integer arithmetic, still
+ * only ever written on main. See valkey-intern-o8-lazyfree-design.md.
+ *----------------------------------------------------------------------------*/
+
+/* Record the main-thread id so the debug-build guard can assert that the
+ * immediate release path and the drain run on main. Called from initServer. */
+void internSetMainThread(void);
+
+/* Open thread-local deferral mode: subsequent internRelease[Field] calls on this
+ * thread record into a coalescing map instead of applying. Nestable begins are
+ * not expected (one per bio job); a second begin without publish is a no-op. */
+void internDeferBegin(void);
+
+/* Close deferral mode: build one message from the coalescing map and push it
+ * onto the MPSC stack for main to drain. If nothing was recorded, frees the map
+ * and publishes nothing. */
+void internDeferPublish(void);
+
+/* MAIN THREAD ONLY. Pop the entire pending-message stack and apply every
+ * recorded decrement through the normal at-zero reclamation (respecting the
+ * admitted flag). Returns the number of individual releases applied. */
+size_t internDrainDeferred(void);
+
+/* Deferred-release counters (main-thread readers). msgs = messages drained,
+ * releases = individual references applied at drain, pending = messages pushed
+ * but not yet drained (atomic). */
+void internGetDeferredCounters(size_t *msgs, size_t *releases, size_t *pending);
+
 #endif

@@ -1783,6 +1783,10 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     ValkeyModuleCronLoopV1 ei = {VALKEYMODULE_CRON_LOOP_VERSION, server.hz};
     moduleFireServerEvent(VALKEYMODULE_EVENT_CRON_LOOP, 0, &ei);
 
+    /* O8/S5: backstop drain of deferred intern-slot releases (beforeSleep is the
+     * primary site; this ensures progress even if the loop is quiet). */
+    if (server.string_interning != INTERN_MODE_NO) internDrainDeferred();
+
     server.cronloops++;
 
     server.el_cron_duration += elapsedUs(cron_start);
@@ -1886,6 +1890,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+
+    /* O8/S5: apply intern-slot releases deferred by the bio lazy-free thread(s).
+     * Drained here (and in serverCron as a backstop) on the main thread only. */
+    if (server.string_interning != INTERN_MODE_NO) internDrainDeferred();
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -2982,6 +2990,7 @@ void initServer(void) {
     server.slot_migration_pipe_read = -1;
     server.slot_migration_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
+    internSetMainThread(); /* O8/S5: capture main thread for the deferred-release guard */
     server.current_client = NULL;
     server.errors = raxNew();
     server.execution_nesting = 0;
@@ -6371,6 +6380,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         internGetProbeCounters(&intern_probe_value_hits, &intern_probe_value_misses, &intern_probe_field_hits, &intern_probe_field_misses);
         size_t intern_admitted_persisted, intern_admitted_loaded;
         internGetPersistCounters(&intern_admitted_persisted, &intern_admitted_loaded);
+        size_t intern_deferred_msgs, intern_deferred_releases, intern_deferred_pending;
+        internGetDeferredCounters(&intern_deferred_msgs, &intern_deferred_releases, &intern_deferred_pending);
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
@@ -6449,7 +6460,10 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "intern_admitted_loaded:%zu\r\n", intern_admitted_loaded,
                 "intern_probe_hits:%zu\r\n", intern_probe_value_hits + intern_probe_field_hits,
                 "intern_probe_misses:%zu\r\n", intern_probe_value_misses + intern_probe_field_misses,
-                "intern_index_mem:%zu\r\n", intern_stats.index_mem));
+                "intern_index_mem:%zu\r\n", intern_stats.index_mem,
+                "intern_deferred_msgs:%zu\r\n", intern_deferred_msgs,
+                "intern_deferred_releases:%zu\r\n", intern_deferred_releases,
+                "intern_deferred_pending:%zu\r\n", intern_deferred_pending));
         freeMemoryOverheadData(mh);
     }
 
