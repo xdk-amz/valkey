@@ -17,6 +17,44 @@
 
 #define INTERN_SSO_MAX 23 /* longest VALUE string stored inline in the slot */
 
+/*-----------------------------------------------------------------------------
+ * R4 -- THREAD CONTRACT (who may call what from which thread).
+ *
+ * The dedup indexes are plain hashtables and every slot->refcount / slot->admitted
+ * / idle stamp is a plain scalar with NO internal synchronization. The subsystem
+ * is therefore MAIN-THREAD ONLY for every operation that reads or writes that
+ * shared state, with exactly one sanctioned exception (deferred release below).
+ *
+ * MAIN THREAD ONLY (asserted in debug builds via serverAssert(internOnMainThread())):
+ *   - internAcquire[Field]       (index insert / refcount bump)
+ *   - internProbe{Value,Field}   (refcount bump on hit; counter on miss)
+ *   - internAdmit{Value,Field}   (admitted-flag / idle-stamp write, insert)
+ *   - internRetain               (refcount bump)
+ *   - internRelease[Field] IMMEDIATE path (refcount decrement, index delete, free)
+ *   - internEvictAdmitted / internEvictIdleFull / internEvictIdleBatch (delete + free)
+ *   - internDrainDeferred        (applies deferred decrements, index delete, free)
+ *   - internGetStats / internForEachAdmitted / internAdmittedIdleMaxTicks
+ *                                (iterate the plain index -- unsafe against a
+ *                                 concurrent main-thread mutation)
+ *
+ * OFF-MAIN, THE ONLY SANCTIONED EXCEPTION -- deferred release (O8 / S5):
+ *   A bio lazy-free thread that destroys an interned entry runs its job between
+ *   internDeferBegin() and internDeferPublish(). In that window internRelease[Field]
+ *   RECORDS the decrement into a thread-local coalescing map (reading only the
+ *   slot POINTER, never a slot field) instead of applying it. At publish the map
+ *   becomes one message on a lock-free MPSC stack; main pops it in
+ *   internDrainDeferred(). No refcount, index or admitted state is ever touched
+ *   off main. See valkey-intern-o8-lazyfree-design.md and HLD §20.
+ *
+ * IO-THREADS (as of Valkey unstable): io threads read/parse input, prefetch,
+ * write replies, and free client argv robjs off-main -- they NEVER execute
+ * commands, so no entryCreate/entryUpdate/entryFree and hence no intern call runs
+ * on an io thread. Command execution (all intern touches) runs on main from
+ * beforeSleep -> processIOThreadsResponses -> processClientsCommandsBatch. If a
+ * future Valkey moves execution onto io threads, the asserts above fail loudly
+ * in debug builds -- see HLD §20 for the design that would be required.
+ *----------------------------------------------------------------------------*/
+
 /* When a slot holds a hash FIELD name (S2 / Type-5 entry), inline_[] is laid out
  * as a real sdshdr8 {len, alloc, flags, bytes, NUL} so slot->buf points at a
  * genuine sds and every hashtable-type callback (sdslen, hash, compare) works

@@ -31,6 +31,13 @@
  * sdshdr8 buffer of (len + header + NUL). */
 #define INTERN_PER_USE_OVERHEAD(len) ((len) + sdsHdrSize(SDS_TYPE_8) + 1)
 
+/* R4 thread contract: true on the main thread (or before the main-thread id has
+ * been captured at initServer). Defined near the deferred-release section; the
+ * forward declaration here lets every index-mutating and index-reading entry
+ * point assert it. See the "R4 -- io-threads" contract block in intern.h and
+ * HLD §20 for who may call what from which thread. */
+static inline int internOnMainThread(void);
+
 static uint64_t internSlotHash(const void *key) {
     const internSlot *slot = key;
     return slot->hash;
@@ -455,6 +462,11 @@ sds internSlotSds(const internSlot *slot) {
 /* Common acquire: probe `index`, on hit bump refcount, on miss build a slot with
  * `builder` and insert. `is_field` selects the storage layout. */
 static internSlot *internAcquireImpl(hashtable *index, const char *buf, size_t len, bool is_field) {
+    /* R4: the dedup index is a plain hashtable and the refcount is a plain
+     * uint32 -- every acquire (hit-bump or miss-insert) mutates one or both and
+     * MUST run on the main thread. A future move of command execution off main
+     * fails loudly here in debug builds instead of racing silently. */
+    serverAssert(internOnMainThread());
     internSlot probe;
     probe.buf = buf;
     probe.len = len;
@@ -551,6 +563,10 @@ static internSlot *internProbeImpl(hashtable *index,
                                    size_t len,
                                    size_t *hits,
                                    size_t *misses) {
+    /* R4: a probe HIT bumps the refcount and the probe counters -- both plain
+     * scalars -- so the whole probe path is main-thread only, even though a miss
+     * mutates nothing but the counter. */
+    serverAssert(internOnMainThread());
     if (index == NULL || !internLenEligible(len)) {
         (*misses)++;
         return NULL;
@@ -596,6 +612,9 @@ static inline uint32_t internNowTick(void) {
  * mark the existing slot admitted without touching its refcount. Returns NULL
  * (nothing admitted) when a MISS would breach an admission cap (P1-2). */
 static internSlot *internAdmitImpl(hashtable *index, const char *buf, size_t len, bool is_field) {
+    /* R4: admission mutates the admitted flag / idle stamp on a hit and inserts
+     * a slot on a miss -- main thread only. */
+    serverAssert(internOnMainThread());
     internSlot probe;
     probe.buf = buf;
     probe.len = len;
@@ -654,6 +673,8 @@ static void internEvictAdmittedIndex(hashtable *index) {
 }
 
 void internEvictAdmitted(void) {
+    /* R4: eviction deletes slots from the index and frees them -- main only. */
+    serverAssert(internOnMainThread());
     internEvictAdmittedIndex(intern_index_value);
     internEvictAdmittedIndex(intern_index_field);
 }
@@ -676,6 +697,7 @@ static inline uint32_t internSlotIdleAge(const internSlot *slot, uint32_t now_ti
 }
 
 uint32_t internAdmittedIdleMaxTicks(uint32_t now_tick) {
+    serverAssert(internOnMainThread()); /* R4: iterates the plain index */
     uint32_t maxage = 0;
     hashtable *idxs[2] = {intern_index_value, intern_index_field};
     for (int x = 0; x < 2; x++) {
@@ -728,6 +750,7 @@ static size_t internEvictIdleFullIndex(hashtable *index, uint32_t now_tick, uint
 }
 
 size_t internEvictIdleFull(uint32_t now_tick, uint32_t idle_ticks) {
+    serverAssert(internOnMainThread()); /* R4: deletes + frees slots */
     size_t evicted = 0;
     evicted += internEvictIdleFullIndex(intern_index_value, now_tick, idle_ticks);
     evicted += internEvictIdleFullIndex(intern_index_field, now_tick, idle_ticks);
@@ -811,6 +834,7 @@ static size_t internEvictIdleBatchIndex(hashtable *index,
 }
 
 size_t internEvictIdleBatch(uint32_t now_tick, uint32_t idle_ticks, size_t batch, int pressure) {
+    serverAssert(internOnMainThread()); /* R4: serverCron-driven; deletes + frees slots */
     /* Split the per-tick budget across the two indexes. */
     size_t half = batch / 2;
     size_t evicted = 0;
@@ -847,6 +871,7 @@ static size_t internForEachAdmittedIndex(hashtable *index, uint8_t kind, internA
 }
 
 size_t internForEachAdmitted(internAdmittedCb cb, void *privdata) {
+    serverAssert(internOnMainThread()); /* R4: iterates the plain index */
     size_t n = 0;
     n += internForEachAdmittedIndex(intern_index_value, 0, cb, privdata);
     n += internForEachAdmittedIndex(intern_index_field, 1, cb, privdata);
@@ -1098,6 +1123,7 @@ void internGetDeferredCounters(size_t *msgs, size_t *releases, size_t *pending) 
 }
 
 void internRetain(internSlot *slot) {
+    serverAssert(internOnMainThread()); /* R4: mutates refcount */
     serverAssert(slot->refcount > 0);
     slot->refcount++;
 }
@@ -1157,6 +1183,7 @@ static void internAccumulate(hashtable *index, bool is_field, internStats *stats
 }
 
 void internGetStats(internStats *stats) {
+    serverAssert(internOnMainThread()); /* R4: iterates both plain indexes */
     memset(stats, 0, sizeof(*stats));
     internAccumulate(intern_index_value, false, stats);
     internAccumulate(intern_index_field, true, stats);
