@@ -2923,6 +2923,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 return NULL;
             }
 
+            s->total_lp_bytes += lp_size;
+
             /* Insert the key in the radix tree. */
             int retval = raxTryInsert(s->rax, (unsigned char *)nodekey, sizeof(streamID), lp, NULL);
             sdsfree(nodekey);

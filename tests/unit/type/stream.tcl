@@ -47,6 +47,22 @@ proc streamSimulateXRANGE {items start end} {
     return $res
 }
 
+proc streamFill {key count {client r}} {
+    set v [string repeat x 100]
+    for {set i 1} {$i <= $count} {incr i} {
+        $client XADD $key $i-0 f $v
+    }
+}
+
+proc streamRecountBytes {key {client r}} {
+    lindex [$client debug stream-bytes $key] 1
+}
+
+proc streamAssertBytes {key {client r}} {
+    set res [$client debug stream-bytes $key]
+    assert_equal [lindex $res 0] [lindex $res 1]
+}
+
 set content {} ;# Will be populated with Tcl side copy of the stream content.
 
 start_server {
@@ -2011,5 +2027,131 @@ start_server {tags {"stream"}} {
     test {XINFO HELP should not have unexpected options} {
         catch {r XINFO help xxx} e
         assert_match "*wrong number of arguments for 'xinfo|help' command" $e
+    }
+}
+
+start_server {tags {"stream"} overrides {stream-node-max-entries 1}} {
+    test {XTRIM MAXBYTES is limited unless LIMIT 0 is given} {
+        streamFill mystream 102
+        assert_equal 100 [r XTRIM mystream MAXBYTES 0]
+        assert_equal 2 [r XTRIM mystream MAXBYTES 0 LIMIT 0]
+    }
+
+    test {MAXBYTES syntax errors} {
+        assert_error "*not an integer*" {r XTRIM mystream MAXBYTES ~ 100}
+        assert_error "*not compatible*" {r XTRIM mystream MAXLEN 5 MAXBYTES 100}
+        assert_error "*>= 0*" {r XTRIM mystream MAXBYTES -1}
+    }
+}
+
+start_server {tags {"stream needs:debug"}} {
+    test {XTRIM with MAXBYTES option basic test} {
+        r config set stream-node-max-entries 2
+        streamFill mystream 20
+        set bytes [streamRecountBytes mystream]
+        set target [expr {$bytes / 2}]
+        assert_equal 10 [r XTRIM mystream MAXBYTES $target]
+        assert_equal 10 [r XLEN mystream]
+        assert_equal 5 [dict get [r XINFO STREAM mystream] radix-tree-keys]
+        assert_equal $target [streamRecountBytes mystream]
+        assert_equal 0 [r XTRIM mystream MAXBYTES [expr {$bytes * 2}]]
+        streamAssertBytes mystream
+    }
+
+    test {XADD with MAXBYTES option} {
+        r del mystream
+        r config set stream-node-max-entries 2
+        streamFill mystream 20
+        set target [expr {[streamRecountBytes mystream] / 2}]
+        r XADD mystream MAXBYTES $target 21-0 f v
+        assert_equal 11 [r XLEN mystream]
+        assert_equal 6 [dict get [r XINFO STREAM mystream] radix-tree-keys]
+        streamAssertBytes mystream
+        r XADD mystream MAXBYTES 0 22-0 f v
+        assert_equal 0 [r XLEN mystream]
+    }
+
+    test {total_lp_bytes is consistent when XADD creates, appends to and splits nodes} {
+        r del mystream
+        r config set stream-node-max-entries 3
+        for {set j 0} {$j < 10} {incr j} {
+            r XADD mystream * item $j value v-$j
+            streamAssertBytes mystream
+        }
+        assert_equal 4 [dict get [r xinfo stream mystream] radix-tree-keys]
+    }
+
+    test {total_lp_bytes is consistent across COPY and DEBUG RELOAD} {
+        r config set stream-node-max-entries 3
+        for {set j 0} {$j < 10} {incr j} {
+            r XADD "{mystream}src" * item $j value v-$j
+        }
+        assert_equal 1 [r COPY "{mystream}src" "{mystream}copy"]
+        streamAssertBytes "{mystream}copy"
+        r debug reload
+        streamAssertBytes "{mystream}src"
+    }
+
+    test {total_lp_bytes is consistent across MAXBYTES trimming and counter encoding widths} {
+        r del mystream
+        r config set stream-node-max-entries 2
+        streamFill mystream 40
+        set total [streamRecountBytes mystream]
+        assert_equal 20 [r XTRIM mystream MAXBYTES [expr {$total / 2}]]
+        streamAssertBytes mystream
+
+        # The node header counters widen past 127 entries.
+        r del mystream
+        r config set stream-node-max-entries 0
+        for {set n 1} {$n <= 130} {incr n} {
+            r XADD mystream $n-0 f v
+        }
+        streamAssertBytes mystream
+        r XDEL mystream 1-0 2-0 3-0
+        streamAssertBytes mystream
+        r XTRIM mystream MAXLEN 2
+        streamAssertBytes mystream
+        r XDEL mystream 129-0 130-0
+        streamAssertBytes mystream
+        r XADD mystream 131-0 f v
+        r XTRIM mystream MAXLEN 0
+        streamAssertBytes mystream
+    }
+}
+
+start_server {tags {"stream needs:repl"} overrides {stream-node-max-entries 10}} {
+    test {XADD with MAXBYTES propagates as MAXLEN} {
+        streamFill mystream 300
+        set repl [attach_to_replication_stream]
+        set eid1 [r XADD mystream MAXBYTES 20000 * f v]
+        set len1 [r XLEN mystream]
+        set eid2 [r XADD mystream MAXBYTES 10000 LIMIT 20 * f v]
+        set len2 [r XLEN mystream]
+        set eid3 [r XADD mystream MAXBYTES 1000000 * f v]
+        set len3 [r XLEN mystream]
+        assert {$len1 < 301}
+        assert_equal [expr {$len1 - 19}] $len2
+        assert_equal [expr {$len2 + 1}] $len3
+        assert_replication_stream $repl [list \
+            {select *} \
+            "xadd mystream MAXLEN $len1 $eid1 f v" \
+            "xadd mystream MAXLEN $len2 $eid2 f v" \
+            "xadd mystream MAXLEN $len3 $eid3 f v"]
+        close_replication_stream $repl
+    }
+
+    test {XTRIM with MAXBYTES propagates as MAXLEN} {
+        r del mystream
+        streamFill mystream 300
+        set repl [attach_to_replication_stream]
+        r XTRIM mystream MAXBYTES 20000
+        set len1 [r XLEN mystream]
+        assert_equal 20 [r XTRIM mystream MAXBYTES 10000 LIMIT 20]
+        assert {$len1 < 300}
+        assert_replication_stream $repl [list \
+            {select *} \
+            "xtrim mystream MAXLEN $len1" \
+            "xtrim mystream MAXLEN [expr {$len1 - 20}]"]
+        close_replication_stream $repl
     }
 }
