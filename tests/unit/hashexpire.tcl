@@ -5214,3 +5214,113 @@ start_server {tags {"hashexpire external:skip"}} {
 
     $r2 close
 }
+
+# HDEL, HGETDEL, HPERSIST and HEXPIRE must leave a synced replica in the same
+# client-visible state as the primary when they name a logically expired field
+# that active expiry has not yet reclaimed.
+
+proc setup_expired_field_hash {primary replica} {
+    $primary flushall
+    $primary hsetex h PX 100000 FIELDS 1 live v
+    $primary hsetex h PX 1 FIELDS 1 expired v
+    after 20
+    wait_for_ofs_sync $primary $replica
+    assert_equal 0 [$primary hexists h expired]
+    assert_equal 2 [$primary hlen h]
+}
+
+# HPEXPIRETIME is an absolute deadline, so primary and replica compare exactly.
+proc assert_same_hash_state {primary replica} {
+    assert_equal [$primary hlen h] [$replica hlen h] "HLEN h"
+    set keys [lsort [$primary hkeys h]]
+    assert_equal $keys [lsort [$replica hkeys h]] "HKEYS h"
+    if {[llength $keys]} {
+        assert_equal [$primary hmget h {*}$keys] [$replica hmget h {*}$keys] "HMGET h"
+        set n [llength $keys]
+        assert_equal [$primary hpexpiretime h FIELDS $n {*}$keys] [$replica hpexpiretime h FIELDS $n {*}$keys] "HPEXPIRETIME h"
+    }
+}
+
+start_server {tags {"hashexpire needs:debug external:skip"}} {
+    start_server {tags {needs:repl external:skip}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        $replica replicaof $primary_host $primary_port
+        wait_for_sync $replica
+        $primary debug set-active-expire 0
+
+        foreach encoding {listpack hashtable} {
+            set max_entries [expr {$encoding eq "hashtable" ? 0 : 128}]
+            $primary config set hash-max-listpack-entries $max_entries
+
+            test "HDEL of an expired field leaves primary and replica in the same state - $encoding" {
+                setup_expired_field_hash $primary $replica
+                assert_equal $encoding [$primary object encoding h]
+
+                assert_equal 1 [$primary hdel h expired live]
+
+                wait_for_ofs_sync $primary $replica
+                assert_same_hash_state $primary $replica
+            }
+
+            test "HGETDEL of an expired field leaves primary and replica in the same state - $encoding" {
+                setup_expired_field_hash $primary $replica
+
+                assert_equal {{} v} [$primary hgetdel h FIELDS 2 expired live]
+
+                wait_for_ofs_sync $primary $replica
+                assert_same_hash_state $primary $replica
+            }
+
+            test "HPERSIST of an expired field leaves primary and replica in the same state - $encoding" {
+                setup_expired_field_hash $primary $replica
+
+                assert_equal {-2 1} [$primary hpersist h FIELDS 2 expired live]
+
+                wait_for_ofs_sync $primary $replica
+                assert_same_hash_state $primary $replica
+            }
+
+            test "HPEXPIRE XX of an expired field leaves primary and replica in the same state - $encoding" {
+                setup_expired_field_hash $primary $replica
+                $primary hset h persistent v
+
+                assert_equal {-2 1 0} [$primary hpexpire h 600000 XX FIELDS 3 expired live persistent]
+
+                wait_for_ofs_sync $primary $replica
+                assert_same_hash_state $primary $replica
+            }
+
+            test "HPEXPIREAT of an expired field leaves primary and replica in the same state - $encoding" {
+                setup_expired_field_hash $primary $replica
+                set deadline [expr {[clock milliseconds] + 600000}]
+
+                assert_equal {-2 1} [$primary hpexpireat h $deadline FIELDS 2 expired live]
+
+                wait_for_ofs_sync $primary $replica
+                assert_same_hash_state $primary $replica
+            }
+
+            test "HDEL, HGETDEL, HPERSIST and HPEXPIREAT propagate only the fields they changed - $encoding" {
+                set deadline [expr {[clock milliseconds] + 600000}]
+                foreach {cmd expected} [list \
+                    "hdel h expired live" "hdel h live" \
+                    "hdel h live expired" "hdel h live" \
+                    "hgetdel h FIELDS 2 live expired" "hdel h live" \
+                    "hpersist h FIELDS 2 live expired" "hpersist h FIELDS 1 live" \
+                    "hpexpireat h $deadline XX FIELDS 3 live expired persistent" "hpexpireat h $deadline XX FIELDS 1 live" \
+                    "hpexpireat h $deadline XX FIELDS 1 live" "hpexpireat h $deadline XX FIELDS 1 live"] {
+                    setup_expired_field_hash $primary $replica
+                    $primary hset h persistent v
+                    set repl [attach_to_replication_stream_on_connection -1]
+                    $primary {*}$cmd
+                    assert_replication_stream $repl [list {select *} $expected]
+                    close_replication_stream $repl
+                }
+            }
+        }
+    }
+}
