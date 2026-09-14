@@ -5343,3 +5343,35 @@ start_server {tags {"hashexpire external:skip"}} {
         } {} {needs:debug}
     }
 }
+
+# Loading and the replication stream ignore field expiry, so HDEL, HGETDEL,
+# HPERSIST and HEXPIRE must not propagate an expired field that they treat as
+# nonexistent but active expiry has not yet reclaimed.
+start_server {tags {"hashexpire needs:debug external:skip"}} {
+    r debug set-active-expire 0
+    set exat [get_long_expire_value HEXPIREAT]
+
+    foreach {encoding max_entries} {listpack 128 hashtable 0} {
+        r config set hash-max-listpack-entries $max_entries
+
+        foreach {name cmd expected} [list \
+            HDEL "hdel myhash expired live" "hdel myhash live" \
+            HGETDEL "hgetdel myhash FIELDS 2 expired live" "hdel myhash live" \
+            HPERSIST "hpersist myhash FIELDS 2 expired live" "hpersist myhash FIELDS 1 live" \
+            HEXPIREAT "hexpireat myhash $exat XX GT FIELDS 2 expired live" "hpexpireat myhash [expr {$exat * 1000}] XX GT FIELDS 1 live"] {
+            test "$name propagates only the fields it changed - $encoding" {
+                r flushall
+                r hsetex myhash PX 100000 FIELDS 1 live v
+                r hsetex myhash PX 1 FIELDS 1 expired v
+                after 20
+                assert_equal 0 [r hexists myhash expired]
+                assert_equal 2 [r hlen myhash]
+                assert_encoding $encoding myhash
+                set repl [attach_to_replication_stream]
+                r {*}$cmd
+                assert_replication_stream $repl [list {select *} $expected]
+                close_replication_stream $repl
+            }
+        }
+    }
+}
