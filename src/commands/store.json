@@ -1,0 +1,75 @@
+{
+    "STORE": {
+        "summary": "Primes the connection so the reply of the next command is stored under a key and replayed on an identical retry.",
+        "complexity": "O(1)",
+        "group": "generic",
+        "since": "9.2.0",
+        "arity": 4,
+        "function": "storeCommand",
+        "command_flags": [
+            "WRITE",
+            "DENYOOM",
+            "FAST"
+        ],
+        "acl_categories": [
+            "FAST",
+            "WRITE"
+        ],
+        "key_specs": [
+            {
+                "flags": [
+                    "RW",
+                    "ACCESS",
+                    "UPDATE"
+                ],
+                "begin_search": {
+                    "index": {
+                        "pos": 1
+                    }
+                },
+                "find_keys": {
+                    "range": {
+                        "lastkey": 0,
+                        "step": 1,
+                        "limit": 0
+                    }
+                }
+            }
+        ],
+        "reply_schema": {
+            "oneOf": [
+                {
+                    "const": "OK",
+                    "description": "No stored reply exists for the key; the next command's reply will be captured."
+                },
+                {
+                    "const": "REPLAY",
+                    "description": "A stored reply exists for the key; the next identical command will be answered from it."
+                }
+            ]
+        },
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "expiration",
+                "type": "oneof",
+                "arguments": [
+                    {
+                        "name": "seconds",
+                        "type": "integer",
+                        "token": "EX"
+                    },
+                    {
+                        "name": "milliseconds",
+                        "type": "integer",
+                        "token": "PX"
+                    }
+                ]
+            }
+        ]
+    }
+}

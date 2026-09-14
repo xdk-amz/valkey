@@ -289,6 +289,12 @@ int blockedClientMayTimeout(client *c) {
  * send it a reply of some kind. After this function is called,
  * unblockClient() will be called with the same client as argument. */
 void replyToBlockedClientTimedOut(client *c) {
+    /* STORE idempotent-retry: capture the timeout (nil) reply if primed. */
+    int store_capturing = 0;
+    if (storeIsTargetArmed(c) && !storeCommandIsNotStorable(c)) {
+        storeCaptureBegin(c);
+        store_capturing = 1;
+    }
     if (c->bstate->btype == BLOCKED_LIST || c->bstate->btype == BLOCKED_ZSET || c->bstate->btype == BLOCKED_STREAM) {
         addReplyNullArray(c);
         updateStatsOnUnblock(c, 0, 0, 0);
@@ -309,6 +315,7 @@ void replyToBlockedClientTimedOut(client *c) {
     } else {
         serverPanic("Unknown btype in replyToBlockedClientTimedOut().");
     }
+    if (store_capturing) storeCaptureCommit(c);
 }
 
 /* If one or more clients are blocked on the SHUTDOWN command, this function

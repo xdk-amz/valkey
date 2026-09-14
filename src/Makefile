@@ -563,6 +563,7 @@ ENGINE_SERVER_OBJ = \
     setproctitle.o \
     sha1.o \
     sha256.o \
+    store.o \
     siphash.o \
     socket.o \
     sort.o \

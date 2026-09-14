@@ -3626,6 +3626,8 @@ standardConfig static_configs[] = {
     createLongLongConfig("commandlog-reply-larger-than", NULL, MODIFIABLE_CONFIG, -1, LLONG_MAX, server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold, 1024 * 1024, MEMORY_CONFIG | SIGNED_MEMORY_CONFIG, NULL, NULL),
     createLongLongConfig("latency-monitor-threshold", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.latency_monitor_threshold, 0, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("proto-max-bulk-len", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.proto_max_bulk_len, 512ll * 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Bulk request max size */
+    /* STORE: max captured reply size; a larger reply stores a tombstone. */
+    createLongLongConfig("store-max-reply-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.store_max_reply_bytes, 1024ll * 1024, MEMORY_CONFIG, NULL, NULL),
     createLongLongConfig("stream-node-max-entries", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.stream_node_max_entries, 100, INTEGER_CONFIG, NULL, NULL),
     createLongLongConfig("repl-backlog-size", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.repl_backlog_size, 10 * 1024 * 1024, MEMORY_CONFIG, NULL, updateReplBacklogSize), /* Default: 10mb */
     createLongLongConfig("cluster-manual-failover-timeout", NULL, MODIFIABLE_CONFIG, 1, INT_MAX, server.cluster_mf_timeout, 5000, INTEGER_CONFIG, NULL, NULL),

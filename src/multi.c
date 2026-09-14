@@ -172,6 +172,7 @@ void discardCommand(client *c) {
         return;
     }
     discardTransaction(c);
+    storeClearTarget(c); /* A pending STORE target is dropped by DISCARD. */
     addReply(c, shared.ok);
 }
 

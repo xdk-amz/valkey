@@ -398,6 +398,10 @@ client *createClient(connection *conn) {
     c->throttle_node = NULL;
     c->throttle_start = 0;
     c->cob_trend = NULL;
+    c->store_target.key = NULL;
+    c->store_target.ttl_ms = 0;
+    c->store_target.armed = 0;
+    c->store_target.capture_now = 0;
     c->bstate = NULL;
     c->pubsub_data = NULL;
     c->module_data = NULL;
@@ -2427,6 +2431,7 @@ int freeClient(client *c) {
 
     /* Free data structures. */
     releaseReplyReferences(c);
+    storeClearTarget(c);
     listRelease(c->reply);
     c->reply = NULL;
     zfree_with_size(c->buf, c->buf_usable_size);

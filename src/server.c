@@ -4223,7 +4223,27 @@ void call(client *c, int flags) {
         }
     }
 
+    /* STORE idempotent-retry: begin capturing this command's reply if a target
+     * was primed for it. Clear the flag immediately so nested calls (e.g. the
+     * queued commands inside EXEC) do not each begin their own capture. */
+    int store_did_capture = 0;
+    if (c->store_target.capture_now) {
+        c->store_target.capture_now = 0;
+        storeCaptureBegin(c);
+        store_did_capture = 1;
+    }
+
     c->cmd->proc(c);
+
+    /* STORE idempotent-retry: capture or roll back within this execution unit
+     * so the marker SET propagates in the same unit as the command's effects. */
+    if (store_did_capture) {
+        if (c->flag.blocked) {
+            storeCaptureRollback(c);
+        } else {
+            storeCaptureCommit(c);
+        }
+    }
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -5015,12 +5035,35 @@ int processCommand(client *c) {
     /* Exec the command */
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != quitCommand &&
-        c->cmd->proc != resetCommand) {
+        c->cmd->proc != resetCommand && c->cmd->proc != storeCommand) {
         queueMultiCommand(c, cmd_flags);
         addReply(c, shared.queued);
+    } else if (c->flag.multi && c->cmd->proc == storeCommand) {
+        /* STORE inside MULTI does not queue: arm the transaction target and
+         * reply OK/REPLAY immediately. Invoke the proc directly rather than
+         * through call() so it does not participate in transaction propagation
+         * or stats; STORE has no data effect of its own. */
+        storeCommand(c);
     } else {
         int flags = CMD_CALL_FULL;
+
+        /* STORE idempotent-retry: if a reply is primed for this connection,
+         * either replay a stored reply (execute nothing) or arm capture so
+         * call() records the reply in the command's own execution unit (so the
+         * marker SET propagates in the same unit). */
+        if (storeIsTargetArmed(c)) {
+            if (storeHandleReplayBeforeCall(c)) {
+                /* Replayed or rejected: nothing to execute. */
+                return C_OK;
+            }
+            if (!storeCommandIsNotStorable(c) && c->cmd->proc != multiCommand) {
+                c->store_target.capture_now = 1;
+            }
+        }
+
         call(c, flags);
+        c->store_target.capture_now = 0;
+
         if (listLength(server.ready_keys) && !isInsideYieldingLongCommand()) handleClientsBlockedOnKeys();
     }
     return C_OK;

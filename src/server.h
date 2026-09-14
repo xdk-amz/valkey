@@ -1384,6 +1384,16 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+/* Pending STORE target set on a connection by the STORE command. When armed,
+ * the reply of the next executed command is captured under 'key' with 'ttl_ms'
+ * TTL, or replayed from an existing stored reply. See store.c. */
+typedef struct storeTarget {
+    robj *key;        /* Key the reply is stored/replayed under (owns a ref). */
+    long long ttl_ms; /* TTL in milliseconds, always > 0. */
+    int armed;        /* 1 if a target is pending consumption. */
+    int capture_now;  /* 1 to capture this command's reply inside call(). */
+} storeTarget;
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
@@ -1496,6 +1506,7 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    storeTarget store_target;          /* Pending STORE target for idempotent-retry reply capture. */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -2338,6 +2349,7 @@ struct valkeyServer {
     int maxmemory_samples;                      /* Precision of random sampling */
     int maxmemory_eviction_tenacity;            /* Aggressiveness of eviction processing */
     long long proto_max_bulk_len;               /* Protocol bulk length maximum size. */
+    long long store_max_reply_bytes;            /* Max captured reply size for STORE; larger -> tombstone. */
     int oom_score_adj_values[CONFIG_OOM_COUNT]; /* Linux oom_score_adj configuration */
     int oom_score_adj;                          /* If true, oom_score_adj is managed */
     int disable_thp;                            /* If true, disable THP by syscall */
@@ -4171,6 +4183,15 @@ void setexCommand(client *c);
 void psetexCommand(client *c);
 void delifeqCommand(client *c);
 void getCommand(client *c);
+void storeCommand(client *c);
+/* STORE (idempotent-retry reply capture) helpers. Defined in store.c. */
+void storeClearTarget(client *c);
+int storeIsTargetArmed(client *c);
+int storeHandleReplayBeforeCall(client *c); /* returns 1 if the call was replayed/rejected (skip execution) */
+void storeCaptureBegin(client *c);
+void storeCaptureCommit(client *c);
+void storeCaptureRollback(client *c);
+int storeCommandIsNotStorable(client *c);
 void getexCommand(client *c);
 void getdelCommand(client *c);
 void delCommand(client *c);
