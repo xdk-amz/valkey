@@ -42,6 +42,10 @@
 
 void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstkey, int op);
 
+static inline bool setTypeListpackIsValidAt(unsigned char *lp, unsigned char *p) {
+    return listpackObjectItemIsValid(setTypeListpackGetExpiry(lp, p));
+}
+
 /* Factory method to return a set that *can* hold "value". When the object has
  * an integer-encodable value, an intset will be returned. Otherwise, a listpack
  * or a regular hash table.
@@ -118,6 +122,20 @@ int setTypeAdd(robj *subject, sds value) {
     return setTypeAddAux(subject, value, sdslen(value), 0, 1);
 }
 
+/* True when the intset plus 'add_member' members of at most 'len' bytes and 'extra_bytes'
+ * of metadata fits the listpack limits; intset elements are budgeted at their widest. */
+bool setTypeIntsetFitsListpack(robj *setobj, bool add_member, size_t len, size_t extra_bytes) {
+    intset *is = objectGetVal(setobj);
+    size_t maxelelen = 0, totsize = 0;
+    unsigned long n = intsetLen(is);
+    if (n != 0) {
+        maxelelen = max(sdigits10(intsetMax(is)), sdigits10(intsetMin(is)));
+        totsize = max(lpEstimateBytesRepeatedInteger(intsetMax(is), n), lpEstimateBytesRepeatedInteger(intsetMin(is), n));
+    }
+    return n + add_member <= server.set_max_listpack_entries && len <= server.set_max_listpack_value &&
+           maxelelen <= server.set_max_listpack_value && lpSafeToAdd(NULL, totsize + len + extra_bytes);
+}
+
 /* Add member. This function is optimized for the different encodings. The
  * value can be provided as an sds string (indicated by passing str_is_sds =
  * 1), as string and length (str_is_sds = 0) or as an integer in which case str
@@ -125,6 +143,7 @@ int setTypeAdd(robj *subject, sds value) {
  *
  * Returns 1 if the value was added and 0 if it was already a member. */
 int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
+    debugServerAssert(!setTypeHasVolatileMembers(set));
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) {
@@ -188,22 +207,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 return 1;
             }
         } else {
-            /* Check if listpack encoding is safe not to cross any threshold. */
-            size_t maxelelen = 0, totsize = 0;
-            unsigned long n = intsetLen(objectGetVal(set));
-            if (n != 0) {
-                size_t elelen1 = sdigits10(intsetMax(objectGetVal(set)));
-                size_t elelen2 = sdigits10(intsetMin(objectGetVal(set)));
-                maxelelen = max(elelen1, elelen2);
-                size_t s1 = lpEstimateBytesRepeatedInteger(intsetMax(objectGetVal(set)), n);
-                size_t s2 = lpEstimateBytesRepeatedInteger(intsetMin(objectGetVal(set)), n);
-                totsize = max(s1, s2);
-            }
-            if (intsetLen((const intset *)objectGetVal(set)) < server.set_max_listpack_entries &&
-                len <= server.set_max_listpack_value && maxelelen <= server.set_max_listpack_value &&
-                lpSafeToAdd(NULL, totsize + len)) {
-                /* In the "safe to add" check above we assumed all elements in
-                 * the intset are of size maxelelen. This is an upper bound. */
+            if (setTypeIntsetFitsListpack(set, true, len, 0)) {
                 setTypeConvertAndExpand(set, OBJ_ENCODING_LISTPACK, intsetLen(objectGetVal(set)) + 1, 1);
                 unsigned char *lp = objectGetVal(set);
                 lp = lpAppend(lp, (unsigned char *)str, len);
@@ -251,7 +255,12 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
         sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
-        int deleted = hashtableDelete(objectGetVal(setobj), sdsval);
+        void *popped;
+        int deleted = hashtablePop(objectGetVal(setobj), sdsval, &popped);
+        if (deleted) {
+            setTypeUntrackMember(setobj, popped);
+            smemberFree(popped);
+        }
         if (sdsval != str) sdsfree(sdsval); /* free temp copy */
         return deleted;
     } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
@@ -260,8 +269,11 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
         if (p == NULL) return 0;
         p = lpFind(lp, p, (unsigned char *)str, len, 0);
         if (p != NULL) {
-            lp = lpDelete(lp, p, NULL);
+            mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+            if (!listpackObjectItemIsValid(expiry)) return 0;
+            lp = lpDeleteRangeWithEntry(lp, &p, 1);
             objectSetVal(setobj, lp);
+            if (expiry != EXPIRY_NONE) listpackObjectUpdateVolatileCount(setobj, -1);
             return 1;
         }
     } else if (setobj->encoding == OBJ_ENCODING_INTSET) {
@@ -301,7 +313,9 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
     if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
-        return p && lpFind(lp, p, (unsigned char *)str, len, 0);
+        if (p == NULL) return 0;
+        p = lpFind(lp, p, (unsigned char *)str, len, 0);
+        return p && setTypeListpackIsValidAt(lp, p);
     } else if (set->encoding == OBJ_ENCODING_INTSET) {
         long long llval;
         return string2ll(str, len, &llval) && intsetFind(objectGetVal(set), llval);
@@ -377,6 +391,7 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
         } else {
             lpi = lpNext(lp, lpi);
         }
+        while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) lpi = lpNext(lp, lpi);
         if (lpi == NULL) return -1;
         si->lpi = lpi;
         unsigned int l;
@@ -405,6 +420,55 @@ sds setTypeNextObject(setTypeIterator *si) {
     return sdsfromlonglong(intele);
 }
 
+mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str) {
+    switch (si->encoding) {
+    case OBJ_ENCODING_HASHTABLE: return smemberGetExpiry((const smember *)str);
+    case OBJ_ENCODING_LISTPACK: return setTypeListpackGetExpiry(objectGetVal(si->subject), si->lpi);
+    default: return EXPIRY_NONE;
+    }
+}
+
+/* Return a uniformly selected live member, or -1 if none exists. */
+static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
+        /* Bracketed: under the validating type hashtableFairRandomEntry loops until it has sampled
+         * enough live members, forever when fewer remain than its sample size. */
+        void *entry = NULL;
+        setTypeIgnoreTTL(setobj, true);
+        for (int tries = 0; tries < 100; tries++) {
+            hashtableFairRandomEntry(objectGetVal(setobj), &entry);
+            if (!smemberIsExpired(entry)) break;
+            entry = NULL;
+        }
+        setTypeIgnoreTTL(setobj, false);
+        if (entry != NULL) {
+            *str = entry;
+            *len = sdslen((sds)entry);
+            *llele = -123456789; /* Not needed. Defensive. */
+            return OBJ_ENCODING_HASHTABLE;
+        }
+    }
+
+    /* Reservoir sampling preserves uniformity when expired members are dense. */
+    int encoding = -1;
+    unsigned long seen = 0;
+    char *s;
+    size_t l;
+    int64_t ll;
+    int enc;
+    setTypeIterator *si = setTypeInitIterator(setobj);
+    while ((enc = setTypeNext(si, &s, &l, &ll)) != -1) {
+        if (rand() % ++seen == 0) {
+            *str = s;
+            *len = l;
+            *llele = ll;
+            encoding = enc;
+        }
+    }
+    setTypeReleaseIterator(si);
+    return encoding;
+}
+
 /* Return random element from a non empty set.
  * The returned element can be an int64_t value if the set is encoded
  * as an "intset" blob of integers, or a string.
@@ -417,8 +481,11 @@ sds setTypeNextObject(setTypeIterator *si) {
  * string which is actually an sds string and it can be used as such.
  *
  * Note that both the str, len and llele pointers should be passed and cannot
- * be NULL. If str is set to NULL, the value is an integer stored in llele. */
+ * be NULL. If str is set to NULL, the value is an integer stored in llele.
+ *
+ * Returns -1 when the set has volatile members and none of them is live. */
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    if (setTypeHasVolatileMembers(setobj)) return setTypeRandomLiveElement(setobj, str, len, llele);
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
         void *entry = NULL;
         hashtableFairRandomEntry(objectGetVal(setobj), &entry);
@@ -441,10 +508,11 @@ int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) 
     return setobj->encoding;
 }
 
-/* Pops a random element and returns it as an object. */
+/* Pops a random element and returns it as an object, or NULL when every
+ * member is expired. */
 robj *setTypePopRandom(robj *set) {
     robj *obj;
-    if (set->encoding == OBJ_ENCODING_LISTPACK) {
+    if (set->encoding == OBJ_ENCODING_LISTPACK && !setTypeHasVolatileMembers(set)) {
         /* Find random and delete it without re-seeking the listpack. */
         unsigned int i = 0;
         unsigned char *p = lpNextRandom(objectGetVal(set), lpFirst(objectGetVal(set)), &i, 1, 0);
@@ -461,6 +529,7 @@ robj *setTypePopRandom(robj *set) {
         size_t len = 0;
         int64_t llele = 0;
         int encoding = setTypeRandomElement(set, &str, &len, &llele);
+        if (encoding == -1) return NULL;
         if (str)
             obj = createStringObject(str, len);
         else
@@ -498,8 +567,8 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
     serverAssertWithInfo(NULL, setobj, setobj->type == OBJ_SET && setobj->encoding != enc);
 
     if (enc == OBJ_ENCODING_HASHTABLE) {
+        bool carry_expiry = setTypeHasVolatileMembers(setobj);
         hashtable *ht = hashtableCreate(&setHashtableType);
-        sds element;
 
         /* Presize the hashtable to avoid rehashing */
         if (panic) {
@@ -509,16 +578,28 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
             return C_ERR;
         }
 
-        /* To add the elements we extract integers and create Objects */
+        /* Expired members are carried too: a conversion changes only the encoding. */
+        setTypeIgnoreTTL(setobj, true);
+        char *str;
+        size_t len;
+        int64_t llele;
+        char tmpbuf[LONG_STR_SIZE];
         si = setTypeInitIterator(setobj);
-        while ((element = setTypeNextObject(si)) != NULL) {
-            serverAssert(hashtableAdd(ht, element));
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            mstime_t expiry = setTypeCurrentExpiry(si, str);
+            if (str == NULL) {
+                len = ll2string(tmpbuf, sizeof(tmpbuf), llele);
+                str = tmpbuf;
+            }
+            serverAssert(hashtableAdd(ht, smemberCreate(str, len, expiry)));
         }
         setTypeReleaseIterator(si);
+        setTypeIgnoreTTL(setobj, false);
 
         freeSetObject(setobj); /* frees the internals but not setobj itself */
         setobj->encoding = OBJ_ENCODING_HASHTABLE;
         objectSetVal(setobj, ht);
+        if (carry_expiry) setTypeTrackVolatileMembers(setobj);
     } else if (enc == OBJ_ENCODING_LISTPACK) {
         /* Preallocate the minimum two bytes per element (enc/value + backlen) */
         size_t estcap = cap * 2;
@@ -579,15 +660,21 @@ robj *setTypeDup(robj *o) {
     } else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
         set = createSetObject();
         hashtable *ht = objectGetVal(o);
-        hashtableExpand(objectGetVal(set), hashtableSize(ht));
+        hashtable *dst = objectGetVal(set);
+        hashtableExpand(dst, hashtableSize(ht));
+        setTypeIgnoreTTL(o, true);
         si = setTypeInitIterator(o);
         char *str;
         size_t len;
         int64_t intobj;
         while (setTypeNext(si, &str, &len, &intobj) != -1) {
-            setTypeAdd(set, (sds)str);
+            mstime_t expiry = smemberGetExpiry(str);
+            smember *m = smemberCreate(str, len, expiry);
+            serverAssert(hashtableAdd(dst, m));
+            if (expiry != EXPIRY_NONE) setTypeTrackMember(set, m);
         }
         setTypeReleaseIterator(si);
+        setTypeIgnoreTTL(o, false);
     } else {
         serverPanic("Unknown set encoding");
     }
@@ -608,8 +695,33 @@ void saddCommand(client *c) {
         setTypeMaybeConvert(set, c->argc - 2);
     }
 
-    for (j = 2; j < c->argc; j++) {
-        if (setTypeAdd(set, objectGetVal(c->argv[j]))) added++;
+    if (setTypeHasVolatileMembers(set)) {
+        robj **expired_members = NULL;
+        size_t num_expired = 0;
+        for (j = 2; j < c->argc; j++) {
+            bool replaced_expired = false;
+            if (setTypeAddWithExpiry(set, objectGetVal(c->argv[j]), EXPIRY_NONE, SET_ADD_KEEP_EXPIRY, &replaced_expired, NULL))
+                added++;
+            if (replaced_expired) {
+                if (expired_members == NULL) expired_members = zmalloc(sizeof(robj *) * (c->argc - 2));
+                expired_members[num_expired++] = c->argv[j];
+                incrRefCount(c->argv[j]);
+            }
+        }
+        if (num_expired > 0) {
+            server.stat_expiredsetmembers += num_expired;
+            notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[1], c->db->id);
+            size_t idx = 0;
+            while (idx < num_expired) {
+                idx += propagateItemsDeletion(c->db, set, num_expired - idx, &expired_members[idx], c->slot);
+            }
+        }
+        zfree(expired_members);
+        if (!setTypeHasVolatileMembers(set)) dbUpdateObjectWithVolatileItemsTracking(c->db, set);
+    } else {
+        for (j = 2; j < c->argc; j++) {
+            if (setTypeAdd(set, objectGetVal(c->argv[j]))) added++;
+        }
     }
     if (added) {
         signalModifiedKey(c, c->db, c->argv[1]);
@@ -625,11 +737,13 @@ void sremCommand(client *c) {
 
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL || checkType(c, set, OBJ_SET)) return;
 
+    bool was_volatile = setTypeHasVolatileMembers(set);
     if (set->encoding == OBJ_ENCODING_HASHTABLE) hashtablePauseAutoShrink(objectGetVal(set));
     for (j = 2; j < c->argc; j++) {
         if (setTypeRemove(set, objectGetVal(c->argv[j]))) {
             deleted++;
             if (setTypeSize(set) == 0) {
+                if (was_volatile) dbUntrackKeyWithVolatileItems(c->db, set);
                 dbDelete(c->db, c->argv[1]);
                 keyremoved = 1;
                 break;
@@ -639,6 +753,8 @@ void sremCommand(client *c) {
     if (!keyremoved && set->encoding == OBJ_ENCODING_HASHTABLE) hashtableResumeAutoShrink(objectGetVal(set));
 
     if (deleted) {
+        if (!keyremoved && was_volatile != setTypeHasVolatileMembers(set))
+            dbUpdateObjectWithVolatileItemsTracking(c->db, set);
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
@@ -669,12 +785,19 @@ void smoveCommand(client *c) {
         return;
     }
 
+    /* The member's TTL moves with it. */
+    mstime_t expiry = EXPIRY_NONE;
+    bool src_volatile = setTypeHasVolatileMembers(srcset);
+    if (src_volatile) setTypeGetExpiry(srcset, objectGetVal(ele), &expiry);
+
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset, objectGetVal(ele))) {
         addReply(c, shared.czero);
         return;
     }
     notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
+
+    if (src_volatile && !setTypeHasVolatileMembers(srcset)) dbUpdateObjectWithVolatileItemsTracking(c->db, srcset);
 
     /* Remove the src set from the database when empty */
     if (setTypeSize(srcset) == 0) {
@@ -692,7 +815,18 @@ void smoveCommand(client *c) {
     server.dirty++;
 
     /* An extra key has changed when ele was successfully added to dstset */
-    if (setTypeAdd(dstset, objectGetVal(ele))) {
+    bool dst_volatile = setTypeHasVolatileMembers(dstset);
+    bool replaced_expired = false;
+    int added = setTypeAddWithExpiry(dstset, objectGetVal(ele), expiry,
+                                     SET_ADD_KEEP_EXPIRY | SET_ADD_USE_INSERT_POSITION, &replaced_expired, NULL);
+    if (replaced_expired) {
+        server.stat_expiredsetmembers++;
+        notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[2], c->db->id);
+        incrRefCount(ele);
+        propagateItemsDeletion(c->db, dstset, 1, &ele, c->slot);
+    }
+    if (dst_volatile != setTypeHasVolatileMembers(dstset)) dbUpdateObjectWithVolatileItemsTracking(c->db, dstset);
+    if (added) {
         server.dirty++;
         signalModifiedKey(c, c->db, c->argv[2]);
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[2], c->db->id);
@@ -801,6 +935,7 @@ void scardCommand(client *c) {
  * implementation for more info. */
 #define SPOP_MOVE_STRATEGY_MUL 5
 
+/* setTypeSize() counts expired members, so a volatile set may pop fewer than 'count'. */
 void spopWithCountCommand(client *c) {
     long l;
     unsigned long count, size;
@@ -823,15 +958,17 @@ void spopWithCountCommand(client *c) {
     }
 
     size = setTypeSize(set);
-
-    /* Generate an SPOP keyspace notification */
-    notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
-    server.dirty += (count >= size) ? size : count;
+    bool volatile_set = setTypeHasVolatileMembers(set);
+    bool has_expired = volatile_set && setTypeHasExpiredMembers(set);
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
      * the number of elements inside the set: simply return the whole set. */
-    if (count >= size) {
+    if (count >= size && !has_expired) {
+        /* Generate an SPOP keyspace notification */
+        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        server.dirty += size;
+
         /* We just return the entire set */
         sunionDiffGenericCommand(c, c->argv + 1, 1, NULL, SET_OP_UNION);
 
@@ -856,13 +993,18 @@ void spopWithCountCommand(client *c) {
     propargv[0] = shared.srem;
     propargv[1] = c->argv[1];
     unsigned long propindex = 2;
-    addReplySetLen(c, count);
+    void *replylen = NULL;
+    if (volatile_set)
+        replylen = addReplyDeferredLen(c);
+    else
+        addReplySetLen(c, count);
+    unsigned long popped = 0;
 
     /* Common iteration vars. */
     char *str;
     size_t len;
     int64_t llele;
-    unsigned long remaining = size - count; /* Elements left after SPOP. */
+    unsigned long remaining = count < size ? size - count : 0; /* Elements left after SPOP. */
 
     /* If we are here, the number of requested elements is less than the
      * number of elements inside the set. Also we are sure that count < size.
@@ -871,7 +1013,7 @@ void spopWithCountCommand(client *c) {
      * CASE 2: The number of elements to return is small compared to the
      * set size. We can just extract random elements and return them to
      * the set. */
-    if (remaining * SPOP_MOVE_STRATEGY_MUL > count && set->encoding == OBJ_ENCODING_LISTPACK) {
+    if (remaining * SPOP_MOVE_STRATEGY_MUL > count && set->encoding == OBJ_ENCODING_LISTPACK && !has_expired) {
         /* Specialized case for listpack. Traverse it only once. */
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
@@ -906,11 +1048,45 @@ void spopWithCountCommand(client *c) {
         lp = lpBatchDelete(lp, ps, count);
         zfree(ps);
         objectSetVal(set, lp);
+        popped = count;
+    } else if (has_expired) {
+        /* Hidden members are never reclaimed by selection. If bounded random
+         * retries need a fallback, select all requested live members in one
+         * reservoir pass for this command, then remove only those members. */
+        robj **selected = zmalloc(sizeof(robj *) * count);
+        unsigned long seen = 0, held = 0;
+        setTypeIterator *si = setTypeInitIterator(set);
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            unsigned long slot = held < count ? held : (unsigned long)rand() % (seen + 1);
+            seen++;
+            if (slot >= count) continue;
+            if (held < count)
+                held++;
+            else
+                decrRefCount(selected[slot]);
+            selected[slot] = str ? createStringObject(str, len) : createStringObjectFromLongLong(llele);
+        }
+        setTypeReleaseIterator(si);
+
+        for (unsigned long i = 0; i < held; i++) {
+            serverAssert(setTypeRemove(set, objectGetVal(selected[i])));
+            addReplyBulk(c, selected[i]);
+            propargv[propindex++] = selected[i];
+            if (propindex == 2 + batchsize) {
+                alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+                for (unsigned long j = 2; j < propindex; j++) decrRefCount(propargv[j]);
+                propindex = 2;
+            }
+        }
+        popped = held;
+        zfree(selected);
     } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count) {
         for (unsigned long i = 0; i < count; i++) {
             propargv[propindex] = setTypePopRandom(set);
+            if (propargv[propindex] == NULL) break;
             addReplyBulk(c, propargv[propindex]);
             propindex++;
+            popped++;
             /* Replicate/AOF this command as an SREM operation */
             if (propindex == 2 + batchsize) {
                 alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
@@ -932,7 +1108,7 @@ void spopWithCountCommand(client *c) {
         robj *newset = NULL;
 
         /* Create a new set with just the remaining elements. */
-        if (set->encoding == OBJ_ENCODING_LISTPACK) {
+        if (set->encoding == OBJ_ENCODING_LISTPACK && !has_expired) {
             /* Specialized case for listpack. Traverse it only once. */
             newset = createSetListpackObject();
             unsigned char *lp = objectGetVal(set);
@@ -943,7 +1119,11 @@ void spopWithCountCommand(client *c) {
                 p = lpNextRandom(lp, p, &index, remaining - i, 0);
                 unsigned int len;
                 str = (char *)lpGetValue(p, &len, (long long *)&llele);
-                setTypeAddAux(newset, str, len, llele, 0);
+                mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+                sds member = str ? sdsnewlen(str, len) : sdsfromlonglong(llele);
+                bool replaced = false;
+                setTypeAddWithExpiry(newset, member, expiry, 0, &replaced, NULL);
+                sdsfree(member);
                 ps[i] = p;
                 p = lpNext(lp, p);
                 index++;
@@ -954,10 +1134,13 @@ void spopWithCountCommand(client *c) {
         } else {
             while (remaining--) {
                 int encoding = setTypeRandomElement(set, &str, &len, &llele);
-                if (!newset) {
-                    newset = str ? createSetListpackObject() : createIntsetObject();
-                }
-                setTypeAddAux(newset, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
+                if (encoding == -1) break;
+                if (!newset) newset = str ? createSetListpackObject() : createIntsetObject();
+                mstime_t expiry = encoding == OBJ_ENCODING_HASHTABLE ? smemberGetExpiry((smember *)str) : EXPIRY_NONE;
+                sds member = str ? (sds)str : sdsfromlonglong(llele);
+                bool replaced = false;
+                setTypeAddWithExpiry(newset, member, expiry, 0, &replaced, NULL);
+                if (!str) sdsfree(member);
                 setTypeRemoveAux(set, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
             }
         }
@@ -972,6 +1155,7 @@ void spopWithCountCommand(client *c) {
                 addReplyBulkCBuffer(c, str, len);
                 propargv[propindex++] = createStringObject(str, len);
             }
+            popped++;
             /* Replicate/AOF this command as an SREM operation */
             if (propindex == 2 + batchsize) {
                 alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
@@ -986,6 +1170,8 @@ void spopWithCountCommand(client *c) {
         /* Assign the new set as the key value. */
         dbReplaceValue(c->db, c->argv[1], &newset);
     }
+    if (volatile_set) setDeferredSetLen(c, replylen, popped);
+    server.dirty += popped;
 
     /* Replicate/AOF the remaining elements as an SREM operation */
     if (propindex != 2) {
@@ -1002,7 +1188,10 @@ void spopWithCountCommand(client *c) {
      * we propagated the command as a set of SREMs operations using
      * the alsoPropagate() API. */
     preventCommandPropagation(c);
-    signalModifiedKey(c, c->db, c->argv[1]);
+    if (popped) {
+        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        signalModifiedKey(c, c->db, c->argv[1]);
+    }
 }
 
 void spopCommand(client *c) {
@@ -1021,8 +1210,13 @@ void spopCommand(client *c) {
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
 
-    /* Pop a random element from the set */
+    bool was_volatile = setTypeHasVolatileMembers(set);
     ele = setTypePopRandom(set);
+    if (ele == NULL) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
+    if (was_volatile && !setTypeHasVolatileMembers(set)) dbUpdateObjectWithVolatileItemsTracking(c->db, set);
 
     notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
 
@@ -1044,6 +1238,57 @@ void spopCommand(client *c) {
     server.dirty++;
 }
 
+/* If client is trying to ask for a very large number of random elements,
+ * queuing may consume an unlimited amount of memory, so we want to limit
+ * the number of randoms per time. */
+#define SRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
+
+/* setTypeSize() counts expired members and a random position may hold one, so the plain samplers do not apply. */
+static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long size = setTypeSize(set);
+    unsigned long cap = uniq ? (count < size ? count : size)
+                             : (count < SRANDFIELD_RANDOM_SAMPLE_LIMIT ? count : SRANDFIELD_RANDOM_SAMPLE_LIMIT);
+    if (cap == 0) {
+        addReply(c, shared.emptyarray);
+        return;
+    }
+
+    listpackEntry *res = zmalloc(sizeof(listpackEntry) * cap);
+    unsigned long seen = 0, held = 0;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};
+        if (held < cap) {
+            res[held++] = e;
+        } else {
+            unsigned long r = (unsigned long)rand() % (seen + 1);
+            if (r < cap) res[r] = e;
+        }
+        seen++;
+    }
+    setTypeReleaseIterator(si);
+
+    if (held == 0) {
+        zfree(res);
+        addReply(c, shared.emptyarray);
+        return;
+    }
+
+    unsigned long reply_count = uniq ? held : count;
+    addReplyArrayLen(c, reply_count);
+    for (unsigned long i = 0; i < reply_count; i++) {
+        unsigned long idx = uniq ? i : (unsigned long)rand() % held;
+        if (res[idx].sval)
+            addReplyBulkCBuffer(c, res[idx].sval, res[idx].slen);
+        else
+            addReplyBulkLongLong(c, res[idx].lval);
+    }
+    zfree(res);
+}
+
 /* handle the "SRANDMEMBER key <count>" variant. The normal version of the
  * command is handled by the srandmemberCommand() function itself. */
 
@@ -1051,11 +1296,6 @@ void spopCommand(client *c) {
  * for us to don't use the "remove elements" strategy? Read later in the
  * implementation for more info. */
 #define SRANDMEMBER_SUB_STRATEGY_MUL 3
-
-/* If client is trying to ask for a very large number of random elements,
- * queuing may consume an unlimited amount of memory, so we want to limit
- * the number of randoms per time. */
-#define SRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
 
 void srandmemberWithCountCommand(client *c) {
     long l;
@@ -1082,6 +1322,11 @@ void srandmemberWithCountCommand(client *c) {
     /* If count is zero, serve it ASAP to avoid special cases later. */
     if (count == 0) {
         addReply(c, shared.emptyarray);
+        return;
+    }
+
+    if (setTypeHasExpiredMembers(set)) {
+        srandmemberWithCountFromVolatileSet(c, set, count, uniq);
         return;
     }
 
@@ -1270,7 +1515,10 @@ void srandmemberCommand(client *c) {
     /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET)) return;
 
-    setTypeRandomElement(set, &str, &len, &llele);
+    if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
     if (str == NULL) {
         addReplyBulkLongLong(c, llele);
     } else {
@@ -1319,6 +1567,7 @@ void sinterGenericCommand(client *c,
     void *replylen = NULL;
     unsigned long j, cardinality = 0;
     int encoding, empty = 0;
+    int volatile_source = 0;
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);
@@ -1333,6 +1582,7 @@ void sinterGenericCommand(client *c,
             return;
         }
         sets[j] = setobj;
+        if (dstkey && setTypeHasExpiredMembers(setobj)) volatile_source = 1;
     }
 
     /* Set intersection with an empty set always results in an empty set.
@@ -1447,11 +1697,13 @@ void sinterGenericCommand(client *c,
             notifyKeyspaceEvent(NOTIFY_SET, "sinterstore", dstkey, c->db->id);
             server.dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
+            if (volatile_source) propagateStoreAsEffects(c, dstkey, dstset);
         } else {
             if (dbDelete(c->db, dstkey)) {
                 server.dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
+                if (volatile_source) propagateStoreAsEffects(c, dstkey, NULL);
             }
             addReply(c, shared.czero);
             decrRefCount(dstset);
@@ -1513,6 +1765,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
     int j, cardinality = 0;
     int diff_algo = 1;
     int sameset = 0;
+    int volatile_source = 0;
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);
@@ -1542,6 +1795,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             dstset_encoding = OBJ_ENCODING_HASHTABLE;
         }
         sets[j] = setobj;
+        if (dstkey && setTypeHasExpiredMembers(setobj)) volatile_source = 1;
         if (j > 0 && sets[0] == sets[j]) {
             sameset = 1;
         }
@@ -1671,11 +1925,13 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             notifyKeyspaceEvent(NOTIFY_SET, op == SET_OP_UNION ? "sunionstore" : "sdiffstore", dstkey, c->db->id);
             server.dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
+            if (volatile_source) propagateStoreAsEffects(c, dstkey, dstset);
         } else {
             if (dbDelete(c->db, dstkey)) {
                 server.dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
+                if (volatile_source) propagateStoreAsEffects(c, dstkey, NULL);
             }
             addReply(c, shared.czero);
             decrRefCount(dstset);

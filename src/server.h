@@ -85,6 +85,7 @@
 #include "vset.h"
 #include "trace/trace.h"
 #include "entry.h"
+#include "smember.h"
 #include "lrulfu.h"
 
 /*
@@ -1572,11 +1573,11 @@ struct sharedObjectsStruct {
         *loadingerr_variants[2], *slowevalerr_variants[2], *slowscripterr_variants[2], *slowmoduleerr_variants[2],
         *bgsaveerr_variants[2],
         *execaborterr, *noautherr, *noreplicaserr, *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk,
-        *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink, *rpop, *lpop, *lpush, *zadd,
-        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hsetex, *hdel, *hpexpireat, *hpersist, *srem,
+        *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink, *rpop, *lpop, *lpush, *rpush, *zadd,
+        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hsetex, *hdel, *hpexpireat, *hpersist, *spexpireat, *spersist, *srem, *sadd,
         *xgroup, *xclaim, *xdel, *xack, *script, *replconf, *eval, *cluster, *syncslots, *persist, *set, *pexpireat, *pexpire, *time, *pxat, *absttl,
         *retrycount, *force, *justid, *entriesread, *lastid, *ping, *setid, *keepttl, *load, *createconsumer, *getack,
-        *special_asterisk, *special_equals, *default_username, *redacted, *ssubscribebulk, *sunsubscribebulk, *fields,
+        *special_asterisk, *special_equals, *default_username, *redacted, *ssubscribebulk, *sunsubscribebulk, *fields, *members,
         *finish, *state, *success, *failed, *name, *message,
         *smessagebulk, *select[PROTO_SHARED_SELECT_CMDS], *integers[OBJ_SHARED_INTEGERS],
         *mbulkhdr[OBJ_SHARED_BULKHDR_LEN], /* "*<value>\r\n" */
@@ -1970,6 +1971,7 @@ struct valkeyServer {
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */
+    long long stat_expiredsetmembers;              /* Number of expired set members */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
     long long stat_expired_time_cap_reached_count; /* Early expire cycle stops.*/
@@ -2993,6 +2995,7 @@ extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern hashtableType setHashtableType;
+extern hashtableType setWithVolatileMembersHashtableType;
 extern hashtableType zsetHashtableType;
 extern hashtableType kvstoreKeysHashtableType;
 extern hashtableType kvstoreExpiresHashtableType;
@@ -3758,11 +3761,32 @@ setTypeIterator *setTypeInitIterator(robj *subject);
 void setTypeReleaseIterator(setTypeIterator *si);
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele);
 sds setTypeNextObject(setTypeIterator *si);
+mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str);
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele);
 unsigned long setTypeSize(const robj *subject);
 void setTypeConvert(robj *subject, int enc);
 int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic);
+bool setTypeIntsetFitsListpack(robj *setobj, bool add_member, size_t len, size_t extra_bytes);
 robj *setTypeDup(robj *o);
+bool setTypeHasVolatileMembers(robj *o); /* O(1); true while any member carries a TTL, expired or not */
+bool setTypeHasExpiredMembers(robj *o);  /* true when a physical member is currently hidden */
+void setTypeInitVolatileIterator(robj *o, vsetIterator *iter);
+bool setTypeNextVolatile(vsetIterator *iter, smember **member);
+void setTypeResetVolatileIterator(vsetIterator *iter);
+void setTypeFreeVolatileSet(robj *o);
+void setTypeTrackVolatileMembers(robj *o);
+long long setTypeVolatileCount(robj *o);
+long long setTypeListpackGetExpiry(unsigned char *lp, unsigned char *p);
+void setTypeIgnoreTTL(robj *o, bool ignore);
+void setTypeTrackMember(robj *o, smember *m);
+void setTypeUntrackMember(robj *o, smember *m);
+int setTypeGetExpiry(robj *o, sds member, mstime_t *expiry);
+size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_members, robj **out_members);
+size_t setTypeScanDefrag(robj *o, size_t cursor, void *(*defragfn)(void *));
+expiryModificationResult setTypeSetExpiry(robj *o, sds member, mstime_t expiry, int flags); /* expiry EXPIRY_NONE removes the TTL; 'flags' are the EXPIRE_NX/XX/GT/LT bits from expire.h; may reallocate the value. */
+#define SET_ADD_KEEP_EXPIRY (1 << 0)
+#define SET_ADD_USE_INSERT_POSITION (1 << 1)
+int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags, bool *replaced_expired, bool *ttl_changed);
 
 /* Hash data type */
 #define HASH_SET_TAKE_FIELD (1 << 0)
@@ -3773,10 +3797,8 @@ robj *setTypeDup(robj *o);
 
 long long hashTypeVolatileCount(robj *o);                                    /* total volatile fields, incl. expired-unreaped */
 long long hashTypeListpackGetExpiry(unsigned char *zl, unsigned char *vptr); /* expiry of the pair whose value entry is vptr, or EXPIRY_NONE */
-bool hashTypeListpackFieldIsValid(long long expiry);                         /* listpack mirror of validateEntry: is a field with this expiry visible now */
 void hashTypeFreeVolatileSet(robj *o);                                       /* needed only for freeHashObject */
 void hashTypeTrackEntry(robj *o, entry *entry);                              /* needed only for rdbLoadObject */
-void hashTypeUpdateVolatileCount(robj *o, long delta);                       /* exported only for rdbLoadObject's HASH_2-to-listpack path */
 size_t hashTypeScanDefrag(robj *ob, size_t cursor, void *(*defragAlloc)(void *));
 size_t hashTypeDeleteExpiredFields(robj *o, mstime_t now, unsigned long max_fields, robj **out_fields);
 
@@ -3932,8 +3954,18 @@ int removeExpire(serverDb *db, robj *key);
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
-int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int slot);
-size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
+void propagateStoreAsEffects(client *c, robj *dstkey, robj *dst);
+int propagateItemsDeletion(serverDb *db, robj *o, size_t n_items, robj *items[], int slot);
+
+/* Membership test for db->keys_with_volatile_items. */
+static inline bool objectHasVolatileItems(robj *o) {
+    int type = objectGetType(o);
+    if (type == OBJ_HASH) return hashTypeHasVolatileFields(o);
+    if (type == OBJ_SET) return setTypeHasVolatileMembers(o);
+    return false;
+}
+
+size_t dbReclaimExpiredItems(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
 int keyIsExpired(serverDb *db, robj *key);
 long long getExpire(serverDb *db, robj *key);
 robj *setExpire(client *c, serverDb *db, robj *key, long long when);
@@ -4235,6 +4267,16 @@ void sunionstoreCommand(client *c);
 void sdiffCommand(client *c);
 void sdiffstoreCommand(client *c);
 void sscanCommand(client *c);
+void sexpireCommand(client *c);
+void sexpireatCommand(client *c);
+void spexpireCommand(client *c);
+void spexpireatCommand(client *c);
+void sttlCommand(client *c);
+void spttlCommand(client *c);
+void sexpiretimeCommand(client *c);
+void spexpiretimeCommand(client *c);
+void spersistCommand(client *c);
+void saddexCommand(client *c);
 void syncCommand(client *c);
 void flushdbCommand(client *c);
 void flushallCommand(client *c);

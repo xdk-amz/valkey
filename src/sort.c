@@ -191,6 +191,18 @@ int sortCompare(const void *s1, const void *s2) {
     return server.sort_desc ? -cmp : cmp;
 }
 
+/* LIMIT <start> <count> as the inclusive [*start, *end] range; clamping to 'vectorlen' avoids integer overflow. */
+static void sortComputeLimitRange(long limit_start, long limit_count, int vectorlen, long *start, long *end) {
+    *start = min(max(limit_start, 0), vectorlen);
+    limit_count = min(max(limit_count, -1), vectorlen);
+    *end = (limit_count < 0) ? vectorlen - 1 : *start + limit_count - 1;
+    if (*start >= vectorlen) {
+        *start = vectorlen - 1;
+        *end = vectorlen - 2;
+    }
+    if (*end >= vectorlen) *end = vectorlen - 1;
+}
+
 /* The SORT command is the most complex command in Valkey. Warning: this code
  * is optimized for speed and a bit less for readability */
 void sortCommandGeneric(client *c, int readonly) {
@@ -334,16 +346,7 @@ void sortCommandGeneric(client *c, int readonly) {
     default: vectorlen = 0; serverPanic("Bad SORT type"); /* Avoid GCC warning */
     }
 
-    /* Perform LIMIT start,count sanity checking.
-     * And avoid integer overflow by limiting inputs to object sizes. */
-    start = min(max(limit_start, 0), vectorlen);
-    limit_count = min(max(limit_count, -1), vectorlen);
-    end = (limit_count < 0) ? vectorlen - 1 : start + limit_count - 1;
-    if (start >= vectorlen) {
-        start = vectorlen - 1;
-        end = vectorlen - 2;
-    }
-    if (end >= vectorlen) end = vectorlen - 1;
+    sortComputeLimitRange(limit_start, limit_count, vectorlen, &start, &end);
 
     /* Whenever possible, we load elements into the output array in a more
      * direct way. This is possible if:
@@ -407,6 +410,9 @@ void sortCommandGeneric(client *c, int readonly) {
             j++;
         }
         setTypeReleaseIterator(si);
+        /* setTypeSize() counts expired members that setTypeNextObject() skips. */
+        vectorlen = j;
+        sortComputeLimitRange(limit_start, limit_count, vectorlen, &start, &end);
     } else if (sortval->type == OBJ_ZSET && dontsort) {
         /* Special handling for a sorted set, if 'dontsort' is true.
          * This makes sure we return elements in the sorted set original
@@ -557,6 +563,8 @@ void sortCommandGeneric(client *c, int readonly) {
          * assume it's a large list and then convert it at the end if needed. */
         robj *sobj = createQuicklistObject(server.list_max_listpack_size, server.list_compress_depth);
 
+        bool volatile_source = sortval && sortval->type == OBJ_SET && setTypeHasExpiredMembers(sortval);
+
         /* STORE option specified, set the sorting result as a List object */
         for (j = start; j <= end; j++) {
             listNode *ln;
@@ -588,6 +596,7 @@ void sortCommandGeneric(client *c, int readonly) {
         if (outputlen) {
             listTypeTryConversion(sobj, LIST_CONV_AUTO, NULL, NULL);
             setKey(c, c->db, storekey, &sobj, 0);
+            if (volatile_source) propagateStoreAsEffects(c, storekey, sobj);
             /* Ownership of sobj transferred to the db. Set to NULL to prevent
              * freeing it below. */
             sobj = NULL;
@@ -597,6 +606,7 @@ void sortCommandGeneric(client *c, int readonly) {
             signalModifiedKey(c, c->db, storekey);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
             server.dirty++;
+            if (volatile_source) propagateStoreAsEffects(c, storekey, NULL);
         }
         if (sobj != NULL) decrRefCount(sobj);
         addReplyLongLong(c, outputlen);

@@ -756,6 +756,10 @@ int rdbGetObjectType(robj *o, int rdbver) {
         else
             serverPanic("Unknown list encoding");
     case OBJ_SET:
+        if (setTypeHasVolatileMembers(o)) {
+            if (rdbver >= 81) return RDB_TYPE_SET_2;
+            return -1;
+        }
         if (objectGetEncoding(o) == OBJ_ENCODING_INTSET)
             return RDB_TYPE_SET_INTSET;
         else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
@@ -945,16 +949,35 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         }
     } else if (objectGetType(o) == OBJ_SET) {
         /* Save a set value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        if (rdbtype == RDB_TYPE_SET_2 && objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+            if ((n = rdbSaveLen(rdb, setTypeSize(o))) == -1) return -1;
+            nwritten += n;
+
+            unsigned char *lp = objectGetVal(o);
+            unsigned char intbuf[LP_INTBUF_SIZE];
+            unsigned char *p = lpFirst(lp);
+            while (p != NULL) {
+                int64_t len;
+                unsigned char *member = lpGet(p, &len, intbuf);
+                mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+
+                if ((n = rdbSaveRawString(rdb, member, len)) == -1) return -1;
+                nwritten += n;
+                if ((n = rdbSaveMillisecondTime(rdb, expiry)) == -1) return -1;
+                nwritten += n;
+
+                p = lpNext(lp, p);
+            }
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
             hashtable *set = objectGetVal(o);
 
             if ((n = rdbSaveLen(rdb, hashtableSize(set))) == -1) {
                 return -1;
             }
             nwritten += n;
-
+            bool add_expiry = (rdbtype == RDB_TYPE_SET_2);
             hashtableIterator iterator;
-            hashtableInitIterator(&iterator, set, 0);
+            hashtableInitIterator(&iterator, set, HASHTABLE_ITER_SKIP_VALIDATION);
             void *next;
             while (hashtableNext(&iterator, &next)) {
                 sds ele = next;
@@ -963,6 +986,13 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                     return -1;
                 }
                 nwritten += n;
+                if (add_expiry) {
+                    if ((n = rdbSaveMillisecondTime(rdb, smemberGetExpiry(ele))) == -1) {
+                        hashtableCleanupIterator(&iterator);
+                        return -1;
+                    }
+                    nwritten += n;
+                }
             }
             hashtableCleanupIterator(&iterator);
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
@@ -2236,6 +2266,116 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 sdsfree(sdsele);
             }
         }
+    } else if (rdbtype == RDB_TYPE_SET_2) {
+        if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+        if (len == 0) goto emptykey;
+        if (len > server.set_max_listpack_entries) {
+            o = createSetObject();
+            /* It's faster to expand the hashtable to the right size asap in order
+             * to avoid rehashing */
+            if (!hashtableTryExpand(objectGetVal(o), len)) {
+                rdbReportCorruptRDB("OOM in hashtableTryExpand %llu", (unsigned long long)len);
+                decrRefCount(o);
+                return NULL;
+            }
+        } else {
+            o = createSetListpackObject();
+        }
+
+        long volatile_members = 0;
+        for (i = 0; i < len; i++) {
+            sds sdsele;
+
+            if ((sdsele = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
+                decrRefCount(o);
+                return NULL;
+            }
+
+            long long itemexpiry = rdbLoadMillisecondTime(rdb, RDB_VERSION);
+            if (itemexpiry < EXPIRY_NONE || rioGetReadError(rdb)) {
+                sdsfree(sdsele);
+                decrRefCount(o);
+                return NULL;
+            }
+
+            if (iAmPrimary() && !(rdbflags & RDBFLAGS_AOF_PREAMBLE) && now != 0 && itemexpiry != EXPIRY_NONE &&
+                itemexpiry < now) {
+                if ((rdbflags & RDBFLAGS_FEED_REPL) && server.repl_backlog) {
+                    robj keyobj, memberobj;
+                    initStaticStringObject(keyobj, key);
+                    initStaticStringObject(memberobj, sdsele);
+                    robj *argv[3];
+                    argv[0] = shared.srem;
+                    argv[1] = &keyobj;
+                    argv[2] = &memberobj;
+                    replicationFeedReplicas(dbid, argv, 3);
+                }
+                sdsfree(sdsele);
+                continue;
+            }
+
+            size_t elelen = sdslen(sdsele);
+            if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+                /* A member carrying a TTL also adds a tagged metadata entry, which
+                 * lpSafeToAdd knows nothing about, so account for its worst case here. */
+                size_t add_bytes = elelen;
+                if (itemexpiry != EXPIRY_NONE) add_bytes += LP_METADATA_MAX_ENTRY_BYTES;
+                if (elelen > server.set_max_listpack_value || !lpSafeToAdd(objectGetVal(o), add_bytes)) {
+                    /* The conversion carries the TTLs of the members already in the
+                     * listpack, which it reads from the aggregate header. */
+                    if (volatile_members > 0) listpackObjectUpdateVolatileCount(o, volatile_members);
+                    if (setTypeConvertAndExpand(o, OBJ_ENCODING_HASHTABLE, len, 0) != C_OK) {
+                        rdbReportCorruptRDB("OOM in hashtableTryExpand %llu", (unsigned long long)len);
+                        sdsfree(sdsele);
+                        decrRefCount(o);
+                        return NULL;
+                    }
+                } else {
+                    unsigned char *lp = objectGetVal(o);
+                    unsigned char *p = lpFirst(lp);
+                    if (p && lpFind(lp, p, (unsigned char *)sdsele, elelen, 0)) {
+                        rdbReportCorruptRDB("Duplicate set members detected");
+                        sdsfree(sdsele);
+                        decrRefCount(o);
+                        return NULL;
+                    }
+                    objectSetVal(o, lpAppend(objectGetVal(o), (unsigned char *)sdsele, elelen));
+                    if (itemexpiry != EXPIRY_NONE) {
+                        unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+                        uint64_t enclen;
+                        lpEncodeIntegerGetType(itemexpiry, intenc, &enclen);
+                        unsigned char *zl = objectGetVal(o);
+                        unsigned char *eofptr = zl + lpGetTotalBytes(zl) - 1;
+                        objectSetVal(o, lpInsertMetadata(zl, intenc, enclen, eofptr, LP_BEFORE, NULL));
+                        volatile_members++;
+                    }
+                    sdsfree(sdsele);
+                    continue;
+                }
+            }
+
+            smember *m = smemberCreate(sdsele, elelen, itemexpiry);
+            sdsfree(sdsele);
+            if (!hashtableAdd(objectGetVal(o), m)) {
+                rdbReportCorruptRDB("Duplicate set members detected");
+                smemberFree(m);
+                decrRefCount(o);
+                return NULL;
+            }
+            if (itemexpiry != EXPIRY_NONE) setTypeTrackMember(o, m);
+        }
+
+        if (setTypeSize(o) == 0) {
+            decrRefCount(o);
+            if (error) *error = RDB_LOAD_ERR_ALL_ITEMS_EXPIRED;
+            return NULL;
+        }
+        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+            /* Install the aggregate volatile-count header in one pass; per-member
+             * updates would rewrite it on every insert. */
+            if (volatile_members > 0) listpackObjectUpdateVolatileCount(o, volatile_members);
+            objectSetVal(o, lpShrinkToFit(objectGetVal(o)));
+        }
     } else if (rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
         /* Read sorted set value. */
         uint64_t zsetlen;
@@ -2451,7 +2591,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
          * any load-time reaping, which gates on the O(1) header peek in
          * hashTypeHasVolatileFields(). */
         if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
-            if (volatile_fields > 0) hashTypeUpdateVolatileCount(o, volatile_fields);
+            if (volatile_fields > 0) listpackObjectUpdateVolatileCount(o, volatile_fields);
             /* Normalize the allocation to the exact listpack size, like the
              * blob-loading path does; the incremental build can leave a
              * larger-than-needed chunk (visible via MEMORY USAGE with libc

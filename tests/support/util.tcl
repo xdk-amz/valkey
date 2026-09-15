@@ -1495,3 +1495,46 @@ proc ldbl_overflow_operand {{level 0}} {
     r $level del __ldbl_probe
     error "no long double operand large enough to overflow on this platform"
 }
+
+proc get_keys_with_volatile_items {r {db *}} {
+    foreach line [split [$r info keyspace] "\n"] {
+        if {[string match "db$db:*" $line]} {
+            if {[regexp {keys_with_volatile_items=(\d+)} $line -> val]} {
+                return $val
+            }
+        }
+    }
+    return 0
+}
+
+proc setup_single_keyspace_notification {r} {
+    $r config set notify-keyspace-events KEA
+    set rd [valkey_deferring_client]
+    assert_equal {1} [psubscribe $rd __keyevent@*]
+    return $rd
+}
+
+proc assert_keyevent_patterns {rd key args} {
+    foreach event_type $args {
+        set event [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*:$event_type $key" $event
+    }
+}
+
+proc validate_aof_content {aof_file pxat_count del_count del_command} {
+    wait_for_condition 100 100 {
+        [file exists $aof_file] eq 1
+    } else {
+        fail "hash value was not expired after timeout"
+    }
+
+    set aof_content [exec cat $aof_file]
+
+    # Verify amount of PXAT and deletions
+    # Count PXAT commands
+    set got_pxat_count [regexp -all {PXAT} $aof_content]
+    assert_equal $got_pxat_count $pxat_count
+    # Count deletion commands
+    set got_del_count [regexp -all $del_command $aof_content]
+    assert_equal $got_del_count $del_count
+}
