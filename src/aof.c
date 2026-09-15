@@ -1965,12 +1965,34 @@ int rewriteListObject(rio *r, robj *key, robj *o) {
 /* Emit the commands needed to rebuild a set object.
  * The function returns 0 on error, 1 on success. */
 int rewriteSetObject(rio *r, robj *key, robj *o) {
-    long long count = 0, items = setTypeSize(o);
-    setTypeIterator *si = setTypeInitIterator(o);
+    /* setTypeSize() counts expired-unremoved members, which setTypeNext() skips. */
+    long long count = 0, items = setTypeSize(o) - setTypeVolatileCount(o);
+    bool volatile_set = setTypeHasVolatileMembers(o);
+    setTypeIterator *si;
     char *str;
     size_t len;
     int64_t llval;
+
+    if (volatile_set) {
+        si = setTypeInitIterator(o);
+        while (setTypeNext(si, &str, &len, &llval) != -1) {
+            mstime_t expiry = setTypeCurrentExpiry(si, str);
+            if (expiry == EXPIRY_NONE) continue;
+            if (!rioWriteBulkCount(r, '*', 7) || !rioWriteBulkString(r, "SADDEX", 6) ||
+                !rioWriteBulkObject(r, key) || !rioWriteBulkString(r, "PXAT", 4) ||
+                !rioWriteBulkLongLong(r, expiry) || !rioWriteBulkString(r, "MEMBERS", 7) ||
+                !rioWriteBulkLongLong(r, 1) ||
+                !(str ? rioWriteBulkString(r, str, len) : rioWriteBulkLongLong(r, llval))) {
+                setTypeReleaseIterator(si);
+                return 0;
+            }
+        }
+        setTypeReleaseIterator(si);
+    }
+
+    si = setTypeInitIterator(o);
     while (setTypeNext(si, &str, &len, &llval) != -1) {
+        if (volatile_set && setTypeCurrentExpiry(si, str) != EXPIRY_NONE) continue;
         if (count == 0) {
             int cmd_items = (items > AOF_REWRITE_ITEMS_PER_CMD) ? AOF_REWRITE_ITEMS_PER_CMD : items;
             if (!rioWriteBulkCount(r, '*', 2 + cmd_items) || !rioWriteBulkString(r, "SADD", 4) ||

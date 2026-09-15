@@ -564,6 +564,7 @@ ENGINE_SERVER_OBJ = \
     sha1.o \
     sha256.o \
     siphash.o \
+    smember.o \
     socket.o \
     sort.o \
     sparkline.o \
@@ -573,6 +574,8 @@ ENGINE_SERVER_OBJ = \
     t_hash.o \
     t_list.o \
     t_set.o \
+    t_set_expire.o \
+    t_set_volatile.o \
     t_stream.o \
     t_string.o \
     t_zset.o \

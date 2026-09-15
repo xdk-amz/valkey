@@ -442,6 +442,38 @@ run_solo {defrag} {
         }
     }
 
+    proc test_volatile_set {type} {
+        set title "Active Defrag big set with member TTLs: $type"
+        test $title {
+            set n 200000
+            perform_defrag_test $title populate {
+                set rd [valkey_deferring_client]
+                $rd client reply off
+                set val [string repeat A 300]
+                for {set j 0} {$j < $n} {incr j} {
+                    $rd saddex myset EX 100000 MEMBERS 1 m$j:$val
+                    if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
+                }
+            } fragment {
+                for {set j 0} {$j < $n} {incr j 2} {
+                    $rd srem myset m$j:$val
+                    if {$j % 1000 == 998} {client_reply_off_wait_for_server $rd}
+                }
+                $rd close
+            }
+            set batch {}
+            for {set i 1} {$i < $n} {incr i 2} {
+                lappend batch m$i:$val
+                if {[llength $batch] == 500} {
+                    foreach ttl [r sttl myset MEMBERS [llength $batch] {*}$batch] {
+                        assert_morethan $ttl 0
+                    }
+                    set batch {}
+                }
+            }
+        }
+    }
+
     proc test_big_zset {type score} {
         set title "Active Defrag big zset: $type $score-score"
         test $title {
@@ -591,6 +623,7 @@ run_solo {defrag} {
     lappend tests [list test_big_hash standalone $std_overrides]
     lappend tests [list test_big_list standalone $std_overrides]
     lappend tests [list test_big_set standalone $std_overrides]
+    lappend tests [list test_volatile_set standalone $std_overrides]
     lappend tests [list test_big_zset_random_score standalone $std_overrides]
     lappend tests [list test_big_zset_fixed_score standalone $std_overrides]
     lappend tests [list test_stream standalone $std_overrides]

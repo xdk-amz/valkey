@@ -304,6 +304,24 @@ tags {"check-rdb network external:skip logreqres:skip"} {
 }
 
 tags {"check-rdb network external:skip logreqres:skip"} {
+    start_server {overrides {save ""}} {
+        test "valkey-check-rdb reads a set with member TTLs" {
+            r flushall
+            r saddex myset ex 600 members 1 a
+            r save
+
+            set dump_rdb [file join [lindex [r config get dir] 1] dump.rdb]
+            set failed [catch {
+                exec $::VALKEY_CHECK_RDB_BIN $dump_rdb --stats --format info
+            } result]
+            assert_equal 0 $failed
+            assert_match {*RDB looks OK!*} $result
+            assert_match "*db.9.type.set.keys.total:1*" $result
+        }
+    }
+}
+
+tags {"check-rdb network external:skip logreqres:skip"} {
     start_server {overrides {save "" rdbchecksum no}} {
         test "valkey-check-rdb accepts compressed RDBs created with rdbchecksum no" {
             r flushall
