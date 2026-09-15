@@ -162,13 +162,14 @@ void expireScanCallback(void *privdata, void *entry, int didx) {
     data->sampled++;
 }
 
-/* Expires up to `max_entries` fields from a hash with volatile fields.
- * Sets `has_more_expired_entries` if more remain. Updates stats. */
+/* Expires up to `max_entries` items from a hash with volatile fields or a set
+ * with volatile members. Sets `has_more_expired_entries` if more remain.
+ * Updates stats. */
 void fieldExpireScanCallback(void *privdata, void *volaKey, int didx) {
     expireScanData *data = privdata;
     robj *o = volaKey;
     serverAssert(o);
-    serverAssert(hashTypeHasVolatileFields(o));
+    serverAssert(objectHasVolatileItems(o));
 
     data->has_more_expired_entries = false;
     data->sampled++;
@@ -176,9 +177,11 @@ void fieldExpireScanCallback(void *privdata, void *volaKey, int didx) {
     if (bgIteration_isEntryInuse(o)) return;
 
     mstime_t now = server.mstime;
-    size_t expired_fields = dbReclaimExpiredFields(o, data->db, now, data->max_entries, didx);
-    if (expired_fields) {
-        data->has_more_expired_entries = (expired_fields == data->max_entries);
+    size_t expired_items = objectGetType(o) == OBJ_SET
+                               ? dbReclaimExpiredMembers(o, data->db, now, data->max_entries, didx)
+                               : dbReclaimExpiredFields(o, data->db, now, data->max_entries, didx);
+    if (expired_items) {
+        data->has_more_expired_entries = (expired_items == data->max_entries);
         data->expired++;
     }
 }

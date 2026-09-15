@@ -181,15 +181,16 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
     return o;
 }
 
-/* For hash keys, checks if they contain volatile items and updates tracking accordingly.
- * Always accesses the tracking kvstore, even if the tracking state doesn't change. */
+/* For hash and set keys, checks if they contain volatile items and updates
+ * tracking accordingly. Always accesses the tracking kvstore, even if the
+ * tracking state doesn't change. */
 void dbUpdateObjectWithVolatileItemsTracking(serverDb *db, robj *o) {
-    if (objectGetType(o) == OBJ_HASH) {
-        if (hashTypeHasVolatileFields(o)) {
-            dbTrackKeyWithVolatileItems(db, o);
-        } else {
-            dbUntrackKeyWithVolatileItems(db, o);
-        }
+    int type = objectGetType(o);
+    if (type != OBJ_HASH && type != OBJ_SET) return;
+    if (objectHasVolatileItems(o)) {
+        dbTrackKeyWithVolatileItems(db, o);
+    } else {
+        dbUntrackKeyWithVolatileItems(db, o);
     }
 }
 
@@ -389,14 +390,15 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         }
     }
 
-    /* If overwriting a hash object, un-track it from the volatile items tracking if it contains volatile items.*/
-    if (old->type == OBJ_HASH && hashTypeHasVolatileFields(old)) {
+    /* If overwriting an object with volatile items (hash fields or set members),
+     * un-track it from the volatile items tracking. */
+    if (objectHasVolatileItems(old)) {
         /* Some commands create a new value (with NO key) and use setKey to change the value of an existing key.
          * In this case the old can be replaced with the provided value and be left without a key
-         * however it is still a hashObject with optional volatile items and we need to untrack it. */
+         * however it is still an object with optional volatile items and we need to untrack it. */
         dbUntrackKeyWithVolatileItems(db, old->hasembkey ? old : new);
     }
-    /* If the new object is a hash with volatile items we need to track it again */
+    /* If the new object has volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
     /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
@@ -520,8 +522,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             debugServerAssert(!kvstoreHashtableDelete(db->expires, dict_index, objectGetVal(key)));
         }
 
-        /* If deleting a hash object, un-track it from the volatile items tracking if it contains volatile items.*/
-        if (objectGetType(val) == OBJ_HASH && hashTypeHasVolatileFields(val)) {
+        /* If deleting an object with volatile items (hash fields or set members),
+         * un-track it from the volatile items tracking. */
+        if (objectHasVolatileItems(val)) {
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
@@ -546,7 +549,7 @@ int dbGenericDelete(serverDb *db, robj *key, int async, int flags) {
 /* Add a key with volatile items to the tracking kvstore. */
 void dbTrackKeyWithVolatileItems(serverDb *db, robj *o) {
     serverAssert(objectGetKey(o));
-    if (objectGetType(o) == OBJ_HASH && hashTypeHasVolatileFields(o)) {
+    if (objectHasVolatileItems(o)) {
         int dict_index = getKVStoreIndexForKey(objectGetKey(o));
         kvstoreHashtableAdd(db->keys_with_volatile_items, dict_index, o);
     }
@@ -1972,7 +1975,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     long long old_when = objectGetExpire(val);
 
     robj *newval = objectSetExpire(val, when);
-    if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
+    if (objectHasVolatileItems(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetKey(newval));
         hashtable *volatile_items_ht = kvstoreGetHashtable(db->keys_with_volatile_items, dict_index);
@@ -2164,6 +2167,92 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         postExecutionUnitOperations();
         decrRefCount(keyobj);
 
+        total_expired += expired;
+        max_entries -= expired;
+        if (deleteKey) break; /* Stop if key was deleted */
+    }
+    return total_expired;
+}
+
+/* Propagate SREM commands for deleted set members to AOF and replicas.
+ *
+ * This function builds and propagates a single SREM command with multiple
+ * members for the given set object `o`. It temporarily enables replication (if
+ * needed), constructs the command using the member names, and sends it via
+ * alsoPropagate(). Returns how many members were propagated. Consumes one
+ * reference of every robj in `members`. */
+int propagateMembersDeletion(serverDb *db, robj *o, size_t n_members, robj *members[], int didx) {
+    int prev_replication_allowed = server.replication_allowed;
+    server.replication_allowed = 1;
+
+    robj *argv[EXPIRE_BULK_LIMIT + 2]; /* SREM + key + members */
+    if (n_members > EXPIRE_BULK_LIMIT) n_members = EXPIRE_BULK_LIMIT;
+
+    int argc = 0;
+    robj *keyobj = createStringObjectFromSds(objectGetKey(o));
+    argv[argc++] = shared.srem; // SREM command
+    argv[argc++] = keyobj;      // key name
+    for (size_t i = 0; i < n_members; i++) {
+        // member to delete
+        argv[argc++] = members[i];
+    }
+
+    alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
+    server.replication_allowed = prev_replication_allowed;
+    for (int i = 0; i < argc; i++) {
+        decrRefCount(argv[i]);
+    }
+    return (int)n_members;
+}
+
+/* Process expired members of a set, delete them and propagate the changes to
+ * replicas and AOF.
+ *
+ * This routine:
+ *  - iteratively identifies expired set members from the volatile set (batching up to 1024 at a time)
+ *  - deletes the expired members
+ *  - deletes the entire key if the set becomes empty
+ *  - propagates SREM commands for deleted members if the key remains, or DEL if the key is fully deleted
+ *
+ * Batching avoids large stack allocations while allowing max_entries to be arbitrarily large.
+ * Returns the total number of expired members removed. */
+size_t dbReclaimExpiredMembers(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx) {
+    size_t total_expired = 0;
+    bool deleteKey = false;
+
+    while (max_entries > 0) {
+        /* Process in batches to avoid large stack allocations. */
+        unsigned long batch_size = max_entries > EXPIRE_BULK_LIMIT ? EXPIRE_BULK_LIMIT : max_entries;
+        robj *entries[EXPIRE_BULK_LIMIT];
+        size_t expired = setTypeDeleteExpiredMembers(o, now, batch_size, entries);
+        if (expired == 0) break;
+
+        /* Clean up the tracking entry if no more volatile members remain */
+        if (!setTypeHasVolatileMembers(o)) {
+            dbUntrackKeyWithVolatileItems(db, o);
+        }
+
+        /* Check if key is now empty after removing expired members */
+        deleteKey = setTypeSize(o) == 0;
+
+        enterExecutionUnit(1, 0);
+        robj *keyobj = createStringObjectFromSds(objectGetKey(o));
+        propagateMembersDeletion(db, o, expired, entries, didx);
+        notifyKeyspaceEvent(NOTIFY_EXPIRED, "sexpired", keyobj, db->id);
+        if (deleteKey) {
+            dbDelete(db, keyobj);
+            propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
+            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
+            server.dirty++;
+        } else {
+            server.dirty += (long long)expired;
+        }
+        signalModifiedKey(NULL, db, keyobj);
+        exitExecutionUnit();
+        postExecutionUnitOperations();
+        decrRefCount(keyobj);
+
+        server.stat_expiredsetmembers += (long long)expired;
         total_expired += expired;
         max_entries -= expired;
         if (deleteKey) break; /* Stop if key was deleted */

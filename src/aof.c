@@ -1966,11 +1966,39 @@ int rewriteListObject(rio *r, robj *key, robj *o) {
  * The function returns 0 on error, 1 on success. */
 int rewriteSetObject(rio *r, robj *key, robj *o) {
     long long count = 0, items = setTypeSize(o);
-    setTypeIterator *si = setTypeInitIterator(o);
+    bool has_volatile = setTypeHasVolatileMembers(o);
+    setTypeIterator *si;
     char *str;
     size_t len;
     int64_t llval;
+
+    /* First serialize volatile members if exist: a per-member expiry cannot
+     * ride along in a batched SADD, so each one is its own SADDEX, as
+     * rewriteHashObject() does with HSETEX. */
+    if (has_volatile) {
+        si = setTypeInitIterator(o);
+        while (setTypeNext(si, &str, &len, &llval) != -1) {
+            mstime_t expiry = setTypeIteratorExpiry(si, str);
+            if (expiry == EXPIRY_NONE) continue;
+            if (!rioWriteBulkCount(r, '*', 7) || !rioWriteBulkString(r, "SADDEX", 6) ||
+                !rioWriteBulkObject(r, key) || !rioWriteBulkString(r, "PXAT", 4) ||
+                !rioWriteBulkLongLong(r, expiry) || !rioWriteBulkString(r, "MEMBERS", 7) ||
+                !rioWriteBulkLongLong(r, 1) ||
+                !(str ? rioWriteBulkString(r, str, len) : rioWriteBulkLongLong(r, llval))) {
+                setTypeReleaseIterator(si);
+                return 0;
+            }
+        }
+        setTypeReleaseIterator(si);
+        /* The SADD batch header below counts only what that pass emits: total
+         * minus ALL volatile members, expired-unremoved included, since the
+         * iterator skips those too. */
+        items -= setTypeVolatileCount(o);
+    }
+
+    si = setTypeInitIterator(o);
     while (setTypeNext(si, &str, &len, &llval) != -1) {
+        if (has_volatile && setTypeIteratorExpiry(si, str) != EXPIRY_NONE) continue;
         if (count == 0) {
             int cmd_items = (items > AOF_REWRITE_ITEMS_PER_CMD) ? AOF_REWRITE_ITEMS_PER_CMD : items;
             if (!rioWriteBulkCount(r, '*', 2 + cmd_items) || !rioWriteBulkString(r, "SADD", 4) ||

@@ -81,6 +81,7 @@
 #include "expire.h"     /* Expiration public API */
 #include "rax.h"        /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "listpack.h"   /* Listpack encoding */
 #include "memory_prefetch.h"
 #include "vset.h"
 #include "trace/trace.h"
@@ -1573,7 +1574,7 @@ struct sharedObjectsStruct {
         *bgsaveerr_variants[2],
         *execaborterr, *noautherr, *noreplicaserr, *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk,
         *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink, *rpop, *lpop, *lpush, *zadd,
-        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hsetex, *hdel, *hpexpireat, *hpersist, *srem,
+        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hsetex, *hdel, *hpexpireat, *hpersist, *spexpireat, *spersist, *srem, *members,
         *xgroup, *xclaim, *xdel, *xack, *script, *replconf, *eval, *cluster, *syncslots, *persist, *set, *pexpireat, *pexpire, *time, *pxat, *absttl,
         *retrycount, *force, *justid, *entriesread, *lastid, *ping, *setid, *keepttl, *load, *createconsumer, *getack,
         *special_asterisk, *special_equals, *default_username, *redacted, *ssubscribebulk, *sunsubscribebulk, *fields,
@@ -1970,6 +1971,7 @@ struct valkeyServer {
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */
+    long long stat_expiredsetmembers;              /* Number of expired set members */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
     long long stat_expired_time_cap_reached_count; /* Early expire cycle stops.*/
@@ -2929,7 +2931,11 @@ typedef struct {
     int encoding;
     int ii; /* intset iterator */
     hashtableIterator *hashtable_iterator;
-    unsigned char *lpi; /* listpack iterator */
+    unsigned char *lpi;   /* listpack iterator */
+    bool lp_has_volatile; /* listpack encoding: cached "set has volatile
+                           * members" test, taken once at init so that
+                           * setTypeNext stays at one branch per member for a
+                           * set without TTLs. */
 } setTypeIterator;
 
 /* Enum for the available hashTypeIterator's */
@@ -2993,6 +2999,8 @@ extern dictType objectKeyPointerValueDictType;
 extern hashtableType objectHashtableType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern hashtableType setHashtableType;
+extern hashtableType setWithVolatileMembersHashtableType; /* 8B metadata tail (vset), validateEntry filters expired */
+extern hashtableType setVolatileIgnoreTTLHashtableType;   /* 8B metadata tail, no validateEntry (ignore bracket) */
 extern hashtableType zsetHashtableType;
 extern hashtableType kvstoreKeysHashtableType;
 extern hashtableType kvstoreExpiresHashtableType;
@@ -3758,11 +3766,66 @@ setTypeIterator *setTypeInitIterator(robj *subject);
 void setTypeReleaseIterator(setTypeIterator *si);
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele);
 sds setTypeNextObject(setTypeIterator *si);
+/* Expiry (or EXPIRY_NONE) of the element most recently returned by
+ * setTypeNext(); 'str' is the pointer setTypeNext() handed back. O(1): reads
+ * the smember prefix or the listpack metadata at the iterator position. */
+mstime_t setTypeIteratorExpiry(setTypeIterator *si, const char *str);
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele);
 unsigned long setTypeSize(const robj *subject);
 void setTypeConvert(robj *subject, int enc);
 int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic);
 robj *setTypeDup(robj *o);
+
+/* Member TTLs (t_set_volatile.c). The member layout is documented in smember.h,
+ * the per-encoding rules and the no-TTL fast path contract at the top of
+ * t_set_volatile.c. */
+
+/* O(1). True when at least one member carries a TTL, expired or not. Inline
+ * because every set fast path pays this one test, and the container's own shape
+ * is the answer: a listpack carries the aggregate volatile-count header only
+ * while that count is > 0, and a hashtable-encoded set sits on setHashtableType
+ * only while it holds no member with an expiry prefix. */
+static inline bool setTypeHasVolatileMembers(robj *o) {
+    if (o == NULL) return false;
+    int encoding = objectGetEncoding(o);
+    if (encoding == OBJ_ENCODING_LISTPACK) return lpIsMetadata(lpStart(objectGetVal(o)));
+    /* Both volatile types, the validating one and the ignore-TTL one, mean the
+     * set holds volatile members. */
+    if (encoding == OBJ_ENCODING_HASHTABLE) return hashtableGetType(objectGetVal(o)) != &setHashtableType;
+    return false; /* an intset has nowhere to store an expiry */
+}
+
+void propagateStoreAsEffects(client *c, robj *dstkey, const char *cmd, robj **members, unsigned long count);
+void setTypeReleaseVolatileSet(robj *o);
+long long setTypeVolatileCount(robj *o);
+long long setTypeListpackGetExpiry(unsigned char *lp, unsigned char *p);
+bool setTypeListpackMemberIsValid(long long expiry);
+void setTypeUpdateVolatileCount(robj *o, long delta);
+void setTypeIgnoreTTL(robj *o, bool ignore);
+int setTypeGetExpiry(robj *o, sds member, mstime_t *expiry);
+int setTypeRemoveVolatile(robj *o, sds member);
+size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max, robj **out);
+size_t setTypeScanDefrag(robj *o, size_t cursor, void *(*defragfn)(void *));
+
+/* Result codes of setTypeSetExpiry, replied verbatim by the S*EXPIRE commands.
+ * Same numeric values as the HEXPIRE reply. */
+#define SET_EXPIRY_NOT_EXIST -2        /* member missing or expired */
+#define SET_EXPIRY_FAILED -1           /* e.g. SPERSIST on member without TTL */
+#define SET_EXPIRY_CONDITION_NOT_MET 0 /* NX|XX|GT|LT failed */
+#define SET_EXPIRY_SET 1               /* applied */
+#define SET_EXPIRY_DELETED 2           /* time in the past: member removed */
+
+/* Set, change or remove (EXPIRY_NONE) the TTL of one member. 'flags' are the
+ * EXPIRE_NX / EXPIRE_XX / EXPIRE_GT / EXPIRE_LT bits from expire.h. Handles the
+ * intset conversion, the hashtable type swap, vset tracking and the listpack
+ * volatile-count header, and may reallocate the object's value. */
+int setTypeSetExpiry(robj *o, sds member, mstime_t expiry, int flags);
+
+/* Add a member with a TTL (EXPIRY_NONE = plain add). Returns 1 if added, 0 if it
+ * already existed and is live. An existing expired member is replaced and
+ * *replaced_expired is set, so the caller can propagate its SREM and emit the
+ * notification before the add itself reaches a replica. */
+int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, bool *replaced_expired);
 
 /* Hash data type */
 #define HASH_SET_TAKE_FIELD (1 << 0)
@@ -3779,6 +3842,19 @@ void hashTypeTrackEntry(robj *o, entry *entry);                              /* 
 void hashTypeUpdateVolatileCount(robj *o, long delta);                       /* exported only for rdbLoadObject's HASH_2-to-listpack path */
 size_t hashTypeScanDefrag(robj *ob, size_t cursor, void *(*defragAlloc)(void *));
 size_t hashTypeDeleteExpiredFields(robj *o, mstime_t now, unsigned long max_fields, robj **out_fields);
+bool hashTypeHasVolatileFields(robj *o);
+
+/* True when the object owns per-item TTLs and therefore belongs in
+ * db->keys_with_volatile_items. Every guard site MUST use this rather than
+ * testing OBJ_HASH on its own, or a volatile set would leave a dangling robj *
+ * in the tracking kvstore. The type compare comes first so that a guard site on
+ * a non-container object costs a single branch. */
+static inline bool objectHasVolatileItems(robj *o) {
+    int type = objectGetType(o);
+    if (type == OBJ_HASH) return hashTypeHasVolatileFields(o);
+    if (type == OBJ_SET) return setTypeHasVolatileMembers(o);
+    return false;
+}
 
 void hashTypeConvert(robj *o, int enc);
 void hashTypeTryConversion(robj *subject, robj **argv, int start, int end);
@@ -3802,7 +3878,6 @@ robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
 robj *hashTypeGetValueObject(robj *o, sds field);
 int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool *expired_overwritten);
 robj *hashTypeDup(robj *o);
-bool hashTypeHasVolatileFields(robj *o);
 int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len);
 bool hashTypeHasStringRef(robj *o, sds field);
 
@@ -3934,6 +4009,8 @@ void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int slot);
 size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
+int propagateMembersDeletion(serverDb *db, robj *o, size_t n, robj *members[], int didx);
+size_t dbReclaimExpiredMembers(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
 int keyIsExpired(serverDb *db, robj *key);
 long long getExpire(serverDb *db, robj *key);
 robj *setExpire(client *c, serverDb *db, robj *key, long long when);
@@ -4235,6 +4312,17 @@ void sunionstoreCommand(client *c);
 void sdiffCommand(client *c);
 void sdiffstoreCommand(client *c);
 void sscanCommand(client *c);
+/* Member TTL commands (t_set_expire.c) */
+void sexpireCommand(client *c);
+void spexpireCommand(client *c);
+void sexpireatCommand(client *c);
+void spexpireatCommand(client *c);
+void sttlCommand(client *c);
+void spttlCommand(client *c);
+void sexpiretimeCommand(client *c);
+void spexpiretimeCommand(client *c);
+void spersistCommand(client *c);
+void saddexCommand(client *c);
 void syncCommand(client *c);
 void flushdbCommand(client *c);
 void flushallCommand(client *c);

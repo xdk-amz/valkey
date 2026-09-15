@@ -191,6 +191,23 @@ int sortCompare(const void *s1, const void *s2) {
     return server.sort_desc ? -cmp : cmp;
 }
 
+/* Turn LIMIT <start> <count> into the inclusive [*start, *end] range over a
+ * vector of 'vectorlen' entries, clamping both to the vector. *limit_count is
+ * clamped in place; calling this a second time with a smaller 'vectorlen'
+ * therefore yields the same range as one call with that smaller length would
+ * have, which is what lets the SET path below redo the computation once it knows
+ * how many members it really got. */
+static void sortComputeLimitRange(long limit_start, long *limit_count, int vectorlen, long *start, long *end) {
+    *start = min(max(limit_start, 0), vectorlen);
+    *limit_count = min(max(*limit_count, -1), vectorlen);
+    *end = (*limit_count < 0) ? vectorlen - 1 : *start + *limit_count - 1;
+    if (*start >= vectorlen) {
+        *start = vectorlen - 1;
+        *end = vectorlen - 2;
+    }
+    if (*end >= vectorlen) *end = vectorlen - 1;
+}
+
 /* The SORT command is the most complex command in Valkey. Warning: this code
  * is optimized for speed and a bit less for readability */
 void sortCommandGeneric(client *c, int readonly) {
@@ -310,6 +327,8 @@ void sortCommandGeneric(client *c, int readonly) {
     else
         sortval = createQuicklistObject(server.list_max_listpack_size, server.list_compress_depth);
 
+    long expired_skipped = 0; /* Expired members hidden from the load below. */
+
     /* When sorting a set with no sort specified, we must sort the output
      * so the result is consistent across scripting and replication.
      *
@@ -335,15 +354,12 @@ void sortCommandGeneric(client *c, int readonly) {
     }
 
     /* Perform LIMIT start,count sanity checking.
-     * And avoid integer overflow by limiting inputs to object sizes. */
-    start = min(max(limit_start, 0), vectorlen);
-    limit_count = min(max(limit_count, -1), vectorlen);
-    end = (limit_count < 0) ? vectorlen - 1 : start + limit_count - 1;
-    if (start >= vectorlen) {
-        start = vectorlen - 1;
-        end = vectorlen - 2;
-    }
-    if (end >= vectorlen) end = vectorlen - 1;
+     * And avoid integer overflow by limiting inputs to object sizes.
+     *
+     * For a SET this runs against a 'vectorlen' that counts expired
+     * members, and is redone after the load below once the real length is
+     * known. */
+    sortComputeLimitRange(limit_start, &limit_count, vectorlen, &start, &end);
 
     /* Whenever possible, we load elements into the output array in a more
      * direct way. This is possible if:
@@ -407,6 +423,16 @@ void sortCommandGeneric(client *c, int readonly) {
             j++;
         }
         setTypeReleaseIterator(si);
+        /* setTypeSize() counts expired members but setTypeNextObject() hides
+         * them, so fewer members were loaded than the oversized allocation
+         * holds. The loaded length is the real one: shrink to it and redo the
+         * LIMIT range against it. A member skipped here is also what makes a
+         * verbatim STORE propagation unsafe. */
+        if (j != vectorlen) {
+            expired_skipped = vectorlen - j;
+            vectorlen = j;
+            sortComputeLimitRange(limit_start, &limit_count, vectorlen, &start, &end);
+        }
     } else if (sortval->type == OBJ_ZSET && dontsort) {
         /* Special handling for a sorted set, if 'dontsort' is true.
          * This makes sure we return elements in the sorted set original
@@ -557,6 +583,14 @@ void sortCommandGeneric(client *c, int readonly) {
          * assume it's a large list and then convert it at the end if needed. */
         robj *sobj = createQuicklistObject(server.list_max_listpack_size, server.list_compress_depth);
 
+        /* A skipped expired member makes verbatim propagation unsafe: a replica
+         * re-executing the SORT sees that member as live (POLICY_IGNORE_EXPIRE)
+         * and would store a longer list, which nothing reconciles afterwards.
+         * Keep a reference to what is stored, in order, to propagate the effect
+         * without walking the destination again. */
+        robj **stored = expired_skipped ? zmalloc(sizeof(robj *) * outputlen) : NULL;
+        unsigned long nstored = 0;
+
         /* STORE option specified, set the sorting result as a List object */
         for (j = start; j <= end; j++) {
             listNode *ln;
@@ -564,6 +598,10 @@ void sortCommandGeneric(client *c, int readonly) {
 
             if (!getop) {
                 listTypePush(sobj, vector[j].obj, LIST_TAIL);
+                if (stored) {
+                    incrRefCount(vector[j].obj);
+                    stored[nstored++] = vector[j].obj;
+                }
             } else {
                 listRewind(operations, &li);
                 while ((ln = listNext(&li))) {
@@ -577,7 +615,10 @@ void sortCommandGeneric(client *c, int readonly) {
                          * care of the incremented refcount caused by either
                          * lookupKeyByPattern or createStringObject("",0) */
                         listTypePush(sobj, val, LIST_TAIL);
-                        decrRefCount(val);
+                        if (stored)
+                            stored[nstored++] = val; /* released after propagating */
+                        else
+                            decrRefCount(val);
                     } else {
                         /* Always fails */
                         serverAssertWithInfo(c, sortval, sop->type == SORT_OP_GET);
@@ -588,16 +629,25 @@ void sortCommandGeneric(client *c, int readonly) {
         if (outputlen) {
             listTypeTryConversion(sobj, LIST_CONV_AUTO, NULL, NULL);
             setKey(c, c->db, storekey, &sobj, 0);
+            notifyKeyspaceEvent(NOTIFY_LIST, "sortstore", storekey, c->db->id);
+            server.dirty += outputlen;
+            if (expired_skipped) propagateStoreAsEffects(c, storekey, "RPUSH", stored, nstored);
             /* Ownership of sobj transferred to the db. Set to NULL to prevent
              * freeing it below. */
             sobj = NULL;
-            notifyKeyspaceEvent(NOTIFY_LIST, "sortstore", storekey, c->db->id);
-            server.dirty += outputlen;
-        } else if (dbDelete(c->db, storekey)) {
-            signalModifiedKey(c, c->db, storekey);
-            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
-            server.dirty++;
+        } else {
+            int deleted = dbDelete(c->db, storekey);
+            if (deleted) {
+                signalModifiedKey(c, c->db, storekey);
+                notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
+                server.dirty++;
+            }
+            /* An empty result with no destination to remove changed nothing, and
+             * server.dirty already keeps the verbatim propagation out. */
+            if (expired_skipped && deleted) propagateStoreAsEffects(c, storekey, "RPUSH", NULL, 0);
         }
+        for (unsigned long i = 0; i < nstored; i++) decrRefCount(stored[i]);
+        zfree(stored);
         if (sobj != NULL) decrRefCount(sobj);
         addReplyLongLong(c, outputlen);
     }

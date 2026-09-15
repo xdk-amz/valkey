@@ -1495,3 +1495,140 @@ proc ldbl_overflow_operand {{level 0}} {
     r $level del __ldbl_probe
     error "no long double operand large enough to overflow on this platform"
 }
+
+# Item-level expiration (hash field TTLs, set member TTLs) helpers.
+
+# Value of $field in an INFO section.
+proc info_field {info field} {
+    foreach line [split $info "\n"] {
+        if {[string match "$field:*" $line]} {
+            return [string trim [lindex [split $line ":"] 1]]
+        }
+    }
+    error "INFO has no field $field"
+}
+
+# The db index the client is currently on.
+proc get_client_db {r} {
+    if {[regexp {db=(\d+)} [$r client info] -> db]} {
+        return $db
+    }
+    return 9
+}
+
+# The INFO keyspace section has one line per non-empty db, so a bare regexp
+# over the whole section reads whichever db comes first. Scope the read to one
+# db, by default the one the client is on.
+proc get_keyspace_field {r field {db ""}} {
+    if {$db eq ""} {
+        set db [get_client_db $r]
+    }
+    foreach line [split [$r info keyspace] "\n"] {
+        if {[string match "db$db:*" $line]} {
+            if {[regexp "$field=(\\d+)" $line -> val]} {
+                return $val
+            }
+            return 0
+        }
+    }
+    return 0
+}
+
+proc get_keys_with_volatile_items {r} {
+    return [get_keyspace_field $r keys_with_volatile_items]
+}
+
+proc get_expired_set_members {r} {
+    return [info_field [$r info stats] expired_set_members]
+}
+
+# Turn $replica into a replica of the primary and wait until the link is up and
+# the two are at the same offset. The primary is NOT flushed, so a test can
+# seed items before the sync and check that the sync carried them.
+proc attach_replica {primary replica primary_host primary_port} {
+    $replica replicaof $primary_host $primary_port
+    wait_for_condition 100 100 {
+        [lindex [$replica role] 0] eq {slave} &&
+        [string match {*master_link_status:up*} [$replica info replication]]
+    } else {
+        fail "Can't turn the instance into a replica"
+    }
+    wait_for_ofs_sync $primary $replica
+}
+
+proc setup_single_keyspace_notification {r} {
+    $r config set notify-keyspace-events KEA
+    set rd [valkey_deferring_client]
+    assert_equal {1} [psubscribe $rd __keyevent@*]
+    return $rd
+}
+
+proc assert_keyevent_patterns {rd key args} {
+    foreach event_type $args {
+        set event [$rd read]
+        assert_match "pmessage __keyevent@* __keyevent@*:$event_type $key" $event
+    }
+}
+
+# Count the expiration rewrites in an AOF file: $del_command is the deletion
+# command the item type propagates for an already-expired item (HDEL for hash
+# fields, SREM for set members).
+proc validate_aof_content {aof_file pxat_count del_count {del_command HDEL}} {
+    wait_for_condition 100 100 {
+        [file exists $aof_file] eq 1
+    } else {
+        fail "AOF file $aof_file was never created"
+    }
+    set aof_content [exec cat $aof_file]
+    assert_equal $pxat_count [regexp -all {PXAT} $aof_content]
+    assert_equal $del_count [regexp -all $del_command $aof_content]
+}
+
+# Select the encoding of every non-intset set created afterwards: a set built
+# from non-integer members lands in listpack or hashtable purely on this limit.
+proc use_set_encoding {encoding} {
+    if {$encoding eq "hashtable"} {
+        r config set set-max-listpack-entries 0
+    } else {
+        r config set set-max-listpack-entries 128
+    }
+}
+
+proc set_member_ttl {r key member} {
+    return [lindex [$r STTL $key MEMBERS 1 $member] 0]
+}
+
+proc set_member_pttl {r key member} {
+    return [lindex [$r SPTTL $key MEMBERS 1 $member] 0]
+}
+
+proc set_member_pexpiretime {r key member} {
+    return [lindex [$r SPEXPIRETIME $key MEMBERS 1 $member] 0]
+}
+
+# Give every member of $members a TTL of 1ms and wait until it has passed. The
+# caller must have active expiry disabled, so the members stay in the set as
+# expired members instead of being removed.
+proc make_members_expired {r key members} {
+    $r SPEXPIRE $key 1 MEMBERS [llength $members] {*}$members
+    foreach member $members {
+        wait_for_condition 100 10 {
+            [$r SISMEMBER $key $member] == 0
+        } else {
+            fail "member $member of $key did not expire"
+        }
+    }
+}
+
+# Wait until active expiry has left $expected_card live members in $key and
+# bumped expired_set_members by $expected_increment.
+proc wait_for_set_active_expiry {r key expected_card initial_expired expected_increment {timeout 100} {interval 100}} {
+    wait_for_condition $timeout $interval {
+        [$r SCARD $key] == $expected_card &&
+        [get_expired_set_members $r] == ($initial_expired + $expected_increment)
+    } else {
+        set got [get_expired_set_members $r]
+        set want [expr {$initial_expired + $expected_increment}]
+        fail "Active expiry did not happen: SCARD [$r SCARD $key] (want $expected_card), expired_set_members $got (want $want)"
+    }
+}

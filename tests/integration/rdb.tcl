@@ -1754,4 +1754,41 @@ test {Server starts with bgsave-default-method before forkless-infrastructure-en
     }
 }
 
+# A set with member expiration is written with its own RDB type, which only
+# exists from RDB 81 (Valkey 9.1) on.
+
+start_server {overrides {save ""}} {
+    test {An RDB with volatile sets reloads its member TTLs and passes valkey-check-rdb} {
+        r flushall
+        r config set set-max-listpack-entries 128
+        set exp [expr {[clock milliseconds] + 600000}]
+        r SADD lpset a b c
+        r SPEXPIREAT lpset $exp MEMBERS 1 a
+        r config set set-max-listpack-entries 0
+        r SADD htset a b c
+        r SPEXPIREAT htset $exp MEMBERS 2 a b
+        r config set set-max-listpack-entries 128
+        r SADD plainset x y z
+        r SAVE
+
+        set rdb_path [file join [lindex [r config get dir] 1] [lindex [r config get dbfilename] 1]]
+        catch {exec $::VALKEY_CHECK_RDB_BIN $rdb_path --stats --format info} result
+        assert_match {*\\o/ RDB looks OK! \\o/*} $result
+        assert_match {*3 keys read*} $result
+        assert_match {*.type.set.keys.total:3*} $result
+
+        restart_server 0 true false
+        wait_done_loading r
+
+        assert_equal 3 [r SCARD lpset]
+        assert_equal $exp [lindex [r SPEXPIRETIME lpset MEMBERS 1 a] 0]
+        assert_equal {-1 -1} [r STTL lpset MEMBERS 2 b c]
+        assert_equal 3 [r SCARD htset]
+        assert_equal [list $exp $exp -1] [r SPEXPIRETIME htset MEMBERS 3 a b c]
+        assert_equal 3 [r SCARD plainset]
+        assert_equal {-1 -1 -1} [r STTL plainset MEMBERS 3 x y z]
+        assert_match {*keys_with_volatile_items=2*} [r info keyspace]
+    }
+}
+
 } ;# tags

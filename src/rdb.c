@@ -42,6 +42,7 @@
 #include "stream.h"
 #include "functions.h"
 #include "intset.h" /* Compact integer set structure */
+#include "smember.h"
 #include "bio.h"
 #include "zmalloc.h"
 #include "module.h"
@@ -756,6 +757,13 @@ int rdbGetObjectType(robj *o, int rdbver) {
         else
             serverPanic("Unknown list encoding");
     case OBJ_SET:
+        if (setTypeHasVolatileMembers(o)) {
+            /* Member TTLs need a TTL-capable RDB type: SET_2 (member, expiry)
+             * pairs for RDB 81 (9.1) and newer targets, regardless of the
+             * in-memory encoding; older targets can't store them. */
+            if (rdbver >= 81) return RDB_TYPE_SET_2;
+            return -1; /* can't be stored in old RDB */
+        }
         if (objectGetEncoding(o) == OBJ_ENCODING_INTSET)
             return RDB_TYPE_SET_INTSET;
         else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
@@ -945,7 +953,52 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
         }
     } else if (objectGetType(o) == OBJ_SET) {
         /* Save a set value */
-        if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        if (rdbtype == RDB_TYPE_SET_2) {
+            /* (member, expiry) pairs whatever the in-memory encoding is, so
+             * the reader picks its own. As HASH_2 does, a member that is
+             * expired but not yet removed is written with its past expiry: the
+             * loader drops it on a primary and keeps it on a replica, so both
+             * sides of a full sync end up with the same members. */
+            if ((n = rdbSaveLen(rdb, setTypeSize(o))) == -1) return -1;
+            nwritten += n;
+
+            if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
+                unsigned char *lp = objectGetVal(o);
+                unsigned char intbuf[LP_INTBUF_SIZE];
+                unsigned char *p = lpFirst(lp);
+                while (p != NULL) {
+                    int64_t len;
+                    unsigned char *member = lpGet(p, &len, intbuf);
+                    mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+
+                    if ((n = rdbSaveRawString(rdb, member, len)) == -1) return -1;
+                    nwritten += n;
+                    if ((n = rdbSaveMillisecondTime(rdb, expiry)) == -1) return -1;
+                    nwritten += n;
+
+                    p = lpNext(lp, p);
+                }
+            } else {
+                serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+                hashtableIterator iter;
+                hashtableInitIterator(&iter, objectGetVal(o), HASHTABLE_ITER_SKIP_VALIDATION);
+                void *next;
+                while (hashtableNext(&iter, &next)) {
+                    smember *m = next;
+                    if ((n = rdbSaveRawString(rdb, (unsigned char *)m, sdslen((sds)m))) == -1) {
+                        hashtableCleanupIterator(&iter);
+                        return -1;
+                    }
+                    nwritten += n;
+                    if ((n = rdbSaveMillisecondTime(rdb, smemberGetExpiry(m))) == -1) {
+                        hashtableCleanupIterator(&iter);
+                        return -1;
+                    }
+                    nwritten += n;
+                }
+                hashtableCleanupIterator(&iter);
+            }
+        } else if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
             hashtable *set = objectGetVal(o);
 
             if ((n = rdbSaveLen(rdb, hashtableSize(set))) == -1) {
@@ -2236,6 +2289,70 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 sdsfree(sdsele);
             }
         }
+    } else if (rdbtype == RDB_TYPE_SET_2) {
+        /* Read a set with member TTLs: (member, expiry) pairs. The in-memory
+         * encoding is not carried in the RDB, so setTypeCreate() picks one from
+         * the size hint (intset/listpack/hashtable) and setTypeAddWithExpiry()
+         * converts and grows as needed. This handles both large and small sets;
+         * a set with no live TTL left simply keeps whatever setTypeCreate chose.
+         *
+         * The object is created lazily from the first member that survives the
+         * expiry check, so that a set whose every member is already expired
+         * reports RDB_LOAD_ERR_ALL_ITEMS_EXPIRED like the hash loader does. */
+        if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
+        if (len == 0) goto emptykey;
+
+        for (i = 0; i < len; i++) {
+            sds sdsele;
+
+            if ((sdsele = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
+                if (o) decrRefCount(o);
+                return NULL;
+            }
+
+            /* Also load the member expiry */
+            long long itemexpiry = rdbLoadMillisecondTime(rdb, RDB_VERSION);
+            if (itemexpiry < EXPIRY_NONE || rioGetReadError(rdb)) {
+                sdsfree(sdsele);
+                if (o) decrRefCount(o);
+                return NULL;
+            }
+
+            /* If this is a non-preamble RDB being loaded on the primary, and this
+             * member is already expired relative to 'now', skip it. */
+            if (iAmPrimary() && !(rdbflags & RDBFLAGS_AOF_PREAMBLE) && now != 0 && itemexpiry != EXPIRY_NONE &&
+                itemexpiry < now) {
+                /* Emit SREM to replicas. */
+                if ((rdbflags & RDBFLAGS_FEED_REPL) && server.repl_backlog) {
+                    robj keyobj, memberobj;
+                    initStaticStringObject(keyobj, key);
+                    initStaticStringObject(memberobj, sdsele);
+                    robj *argv[3];
+                    argv[0] = shared.srem;
+                    argv[1] = &keyobj;
+                    argv[2] = &memberobj;
+                    replicationFeedReplicas(dbid, argv, 3);
+                }
+                sdsfree(sdsele);
+                continue;
+            }
+
+            if (o == NULL) o = setTypeCreate(sdsele, len);
+            if (!setTypeAddWithExpiry(o, sdsele, itemexpiry, NULL)) {
+                rdbReportCorruptRDB("Duplicate set members detected");
+                sdsfree(sdsele);
+                decrRefCount(o);
+                return NULL;
+            }
+            sdsfree(sdsele);
+        }
+
+        /* Check if the set became empty after skipping all expired members */
+        if (o == NULL) {
+            if (error) *error = RDB_LOAD_ERR_ALL_ITEMS_EXPIRED;
+            return NULL;
+        }
+        if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) objectSetVal(o, lpShrinkToFit(objectGetVal(o)));
     } else if (rdbtype == RDB_TYPE_ZSET_2 || rdbtype == RDB_TYPE_ZSET) {
         /* Read sorted set value. */
         uint64_t zsetlen;

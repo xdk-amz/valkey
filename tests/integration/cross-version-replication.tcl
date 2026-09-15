@@ -132,3 +132,43 @@ start_server {tags {"repl needs:other-server external:skip"}} {
         }
     }
 }
+
+# A set with member expiration is written with a new RDB type and bumps the RDB
+# version, so an older server that predates it must refuse both a DUMP payload
+# and a full sync of it.
+start_server {tags {"repl needs:other-server external:skip"}} {
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    r SADD myset m1 m2
+    r SEXPIRE myset 600 MEMBERS 1 m1
+    set payload [r DUMP myset]
+
+    start_server {start-other-server 1 config "minimal.conf"} {
+        set old_server [srv 0 client]
+        set old_server_version [dict get [$old_server hello] version]
+
+        test "An older server refuses a DUMP payload of a set with member expiration" {
+            if {[version_greater_or_equal $old_server_version 9.1.0]} {
+                skip "Server $old_server_version does support set member expiration"
+            }
+            # The payload carries an RDB version the old server does not know,
+            # so it is refused before its body is even parsed.
+            assert_error {*DUMP payload version or checksum are wrong*} {
+                $old_server RESTORE myset 0 $payload
+            }
+            assert_equal 0 [$old_server EXISTS myset]
+        }
+
+        test "An older replica cannot full-sync a primary that holds a volatile set" {
+            if {[version_greater_or_equal $old_server_version 9.1.0]} {
+                skip "Replica $old_server_version does support set member expiration"
+            }
+            $old_server replicaof $primary_host $primary_port
+            # The primary writes the highest RDB version the replica understands
+            # and has no way to encode the volatile set in it.
+            wait_for_log_messages -1 [list {*Can't store key 'myset'*}] 0 50 100
+            assert_match {*master_link_status:down*} [$old_server info replication]
+            $old_server replicaof no one
+        }
+    }
+}

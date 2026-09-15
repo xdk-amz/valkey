@@ -35,12 +35,30 @@
 #include "server.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
+#include "smember.h"
 
 /*-----------------------------------------------------------------------------
  * Set Commands
  *----------------------------------------------------------------------------*/
 
 void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstkey, int op);
+
+/*-----------------------------------------------------------------------------
+ * Member TTL support for the setType* API
+ *----------------------------------------------------------------------------*
+ *
+ * The volatile state itself is owned by t_set_volatile.c; this file only makes
+ * the type API honour it. A set that never received a TTL must run the
+ * instruction stream it ran before member TTLs existed, so every function below
+ * pays at most one O(1) setTypeHasVolatileMembers() test and never a per-member
+ * one. */
+
+/* True when the listpack member at 'p' is visible in the current execution
+ * context. An expired member is invisible, except inside an
+ * ignore-TTL bracket or under POLICY_IGNORE_EXPIRE. */
+static inline bool setTypeListpackIsValidAt(unsigned char *lp, unsigned char *p) {
+    return setTypeListpackMemberIsValid(setTypeListpackGetExpiry(lp, p));
+}
 
 /* Factory method to return a set that *can* hold "value". When the object has
  * an integer-encodable value, an intset will be returned. Otherwise, a listpack
@@ -87,7 +105,10 @@ static void maybeConvertIntset(robj *subject) {
  * an intset. No conversion happens if the set contains too many entries for an
  * intset. */
 static void maybeConvertToIntset(robj *set) {
-    if (set->encoding == OBJ_ENCODING_INTSET) return;  /* already intset */
+    if (set->encoding == OBJ_ENCODING_INTSET) return; /* already intset */
+    /* An intset has nowhere to store a member expiry, so a set with volatile
+     * members must keep its current encoding. */
+    if (setTypeHasVolatileMembers(set)) return;
     if (setTypeSize(set) > intsetMaxEntries()) return; /* can't use intset */
     intset *is = intsetNew();
     char *str;
@@ -123,8 +144,13 @@ int setTypeAdd(robj *subject, sds value) {
  * 1), as string and length (str_is_sds = 0) or as an integer in which case str
  * is set to NULL and llval is provided instead.
  *
+ * The set must not have volatile members: SADD, SADDEX and SMOVE call
+ * setTypeAddWithExpiry() so that they can propagate the SREM for an expired
+ * member they replace, and every other caller fills a set it just created.
+ *
  * Returns 1 if the value was added and 0 if it was already a member. */
 int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds) {
+    serverAssert(!setTypeHasVolatileMembers(set));
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (set->encoding == OBJ_ENCODING_INTSET) {
@@ -172,7 +198,8 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 }
                 objectSetVal(set, lp);
             } else {
-                /* Size limit is reached. Convert to hashtable and add. */
+                /* Size limit is reached. Convert to hashtable and add. The
+                 * conversion carries the member expiries over. */
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, lpLength(lp) + 1, 1);
                 serverAssert(hashtableAdd(objectGetVal(set), sdsnewlen(str, len)));
             }
@@ -237,6 +264,7 @@ int setTypeRemove(robj *setobj, sds value) {
  *
  * Returns 1 if the value was deleted and 0 if it was not a member of the set. */
 int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str_is_sds) {
+    bool volatile_set = setTypeHasVolatileMembers(setobj);
     char tmpbuf[LONG_STR_SIZE];
     if (!str) {
         if (setobj->encoding == OBJ_ENCODING_INTSET) {
@@ -250,6 +278,16 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
     }
 
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
+        if (volatile_set) {
+            /* setTypeRemoveVolatile removes LIVE members only (an expired one is
+             * invisible and only active expiration may take it), untracks the vset
+             * entry, frees with smemberFree and drops the volatile type when the
+             * last volatile member goes away. */
+            sds member = str_is_sds ? (sds)str : sdsnewlen(str, len);
+            int deleted = setTypeRemoveVolatile(setobj, member);
+            if (member != str) sdsfree(member);
+            return deleted;
+        }
         sds sdsval = str_is_sds ? (sds)str : sdsnewlen(str, len);
         int deleted = hashtableDelete(objectGetVal(setobj), sdsval);
         if (sdsval != str) sdsfree(sdsval); /* free temp copy */
@@ -260,6 +298,19 @@ int setTypeRemoveAux(robj *setobj, char *str, size_t len, int64_t llval, int str
         if (p == NULL) return 0;
         p = lpFind(lp, p, (unsigned char *)str, len, 0);
         if (p != NULL) {
+            if (volatile_set) {
+                long long expiry = setTypeListpackGetExpiry(lp, p);
+                /* SREM of an expired member returns 0 and does NOT delete: the
+                 * member is invisible and only active expiration may remove it, so that
+                 * the deletion is propagated exactly once. */
+                if (!setTypeListpackMemberIsValid(expiry)) return 0;
+                /* lpDeleteRangeWithEntry consumes the trailing metadata entry
+                 * along with the member; plain lpDelete would orphan it. */
+                lp = lpDeleteRangeWithEntry(lp, &p, 1);
+                objectSetVal(setobj, lp);
+                if (expiry != EXPIRY_NONE) setTypeUpdateVolatileCount(setobj, -1);
+                return 1;
+            }
             lp = lpDelete(lp, p, NULL);
             objectSetVal(setobj, lp);
             return 1;
@@ -301,11 +352,18 @@ int setTypeIsMemberAux(robj *set, char *str, size_t len, int64_t llval, int str_
     if (set->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
-        return p && lpFind(lp, p, (unsigned char *)str, len, 0);
+        if (p == NULL) return 0;
+        p = lpFind(lp, p, (unsigned char *)str, len, 0);
+        if (p == NULL) return 0;
+        /* One leading-header test; only a volatile set pays the metadata read
+         * needed to hide expired members. */
+        return !setTypeHasVolatileMembers(set) || setTypeListpackIsValidAt(lp, p);
     } else if (set->encoding == OBJ_ENCODING_INTSET) {
         long long llval;
         return string2ll(str, len, &llval) && intsetFind(objectGetVal(set), llval);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE && str_is_sds) {
+        /* No new test: the volatile hashtable type filters expired members in
+         * its validateEntry callback, and the plain type has none. */
         return hashtableFind(objectGetVal(set), (sds)str, NULL);
     } else if (set->encoding == OBJ_ENCODING_HASHTABLE) {
         sds sdsval = sdsnewlen(str, len);
@@ -321,12 +379,14 @@ setTypeIterator *setTypeInitIterator(robj *subject) {
     setTypeIterator *si = zmalloc(sizeof(setTypeIterator));
     si->subject = subject;
     si->encoding = subject->encoding;
+    si->lp_has_volatile = false;
     if (si->encoding == OBJ_ENCODING_HASHTABLE) {
         si->hashtable_iterator = hashtableCreateIterator(objectGetVal(subject), 0);
     } else if (si->encoding == OBJ_ENCODING_INTSET) {
         si->ii = 0;
     } else if (si->encoding == OBJ_ENCODING_LISTPACK) {
         si->lpi = NULL;
+        si->lp_has_volatile = setTypeHasVolatileMembers(subject);
     } else {
         serverPanic("Unknown set encoding");
     }
@@ -362,6 +422,8 @@ void setTypeReleaseIterator(setTypeIterator *si) {
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
     if (si->encoding == OBJ_ENCODING_HASHTABLE) {
         void *next;
+        /* No new test: on a volatile set the hashtable iterator filters
+         * expired members through the type's validateEntry callback. */
         if (!hashtableNext(si->hashtable_iterator, &next)) return -1;
         *str = next;
         *len = sdslen(*str);
@@ -372,10 +434,10 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
     } else if (si->encoding == OBJ_ENCODING_LISTPACK) {
         unsigned char *lp = objectGetVal(si->subject);
         unsigned char *lpi = si->lpi;
-        if (lpi == NULL) {
-            lpi = lpFirst(lp);
-        } else {
-            lpi = lpNext(lp, lpi);
+        lpi = (lpi == NULL) ? lpFirst(lp) : lpNext(lp, lpi);
+        if (si->lp_has_volatile) {
+            /* Expired members are invisible to iteration. */
+            while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) lpi = lpNext(lp, lpi);
         }
         if (lpi == NULL) return -1;
         si->lpi = lpi;
@@ -405,6 +467,89 @@ sds setTypeNextObject(setTypeIterator *si) {
     return sdsfromlonglong(intele);
 }
 
+mstime_t setTypeIteratorExpiry(setTypeIterator *si, const char *str) {
+    switch (si->encoding) {
+    case OBJ_ENCODING_HASHTABLE: return smemberGetExpiry((const smember *)str);
+    case OBJ_ENCODING_LISTPACK: return si->lp_has_volatile ? setTypeListpackGetExpiry(objectGetVal(si->subject), si->lpi) : EXPIRY_NONE;
+    default: return EXPIRY_NONE;
+    }
+}
+
+/* One live member of a set that carries member TTLs, drawn uniformly.
+ *
+ * Fair random picks with expired members rejected are uniform over the live
+ * ones and cost O(1) as long as the expired ones are not dense. When too many
+ * picks in a row land on an expired member the draw falls back to reservoir
+ * sampling over a single pass of the live members: still uniform, but O(n) in
+ * the set size, which is the price of a set that is mostly expired members.
+ *
+ * Returns the encoding, or -1 when the set holds no live member. */
+static int setTypeRandomVolatileElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    int found = 0;
+
+    if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
+        /* The volatile type's validateEntry hides expired members from the
+         * sampler, so without the bracket a set dense with them would spin.
+         * Inside it we do the rejecting ourselves against the raw expiry. */
+        setTypeIgnoreTTL(setobj, true);
+        for (int tries = 0; tries < 100; tries++) {
+            void *entry = NULL;
+            if (!hashtableFairRandomEntry(objectGetVal(setobj), &entry)) break;
+            if (smemberIsExpired(entry)) continue;
+            *str = entry;
+            *len = sdslen((sds)entry);
+            *llele = -123456789; /* Not needed. Defensive. */
+            found = 1;
+            break;
+        }
+        setTypeIgnoreTTL(setobj, false);
+    } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
+        /* No bracket here: lpSeek/lpGetValue never consult member validity, so
+         * the sampler already sees expired members, and an ignore bracket would
+         * instead make setTypeListpackMemberIsValid() accept them. */
+        unsigned char *lp = objectGetVal(setobj);
+        unsigned long total = lpLength(lp);
+        for (int tries = 0; total > 0 && tries < 100; tries++) {
+            unsigned char *p = lpSeek(lp, rand() % total);
+            if (p == NULL) break;
+            if (!setTypeListpackIsValidAt(lp, p)) continue;
+            unsigned int l;
+            *str = (char *)lpGetValue(p, &l, (long long *)llele);
+            *len = (size_t)l;
+            found = 1;
+            break;
+        }
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    if (found) return setobj->encoding;
+
+    /* Sampling defeated by dense expired members, or every member is expired.
+     * Reservoir-sample the live members, which the iterator already filters
+     * for: the previous "return the first live member" fallback was not
+     * uniform. */
+    int encoding = -1;
+    unsigned long seen = 0;
+    char *s;
+    size_t l;
+    int64_t ll;
+    int enc;
+    setTypeIterator *si = setTypeInitIterator(setobj);
+    while ((enc = setTypeNext(si, &s, &l, &ll)) != -1) {
+        /* Keep the member just seen with probability 1/(seen+1), which leaves
+         * every live member equally likely once the pass is over. */
+        if (seen == 0 || (unsigned long)rand() % (seen + 1) == 0) {
+            *str = s;
+            *len = l;
+            *llele = ll;
+            encoding = enc;
+        }
+        seen++;
+    }
+    setTypeReleaseIterator(si);
+    return encoding;
+}
+
 /* Return random element from a non empty set.
  * The returned element can be an int64_t value if the set is encoded
  * as an "intset" blob of integers, or a string.
@@ -417,18 +562,23 @@ sds setTypeNextObject(setTypeIterator *si) {
  * string which is actually an sds string and it can be used as such.
  *
  * Note that both the str, len and llele pointers should be passed and cannot
- * be NULL. If str is set to NULL, the value is an integer stored in llele. */
+ * be NULL. If str is set to NULL, the value is an integer stored in llele.
+ *
+ * Returns -1 when the set has volatile members and none of them is live. */
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
+        if (setTypeHasVolatileMembers(setobj)) return setTypeRandomVolatileElement(setobj, str, len, llele);
         void *entry = NULL;
         hashtableFairRandomEntry(objectGetVal(setobj), &entry);
         *str = entry;
         *len = sdslen(*str);
         *llele = -123456789; /* Not needed. Defensive. */
     } else if (setobj->encoding == OBJ_ENCODING_INTSET) {
+        /* An intset never carries TTLs, so no test at all here. */
         *llele = intsetRandom(objectGetVal(setobj));
         *str = NULL; /* Not needed. Defensive. */
     } else if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
+        if (setTypeHasVolatileMembers(setobj)) return setTypeRandomVolatileElement(setobj, str, len, llele);
         unsigned char *lp = objectGetVal(setobj);
         int r = rand() % lpLength(lp);
         unsigned char *p = lpSeek(lp, r);
@@ -441,10 +591,12 @@ int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) 
     return setobj->encoding;
 }
 
-/* Pops a random element and returns it as an object. */
+/* Pops a random element and returns it as an object. Returns NULL when the set
+ * has volatile members and none of them is live: a set with a non-zero reported
+ * size can still yield NULL, so every caller has to handle it. */
 robj *setTypePopRandom(robj *set) {
     robj *obj;
-    if (set->encoding == OBJ_ENCODING_LISTPACK) {
+    if (set->encoding == OBJ_ENCODING_LISTPACK && !setTypeHasVolatileMembers(set)) {
         /* Find random and delete it without re-seeking the listpack. */
         unsigned int i = 0;
         unsigned char *p = lpNextRandom(objectGetVal(set), lpFirst(objectGetVal(set)), &i, 1, 0);
@@ -457,10 +609,14 @@ robj *setTypePopRandom(robj *set) {
             obj = createStringObjectFromLongLong(llele);
         objectSetVal(set, lpDelete(objectGetVal(set), p, NULL));
     } else {
+        /* A volatile listpack comes here too: lpNextRandom would pick expired
+         * members, and lpDelete would orphan the picked member's metadata
+         * entry. */
         char *str;
         size_t len = 0;
         int64_t llele = 0;
         int encoding = setTypeRandomElement(set, &str, &len, &llele);
+        if (encoding == -1) return NULL;
         if (str)
             obj = createStringObject(str, len);
         else
@@ -489,6 +645,63 @@ void setTypeConvert(robj *setobj, int enc) {
     setTypeConvertAndExpand(setobj, enc, setTypeSize(setobj), 1);
 }
 
+/* Snapshot the members of a volatile set together with their expiries, so that
+ * they can be rebuilt in another container. Expired members are
+ * CARRIED with their expiry, not dropped (see the body for why).
+ *
+ * Returns the number collected. *members and *expiries are zmalloc'd arrays
+ * owned by the caller; every sds in *members must be freed. */
+static size_t setTypeCollectMembers(robj *setobj, sds **members, mstime_t **expiries) {
+    size_t cap = setTypeSize(setobj); /* counts expired members, so an upper bound */
+    sds *m = zmalloc(sizeof(sds) * (cap + 1));
+    mstime_t *e = zmalloc(sizeof(mstime_t) * (cap + 1));
+    size_t n = 0;
+    char *str;
+    size_t len;
+    int64_t llele;
+    int encoding;
+
+    /* Expired members are carried across WITH their expiry rather
+     * than dropped: a replica applying the same command sees them as live
+     * (POLICY_IGNORE_EXPIRE), so dropping them here without a propagated SREM
+     * would leave primary and replica with different SCARD / digests. They
+     * stay invisible and active expiration removes and propagates them later. */
+    setTypeIgnoreTTL(setobj, true);
+    setTypeIterator *si = setTypeInitIterator(setobj);
+    while ((encoding = setTypeNext(si, &str, &len, &llele)) != -1) {
+        serverAssert(n < cap);
+        if (encoding == OBJ_ENCODING_HASHTABLE) {
+            /* str IS the smember pointer, so its expiry travels with it. */
+            e[n] = smemberGetExpiry(str);
+            m[n] = sdsnewlen(str, len);
+        } else {
+            e[n] = setTypeListpackGetExpiry(objectGetVal(setobj), si->lpi);
+            m[n] = str ? sdsnewlen(str, len) : sdsfromlonglong(llele);
+        }
+        n++;
+    }
+    setTypeReleaseIterator(si);
+    setTypeIgnoreTTL(setobj, false);
+
+    *members = m;
+    *expiries = e;
+    return n;
+}
+
+/* Add a snapshot taken by setTypeCollectMembers() to 'setobj' (which must be an
+ * empty container of the target encoding) and release it. setTypeAddWithExpiry
+ * owns the per-encoding TTL bookkeeping: listpack metadata entry plus the
+ * volatile-count header, or smember plus vset plus the volatile hashtable
+ * type. */
+static void setTypeAddCollectedMembers(robj *setobj, sds *members, mstime_t *expiries, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        setTypeAddWithExpiry(setobj, members[i], expiries[i], NULL);
+        sdsfree(members[i]);
+    }
+    zfree(members);
+    zfree(expiries);
+}
+
 /* Converts a set to the specified encoding, pre-sizing it for 'cap' elements.
  * The 'panic' argument controls whether to panic on OOM (panic=1) or return
  * C_ERR on OOM (panic=0). If panic=1 is given, this function always returns
@@ -496,6 +709,14 @@ void setTypeConvert(robj *setobj, int enc) {
 int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic) {
     setTypeIterator *si;
     serverAssertWithInfo(NULL, setobj, setobj->type == OBJ_SET && setobj->encoding != enc);
+
+    /* Only listpack and hashtable sets can be volatile (an intset has nowhere
+     * to store an expiry), and a volatile set must carry its member expiries
+     * over to the new encoding. */
+    bool carry_expiry = setobj->encoding != OBJ_ENCODING_INTSET && setTypeHasVolatileMembers(setobj);
+    sds *members = NULL;
+    mstime_t *expiries = NULL;
+    size_t nmembers = 0;
 
     if (enc == OBJ_ENCODING_HASHTABLE) {
         hashtable *ht = hashtableCreate(&setHashtableType);
@@ -509,12 +730,18 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
             return C_ERR;
         }
 
-        /* To add the elements we extract integers and create Objects */
-        si = setTypeInitIterator(setobj);
-        while ((element = setTypeNextObject(si)) != NULL) {
-            serverAssert(hashtableAdd(ht, element));
+        if (carry_expiry) {
+            /* Snapshot before the source is freed; the members are re-added
+             * after the new container is installed. */
+            nmembers = setTypeCollectMembers(setobj, &members, &expiries);
+        } else {
+            /* To add the elements we extract integers and create Objects */
+            si = setTypeInitIterator(setobj);
+            while ((element = setTypeNextObject(si)) != NULL) {
+                serverAssert(hashtableAdd(ht, element));
+            }
+            setTypeReleaseIterator(si);
         }
-        setTypeReleaseIterator(si);
 
         freeSetObject(setobj); /* frees the internals but not setobj itself */
         setobj->encoding = OBJ_ENCODING_HASHTABLE;
@@ -528,18 +755,26 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
             size_t s2 = lpEstimateBytesRepeatedInteger(intsetMax(objectGetVal(setobj)), cap);
             estcap = max(s1, s2);
         }
+        if (carry_expiry) {
+            /* Room for one metadata entry per member plus the aggregate header. */
+            estcap += (cap + 1) * LP_METADATA_MAX_ENTRY_BYTES;
+        }
         unsigned char *lp = lpNew(estcap);
         char *str;
         size_t len;
         int64_t llele;
-        si = setTypeInitIterator(setobj);
-        while (setTypeNext(si, &str, &len, &llele) != -1) {
-            if (str != NULL)
-                lp = lpAppend(lp, (unsigned char *)str, len);
-            else
-                lp = lpAppendInteger(lp, llele);
+        if (carry_expiry) {
+            nmembers = setTypeCollectMembers(setobj, &members, &expiries);
+        } else {
+            si = setTypeInitIterator(setobj);
+            while (setTypeNext(si, &str, &len, &llele) != -1) {
+                if (str != NULL)
+                    lp = lpAppend(lp, (unsigned char *)str, len);
+                else
+                    lp = lpAppendInteger(lp, llele);
+            }
+            setTypeReleaseIterator(si);
         }
-        setTypeReleaseIterator(si);
 
         freeSetObject(setobj); /* frees the internals but not setobj itself */
         setobj->encoding = OBJ_ENCODING_LISTPACK;
@@ -547,6 +782,8 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
     } else {
         serverPanic("Unsupported set conversion");
     }
+
+    if (carry_expiry) setTypeAddCollectedMembers(setobj, members, expiries, nmembers);
     return C_OK;
 }
 
@@ -554,7 +791,18 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
  * Duplicate a set object, with the guarantee that the returned object
  * has the same encoding as the original one.
  *
- * The resulting object always has refcount set to 1 */
+ * The resulting object always has refcount set to 1
+ *
+ * Member TTLs are preserved, and so are expired members: a replica
+ * applying the same command sees them as live (POLICY_IGNORE_EXPIRE), so
+ * dropping them here without a propagated SREM would leave the two sides with
+ * different SCARD and digests. They stay invisible and are removed later, on
+ * the copy as on the original. The two encodings get there differently:
+ * - listpack: the raw memcpy carries the metadata entries and the
+ *   volatile-count header verbatim, which is what keeps the "same encoding"
+ *   guarantee unconditional.
+ * - hashtable: each member is its own allocation and the vset has to be
+ *   rebuilt, so the copy is built member by member, expiries included. */
 robj *setTypeDup(robj *o) {
     robj *set;
     setTypeIterator *si;
@@ -580,14 +828,26 @@ robj *setTypeDup(robj *o) {
         set = createSetObject();
         hashtable *ht = objectGetVal(o);
         hashtableExpand(objectGetVal(set), hashtableSize(ht));
+        /* Stream the members into the fresh object. Expired members are copied
+         * with their expiry rather than dropped, so that the copy agrees with
+         * the one a replica builds from the same command; the ignore-TTL
+         * bracket makes the source iterator yield them. */
+        bool volatile_source = setTypeHasVolatileMembers(o);
+        if (volatile_source) setTypeIgnoreTTL(o, true);
         si = setTypeInitIterator(o);
         char *str;
         size_t len;
         int64_t intobj;
         while (setTypeNext(si, &str, &len, &intobj) != -1) {
-            setTypeAdd(set, (sds)str);
+            if (volatile_source) {
+                /* str is the smember itself, so its expiry travels with it. */
+                setTypeAddWithExpiry(set, (sds)str, smemberGetExpiry(str), NULL);
+            } else {
+                setTypeAdd(set, (sds)str);
+            }
         }
         setTypeReleaseIterator(si);
+        if (volatile_source) setTypeIgnoreTTL(o, false);
     } else {
         serverPanic("Unknown set encoding");
     }
@@ -608,8 +868,42 @@ void saddCommand(client *c) {
         setTypeMaybeConvert(set, c->argc - 2);
     }
 
-    for (j = 2; j < c->argc; j++) {
-        if (setTypeAdd(set, objectGetVal(c->argv[j]))) added++;
+    /* An expired member is still there until active expiration removes it, and
+     * SADD replaces it with a plain one. A replica does not see it as expired,
+     * so its SREM must reach the replication stream before this SADD does. */
+    if (setTypeHasVolatileMembers(set)) {
+        robj **expired_members = NULL;
+        size_t num_expired = 0;
+        for (j = 2; j < c->argc; j++) {
+            bool replaced_expired = false;
+            if (setTypeAddWithExpiry(set, objectGetVal(c->argv[j]), EXPIRY_NONE, &replaced_expired)) added++;
+            if (replaced_expired) {
+                if (expired_members == NULL) expired_members = zmalloc(sizeof(robj *) * (c->argc - 2));
+                expired_members[num_expired++] = c->argv[j];
+                incrRefCount(c->argv[j]);
+            }
+        }
+        if (num_expired > 0) {
+            /* Propagate the deletions in batches, as propagateFieldsDeletion
+             * is used for hash fields. */
+            size_t idx = 0;
+            while (idx < num_expired) {
+                idx += propagateMembersDeletion(c->db, set, num_expired - idx, &expired_members[idx], c->slot);
+            }
+            server.stat_expiredsetmembers += num_expired;
+            notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[1], c->db->id);
+            /* No decrRefCount loop here: propagateMembersDeletion consumed the
+             * reference taken above for every member, exactly as the hash
+             * keepttl_fields path does with propagateFieldsDeletion. */
+        }
+        zfree(expired_members);
+        /* Replacing the last expired member may have dropped the volatile
+         * state. */
+        if (!setTypeHasVolatileMembers(set)) dbUpdateObjectWithVolatileItemsTracking(c->db, set);
+    } else {
+        for (j = 2; j < c->argc; j++) {
+            if (setTypeAdd(set, objectGetVal(c->argv[j]))) added++;
+        }
     }
     if (added) {
         signalModifiedKey(c, c->db, c->argv[1]);
@@ -625,11 +919,22 @@ void sremCommand(client *c) {
 
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL || checkType(c, set, OBJ_SET)) return;
 
+    /* An expired member named in the argv is left alone here, but it is a plain
+     * member for a replica and for AOF loading (both run under
+     * POLICY_IGNORE_EXPIRE), so propagating this argv verbatim would remove it
+     * there. Propagate only the members really removed. */
+    bool was_volatile = setTypeHasVolatileMembers(set);
+    int *removed = was_volatile ? zmalloc(sizeof(int) * (c->argc - 2)) : NULL;
     if (set->encoding == OBJ_ENCODING_HASHTABLE) hashtablePauseAutoShrink(objectGetVal(set));
     for (j = 2; j < c->argc; j++) {
         if (setTypeRemove(set, objectGetVal(c->argv[j]))) {
+            if (removed) removed[deleted] = j;
             deleted++;
             if (setTypeSize(set) == 0) {
+                /* Removing the last member already dropped the volatile state,
+                 * so dbDelete() can no longer recognize the key as tracked:
+                 * untrack it here with the pre-removal flag, as HDEL does. */
+                if (was_volatile) dbUntrackKeyWithVolatileItems(c->db, set);
                 dbDelete(c->db, c->argv[1]);
                 keyremoved = 1;
                 break;
@@ -637,14 +942,64 @@ void sremCommand(client *c) {
         }
     }
     if (!keyremoved && set->encoding == OBJ_ENCODING_HASHTABLE) hashtableResumeAutoShrink(objectGetVal(set));
+    /* Removing the last volatile member drops the volatile state, so the key
+     * must stop being tracked for active expiration. */
+    if (!keyremoved && was_volatile && !setTypeHasVolatileMembers(set)) dbUpdateObjectWithVolatileItemsTracking(c->db, set);
 
     if (deleted) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         server.dirty += deleted;
+        /* Some argument named a member the primary did not remove (an expired
+         * one, one that was never there, or one after the early exit above):
+         * propagate only the removals. Nothing removed needs no filtering,
+         * because dirty == 0 already suppresses the propagation, and the common
+         * "everything was removed" case keeps the original argv and allocates
+         * nothing. */
+        if (removed && deleted < c->argc - 2) {
+            int new_argc = deleted + 2;
+            robj **new_argv = zmalloc(sizeof(robj *) * new_argc);
+            new_argv[0] = shared.srem;
+            new_argv[1] = c->argv[1];
+            incrRefCount(c->argv[1]);
+            for (j = 0; j < deleted; j++) {
+                new_argv[j + 2] = c->argv[removed[j]];
+                incrRefCount(c->argv[removed[j]]);
+            }
+            replaceClientCommandVector(c, new_argc, new_argv);
+        }
     }
+    zfree(removed);
     addReplyLongLong(c, deleted);
+}
+
+/* SMOVE destination side for a member that carries a TTL: the source member's
+ * expiry is written into the destination unconditionally, also when the
+ * destination already holds the member. Returns 1 when the member was newly
+ * added, 0 when the destination already held it live. */
+static int smoveAddToDestWithExpiry(client *c, robj *dstset, robj *ele, mstime_t expiry) {
+    bool replaced_expired = false;
+    int added = setTypeAddWithExpiry(dstset, objectGetVal(ele), expiry, &replaced_expired);
+    if (replaced_expired) {
+        /* The destination copy was an expired member. A replica does not see
+         * it as expired and would keep its TTL, so propagate its SREM before
+         * the SMOVE itself, as saddCommand does. */
+        robj *members[1] = {ele};
+        /* propagateMembersDeletion consumes one reference of every member, and
+         * 'ele' is c->argv[3], which the client still owns. */
+        incrRefCount(ele);
+        propagateMembersDeletion(c->db, dstset, 1, members, c->slot);
+        server.stat_expiredsetmembers++;
+        notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[2], c->db->id);
+    } else if (!added) {
+        /* The destination already held the member live: overwrite its TTL with
+         * the source's, including removing it when the source had none. */
+        setTypeSetExpiry(dstset, objectGetVal(ele), expiry, 0);
+    }
+    /* The destination may have just gained (or lost) its volatile state. */
+    dbUpdateObjectWithVolatileItemsTracking(c->db, dstset);
+    return added;
 }
 
 void smoveCommand(client *c) {
@@ -669,12 +1024,25 @@ void smoveCommand(client *c) {
         return;
     }
 
+    /* SMOVE carries the member's TTL to the destination, so read it while the
+     * member is still in the source. */
+    mstime_t expiry = EXPIRY_NONE;
+    bool src_volatile = setTypeHasVolatileMembers(srcset);
+    if (src_volatile && setTypeGetExpiry(srcset, objectGetVal(ele), &expiry) != C_OK) {
+        /* Missing, or expired: not visible, so there is nothing to move. */
+        addReply(c, shared.czero);
+        return;
+    }
+
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset, objectGetVal(ele))) {
         addReply(c, shared.czero);
         return;
     }
     notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
+
+    /* Moving out the last volatile member drops the source's volatile state. */
+    if (src_volatile && !setTypeHasVolatileMembers(srcset)) dbUpdateObjectWithVolatileItemsTracking(c->db, srcset);
 
     /* Remove the src set from the database when empty */
     if (setTypeSize(srcset) == 0) {
@@ -692,7 +1060,14 @@ void smoveCommand(client *c) {
     server.dirty++;
 
     /* An extra key has changed when ele was successfully added to dstset */
-    if (setTypeAdd(dstset, objectGetVal(ele))) {
+    int added;
+    if (expiry == EXPIRY_NONE && !setTypeHasVolatileMembers(dstset)) {
+        /* Neither side carries a TTL: the plain path, one object-level branch. */
+        added = setTypeAdd(dstset, objectGetVal(ele));
+    } else {
+        added = smoveAddToDestWithExpiry(c, dstset, ele, expiry);
+    }
+    if (added) {
         server.dirty++;
         signalModifiedKey(c, c->db, c->argv[2]);
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[2], c->db->id);
@@ -801,17 +1176,23 @@ void scardCommand(client *c) {
  * implementation for more info. */
 #define SPOP_MOVE_STRATEGY_MUL 5
 
+/* SPOP <key> <count> sampler.
+ *
+ * No command expires members, so setTypeSize() counts the expired ones
+ * and is only an upper bound on what can be popped: for a set with volatile
+ * members the reply length is deferred (a short pop must become a short reply,
+ * not a protocol error) and such a set takes neither the listpack fast path,
+ * which deletes by position with lpBatchDelete and would orphan the metadata
+ * entries, nor CASE 3, which rebuilds the remainder into a plain set. */
 void spopWithCountCommand(client *c) {
     long l;
-    unsigned long count, size;
-    robj *set;
-
     /* Get the count argument */
     if (getPositiveLongFromObjectOrReply(c, c->argv[2], &l, NULL) != C_OK) return;
-    count = (unsigned long)l;
+    unsigned long count = (unsigned long)l;
 
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set. Otherwise, return nil */
+    robj *set;
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.emptyset[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
 
@@ -822,16 +1203,17 @@ void spopWithCountCommand(client *c) {
         return;
     }
 
-    size = setTypeSize(set);
-
-    /* Generate an SPOP keyspace notification */
-    notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
-    server.dirty += (count >= size) ? size : count;
+    unsigned long size = setTypeSize(set);
+    bool volatile_set = setTypeHasVolatileMembers(set);
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
      * the number of elements inside the set: simply return the whole set. */
     if (count >= size) {
+        /* Generate an SPOP keyspace notification */
+        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        server.dirty += size;
+
         /* We just return the entire set */
         sunionDiffGenericCommand(c, c->argv + 1, 1, NULL, SET_OP_UNION);
 
@@ -856,7 +1238,12 @@ void spopWithCountCommand(client *c) {
     propargv[0] = shared.srem;
     propargv[1] = c->argv[1];
     unsigned long propindex = 2;
-    addReplySetLen(c, count);
+    void *replylen = NULL;
+    if (volatile_set)
+        replylen = addReplyDeferredLen(c);
+    else
+        addReplySetLen(c, count);
+    unsigned long popped = 0;
 
     /* Common iteration vars. */
     char *str;
@@ -871,7 +1258,7 @@ void spopWithCountCommand(client *c) {
      * CASE 2: The number of elements to return is small compared to the
      * set size. We can just extract random elements and return them to
      * the set. */
-    if (remaining * SPOP_MOVE_STRATEGY_MUL > count && set->encoding == OBJ_ENCODING_LISTPACK) {
+    if (remaining * SPOP_MOVE_STRATEGY_MUL > count && set->encoding == OBJ_ENCODING_LISTPACK && !volatile_set) {
         /* Specialized case for listpack. Traverse it only once. */
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
@@ -906,11 +1293,15 @@ void spopWithCountCommand(client *c) {
         lp = lpBatchDelete(lp, ps, count);
         zfree(ps);
         objectSetVal(set, lp);
-    } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count) {
+        popped = count;
+    } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count || volatile_set) {
         for (unsigned long i = 0; i < count; i++) {
-            propargv[propindex] = setTypePopRandom(set);
+            robj *ele = setTypePopRandom(set);
+            if (ele == NULL) break; /* only expired members remain */
+            propargv[propindex] = ele;
             addReplyBulk(c, propargv[propindex]);
             propindex++;
+            popped++;
             /* Replicate/AOF this command as an SREM operation */
             if (propindex == 2 + batchsize) {
                 alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
@@ -920,6 +1311,8 @@ void spopWithCountCommand(client *c) {
                 propindex = 2;
             }
         }
+        /* Popping the last volatile member drops the volatile state (see SREM). */
+        if (volatile_set && !setTypeHasVolatileMembers(set)) dbUpdateObjectWithVolatileItemsTracking(c->db, set);
     } else {
         /* CASE 3: The number of elements to return is very big, approaching
          * the size of the set itself. After some time extracting random elements
@@ -985,7 +1378,10 @@ void spopWithCountCommand(client *c) {
 
         /* Assign the new set as the key value. */
         dbReplaceValue(c->db, c->argv[1], &newset);
+        popped = count;
     }
+    if (volatile_set) setDeferredSetLen(c, replylen, popped);
+    server.dirty += popped;
 
     /* Replicate/AOF the remaining elements as an SREM operation */
     if (propindex != 2) {
@@ -1002,7 +1398,12 @@ void spopWithCountCommand(client *c) {
      * we propagated the command as a set of SREMs operations using
      * the alsoPropagate() API. */
     preventCommandPropagation(c);
-    signalModifiedKey(c, c->db, c->argv[1]);
+    /* A set whose remaining members are all expired pops nothing, and a command
+     * that changed nothing emits no event and invalidates nothing. */
+    if (popped) {
+        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        signalModifiedKey(c, c->db, c->argv[1]);
+    }
 }
 
 void spopCommand(client *c) {
@@ -1021,8 +1422,17 @@ void spopCommand(client *c) {
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
 
-    /* Pop a random element from the set */
+    /* setTypePopRandom() yields NULL when no remaining member is live. */
+    bool was_volatile = setTypeHasVolatileMembers(set);
     ele = setTypePopRandom(set);
+    if (ele == NULL) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
+    /* Popping the last volatile member drops the volatile state (see SREM). An
+     * emptied set is untracked in the delete branch below instead. */
+    if (was_volatile && setTypeSize(set) > 0 && !setTypeHasVolatileMembers(set))
+        dbUpdateObjectWithVolatileItemsTracking(c->db, set);
 
     notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
 
@@ -1035,6 +1445,10 @@ void spopCommand(client *c) {
 
     /* Delete the set if it's empty */
     if (setTypeSize(set) == 0) {
+        /* Popping the last member already dropped the volatile state, so
+         * dbDelete() can no longer recognize the key as tracked: untrack it
+         * here with the pre-pop flag, as HDEL does. */
+        if (was_volatile) dbUntrackKeyWithVolatileItems(c->db, set);
         dbDelete(c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
     }
@@ -1057,14 +1471,14 @@ void spopCommand(client *c) {
  * the number of randoms per time. */
 #define SRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
 
+static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq);
+static void srandmemberWithCountFromSet(client *c, robj *set, unsigned long count, int uniq);
+
 void srandmemberWithCountCommand(client *c) {
     long l;
-    unsigned long count, size;
+    unsigned long count;
     int uniq = 1;
     robj *set;
-    char *str;
-    size_t len;
-    int64_t llele;
 
     if (getRangeLongFromObjectOrReply(c, c->argv[2], -LONG_MAX, LONG_MAX, &l, NULL) != C_OK) return;
     if (l >= 0) {
@@ -1077,13 +1491,171 @@ void srandmemberWithCountCommand(client *c) {
     }
 
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.emptyarray)) == NULL || checkType(c, set, OBJ_SET)) return;
-    size = setTypeSize(set);
 
     /* If count is zero, serve it ASAP to avoid special cases later. */
     if (count == 0) {
         addReply(c, shared.emptyarray);
         return;
     }
+
+    /* SRANDMEMBER is read-only, so it must not remove anything: the plain
+     * sampler needs an exact setTypeSize() and position-indexed listpack access,
+     * which expired members break, hence a sampler of its own. */
+    if (setTypeHasVolatileMembers(set)) {
+        srandmemberWithCountFromVolatileSet(c, set, count, uniq);
+        return;
+    }
+    srandmemberWithCountFromSet(c, set, count, uniq);
+}
+
+/* Pointer identifying the member the iterator currently sits on, for
+ * addReplyVolatileSetMember(): the smember itself for the hashtable encoding,
+ * the listpack entry otherwise. Only valid while nothing mutates the set. */
+static void *setTypeIteratorMemberRef(setTypeIterator *si, char *str) {
+    return si->encoding == OBJ_ENCODING_HASHTABLE ? (void *)str : (void *)si->lpi;
+}
+
+/* Reply with the member 'ref' addresses, as taken from setTypeIteratorMemberRef(). */
+static void addReplyVolatileSetMember(client *c, robj *set, void *ref) {
+    if (set->encoding == OBJ_ENCODING_HASHTABLE) {
+        addReplyBulkCBuffer(c, ref, sdslen((sds)ref));
+        return;
+    }
+    unsigned int len;
+    long long llele;
+    char *str = (char *)lpGetValue((unsigned char *)ref, &len, &llele);
+    if (str == NULL)
+        addReplyBulkLongLong(c, llele);
+    else
+        addReplyBulkCBuffer(c, str, len);
+}
+
+/* Pointers to every LIVE member of a set that carries member TTLs. *out is a
+ * zmalloc'd array owned by the caller; the pointers address the set's own
+ * memory, so they die with the first mutation of it. Returns the count. */
+static unsigned long setTypeCollectLiveMembers(robj *set, void ***out) {
+    /* setTypeSize() counts the expired members too, so this is an upper bound. */
+    unsigned long cap = setTypeSize(set);
+    void **refs = zmalloc(sizeof(void *) * (cap + 1));
+    unsigned long n = 0;
+    char *str;
+    size_t len;
+    int64_t llele;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        serverAssert(n < cap);
+        refs[n++] = setTypeIteratorMemberRef(si, str);
+    }
+    setTypeReleaseIterator(si);
+    *out = refs;
+    return n;
+}
+
+/* SRANDMEMBER key <count> on a set that carries member TTLs.
+ *
+ * Expired members break both invariants the plain samplers rely
+ * on: setTypeSize() is only an upper bound on the live members, and a listpack
+ * position no longer maps to a live one. So each variant below makes at most ONE
+ * pass over the live members instead of probing repeatedly, which costs O(n) in
+ * the set size and is what an exactly uniform, bounded reply is worth while
+ * expired members are still there. The members are addressed by pointer into
+ * the set, which is safe because SRANDMEMBER never mutates it. */
+static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
+    char *str;
+    size_t len;
+    int64_t llele;
+
+    /* A single member is a single draw, so the shared primitive is both uniform
+     * and cheaper than a pass: it rejects expired members out of fair random
+     * picks and only falls back to a pass when those are dense. */
+    if (count == 1) {
+        if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
+            addReply(c, shared.emptyarray);
+            return;
+        }
+        addReplyArrayLen(c, 1);
+        if (str == NULL)
+            addReplyBulkLongLong(c, llele);
+        else
+            addReplyBulkCBuffer(c, str, len);
+        return;
+    }
+
+    if (!uniq) {
+        /* A negative count allows repetition, so the draws are independent. A
+         * small count draws each element on its own, which is cheaper than a
+         * pass over the set; a larger one amortizes one pass by sampling the
+         * collected live members with replacement. */
+        if (count <= 16) {
+            /* The set cannot change under a read-only command, so once one draw
+             * finds a live member every further draw finds one too. */
+            if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
+                addReply(c, shared.emptyarray);
+                return;
+            }
+            addReplyArrayLen(c, count);
+            for (unsigned long i = 0; i < count; i++) {
+                if (i > 0) serverAssert(setTypeRandomElement(set, &str, &len, &llele) != -1);
+                if (str == NULL)
+                    addReplyBulkLongLong(c, llele);
+                else
+                    addReplyBulkCBuffer(c, str, len);
+            }
+            return;
+        }
+        void **live;
+        unsigned long n = setTypeCollectLiveMembers(set, &live);
+        if (n == 0) {
+            zfree(live);
+            addReply(c, shared.emptyarray);
+            return;
+        }
+        addReplyArrayLen(c, count);
+        while (count--) {
+            addReplyVolatileSetMember(c, set, live[(unsigned long)rand() % n]);
+            if (c->flag.close_asap) break;
+        }
+        zfree(live);
+        return;
+    }
+
+    /* Unique members: reservoir-sample the live members in one pass. Set members
+     * are distinct, so the reservoir is distinct too and no auxiliary hashtable
+     * is needed; it yields a uniform subset without knowing the live count up
+     * front, and degrades to "every live member" when there are at most 'count'
+     * of them. The reservoir is capped by setTypeSize() so that a huge 'count'
+     * cannot ask for an allocation larger than the set. */
+    unsigned long size = setTypeSize(set);
+    unsigned long cap = count < size ? count : size;
+    void **res = zmalloc(sizeof(void *) * (cap + 1));
+    unsigned long seen = 0, held = 0;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        void *ref = setTypeIteratorMemberRef(si, str);
+        if (held < cap) {
+            res[held++] = ref;
+        } else {
+            unsigned long r = (unsigned long)rand() % (seen + 1);
+            if (r < cap) res[r] = ref;
+        }
+        seen++;
+    }
+    setTypeReleaseIterator(si);
+
+    addReplyArrayLen(c, held);
+    for (unsigned long i = 0; i < held; i++) addReplyVolatileSetMember(c, set, res[i]);
+    zfree(res);
+}
+
+/* The SRANDMEMBER key <count> sampler proper. 'set' never received a member
+ * TTL, so setTypeSize() is exact and every member it holds is visible. */
+static void srandmemberWithCountFromSet(client *c, robj *set, unsigned long count, int uniq) {
+    unsigned long size;
+    char *str;
+    size_t len;
+    int64_t llele;
+
+    size = setTypeSize(set);
 
     /* CASE 1: The count was negative, so the extraction method is just:
      * "return N random elements" sampling the whole set every time.
@@ -1270,7 +1842,11 @@ void srandmemberCommand(client *c) {
     /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET)) return;
 
-    setTypeRandomElement(set, &str, &len, &llele);
+    /* setTypeRandomElement() returns -1 when no member is live. */
+    if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
     if (str == NULL) {
         addReplyBulkLongLong(c, llele);
     } else {
@@ -1296,6 +1872,58 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
     return 0;
 }
 
+#define STORE_PROP_BATCH 1024 /* members per propagated command, as SPOP's SREM batching */
+
+/* Propagate a *STORE destination by effect instead of verbatim: a deletion of
+ * 'dstkey' followed by batched '<cmd> dstkey member ...' over 'members'.
+ *
+ * Needed as soon as a source carries member TTLs. An expired member is excluded
+ * from the result on the primary, but a replica re-executing the same command
+ * runs under POLICY_IGNORE_EXPIRE and sees it as live, so it would store a
+ * different destination. Nothing later reconciles a *STORE destination, so the
+ * divergence is permanent -- unlike a read, which is merely stale until the
+ * primary removes the member.
+ *
+ * The caller keeps ownership of 'members'. */
+void propagateStoreAsEffects(client *c, robj *dstkey, const char *cmd, robj **members, unsigned long count) {
+    propagateDeletion(c->db, dstkey, server.lazyfree_lazy_server_del, c->slot);
+
+    if (count > 0) {
+        robj **argv = zmalloc(sizeof(robj *) * (2 + STORE_PROP_BATCH));
+        argv[0] = createStringObject(cmd, strlen(cmd));
+        argv[1] = dstkey;
+        for (unsigned long i = 0; i < count;) {
+            int n = 2;
+            while (i < count && n < 2 + STORE_PROP_BATCH) argv[n++] = members[i++];
+            alsoPropagate(c->db->id, argv, n, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+        }
+        decrRefCount(argv[0]);
+        zfree(argv);
+    }
+    preventCommandPropagation(c);
+}
+
+/* propagateStoreAsEffects() for a destination SET, which holds plain members
+ * with no TTL of their own. 'dstset' is NULL when the result is empty, and then
+ * only the deletion goes out. */
+static void propagateSetStoreAsEffects(client *c, robj *dstkey, robj *dstset) {
+    unsigned long size = dstset ? setTypeSize(dstset) : 0;
+    robj **members = size > 0 ? zmalloc(sizeof(robj *) * size) : NULL;
+    unsigned long count = 0;
+    if (members) {
+        char *str;
+        size_t len;
+        int64_t llval;
+        setTypeIterator *si = setTypeInitIterator(dstset);
+        while (setTypeNext(si, &str, &len, &llval) != -1)
+            members[count++] = str ? createStringObject(str, len) : createStringObjectFromLongLong(llval);
+        setTypeReleaseIterator(si);
+    }
+    propagateStoreAsEffects(c, dstkey, "SADD", members, count);
+    for (unsigned long i = 0; i < count; i++) decrRefCount(members[i]);
+    zfree(members);
+}
+
 /* SINTER / SMEMBERS / SINTERSTORE / SINTERCARD
  *
  * 'cardinality_only' work for SINTERCARD, only return the cardinality
@@ -1303,6 +1931,10 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
  *
  * 'limit' work for SINTERCARD, stop searching after reaching the limit.
  * Passing a 0 means unlimited.
+ *
+ * setTypeSize() counting expired members costs at most a suboptimal iteration
+ * order here, but the SINTERSTORE variant must be propagated by effect when a
+ * source carries member TTLs; see propagateStoreAsEffects().
  */
 void sinterGenericCommand(client *c,
                           robj **setkeys,
@@ -1319,6 +1951,7 @@ void sinterGenericCommand(client *c,
     void *replylen = NULL;
     unsigned long j, cardinality = 0;
     int encoding, empty = 0;
+    int volatile_source = 0;
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);
@@ -1333,10 +1966,15 @@ void sinterGenericCommand(client *c,
             return;
         }
         sets[j] = setobj;
+        if (dstkey && setTypeHasVolatileMembers(setobj)) volatile_source = 1;
     }
 
     /* Set intersection with an empty set always results in an empty set.
-     * Return ASAP if there is an empty set. */
+     * Return ASAP if there is an empty set.
+     *
+     * Verbatim propagation is safe here: 'empty' counts only MISSING keys, and
+     * a set holding nothing but expired members is still a key, so a replica
+     * reaches the same empty result from the same command. */
     if (empty > 0) {
         zfree(sets);
         if (dstkey) {
@@ -1447,13 +2085,19 @@ void sinterGenericCommand(client *c,
             notifyKeyspaceEvent(NOTIFY_SET, "sinterstore", dstkey, c->db->id);
             server.dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
+            if (volatile_source) propagateSetStoreAsEffects(c, dstkey, dstset);
         } else {
-            if (dbDelete(c->db, dstkey)) {
+            int deleted = dbDelete(c->db, dstkey);
+            if (deleted) {
                 server.dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
             }
             addReply(c, shared.czero);
+            /* Nothing stored and no destination to remove: a plain set
+             * propagates nothing here (server.dirty is untouched), so neither
+             * may the by-effect path. */
+            if (volatile_source && deleted) propagateSetStoreAsEffects(c, dstkey, NULL);
             decrRefCount(dstset);
         }
     } else {
@@ -1501,6 +2145,11 @@ void sinterstoreCommand(client *c) {
     sinterGenericCommand(c, c->argv + 2, c->argc - 2, c->argv[1], 0, 0);
 }
 
+/* SUNION / SUNIONSTORE / SDIFF / SDIFFSTORE
+ *
+ * As in sinterGenericCommand above: the set sizes only pick the SDIFF
+ * algorithm, and the STORE variant is propagated by effect when a source
+ * carries member TTLs. */
 void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstkey, int op) {
     robj **sets = zmalloc(sizeof(robj *) * setnum);
     setTypeIterator *si;
@@ -1513,6 +2162,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
     int j, cardinality = 0;
     int diff_algo = 1;
     int sameset = 0;
+    int volatile_source = 0;
 
     for (j = 0; j < setnum; j++) {
         robj *setobj = lookupKeyRead(c->db, setkeys[j]);
@@ -1542,6 +2192,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             dstset_encoding = OBJ_ENCODING_HASHTABLE;
         }
         sets[j] = setobj;
+        if (dstkey && setTypeHasVolatileMembers(setobj)) volatile_source = 1;
         if (j > 0 && sets[0] == sets[j]) {
             sameset = 1;
         }
@@ -1671,13 +2322,18 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
             notifyKeyspaceEvent(NOTIFY_SET, op == SET_OP_UNION ? "sunionstore" : "sdiffstore", dstkey, c->db->id);
             server.dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
+            if (volatile_source) propagateSetStoreAsEffects(c, dstkey, dstset);
         } else {
-            if (dbDelete(c->db, dstkey)) {
+            int deleted = dbDelete(c->db, dstkey);
+            if (deleted) {
                 server.dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
             }
             addReply(c, shared.czero);
+            /* See sinterGenericCommand: nothing stored and nothing removed is a
+             * no-op, and a no-op propagates nothing. */
+            if (volatile_source && deleted) propagateSetStoreAsEffects(c, dstkey, NULL);
             decrRefCount(dstset);
         }
     }
