@@ -207,11 +207,7 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
     }
 }
 
-/* W5b (never-free-on-main): unconditionally free a sole-reference object on a
- * bio thread, ignoring the LAZYFREE_THRESHOLD effort heuristic. Used for shapes
- * that cannot run on an IO thread (module VM_Free, streams) so their free never
- * lands on the main thread. If the object is still shared (refcount > 1) the
- * decrement is non-terminal and is applied inline (no free occurs). */
+/* Sole references always free on bio; shared references only decrement here. */
 void freeObjAsyncForce(robj *obj) {
     if (obj->refcount == 1) {
         atomic_fetch_add_explicit(&lazyfree_objects, 1, memory_order_relaxed);

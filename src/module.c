@@ -10533,8 +10533,7 @@ int VM_FreeModuleUser(ValkeyModuleUser *user) {
  * Returns VALKEYMODULE_OK on success and VALKEYMODULE_ERR on failure
  * and will set an errno describing why the operation failed. */
 int VM_SetModuleUserACL(ValkeyModuleUser *user, const char *acl) {
-    int retval = ACLSetUser(user->user, acl, -1);
-    return retval;
+    return ACLSetUser(user->user, acl, -1);
 }
 
 /* Sets the permission of a user with a complete ACL string, such as one

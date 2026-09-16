@@ -129,7 +129,6 @@ typedef struct serverObject dbEntry; // Explicitly a key/value pair
 struct hdr_histogram;
 struct ValkeyModule;
 
-
 /* helpers */
 #define numElements(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -449,7 +448,6 @@ typedef enum {
                              * PSYNC FAILOVER request. */
 } failover_state;
 
-
 /* State of replicas from the POV of the primary. Used in client->replstate.
  * In SEND_BULK and ONLINE state the replica receives new updates
  * in its output queue. In the WAIT_BGSAVE states instead the server is waiting
@@ -517,7 +515,6 @@ typedef enum {
 #define SUPERVISED_AUTODETECT 1
 #define SUPERVISED_SYSTEMD 2
 #define SUPERVISED_UPSTART 3
-
 
 /* Append only defines */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024 * 1024 * 8) /* 8 MB */
@@ -1103,7 +1100,6 @@ typedef struct readyList {
 #define SELECTOR_FLAG_ALLCHANNELS (1 << 3) /* The user can mention any Pub/Sub \
                                               channel. */
 #define SELECTOR_FLAG_ALLDBS (1 << 4)      /* Allow all databases */
-
 
 typedef struct user {
     sds name;         /* The username as an SDS string. */
@@ -1873,7 +1869,7 @@ typedef enum childInfoType {
 } childInfoType;
 
 /* Reply copy-avoidance gate mode (avoid-copy-reply-mode config). */
-#define COPY_AVOID_MODE_STATIC 0   /* Fixed size gates (default, legacy behavior). */
+#define COPY_AVOID_MODE_STATIC 0   /* Fixed size gates (default). */
 #define COPY_AVOID_MODE_ADAPTIVE 1 /* Main-thread pressure drives the size floor. */
 #define COPY_AVOID_MODE_OFF 2      /* Never copy-avoid; always serialize inline. */
 
@@ -2012,8 +2008,6 @@ struct valkeyServer {
     double copy_avoid_busy_ema;              /* Main-thread busy percent EMA (0..100) driving the adaptive floor */
     monotime copy_avoid_last_sample_time;    /* Wall clock (us) of last pressure sample */
     long long copy_avoid_last_active_time;   /* server.stat_active_time captured at last pressure sample */
-    int io_threads_free_min_size;            /* Minimum flat-object payload size to offload its free to an IO thread; smaller frees run inline */
-    int io_threads_free_min_effort;          /* Minimum lazyfreeGetFreeEffort() for an aggregate value to offload its free to an IO thread; smaller frees run inline */
     /* RDB / AOF loading information */
     volatile sig_atomic_t loading;       /* We are loading data from disk if true */
     volatile sig_atomic_t async_loading; /* We are loading data without blocking the db being served */
@@ -3865,7 +3859,6 @@ robj *setTypeDup(robj *o);
 #define HASH_SET_KEEP_EXPIRY (1 << 2)
 #define HASH_SET_COPY 0
 
-
 long long hashTypeVolatileCount(robj *o);                                    /* total volatile fields, incl. expired-unreaped */
 long long hashTypeListpackGetExpiry(unsigned char *zl, unsigned char *vptr); /* expiry of the pair whose value entry is vptr, or EXPIRY_NONE */
 bool hashTypeListpackFieldIsValid(long long expiry);                         /* listpack mirror of validateEntry: is a field with this expiry visible now */
@@ -4119,7 +4112,7 @@ size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
 void freeObjAsyncForce(robj *obj);
-/* W5b never-free-on-main enforcement hooks (defined in io_threads.c). */
+/* Debug hooks for terminal frees routed off main. */
 void armNoMainThreadFree(void);
 void disarmNoMainThreadFree(void);
 int noMainThreadFreeArmed(void);

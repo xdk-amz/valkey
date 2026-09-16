@@ -56,7 +56,6 @@ static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
-
 /* Lookup a key for read or write operations, or return NULL if the key is not
  * found in the specified DB. This function implements the functionality of
  * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
@@ -401,8 +400,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* W5b: the overwritten value's terminal free never runs on the main thread
-     * (IO thread for strings/aggregates, bio for module/stream). */
+    /* Preserve mutation ordering; only the old value's terminal free is deferred. */
     freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
@@ -522,17 +520,7 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        /* Physical value free: W5b routes EVERY terminal value free off the
-         * main thread. All keyspace-notification, signalDeletedKeyAsReady,
-         * module-unlink, dirty accounting, table deletes and volatile-hash
-         * un-tracking above have already run on the main thread; only the
-         * physical free is deferred here, so no ordering guarantee changes.
-         *
-         * freeValueNeverOnMain routes: strings + audited aggregates -> IO
-         * thread (or the main-side pending list on a full queue); module /
-         * stream / (IO threads disabled) -> bio lazyfree. The main thread never
-         * runs the terminal free. The `async` (lazyfree-lazy-*) config no longer
-         * gates this: off-main routing is now unconditional. */
+        /* All unlink side effects precede the terminal free; `async` no longer selects its route. */
         UNUSED(async);
         freeValueNeverOnMain(key, val, db->id);
 
@@ -1846,7 +1834,6 @@ int dbSwapDatabases(int id1, int id2) {
     db1->keys_with_volatile_items = db2->keys_with_volatile_items;
     copyDbExpiry(db1, db2);
 
-
     db2->keys = aux.keys;
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
@@ -2040,7 +2027,6 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
     server.stat_expiredkeys++;
 }
-
 
 /* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {

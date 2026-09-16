@@ -1160,7 +1160,6 @@ int clientEvictionAllowed(client *c) {
     return (type == CLIENT_TYPE_NORMAL || type == CLIENT_TYPE_PUBSUB);
 }
 
-
 /* This function is used to cleanup the client's previously tracked memory usage.
  * This is called during incremental client memory usage tracking as well as
  * used to reset when client to bucket allocation is not required when
@@ -1302,9 +1301,7 @@ static void clientsCron(int clients_this_cycle) {
          * terminated. */
         if (clientsCronHandleTimeout(c, now)) continue;
         if (clientsCronTcpIsClosing(c)) continue;
-        /* The query buffer of an armed partitioned client may be read into by
-         * its IO thread at any moment: hold the socket while resizing it, and
-         * re-arm a client that lost its arm (ring full at staging time). */
+        /* Hold armed sockets while clientsCron mutates read-side buffers. */
         if (c->flag.partitioned) {
             armPartitionedClientRead(c);
             if (partitionedClientHold(c)) {
@@ -1842,7 +1839,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     return 1000 / server.hz;
 }
 
-
 void blockingOperationStarts(void) {
     if (!server.blocking_op_nesting++) {
         updateCachedTime(0);
@@ -1945,28 +1941,13 @@ static bool processPendingReplStreamDecode(void) {
  *
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
-/* --- Adaptive reply copy-avoidance: main-thread pressure loop ---------------
- *
- * Signal: main-thread busy fraction, derived from server.stat_active_time (the
- * cumulative microseconds the main thread spent doing work per event loop, i.e.
- * command-exec/processing time, excluding time parked in epoll_wait). It is
- * already maintained every beforeSleep, so sampling it is O(1) with no new
- * hot-path instrumentation. It answers the exact question the gate needs: is
- * the main thread the constraint? (IO-queue depth measures IO-thread backlog,
- * the inverse of what copy-avoidance protects; events-per-iteration cannot tell
- * cheap from expensive commands.)
- *
- * We sample the active-time delta over a fixed window, convert to a busy %, feed
- * an EMA, and drive a hysteretic size floor: engage (floor -> 1024) when the EMA
- * crosses above ENGAGE %, release (floor -> the threaded static gate) when it
- * drops below RELEASE %. The gap between the two thresholds prevents flapping. */
+/* Separate engage/release thresholds keep the adaptive copy-avoidance floor from flapping. */
 #define COPY_AVOID_PRESSURE_WINDOW_US 100000 /* Resample main-thread busy % every 100ms. */
 #define COPY_AVOID_ENGAGE_PCT 75             /* Engage aggressive offload above this busy EMA. */
 #define COPY_AVOID_RELEASE_PCT 50            /* Release back to the high floor below this busy EMA. */
 #define COPY_AVOID_EMA_ALPHA_PCT 30          /* EMA smoothing factor (0.30). */
 
 static void updateCopyAvoidPressure(monotime current_time) {
-    /* Seed on first call. */
     if (server.copy_avoid_last_sample_time == 0) {
         server.copy_avoid_last_sample_time = current_time;
         server.copy_avoid_last_active_time = server.stat_active_time;
@@ -1986,7 +1967,6 @@ static void updateCopyAvoidPressure(monotime current_time) {
 
     server.copy_avoid_busy_ema += ((double)COPY_AVOID_EMA_ALPHA_PCT / 100.0) * (busy_pct - server.copy_avoid_busy_ema);
 
-    /* Hysteresis: engage high, release low, so the floor cannot flap. */
     if (!server.copy_avoid_engaged) {
         if (server.copy_avoid_busy_ema > COPY_AVOID_ENGAGE_PCT) {
             server.copy_avoid_engaged = 1;
@@ -2038,9 +2018,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
-    /* W5b: re-attempt any value/buffer frees that were parked because the IO
-     * inbox was full when the free was requested. Never frees synchronously on
-     * the main thread; entries that still cannot be enqueued stay parked. */
+    /* Full IO queues leave terminal frees parked for the next beforeSleep pass. */
     drainPendingMainFrees();
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
@@ -2079,12 +2057,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
     }
 
-    /* When maxmemory-eviction-batch is enabled, key eviction is consolidated
-     * off the per-command hot path into a single pass here, once per event
-     * loop. This refreshes the cached OOM verdict used by processCommand for
-     * the next batch of commands. Placed before the AOF flush below so eviction
-     * DELs land in the AOF buffer, and before the tracking-pending assert so
-     * invalidations produced by eviction are flushed. */
+    /* Batched eviction runs before AOF flush and tracking assertions. */
     if (server.maxmemory_eviction_batch && server.maxmemory && !isInsideYieldingLongCommand()) {
         server.pre_command_oom_state = (performEvictions() == EVICT_FAIL);
         trackingHandlePendingKeyInvalidations();
@@ -2215,12 +2188,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * event loop knows nothing about, so main polls while such clients exist. */
     aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
 
-    /* Refresh the adaptive copy-avoidance size floor from main-thread pressure. */
     updateCopyAvoidPressure(current_time);
 
-    /* Strict offload: re-dispatch any client reads that were deferred off the
-     * main thread to IO threads. Must run before IOThreadsBeforeSleep commits
-     * the submitted IO jobs to the worker threads. */
     if (strictOffloadActive()) processDeferredReads();
 
     IOThreadsBeforeSleep(current_time);
@@ -3087,8 +3056,7 @@ void resetServerStats(void) {
     server.priority_el_cmd_cnt_max = 0;
     server.priority_el_cmd_cnt_prev = 0;
     server.stat_active_time = 0;
-    /* (Re)seed the adaptive copy-avoidance pressure state. Default to the
-     * released (high) floor; the pressure loop lowers it only under load. */
+
     server.copy_avoid_engaged = 0;
     server.copy_avoid_busy_ema = 0;
     server.copy_avoid_current_floor = server.min_string_size_copy_avoid_threaded;
@@ -4665,12 +4633,7 @@ uint64_t getCommandFlags(client *c) {
     return cmd_flags;
 }
 
-/* W4c: prebuild the store-ready value object at argv[val_idx] with the key at
- * argv[key_idx] embedded, and install it back into argv on this (IO) thread.
- * The throwaway parsed value object is freed on the same thread that allocated
- * it. The hasembkey guard skips a value that was already prebuilt (e.g. after a
- * command-filter rewrite re-runs prepare). Falls back silently (NULL) for
- * shared / large-non-embedding values. */
+/* Prebuilt values replace only parser-owned argv entries and remain idempotent across prepare retries. */
 static inline void prebuildArgvEntry(robj **argv, int key_idx, int val_idx) {
     if (argv[val_idx]->hasembkey) return;
     robj *pb = tryPrebuildStringEntry(argv[val_idx], objectGetVal(argv[key_idx]));
@@ -4680,10 +4643,7 @@ static inline void prebuildArgvEntry(robj **argv, int key_idx, int val_idx) {
     }
 }
 
-/* W4c: true only for the pure expire form "SET key val <EX|PX|EXAT|PXAT> arg"
- * (argc == 5), which stores the value as-is and applies a TTL separately. Every
- * other 5-arg SET form (NX/XX/GET/IFEQ/IFNE/KEEPTTL) carries a non-expire token
- * at argv[3], so inspecting argv[3] alone is sufficient to exclude them. */
+/* Only argc-5 SET expire forms store argv[2] unchanged and apply TTL separately. */
 static int setIsPureExpireForm(robj **argv) {
     if (!sdsEncodedObject(argv[3])) return 0;
     sds opt = objectGetVal(argv[3]);
@@ -4713,31 +4673,17 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         *slot = clusterSlotByCommand(*cmd, argv, argc, read_flags);
     }
 
-    /* Prebuild the store-ready value object(s) for the SET/MSET family fast path
-     * and install them directly into argv on this (IO) thread, so the main
-     * thread installs each with a pure pointer swap and never allocates or
-     * copies the value (objectSetKeyAndExpire's fast return). Scoped to forms
-     * whose stored value is fully determined by the request and whose key never
-     * changes. For the TTL forms (SETEX/PSETEX and bare SET k v EX|PX|EXAT|PXAT)
-     * the store object is built with no expire and the absolute TTL is written
-     * into the reserved expire slot in place by setExpire on the main thread, so
-     * no parse-time clock is needed. KEEPTTL and the conditional/GET forms punt.
-     * The hasembkey guard (in prebuildArgvEntry) avoids re-prebuilding after a
-     * command-filter rewrite. */
+    /* Prebuild only request-determined values whose keys cannot change. */
     if (*cmd && !(*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
         serverCommandProc *p = (*cmd)->proc;
         if (argc == 3 && (p == setCommand || p == setnxCommand || p == getsetCommand)) {
-            /* SET k v / SETNX k v / GETSET k v */
             prebuildArgvEntry(argv, 1, 2);
         } else if (argc == 4 && (p == setexCommand || p == psetexCommand)) {
-            /* SETEX key seconds value / PSETEX key milliseconds value */
             prebuildArgvEntry(argv, 1, 3);
         } else if (argc == 5 && p == setCommand && setIsPureExpireForm(argv)) {
-            /* SET k v EX|PX|EXAT|PXAT n */
             prebuildArgvEntry(argv, 1, 2);
         } else if ((p == msetCommand || p == msetnxCommand) && (argc & 1) == 1) {
-            /* MSET / MSETNX k v [k v ...]: prebuild each value into its slot;
-             * msetGenericCommand's setKey loop hits the fast return per pair. */
+
             for (int j = 1; j + 1 < argc; j += 2) prebuildArgvEntry(argv, j, j + 1);
         }
     }
@@ -5010,7 +4956,6 @@ int processCommand(client *c) {
     if (!server.maxmemory_eviction_batch) {
         evictClients();
         if (server.current_client == NULL) {
-            /* If we evicted ourself then abort processing the command */
             return C_ERR;
         }
     }
@@ -5024,19 +4969,7 @@ int processCommand(client *c) {
     if (server.maxmemory && !isInsideYieldingLongCommand()) {
         int out_of_memory;
 
-        /* Decide whether to run the (expensive) eviction pass now.
-         *
-         * Default behavior (maxmemory-eviction-batch off): run it before every
-         * command, so memory never overshoots maxmemory by more than a single
-         * command's allocation and OOM denial is exact per command.
-         *
-         * Batched behavior (maxmemory-eviction-batch on): the eviction pass runs
-         * once per event loop in beforeSleep. On the per-command path we only
-         * re-run it when we may have allocated more than the allowed overshoot
-         * slack since the last check; otherwise we reuse the cached OOM verdict.
-         * This bounds worst-case overshoot to (slack + one command's allocation)
-         * per event-loop iteration, at the cost of admitting writes that cross
-         * the limit mid-batch until the slack threshold forces a recheck. */
+        /* Batched eviction bounds overshoot to the configured slack plus one command allocation. */
         int run_eviction = 1;
         if (server.maxmemory_eviction_batch) {
             size_t used = zmalloc_used_memory();
@@ -7427,7 +7360,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoDebugMetrics(info);
     }
 
-    /* Fast path */
     if (all_sections || (dictFind(section_dict, "fastpath") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Fastpath\r\n");

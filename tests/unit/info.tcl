@@ -425,15 +425,10 @@ start_server {tags {"info" "external:skip" "debug_defrag:skip"}} {
                 catch {r get key}
                 r config set client-output-buffer-limit $org_outbuf_limit
 
-                # Restore copy avoidance configs
-                r config set min-string-size-avoid-copy-reply $min_size
-
                 set info [r info stats]
                 assert_equal [getInfoProperty $info client_output_buffer_limit_disconnections] {1}
-            } else {
-                # Restore copy avoidance configs
-                r config set min-string-size-avoid-copy-reply $min_size
             }
+            r config set min-string-size-avoid-copy-reply $min_size
             set _ {}
         } {} {logreqres:skip} ;# same as obuf-limits.tcl, skip logreqres
 

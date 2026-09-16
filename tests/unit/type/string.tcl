@@ -959,7 +959,6 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_error {WRONGTYPE Operation against a key holding the wrong kind of value} {r set foo "new_value" ifeq "some_set_value"}
     }
 
-
     test "SET with IFEQ conditional - with get" {
         r del foo
 
@@ -1244,10 +1243,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     } {} {needs:debug}
 } ; # if jemalloc
 
-    # W4c: parse-time entry prebuild extended to the SET-with-TTL family and
-    # MSET. These assert value+encoding+TTL correctness through the prebuilt
-    # store path (exercised under io-threads > 1 by the runtest --config).
-    test {W4c SETEX stores value and TTL via prebuilt path} {
+    test {SETEX stores value and TTL} {
         r del k
         r setex k 100 helloworld
         assert_equal helloworld [r get k]
@@ -1255,14 +1251,14 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_encoding embstr k
     } {}
 
-    test {W4c PSETEX stores value and TTL via prebuilt path} {
+    test {PSETEX stores value and TTL} {
         r del k
         r psetex k 100000 helloworld
         assert_equal helloworld [r get k]
         assert_range [r pttl k] 90000 100000
     } {}
 
-    test {W4c SETEX integer value keeps int encoding through prebuild} {
+    test {SETEX integer value keeps int encoding} {
         r del k
         r setex k 100 12345
         assert_equal 12345 [r get k]
@@ -1270,7 +1266,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_range [r ttl k] 90 100
     } {}
 
-    test {W4c SET k v EX n stores value then TTL} {
+    test {SET k v EX n stores value and TTL} {
         r del k
         r set k helloworld ex 100
         assert_equal helloworld [r get k]
@@ -1278,7 +1274,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_encoding embstr k
     } {}
 
-    test {W4c SET k v PXAT absolute expiry via prebuild} {
+    test {SET k v PXAT stores an absolute expiry} {
         r del k
         set future [expr {[clock milliseconds] + 100000}]
         r set k valuebytes pxat $future
@@ -1286,7 +1282,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_range [r pttl k] 90000 100000
     } {}
 
-    test {W4c bare SET clears an existing TTL (prebuilt overwrite)} {
+    test {bare SET clears an existing TTL} {
         r del k
         r setex k 100 first
         assert_range [r ttl k] 90 100
@@ -1295,7 +1291,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal -1 [r ttl k]
     } {}
 
-    test {W4c SET encoding parity: SETEX vs plain SET vs SET EX} {
+    test {SETEX, SET, and SET EX preserve encoding parity} {
         foreach v [list a 12345 [string repeat x 40] [string repeat y 200]] {
             r del ka kb kc
             r set ka $v
@@ -1309,7 +1305,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         }
     } {}
 
-    test {W4c MSET 10 pairs correctness and encodings} {
+    test {MSET 10 pairs preserves values and encodings} {
         set keys {}
         for {set i 0} {$i < 10} {incr i} { lappend keys msk:$i }
         foreach k $keys { r del $k }
@@ -1330,7 +1326,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         }
     } {}
 
-    test {W4c MSET with odd arity leaves no partial state or leak} {
+    test {MSET odd arity leaves no partial state or leak} {
         r flushdb
         # even number of key/value tokens -> wrong arity, atomic no-op
         assert_error "*wrong number*" {r mset lk1 lv1 lk2}
@@ -1342,7 +1338,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal ok [r get probe]
     } {}
 
-    test {W4c MSETNX all-new prebuilt values then abort on conflict} {
+    test {MSETNX aborts all writes on conflict} {
         r flushdb
         assert_equal 1 [r msetnx nk1 v1 nk2 22222]
         assert_equal v1 [r get nk1]

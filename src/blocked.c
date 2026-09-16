@@ -185,15 +185,7 @@ void processUnblockedClients(void) {
                 continue;
             }
         }
-        /* Process remaining data in the input buffer, unless the client
-         * is blocked again. Actually processInputBuffer() checks that the
-         * client is not blocked before to proceed, but things may change and
-         * the code is conceptually more correct this way.
-         *
-         * A partitioned client kept reading while blocked. Its buffers are
-         * touched only with the socket held away from its IO thread; a read
-         * in flight or already landed drains through the read's own epilogue
-         * instead, now that the client is no longer blocked. */
+        /* Hold a partitioned client's socket until any landed read drains after unblock. */
         if (!c->flag.blocked) {
             if (c->io_read_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_COMPLETED_IO) continue;
             if (!partitionedClientHold(c)) continue;

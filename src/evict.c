@@ -297,12 +297,7 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
     }
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
 
-    /* W5f: subtract memory already committed to an off-main free. W5b routes
-     * every terminal value/reply-buffer free to an IO thread, so used_memory
-     * stays elevated until the freeing thread runs. These bytes are certain to
-     * be reclaimed imminently, so treat them as freed for the eviction verdict;
-     * otherwise the eviction loop (and client-eviction feedback) over-evicts
-     * while the async frees are still in flight. */
+    /* Pending off-main frees count as reclaimed so eviction does not over-evict. */
     size_t pending_offload_free = offloadPendingFreeBytes();
     mem_used = (mem_used > pending_offload_free) ? mem_used - pending_offload_free : 0;
 
@@ -422,12 +417,7 @@ static long long evictSingleKey(serverDb *db, robj *keyobj, int slot) {
      * the read command on key eviction. */
     enterExecutionUnit(1, 0);
     delta = (long long)zmalloc_used_memory();
-    /* W5f: the value free is routed off the main thread (W5b), so it does not
-     * show up in the zmalloc_used_memory() delta below -- the physical free
-     * happens later on an IO/bio thread. Capture the bytes committed to that
-     * off-main free so `delta` reflects the memory this eviction will actually
-     * release. Without this, mem_freed never reaches mem_tofree and the loop
-     * over-evicts (drains the DB) while frees are in flight. */
+    /* Include newly pending off-main frees in this eviction's reclaimed-byte delta. */
     size_t offload_pending_before = offloadPendingFreeBytes();
     latencyStartMonitor(eviction_latency);
     int deleted = dbGenericDelete(db, keyobj, server.lazyfree_lazy_eviction, DB_FLAG_KEY_EVICTED);

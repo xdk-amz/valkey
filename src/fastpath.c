@@ -1,24 +1,4 @@
-/* Fast path: the main thread as a pure command executor.
- *
- * An IO thread owns a fast-path client's socket for the client's whole life:
- * it reads, parses, and appends each complete command as one entry to the
- * batch it is assembling. When the batch holds io-batch-commands entries, or
- * the thread's epoll pass ends with a non-empty batch, the batch is published
- * to the main thread on the thread's submit ring. Main executes every entry
- * with an executor client whose reply buffer is the batch's arena, and hands
- * the batch back on the thread's return ring. The IO thread writes each
- * client's reply bytes to its socket, frees what is left to free, and recycles
- * the batch.
- *
- * Main never dereferences a fast-path client. The only per-command traffic
- * between threads is the batch itself: one pointer per ring per batch, and the
- * batch's lines, written by one side and read once by the other.
- *
- * Scope: plain read/write data commands. A client that sends anything else
- * (MULTI, blocking, pubsub, CLIENT, SELECT, AUTH, scripting, a protocol
- * error) leaves the fast path for good: the IO thread stops reading it, lets
- * its entries in flight return, and hands the client to the main thread, which
- * takes it over on the existing path. */
+/* IO threads own fast-path clients; main only executes their published command batches. */
 
 #include "server.h"
 #include "fastpath.h"
@@ -35,7 +15,6 @@ extern int ProcessingEventsWhileBlocked; /* networking.c */
 #define FP_CLIENT_INFLIGHT_MAX 256 /* commands of one client on main at once */
 #define FP_TAG_DETACH ((uintptr_t)1) /* return-ring entry is a client to detach, not a batch */
 
-/* ---- per IO thread state (touched by that thread only, except the rings) --- */
 typedef struct fpThread {
     spscQueue submit; /* IO thread -> main: cmdBatch * */
     spscQueue ret;    /* main -> IO thread: cmdBatch *, or client * | FP_TAG_DETACH */
@@ -44,7 +23,6 @@ typedef struct fpThread {
     int nfree;
     int inflight;     /* batches submitted, not yet returned */
     list *leaving;    /* clients waiting for their entries to return before hand-off or close */
-    /* stats, summed by INFO */
     long long reads, net_input_bytes, net_output_bytes, writes, batches;
 } fpThread;
 
@@ -57,9 +35,6 @@ size_t fastpathClientCount(void) {
     return fastpath_clients;
 }
 
-/* ---------------------------------------------------------------------------
- * Batch memory (owning IO thread)
- * ------------------------------------------------------------------------- */
 static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     cmdBatch *b;
     if (t->nfree > 0) {
@@ -112,9 +87,6 @@ void fastpathFreeThread(int tid) {
     t->leaving = NULL;
 }
 
-/* ---------------------------------------------------------------------------
- * Eligibility (main thread, at accept)
- * ------------------------------------------------------------------------- */
 int fastpathEligible(client *c) {
     if (!server.io_threads_fast_path) return 0;
     if (!strictOffloadActive() || server.io_threads_num < 2) return 0;
@@ -125,14 +97,11 @@ int fastpathEligible(client *c) {
     return 1;
 }
 
-/* Hand a freshly accepted client to an IO thread's epoll set, level triggered.
- * The main thread never installs a read handler for it. */
+/* Publish all client state before level-triggered epoll can expose the socket. */
 int fastpathAttach(client *c) {
     int tid = 1 + (int)(fp_rr++ % (unsigned)(server.io_threads_num - 1));
     int epfd = ioThreadEpollFd(tid);
     if (epfd <= 0) return C_ERR;
-    /* Everything the IO thread reads is in place before the socket enters
-     * its epoll set: readiness can fire the moment the fd is added. */
     c->io_tid = tid;
     c->flag.fastpath = 1;
     c->fp_state = FP_ACTIVE;
@@ -148,8 +117,6 @@ int fastpathAttach(client *c) {
     return C_OK;
 }
 
-/* Commands the executor runs. Anything touching connection state, blocking,
- * pubsub, transactions, scripting or administration is left to the main path. */
 static int fpCommandAllowed(struct serverCommand *cmd) {
     if (!cmd) return 0; /* unknown command: the main path replies (and runs the host:/post check) */
     if (!(cmd->flags & (CMD_WRITE | CMD_READONLY))) return 0;
@@ -159,9 +126,6 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
     return 1;
 }
 
-/* ---------------------------------------------------------------------------
- * IO thread: read, parse, batch, submit
- * ------------------------------------------------------------------------- */
 static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
@@ -171,21 +135,15 @@ static void fpSubmit(fpThread *t) {
     t->batches++;
 }
 
-/* End of an IO-thread loop iteration. A partial batch goes to main only when
- * main has already consumed everything this thread submitted: an idle main
- * gets the commands at once, a busy main gets full batches. No timer. */
 void fastpathSubmitPending(int tid) {
     fpThread *t = &fp_threads[tid];
     if (!t->cur || t->cur->count == 0 || spscBacklog(&t->submit) != 0) return;
-    /* A partial batch is held for io-batch-hold-us so that main's per-batch
-     * work (ring hop, prefetch pass, executor setup) is paid for several
-     * commands rather than one; the hold bounds the added latency. */
+    /* The hold amortizes per-batch work while bounding latency. */
     if (server.io_batch_hold_us > 0 && getMonotonicUs() - t->cur->opened_us < (monotime)server.io_batch_hold_us) return;
     fpSubmit(t);
 }
 
-/* Stop reading a client and remember it: once nothing of it is in flight the
- * client is handed to the main thread, to be freed (closing) or taken over. */
+/* Handoff waits until every published command for the client returns. */
 static void fpBeginLeave(fpThread *t, client *c, int state) {
     if (c->fp_state != FP_ACTIVE) return;
     c->fp_state = state;
@@ -193,7 +151,6 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
     listAddNodeTail(t->leaving, c);
 }
 
-/* Move a parsed command into the batch as one entry. */
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
                           unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
@@ -214,18 +171,12 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     c->fp_inflight++;
 }
 
-/* Take the complete commands the parser left in c->argv and c->cmd_queue into
- * the batch, in order. Stops at the first command the fast path does not run
- * (or a parse error): that command and everything after it stay with the
- * client, which leaves the fast path. A trailing partial command is moved
- * back into c->argv so the next read continues parsing it, and the queue is
- * left empty as the parser requires. */
+/* The first unsupported command and all successors remain queued for main. */
 static void fpHarvest(fpThread *t, int tid, client *c) {
     int leave = 0;
     int max = server.io_batch_commands;
     cmdQueue *q = &c->cmd_queue;
 
-    /* First command: in c->argv. */
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
@@ -245,7 +196,6 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         leave = 1;
     }
 
-    /* Queued commands. */
     while (!leave && q->off < q->len) {
         parsedCommand *p = &q->cmds[q->off];
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
@@ -262,10 +212,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     }
 
     if (leave) {
-        /* The offending command (and anything behind it) stays with the client
-         * exactly as the parser left it; the main thread processes it after the
-         * hand-off with processPendingCommandAndInputBuffer. If it is a queued
-         * command and c->argv is empty, promote it so the main path finds it. */
+        /* Promote the first queued command so the main path can resume parsing. */
         if (c->argc == 0 && q->off < q->len) {
             parsedCommand *p = &q->cmds[q->off++];
             c->argv = p->argv, c->argc = p->argc, c->argv_len = p->argv_len, c->argv_len_sum = p->argv_len_sum;
@@ -309,7 +256,7 @@ void fastpathClientReadable(int tid, client *c) {
     }
     t->net_input_bytes += c->nread;
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
-        trimClientQueryBuffer(c); /* the client takes the buffer with it */
+        trimClientQueryBuffer(c);
         fpBeginLeave(t, c, FP_LEAVING);
         return;
     }
@@ -319,15 +266,11 @@ void fastpathClientReadable(int tid, client *c) {
     trimClientQueryBuffer(c);
 }
 
-/* ---------------------------------------------------------------------------
- * IO thread: write replies, free, recycle, finish leaving clients
- * ------------------------------------------------------------------------- */
 static void fpEnableWriteInterest(client *c, int on) {
     struct epoll_event ev = {.events = on ? (EPOLLIN | EPOLLOUT) : EPOLLIN, .data.ptr = c};
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_MOD, c->conn->fd, &ev);
 }
 
-/* Write what the client has buffered; returns 1 when the buffer is empty. */
 static int fpFlushOut(fpThread *t, client *c) {
     while (c->fp_out && sdslen(c->fp_out) > 0) {
         ssize_t n = write(c->conn->fd, c->fp_out, sdslen(c->fp_out));
@@ -343,9 +286,7 @@ static int fpFlushOut(fpThread *t, client *c) {
     return 1;
 }
 
-/* Send iov to the client: straight to the socket when nothing is buffered,
- * otherwise appended behind what is. A short write buffers the remainder and
- * asks for EPOLLOUT. */
+/* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     if (c->fp_state == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
@@ -362,7 +303,6 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     }
     t->net_output_bytes += n;
     t->writes++;
-    /* Buffer whatever did not go out. */
     for (int i = 0; i < iovcnt; i++) {
         if ((size_t)n >= iov[i].iov_len) {
             n -= iov[i].iov_len;
@@ -380,8 +320,7 @@ void fastpathClientWritable(int tid, client *c) {
     if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
 }
 
-/* Replies of a returned batch: consecutive entries of one client go out in one
- * writev. */
+/* Consecutive entries for one client share a writev. */
 static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
     int i = 0;
@@ -457,9 +396,6 @@ int fastpathProcessReturns(int tid) {
     return total;
 }
 
-/* ---------------------------------------------------------------------------
- * Main thread: execute batches
- * ------------------------------------------------------------------------- */
 static client *fpExecutor(int tid) {
     client *ec = fp_exec_client[tid];
     if (ec) return ec;
@@ -470,8 +406,7 @@ static client *fpExecutor(int tid) {
     return ec;
 }
 
-/* Run one entry: the executor client borrows the entry's argv and writes its
- * reply into the batch arena. */
+/* The executor borrows argv and writes replies into the batch arena. */
 static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     char *saved_buf = ec->buf;
     size_t saved_usable = ec->buf_usable_size;
@@ -498,7 +433,6 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     e->reply_len = (uint32_t)ec->bufpos;
     b->arena_used += ec->bufpos;
     if (listLength(ec->reply) > 0) {
-        /* The reply did not fit the arena: move it whole to a heap buffer. */
         size_t total = ec->bufpos;
         listIter li;
         listNode *ln;
@@ -524,10 +458,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->bufpos = 0;
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
-    /* argv goes back to the IO thread that allocated it. An object the command
-     * kept (stored value: refcount > 1) is released here with a plain
-     * decrement, so the IO thread only ever performs terminal frees of objects
-     * nothing else references; shared objects are left alone. */
+    /* IO threads receive only sole-reference argv objects for terminal frees. */
     for (int j = 0; j < e->argc; j++) {
         robj *o = e->argv[j];
         if (!o) continue;
@@ -540,17 +471,10 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
 
 int fastpathDrain(void) {
     int total = 0;
-    /* Inside processEventsWhileBlocked (busy script) commands are still run,
-     * and rejected with BUSY like any other client's; the prefetch batch of
-     * the interrupted outer command is not disturbed. */
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    /* CLIENT PAUSE would block the executor client itself; leave the batches
-     * in the rings until the pause ends. */
+    /* CLIENT PAUSE must not block the executor client. */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0;
-    /* An event-loop iteration costs a few thousand cycles of housekeeping. When
-     * a pass over the rings yields little, keep collecting for up to
-     * io-batch-drain-us before going back to the loop; at high load the
-     * batches fill in that time, at low load nothing waits longer than that. */
+    /* io-batch-drain-us bounds how long a thin batch waits for amortization. */
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
 again:
@@ -586,19 +510,14 @@ again:
     return total;
 }
 
-/* Main thread: a fast-path client is being freed from main's side (CLIENT
- * KILL, shutdown, timeout). Ask its IO thread to detach it; the thread comes
- * back with JOB_RES_FP_CLOSE once nothing is in flight. */
+/* Main requests detach through the IO-owned return ring. */
 void fastpathRequestDetach(client *c) {
     fpThread *t = &fp_threads[c->io_tid];
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
-    /* The return ring is a single-producer ring owned by main; the tagged
-     * pointer tells the IO thread this is a client, not a batch. */
     spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
 }
 
-/* Main thread: the IO thread is done with this client. */
 void fastpathHandoffDone(client *c, int closing) {
     c->flag.fastpath = 0;
     c->fp_state = FP_DETACHED;
@@ -611,7 +530,6 @@ void fastpathHandoffDone(client *c, int closing) {
         freeClient(c); /* removes it from clients_to_close itself when close_asap is set */
         return;
     }
-    /* Taken over by the main path: read handler back, pending command run. */
     connSetReadHandler(c->conn, readQueryFromClient);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;

@@ -434,17 +434,12 @@ void removeClientFromPendingCommandsBatch(client *c) {
     }
 }
 
-/* ---- Command-level batches (command ring) ---------------------------------
- * The ring hands the main thread a fixed number of commands that may belong to
- * any mix of clients. These entry points add one command's keys and argv to
- * the prefetch batch without registering a client, run the prefetch, and
- * reset the batch once the caller has executed the commands. */
+/* Command-ring prefetch batches contain commands from unrelated clients. */
 
 int prefetchBatchEnabled(void) {
     return batch != NULL && batch->max_prefetch_size > 1;
 }
 
-/* Returns 0 when the batch has no room for more keys. */
 int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
                             void *result) {
     if (batch->key_count >= batch->max_prefetch_size) return 0;
@@ -454,11 +449,9 @@ int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, se
 }
 
 void prefetchBatchRun(void) {
-    /* A client batch left half-filled would have its keys converted twice;
-     * the ring drain flushes it before every command batch. */
+    /* Client and command batches must not share pending keys. */
     serverAssert(batch->client_count == 0);
     if (batch->key_count == 0) return;
-    /* argv pointers were prefetched at add time; now the string payloads. */
     for (size_t i = 0; i < batch->key_count; i++) {
         robj *key = (robj *)batch->keys[i];
         if (key->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(key));

@@ -610,7 +610,7 @@ start_server {tags {"maxmemory" "external:skip"}} {
     }
 }
 
-# --- T11: maxmemory-eviction-batch (consolidate per-command eviction into beforeSleep) ---
+# Batched maxmemory checks preserve OOM denial and eviction bounds.
 foreach io_threads {1 6} {
 start_server {tags {"maxmemory external:skip"}} {
     r config set io-threads $io_threads
@@ -625,8 +625,7 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory-eviction-batch no
     }
 
-    # Pipeline `count` SETs of `vsize`-byte values through one deferring client,
-    # then drain replies. Returns the number of successful (non-OOM) writes.
+    # Returns the number of successful pipelined writes.
     proc pipelined_write_storm {count vsize} {
         set val [string repeat x $vsize]
         set rd [valkey_deferring_client]
@@ -654,25 +653,20 @@ start_server {tags {"maxmemory external:skip"}} {
             }
             r config set maxmemory 20mb
 
-            # Storm ~32mb of 4kb writes against a 20mb noeviction limit.
             set vsize 4096
             set ok [pipelined_write_storm 8000 $vsize]
 
-            # The deny path must remain effective in both modes: some writes rejected.
             assert {$ok < 8000}
 
-            # Effective overshoot slack = min(configured slack, 1% of maxmemory).
-            # maxmemory=20mb -> 1% = ~200kb; configured 1mb -> effective ~200kb.
+            # Effective slack is capped at 1% of maxmemory.
             set maxmemory [expr {20*1024*1024}]
             set eff_slack [expr {$maxmemory/100}]
             set margin [expr {1024*1024}] ;# allocator + eviction-exempt overhead
             set used [s used_memory]
 
             if {$mode eq {on}} {
-                # Batched: overshoot bounded by slack + one command's value.
                 set bound [expr {$maxmemory + $eff_slack + $vsize + $margin}]
             } else {
-                # Per-command (today's behavior): overshoot bounded by one value.
                 set bound [expr {$maxmemory + $vsize + $margin}]
             }
             assert {$used <= $bound}
@@ -687,9 +681,7 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory-policy allkeys-lru
         r config resetstat
         r config set maxmemory 8mb
-        # Pipeline ~16mb of 4kb writes against an 8mb allkeys-lru limit.
         pipelined_write_storm 4000 4096
-        # With allkeys-lru the keyspace is capped near maxmemory and keys are evicted.
         assert {[s evicted_keys] > 0}
         assert {[s used_memory] <= [expr {8*1024*1024 + 4*1024*1024}]}
         r config set maxmemory 0

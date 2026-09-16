@@ -1,17 +1,5 @@
 # Tests for the adaptive reply copy-avoidance gate (avoid-copy-reply-mode).
-#
-# The gate has three modes:
-#   static   - fixed size gates (legacy behavior, default).
-#   adaptive - a main-thread busy-pct EMA drives a hysteretic size floor:
-#              engaged (main is the constraint) -> floor drops toward 1024 so
-#              large values offload; released (main idle) -> high floor so
-#              copying stays inline and loopback rps is preserved.
-#   off      - never copy-avoid; always serialize inline.
-#
-# Wire correctness must hold in every mode and across runtime mode flips. The
-# adaptive hysteresis is pinned deterministically for tests via
-#   DEBUG COPY-AVOID <ENGAGE|RELEASE> [floor]
-# so no load generation or benchmarking is needed here.
+# DEBUG COPY-AVOID pins adaptive state without load generation.
 
 proc mkbig {nbytes} {
     set unit "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$"
@@ -22,7 +10,6 @@ proc mkbig {nbytes} {
 start_server {tags {"reply-offload"} overrides {io-threads 6 enable-debug-command yes save ""}} {
     assert_equal {io-threads 6} [r config get io-threads]
 
-    # -------- off mode: correctness holds, nothing is ever offloaded --------
     test {avoid-copy-reply-mode off: large GET byte-exact and zero offload} {
         r config set avoid-copy-reply-mode off
         foreach nbytes {65536 1048576} {
@@ -31,12 +18,10 @@ start_server {tags {"reply-offload"} overrides {io-threads 6 enable-debug-comman
             set before [s reply_copy_avoided]
             set got [r get k]
             assert_equal $v $got
-            # off mode must never take the ref path, even at io-threads 6.
             assert_equal $before [s reply_copy_avoided]
         }
     }
 
-    # -------- adaptive: engaged floor offloads, released floor does not ------
     test {avoid-copy-reply-mode adaptive: engaged low floor offloads large GET} {
         r config set avoid-copy-reply-mode adaptive
         r debug copy-avoid engage 1024

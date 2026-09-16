@@ -32,15 +32,12 @@ static inline void cpuRelax(void) {
 #define IO_SPMC_QUEUE_SIZE 4096
 #define IO_SPSC_QUEUE_SIZE 4096
 #define IO_EPOLL_BATCH 64
-/* Upper bound on outbox batches (of JOB_BATCH_SIZE) one processIOThreadsResponses
- * call handles, so the main thread returns to its event loop under load. */
+/* Bound response draining so main returns to the event loop under load. */
 #define IO_RESPONSE_BATCHES_PER_CALL 256
 /* Cap on partitioned read completions handled per call, for the same reason. */
 #define IO_PARTITION_COMPLETIONS_PER_CALL 4096
 
-/* Per-IO-thread epoll set watching the sockets of the clients partitioned to
- * that thread, and a sequence number the thread bumps after every pass over
- * its events so the main thread can wait out a pass before freeing a client. */
+/* io_epoll_seq lets main wait out stale references from the last epoll pass. */
 static int io_epfd[IO_THREADS_MAX_NUM];
 int ioThreadEpollFd(int tid) {
     return io_epfd[tid];
@@ -77,14 +74,9 @@ static spmcQueue io_shared_inbox[JOB_PRIORITY_COUNT] = {0};
 static mpscQueue io_shared_outbox[JOB_PRIORITY_COUNT] = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
-/* Command ring: one per IO thread (producer), drained by the main thread
- * (consumer). An IO thread that has read and parsed a partitioned client's
- * input appends one RING_CMD entry per complete command and one RING_END
- * entry for the read itself. Main executes commands straight from the ring in
- * fixed-size batches and runs the per-client epilogue only on RING_END. */
+/* Each IO thread publishes parsed commands and one read epilogue to its SPSC ring. */
 static spscQueue io_cmd_ring[IO_THREADS_MAX_NUM] = {0};
-/* Entries per IO thread (8 bytes each). The fast path carries the bulk of the
- * traffic now; a full ring falls back to the per-client completion path. */
+/* A full command ring falls back to the per-client completion path. */
 #define IO_CMD_RING_SIZE 16384
 #define RING_CMD ((uintptr_t)1)
 #define RING_END ((uintptr_t)2)
@@ -131,39 +123,9 @@ int inMainThread(void) {
     return thread_id == 0;
 }
 
-/* ===================== W5b: never-free-on-main ==========================
- * Charter directive: the main thread must never perform a terminal free of a
- * customer-data object or a hot-path heap buffer. All such frees are routed to
- * an IO thread (JOB_REQ_FREE_OBJ / JOB_REQ_FREE_PTR) or, for shapes IO threads
- * cannot run (module VM_Free, streams), to the bio lazyfree threads.
- *
- * Enqueue-failure discipline: if the SPMC inbox is momentarily full we must NOT
- * free inline. The object/pointer is parked on a main-thread-private pending
- * list and re-attempted from beforeSleep (drainPendingMainFrees). This list
- * only grows under SUSTAINED queue-full pressure; under normal load it drains
- * to empty every event-loop iteration. Everything parked here is either a
- * sole-reference (refcount == 1) FREE_OBJ-admitted robj or a raw pointer, so
- * re-enqueue is always valid and never requires a synchronous free.
- *
- * Debug enforcement (behind DEBUG_NEVER_FREE_ON_MAIN, sibling of T6's
- * DEBUG_REFCOUNT_DISCIPLINE): assertNoMainThreadFree() fires if the main thread
- * reaches a terminal free at a converted routing site outside the pending-list
- * enqueue. Release builds compile it to a no-op. */
+/* Full IO queues park terminal frees rather than falling back to main. */
 
-/* ---- Slab free hand-off -------------------------------------------------
- * Terminal frees are NOT enqueued per object: main appends the pointer to the
- * current slab and hands the whole slab to the IO threads as ONE
- * JOB_SPSC_FREE_SLAB job per event-loop drain (or sooner, when a slab fills).
- * This amortizes the contended SPMC enqueue from one-per-object (several per
- * command under a mixed workload) to one-per-batch, and removes queue-full
- * spill at per-object granularity: a slab the ring rejects is parked whole on
- * a pending-slab list and re-attempted from beforeSleep (drainPendingMainFrees).
- * Nothing is ever freed synchronously on main while IO threads are live.
- *
- * Entry encoding: bit 0 marks a robj (decrRefCount) vs a raw heap buffer
- * (zfree). Slabs are zmalloc'd on main and zfree'd by the IO thread that
- * drains them: one cross-arena allocation per slab, amortized over up to
- * FREE_SLAB_CAPACITY frees. */
+/* Main batches terminal frees into tagged slabs drained by IO threads. */
 #define FREE_SLAB_CAPACITY 1022 /* header + entries ~= one 8KB allocation */
 #define FREE_ENTRY_OBJ_BIT ((uintptr_t)1)
 
@@ -184,30 +146,10 @@ size_t pendingMainFreesLen(void) {
     return n;
 }
 
-/* ---- W5f: off-main pending-free byte accounting ------------------------
- * W5b routes every terminal value/buffer free off the main thread, so the
- * physical reclamation is asynchronous: an evict/delete enqueues the free but
- * used_memory does not drop until an IO thread runs it. The eviction and
- * client-eviction logic reads used_memory to decide how much to free, so
- * without this it over-evicts (drains the DB / evicts keys instead of clients)
- * while the frees are still in flight.
- *
- * We track the bytes committed to be freed off-main but not yet freed:
- * incremented at enqueue, decremented by the freeing thread. getMaxmemoryState
- * subtracts it so eviction sees the effective (post-drain) memory immediately.
- * This mirrors the intent of upstream's lazyfree-lazy-eviction handling (which
- * re-polls real memory as bio threads free); the counter makes the same
- * correction non-blocking and also covers reply-block frees. */
+/* Pending-free bytes leave maxmemory pressure until physical reclamation completes. */
 static _Atomic size_t offload_pending_free_bytes = 0;
 
-/* Conservative estimate of the bytes a terminal free of o will release. Must
- * never exceed the real amount (so getMaxmemoryState never under-evicts) and
- * must be computed identically at enqueue and at free (o is sole-referenced and
- * unmodified in between, so the two calls agree). The top allocation already
- * includes any embedded key/expire; a RAW string's sds payload is the one
- * common separate allocation and is added explicitly. Aggregate element memory
- * is intentionally not walked here (cost): the estimate is then a floor, and
- * the eviction re-poll of real memory corrects any residual. */
+/* Estimates never exceed physical frees, so maxmemory cannot under-evict. */
 static inline size_t offloadObjFreeBytes(robj *o) {
     size_t sz = zmalloc_size(o);
     if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_RAW && !o->hasembval)
@@ -223,11 +165,7 @@ static inline void offloadFreeAccountSub(size_t bytes) {
     atomic_fetch_sub_explicit(&offload_pending_free_bytes, bytes, memory_order_relaxed);
 }
 
-/* Emergency inline reclaim: while a client is being evicted for memory
- * pressure, freeing its buffers synchronously is the point of the eviction.
- * Within this window the never-free-on-main routing is bypassed so the
- * reclaimed bytes land in used_memory before the next eviction decision.
- * Scoped strictly to the client-eviction kill path. */
+/* Client eviction reclaims inline so its next pressure check sees the freed bytes. */
 static int inline_reclaim_depth = 0;
 void beginInlineReclaim(void) {
     inline_reclaim_depth++;
@@ -242,8 +180,7 @@ size_t offloadPendingFreeBytes(void) {
 }
 
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
-/* Armed only inside converted routing sites; a fire means our routing fell
- * through to a synchronous main-thread free instead of an off-main hand-off. */
+/* A fired debug guard means a routed terminal free fell back to main. */
 static _Thread_local int never_free_armed = 0;
 void armNoMainThreadFree(void) { never_free_armed = 1; }
 void disarmNoMainThreadFree(void) { never_free_armed = 0; }
@@ -254,12 +191,8 @@ void disarmNoMainThreadFree(void) {}
 int noMainThreadFreeArmed(void) { return 0; }
 #endif
 
-/* Hand one slab to the IO threads as a single job. On a full ring (or IO
- * threads inactive) the slab is parked whole on the pending-slab list and
- * re-attempted from beforeSleep. Never frees on main. */
-/* Slab jobs travel on a private SPSC inbox (the shared tag space is full):
- * any active IO thread can run them, chosen round-robin. Returns 0 when the
- * chosen inbox is full or no IO thread is active. */
+/* Full private inboxes park whole free slabs for the next beforeSleep pass. */
+/* Free slabs use private SPSC inboxes because the shared job tag space is full. */
 static int submitSlabJob(void *slab, int spsc_type) {
     static unsigned slab_rr = 0;
     if (server.active_io_threads_num <= 1) return 0;
@@ -280,9 +213,6 @@ static void submitFreeSlab(freeSlab *slab) {
     pending_free_slabs[pending_free_slabs_len++] = slab;
 }
 
-/* Append one terminal free to the current slab; hands the slab off when it
- * fills. The common flush point is drainPendingMainFrees in beforeSleep, once
- * per event-loop iteration. */
 static void slabAppendFree(void *ptr, int is_obj) {
     if (cur_free_slab == NULL) {
         cur_free_slab = zmalloc(sizeof(freeSlab) + FREE_SLAB_CAPACITY * sizeof(void *));
@@ -297,21 +227,7 @@ static void slabAppendFree(void *ptr, int is_obj) {
     }
 }
 
-/* Client slab: per-client work the main thread hands to the IO threads as ONE
- * job per event loop drain (or sooner, when the slab fills), instead of one job
- * per client. Each entry is a client pointer tagged with what to do:
- *   SLAB_WRITE  write the client's fenced replies
- *   SLAB_REARM  re-arm the client's socket in its IO thread's epoll set so the
- *               next read starts there (partitioned clients, W6a)
- *   SLAB_LAZY   the write is a plain buffer with nothing to release on main:
- *               if it goes out whole, the IO thread keeps the completion to
- *               itself and main reconciles the client's buffer the next time
- *               it touches the client (next command, next reply, cron, free)
- * The IO thread handles every entry and returns the slab as one response only
- * when some entry needs the main thread (SLAB_NOTIFY); otherwise it frees it. Each client's
- * fence (io_last_reply_block / io_last_bufpos), read flags and IO states are
- * set by the main thread before the slab is published; the ring enqueue is the
- * release, the dequeue the acquire. */
+/* Slab publication releases client fences and IO state before tagged write/rearm work becomes visible. */
 #define WRITE_SLAB_CAPACITY 1022
 #define SLAB_FLUSH_THRESHOLD 128
 #define SLAB_WRITE ((uintptr_t)1)
@@ -346,7 +262,6 @@ static void recycleWriteSlab(writeSlab *s) {
     }
 }
 
-/* Undo the staging of a client whose slab could not be handed off. */
 static void unstageWriteClient(client *c, int lazy) {
     c->io_write_state = CLIENT_IDLE;
     connSetPostponeUpdateState(c->conn, 0);
@@ -362,10 +277,7 @@ static void unstageRearmClient(client *c) {
     c->io_read_state = CLIENT_IDLE;
 }
 
-/* Hand the accumulated slab to an IO thread. When the ring is full the
- * clients are unstaged: writes go back to the pending write queue for the
- * next iteration and re-arms are retried from clientsCron; nothing is ever
- * written on the main thread here. */
+/* Failed slab submission restores writes and rearms to their retry paths. */
 void flushWriteSlab(void) {
     writeSlab *s = cur_write_slab;
     if (s == NULL) return;
@@ -388,25 +300,20 @@ void flushWriteSlab(void) {
 
 static void stageSlabEntry(client *c, uintptr_t tag) {
     if (cur_write_slab == NULL) cur_write_slab = allocWriteSlab();
-    /* Merge with the previous entry when it is the same client: a write and a
-     * re-arm for one client in the same pass become one entry, write first. */
+    /* One entry preserves write-before-rearm ordering for the same client. */
     if (cur_write_slab->count > 0 &&
         (cur_write_slab->entries[cur_write_slab->count - 1] & ~SLAB_TAGS) == (uintptr_t)c) {
         cur_write_slab->entries[cur_write_slab->count - 1] |= tag;
         return;
     }
     cur_write_slab->entries[cur_write_slab->count++] = (uintptr_t)c | tag;
-    /* Flush well before the slab is full: handing work to the IO threads
-     * several times per loop keeps clients out of lockstep with main, so
-     * completions arrive while main is still busy instead of after it idles. */
+    /* Early flush keeps IO completions concurrent with main-thread work. */
     if (cur_write_slab->count >= SLAB_FLUSH_THRESHOLD) flushWriteSlab();
 }
 
 static void stageWriteClient(client *c) {
     stageSlabEntry(c, SLAB_WRITE);
 }
-
-/* ---- Client partitioning (W6a) ------------------------------------------ */
 
 static int clientIsPartitionable(client *c) {
     if (!c->conn || c->flag.fake) return 0;
@@ -424,11 +331,7 @@ static void setClientReadFlagsForOffload(client *c) {
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 }
 
-/* Watch a new regular TCP client's socket from one IO thread's epoll set.
- * The main thread never installs a read handler for such a client: the IO
- * thread reads and parses on readiness, main only consumes the parsed
- * commands and re-arms the socket once it has drained them. One-shot
- * readiness is what serializes reads against main's drain. */
+/* One-shot readiness serializes IO-thread reads against main-thread command drains. */
 int tryPartitionClient(client *c) {
     if (!clientIsPartitionable(c)) return C_ERR;
     int tid = 1 + (int)(partition_rr++ % (unsigned)(server.io_threads_num - 1));
@@ -447,10 +350,6 @@ int tryPartitionClient(client *c) {
     return C_OK;
 }
 
-/* Re-arm a partitioned client's socket once the main thread is done with it:
- * its previous read has been consumed, its parsed commands executed, and it is
- * neither blocked nor closing. Staged into the slab, so the epoll_ctl runs on
- * an IO thread. */
 void armPartitionedClientRead(client *c) {
     if (!c->flag.partitioned) return;
     if (c->flag.pending_read) return; /* armed, or a read is in flight */
@@ -458,9 +357,7 @@ void armPartitionedClientRead(client *c) {
     if (c->flag.close_asap || c->flag.protected || c->flag.close_after_reply) return;
     if (c->flag.unblocked) return; /* main is about to resume it and re-arms then */
     if (!c->flag.blocked) {
-        /* A blocked client keeps reading (without parsing: DONT_PARSE) so the
-         * bytes completing a partial command arrive while it waits; its queued
-         * commands run on unblock. Otherwise nothing may be left to execute. */
+        /* Blocked clients keep reading without parsing so partial commands can complete. */
         if (c->cmd_queue.off < c->cmd_queue.len) return; /* commands still to execute */
         if (c->flag.pending_command) return;            /* a complete command still in argv */
     }
@@ -468,18 +365,15 @@ void armPartitionedClientRead(client *c) {
     setClientReadFlagsForOffload(c);
     c->flag.pending_read = 1;
     server.stat_io_reads_pending++;
-    /* Busy to main until the IO thread has touched the socket: a client with
-     * a staged re-arm cannot be freed, held or unpartitioned underneath it. */
+    /* CLIENT_ARMING_IO prevents teardown before the IO thread touches the socket. */
     c->io_read_state = CLIENT_ARMING_IO;
     stageSlabEntry(c, SLAB_REARM);
 }
 
-/* Wait until the client's IO thread has finished the pass it may be in with a
- * stale reference to this client (the event array of one epoll_wait). */
+/* Wait out any epoll event array that may still reference the client. */
 static void waitPartitionPass(int tid) {
     if (tid <= 0 || io_threads[tid] == 0) return;
-    /* An inactive thread is parked on its mutex and polls nothing: there is
-     * no pass to wait for (io-threads is being changed). */
+
     if (tid >= server.active_io_threads_num) return;
     uint64_t seq = atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire);
     while (atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire) == seq) {
@@ -487,16 +381,12 @@ static void waitPartitionPass(int tid) {
     }
 }
 
-/* Claim a partitioned client for teardown. Removes the socket from its IO
- * thread's epoll set and moves IDLE to CLOSING so that thread starts no read.
- * A read in flight is left alone: the caller sees clientHasPendingIO and frees
- * asynchronously, and the retry gets here again once the read has landed. */
+/* A read in flight keeps teardown asynchronous until its completion lands. */
 void partitionedClientDetach(client *c) {
     if (!c->flag.partitioned) return;
     int tid = c->io_tid;
     if (io_epfd[tid] > 0 && c->conn) epoll_ctl(io_epfd[tid], EPOLL_CTL_DEL, c->conn->fd, NULL);
-    /* A staged re-arm lands soon (the slab is published or being published);
-     * wait for it rather than racing the IO thread's epoll_ctl. */
+    /* Publish a staged rearm before claiming the client. */
     if (c->io_read_state == CLIENT_ARMING_IO) {
         flushWriteSlab();
         while (c->io_read_state == CLIENT_ARMING_IO) atomic_thread_fence(memory_order_acquire);
@@ -516,15 +406,12 @@ void partitionedClientDetach(client *c) {
     partitioned_clients--;
 }
 
-/* Return a partitioned client to the main event loop, for roles the IO
- * threads do not own (replica, monitor, throttled, slot migration). */
 void unpartitionClient(client *c) {
     if (!c->flag.partitioned) return;
     int tid = c->io_tid;
     if (io_epfd[tid] > 0 && c->conn) epoll_ctl(io_epfd[tid], EPOLL_CTL_DEL, c->conn->fd, NULL);
     if (c->io_read_state == CLIENT_ARMING_IO) flushWriteSlab();
     waitPartitionPass(tid);
-    /* A staged re-arm lands, then a read in flight completes through the normal response path. */
     while (c->io_read_state == CLIENT_ARMING_IO || c->io_read_state == CLIENT_PENDING_IO)
         atomic_thread_fence(memory_order_acquire);
     if (c->flag.pending_read && c->io_read_state == CLIENT_IDLE) {
@@ -545,11 +432,7 @@ void unpartitionAllClients(void) {
     while ((ln = listNext(&li))) unpartitionClient((client *)listNodeValue(ln));
 }
 
-/* Briefly take an armed partitioned client's socket away from its IO thread so
- * the main thread can touch the read-side buffers (clientsCron). Returns 0 when
- * a read is in flight, in which case the caller skips this round. Release
- * re-arms the socket directly: a readiness event consumed while held was
- * skipped by the IO thread and would otherwise be lost. */
+/* Holding the socket prevents clientsCron from racing reads; release restores consumed readiness. */
 int partitionedClientHold(client *c) {
     if (!c->flag.partitioned || !c->flag.pending_read) return 1; /* main already owns it */
     uint8_t expected = CLIENT_IDLE;
@@ -564,17 +447,9 @@ void partitionedClientRelease(client *c) {
     if (io_epfd[c->io_tid] > 0 && c->conn) epoll_ctl(io_epfd[c->io_tid], EPOLL_CTL_MOD, c->conn->fd, &ev);
 }
 
-/* IO-thread side: one pass over the sockets partitioned to this thread. A
- * client whose state is not IDLE (main is draining it, or is closing it) is
- * skipped; one-shot readiness will not fire again until main re-arms it.
- * Completions are queued on this thread's own ring and published once at the
- * end of the pass. */
+/* One-shot readiness keeps a partitioned client idle until main rearms it. */
 static int ioThreadPollPartition(int id) {
-    /* An empty poll is a wasted syscall, and a spinning thread makes several
-     * per command it eventually serves. After an empty poll the set is left
-     * alone for a few microseconds (the thread keeps serving its inbox), which
-     * bounds the added read latency and cuts the poll rate to what readiness
-     * actually arrives at. */
+    /* Empty polls back off briefly while inbox work continues. */
     static _Thread_local monotime next_poll_at = 0;
     if (next_poll_at) {
         if (getMonotonicUs() < next_poll_at) return 0;
@@ -587,7 +462,6 @@ static int ioThreadPollPartition(int id) {
     for (int i = 0; i < n; i++) {
         client *c = (client *)evs[i].data.ptr;
         if (c->flag.fastpath) {
-            /* Fast-path client: level triggered, owned here for life. */
             if (evs[i].events & EPOLLOUT) fastpathClientWritable(id, c);
             if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) fastpathClientReadable(id, c);
             processed++;
@@ -605,13 +479,7 @@ static int ioThreadPollPartition(int id) {
     return processed;
 }
 
-/* IO-thread side. After a read has been parsed, publish the client's work on
- * this thread's ring: one RING_CMD per complete command, then RING_END. When
- * the ring cannot take the whole read, only RING_END is queued and the main
- * thread runs the read through the per-client path instead; when it cannot
- * take even that, the completion goes through the shared outbox. Commands are
- * only ringed for a clean read (data, parse succeeded so far, first command
- * complete); anything else is the per-client path's business. */
+/* Clean reads publish commands then RING_END; ring pressure falls back to per-client completion. */
 void ioThreadQueueReadCompletion(client *c) {
     int id = thread_id;
     spscQueue *q = &io_cmd_ring[id];
@@ -624,9 +492,7 @@ void ioThreadQueueReadCompletion(client *c) {
         !isParsingError(c) && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && c->argc > 0) {
         ncmd = 1;
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-            /* Stop at the first incomplete command: it and anything after it
-             * are re-parsed by main. Error entries are complete and are ringed;
-             * main replies to them in order. */
+
             if (!(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_PARSING_COMPLETED) &&
                 !(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_ERROR_MASK))
                 break;
@@ -643,7 +509,6 @@ void ioThreadQueueReadCompletion(client *c) {
     spscEnqueue(q, (void *)((uintptr_t)c | RING_END), false);
 }
 
-/* Accounting a read shares with handleReadResult's success branch. */
 static void accountRingRead(client *c) {
     server.stat_total_reads_processed++;
     c->last_interaction = server.unixtime;
@@ -651,18 +516,13 @@ static void accountRingRead(client *c) {
     server.stat_net_input_bytes += c->nread;
 }
 
-/* Main-thread side: the per-client epilogue of one read. On the fast path all
- * commands were executed from the ring, so what remains is to account the
- * read, release the client's IO state and hand it back to its IO thread
- * (write staged, socket re-armed). Anything unusual takes the existing
- * per-client completion path. */
+/* RING_END releases read ownership after every ringed command has executed. */
 static void ringReadEnd(client *c) {
     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
     server.stat_io_reads_pending--;
     server.stat_io_reads_processed++;
     if (c->flag.close_after_reply) {
-        /* A protocol error replied from the ring, or an earlier close request:
-         * nothing more is executed, the reply goes out, the socket stays disarmed. */
+
         c->flag.pending_read = 0;
         c->io_read_state = CLIENT_IDLE;
         if (c->flag.protected) return;
@@ -670,10 +530,7 @@ static void ringReadEnd(client *c) {
         beforeNextClient(c); /* frees a client marked close_asap, as the per-client path does */
         return;
     }
-    /* The fast path requires a read whose first command was complete and ran
-     * from the ring. A parse error, an empty or negative multibulk, a partial
-     * command, no data, a query buffer limit or a read taken without parsing
-     * all need handleParseResults/handleReadResult and take the per-client path. */
+
     if (c->argc > 0 || c->nread <= 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
         (c->read_flags & (READ_FLAGS_DONT_PARSE | READ_FLAGS_QB_LIMIT_REACHED | READ_FLAGS_ERROR_MASK))) {
         processClientIOReadsDone(c);
@@ -683,11 +540,7 @@ static void ringReadEnd(client *c) {
     c->io_read_state = CLIENT_IDLE;
     if (c->flag.protected) return;
     accountRingRead(c);
-    /* A partial command, or commands left by a client that could not execute
-     * them (blocked), follow the per-client drain; it re-parses partials. A
-     * client marked close_asap (output buffer limit, CLIENT KILL) is freed by
-     * beforeNextClient right away, as on the per-client path, so its memory
-     * is gone before the next command's eviction check. */
+
     if (!c->flag.close_asap &&
         (c->cmd_queue.off < c->cmd_queue.len || (c->querybuf && c->qb_pos < sdslen(c->querybuf)))) {
         if (processPendingCommandAndInputBuffer(c) != C_OK) return;
@@ -701,18 +554,10 @@ static void ringReadEnd(client *c) {
     c->flag.ring_epilogue = 0;
 }
 
-/* Main-thread side: drain the command rings. A batch is formed from one
- * thread's ring in small chunks until its keys fill the prefetch budget (so
- * every command in the batch has its keys prefetched, as the per-client batch
- * did) or RING_BATCH entries are in hand; then the entries run in order.
- * Bounded so main keeps returning to its event loop under load. */
+/* Command-ring drains stop at the prefetch budget or RING_BATCH. */
 #define RING_CHUNK 8
 static size_t ringAddChunkToPrefetch(uintptr_t *ents, size_t from, size_t to, getKeysResult *result, int *room) {
-    /* The k-th command of a client in this batch is its current argv (k == 0
-     * with a command pending) or the k-th queued one. With a stride above 1
-     * only one command in N has its keys prefetched: coverage is a trade
-     * between key extraction cost and the misses it hides, and the right
-     * setting depends on how much of the keyspace is cache resident. */
+    /* prefetch-ring-stride trades key extraction cost for cache-miss coverage. */
     static unsigned stride_pos = 0;
     int stride = server.prefetch_ring_stride;
     for (size_t i = from; i < to && *room; i++) {
@@ -739,9 +584,6 @@ static size_t ringAddChunkToPrefetch(uintptr_t *ents, size_t from, size_t to, ge
     return to;
 }
 
-/* Warm the lines main touches first for each client of a chunk: the head of
- * the client struct (flags, IO states, argv), the command queue, and the head
- * of the reply buffer the first reply lands in. */
 static void ringPrefetchClients(uintptr_t *ents, size_t from, size_t to) {
     for (size_t i = from; i < to; i++) {
         client *c = (client *)(ents[i] & ~RING_TAGS);
@@ -751,14 +593,7 @@ static void ringPrefetchClients(uintptr_t *ents, size_t from, size_t to) {
     }
 }
 
-/* With one command per client in flight (no pipelining) the rings receive
- * entries at the rate main completes them, so a drain that runs every event
- * loop iteration finds one or two entries and the whole loop's fixed cost
- * (beforeSleep, epoll_wait, ring scan) is paid per command. When the backlog
- * across the rings is thin, spin here for a bounded time until a batch's worth
- * has arrived: main is the bottleneck of the closed loop, so cycles saved per
- * command return as throughput, and the added wait is bounded and small
- * against the queueing latency of thousands of clients. */
+/* Thin ring backlogs wait briefly to amortize main-loop fixed costs. */
 static void ringCoalesce(void) {
     int budget_us = server.io_ring_coalesce_us;
     if (budget_us <= 0 || partitioned_clients == 0) return;
@@ -779,8 +614,7 @@ static void ringCoalesce(void) {
 static int processCommandRing(void) {
     uintptr_t ents[RING_BATCH];
     int total = 0;
-    /* Inside processEventsWhileBlocked the interrupted command's client batch
-     * may still hold prefetch state; leave it alone. */
+
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     ringCoalesce();
     while (total < IO_PARTITION_COMPLETIONS_PER_CALL) {
@@ -790,10 +624,7 @@ static int processCommandRing(void) {
             if (q->buffer == NULL) continue;
             size_t n = 0;
             if (use_prefetch) {
-                /* Each chunk's client structs are prefetched before its keys are
-                 * extracted, so the misses of eight remote clients overlap
-                 * instead of being taken one at a time; the batch still stops
-                 * at the key budget so every command in it has its keys warm. */
+                /* Prefetch client state before extracting keys from each chunk. */
                 getKeysResult result;
                 initGetKeysResult(&result);
                 int room = 1;
@@ -807,8 +638,6 @@ static int processCommandRing(void) {
                 }
                 getKeysFreeResult(&result);
                 prefetchBatchRun();
-                /* The key arrays are spent once the prefetch is issued; a read
-                 * taking the per-client path below starts its client batch clean. */
                 prefetchBatchReset();
             } else {
                 n = spscDequeueBatch(q, (void **)ents, RING_BATCH);
@@ -826,7 +655,6 @@ static int processCommandRing(void) {
                     ringReadEnd(c);
                 }
             }
-            /* Reads that took the per-client path may have left a client batch. */
             processClientsCommandsBatch();
         }
         if (!got_any) break;
@@ -865,9 +693,7 @@ void drainIOThreadsQueue(void) {
     }
 }
 
-/* Finish a lazily completed write on the main thread: the IO thread wrote the
- * fenced buffer and moved on without a response. Cheap when there is nothing
- * to do; called wherever main is about to depend on the write state. */
+/* Lazy writes reconcile only when main next depends on their state. */
 void reconcileLazyWrite(client *c) {
     if (c->io_write_state != CLIENT_COMPLETED_IO || !(c->write_flags & WRITE_FLAGS_LAZY)) return;
     atomic_thread_fence(memory_order_acquire);
@@ -946,9 +772,7 @@ void IOThreadsAfterSleep(int numevents) {
     serverAssert(inMainThread());
     /* Always Active Policy */
     if (server.io_threads_always_active) {
-        /* Strict offload defers every regular client write until a worker is
-         * active, so a scale-up that reset the active count must not wait for
-         * a socket event: the deferred write is the event that would arrive. */
+
         if ((numevents > 0 || strictOffloadActive()) && server.active_io_threads_num < server.io_threads_num) {
             for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
                 pthread_mutex_unlock(&io_threads_mutex[i]);
@@ -961,10 +785,7 @@ void IOThreadsAfterSleep(int numevents) {
     mstime_t now = server.mstime;
     static long long last_scale_time = 0;
 
-    /* Strict offload with client partitioning: every IO thread owns sockets and
-     * polls them itself, so a parked thread would stall its clients. Keep all
-     * configured threads active; the load-based policy below is for the
-     * non-strict mode. */
+    /* Parked threads would stall the partitioned sockets they own. */
     if (strictOffloadActive()) {
         if (server.active_io_threads_num < server.io_threads_num) {
             for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
@@ -982,9 +803,7 @@ void IOThreadsAfterSleep(int numevents) {
         float main_thread_active_time = (float)getInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME) / 10000.0;
         /* Ignite IO threads when main-thread active time exceeds the threshold (30%) */
         should_ignite = (main_thread_active_time > (float)IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT);
-        /* Strict offload requires a worker to be active at all times so that no
-         * regular client socket op ever falls back to the main thread. Ignite
-         * unconditionally, regardless of load. */
+
         if (strictOffloadActive()) should_ignite = 1;
         if (should_ignite) {
             pthread_mutex_unlock(&io_threads_mutex[1]);
@@ -1020,8 +839,7 @@ void IOThreadsAfterSleep(int numevents) {
     if (avg_q_size > 1 && active < (size_t)server.io_threads_num) {
         target++;
     } else if (avg_q_size == 0 && (now - last_scale_time > IO_COOLDOWN_MS)) {
-        /* Strict offload keeps at least one worker (2 total incl. main) active
-         * so deferred socket ops always have a thread to dispatch to. */
+
         size_t min_active = strictOffloadActive() ? 2 : 1;
         if (target > min_active) target--;
     }
@@ -1115,18 +933,12 @@ void cleanupThreadResources(void *dummy) {
     freeSharedQueryBuf();
 }
 
-/* A write slab: handle every entry, then return the slab as one response
- * instead of one response per client. The states stored here become visible
- * to the main thread through the outbox enqueue. */
 static void ioThreadWriteSlab(writeSlab *slab) {
     int notify = 0;
     for (size_t j = 0; j < slab->count; j++) {
         uintptr_t e = slab->entries[j];
         client *c = (client *)(e & ~SLAB_TAGS);
-        /* Order matters: the client is ours until the last state we publish.
-         * The write goes out first, the socket is re-armed (read state
-         * ARMING -> IDLE), and only then is the write state published, after
-         * which main may free the client. */
+        /* Publish write completion only after write and rearm state. */
         int needs_main = 0;
         if (e & SLAB_WRITE) needs_main = ioThreadWriteClientNoSignal(c, 0);
         if (e & SLAB_REARM) {
@@ -1151,8 +963,6 @@ static void ioThreadWriteSlab(writeSlab *slab) {
     }
 }
 
-/* A batch of terminal frees accumulated by main and handed off as one job:
- * walk the entries, then free the slab itself. */
 static void ioThreadFreeSlab(freeSlab *slab) {
     for (size_t j = 0; j < slab->count; j++) {
         uintptr_t e = (uintptr_t)slab->entries[j];
@@ -1258,10 +1068,6 @@ static void *IOThreadMain(void *myid) {
             processed += batch_count;
         }
 
-        /* PRIORITY 2: Shared Global Queues (SPMC), high priority first.
-         * Only checked after SPSC is drained. A bounded run of jobs per
-         * iteration: with the fast path an iteration serves many sockets, so
-         * one job per iteration would let the shared queues fill. */
         for (int shared_n = 0; shared_n < 64; shared_n++) {
             void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
             if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
@@ -1274,11 +1080,8 @@ static void *IOThreadMain(void *myid) {
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
         }
 
-        /* PRIORITY 3: sockets partitioned to this thread. These reads are not
-         * submitted jobs, so they count as work done but not as jobs finished. */
         if (io_epfd[id] > 0) processed += ioThreadPollPartition(id);
-        /* Batches main has executed: write the replies, recycle the batches;
-         * then a partial batch goes out if main has nothing of ours left. */
+
         processed += fastpathProcessReturns(id);
         fastpathSubmitPending(id);
 
@@ -1314,7 +1117,6 @@ static void createIOThread(int id) {
     spscInit(&io_cmd_ring[id], IO_CMD_RING_SIZE);
     fastpathInitThread(id);
 
-    /* Epoll set for the sockets partitioned to this thread. */
     io_epfd[id] = epoll_create1(EPOLL_CLOEXEC);
     if (io_epfd[id] < 0) serverLog(LL_WARNING, "IO thread %d: epoll_create1 failed (%s); no clients will be partitioned to it", id, strerror(errno));
 
@@ -1429,9 +1231,7 @@ int updateIOThreads(const char **err) {
     }
 
     serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", prev_threads_num, server.io_threads_num);
-    /* Partitioned clients belong to a specific thread's epoll set; return them
-     * to the main loop before the thread set changes. New clients partition
-     * across the new count. */
+    /* Repartition clients before changing the worker set. */
     unpartitionAllClients();
     drainIOThreadsQueue();
 
@@ -1583,7 +1383,6 @@ int trySendReadToIOThreads(client *c) {
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     if (!c->conn) return C_ERR;
-    /* A lazily completed write is finished here first; it may stage the next. */
     reconcileLazyWrite(c);
     if (c->flag.close_asap) return C_ERR;
     /* The I/O thread is already writing for this client. */
@@ -1627,9 +1426,7 @@ int trySendWriteToIOThreads(client *c) {
     c->write_flags = is_replica ? WRITE_FLAGS_IS_REPLICA : 0;
     c->io_write_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, clientConnPostponeMaskFromIOState(c));
-    /* Priority connections (replication, cluster, slot migration) keep a job
-     * of their own on the high-priority queue; regular clients are staged in
-     * the write slab below. */
+
     jobPriority qidx = getJobPriority(c);
     if (qidx == JOB_PRIORITY_HIGH) {
         void *job = tagJob(c, JOB_REQ_WRITE_CLIENT);
@@ -1642,8 +1439,7 @@ int trySendWriteToIOThreads(client *c) {
             return C_ERR;
         }
     }
-    /* Force a new header so the main thread never extends a header the IO
-     * thread will be reading once the job or slab is published. */
+    /* Published writes cannot share a mutable payload header with main. */
     if (!is_replica) {
         if (block) {
             if (block->flag.buf_encoded) block->last_header = NULL;
@@ -1661,10 +1457,7 @@ int trySendWriteToIOThreads(client *c) {
         return C_OK;
     }
 
-    /* Lazy completion: a plain, unencoded buffer write of a partitioned client
-     * has nothing for main to do on success but reset bufpos and account bytes,
-     * and that can wait until main next touches the client. Such writes are
-     * not counted as pending responses: none is expected. */
+    /* Successful plain partitioned writes reconcile lazily without an outbox response. */
     int lazy = c->flag.partitioned && !is_replica && block == NULL && !c->flag.buf_encoded &&
                !c->flag.close_after_reply;
     if (lazy) {
@@ -1919,81 +1712,34 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     return C_OK;
 }
 
-/* This function attempts to offload the free of an object to an IO thread.
- * Returns C_OK if the object was successfully offloaded to an IO thread,
- * C_ERR otherwise.
- *
- * Off-main safety: the IO thread runs a bare decrRefCount, which for a
- * sole-reference (refcount == 1) object is exactly the same teardown that
- * lazyfree's bio thread already performs today (see lazyfreeFreeObject). Any
- * object shape lazyfree already frees off the main thread is therefore proven
- * safe to free on an IO thread. We admit:
- *   - OBJ_STRING RAW: leaf sdsfree + zfree (the original v1 shape).
- *   - OBJ_LIST / OBJ_SET / OBJ_ZSET / OBJ_HASH, all encodings: pure
- *     object-graph teardown. No shared server/db state is touched inside the
- *     free. In particular a hash with field TTLs is un-tracked from the
- *     db-level keys_with_volatile_items kvstore on the main thread in
- *     dbGenericDeleteWithDictIndex BEFORE this call; freeHashObject then only
- *     releases the per-object volatile-set bucket (vsetRelease) and the
- *     hashtable, both object-local.
- * We deliberately exclude:
- *   - OBJ_MODULE: the value free runs a module VM_Free callback which may call
- *     back into the module API and must stay on the main thread.
- *   - OBJ_STREAM: rax + consumer-group / PEL teardown, not audited here.
- * These fall through to lazyfree / inline decref unchanged.
- *
- * Effort gate: strings gate on payload size (io-threads-free-min-size);
- * aggregates gate on lazyfreeGetFreeEffort() (io-threads-free-min-effort) so
- * only aggregates expensive enough to matter leave the main thread. A small
- * listpack/intset aggregate reports effort 1 and frees inline, just like a
- * short string. */
+/* Only sole-reference strings and object-local aggregates may free on IO threads. */
 int tryOffloadFreeObjToIOThreads(robj *obj) {
     if (server.active_io_threads_num <= 1) {
         return C_ERR;
     }
 
-    /* refcount > 1 is NOT a terminal free: decrRefCount merely decrements the
-     * shared counter and does not free. That is cheap and safe on main, so we
-     * decline here and let the caller decrRefCount inline (no free happens). */
     if (obj->refcount > 1) return C_ERR;
 
     switch (obj->type) {
     case OBJ_STRING:
-        /* All string encodings are leaf frees safe off-main:
-         *   RAW    -> sdsfree(payload) + zfree(robj)
-         *   EMBSTR -> single zfree of the combined robj+sds allocation
-         *   INT    -> single zfree of the robj (shared ints have refcount
-         *             OBJ_SHARED_REFCOUNT > 1 and were already declined above)
-         * W5b removes the io-threads-free-min-size gate: per the never-free
-         * directive even tiny strings must leave the main thread. */
         break;
     case OBJ_LIST:
     case OBJ_SET:
     case OBJ_ZSET:
     case OBJ_HASH:
-        /* Audited off-main-safe aggregates (see W4b). W5b removes the
-         * io-threads-free-min-effort gate: every aggregate, including small
-         * listpack/intset encodings, is offloaded rather than freed inline. */
         break;
     default:
-        /* OBJ_MODULE (VM_Free callback) and OBJ_STREAM (unaudited rax/cgroup
-         * teardown) cannot run on an IO thread. The caller routes these to bio
-         * lazyfree, which is also off-main (see freeValueNeverOnMain). */
+        /* Module callbacks and stream teardown remain on bio. */
         return C_ERR;
     }
 
-    /* Count the bytes now committed to an off-main free (decremented by the
-     * IO thread that drains the slab). */
     offloadFreeAccountAdd(offloadObjFreeBytes(obj));
     slabAppendFree(obj, 1);
     server.stat_io_freed_objects++;
     return C_OK;
 }
 
-/* Offload the free of a raw heap buffer (reply block, argv array, decoded
- * scratch buffer) to an IO thread. zfree is thread-safe. On a full queue the
- * pointer is parked on the pending list (never freed inline). Returns C_OK when
- * handled off-main, C_ERR only when IO threads are disabled. */
+/* Full IO queues park raw buffers; disabled IO threads return them to the caller. */
 int tryOffloadFreePtrToIOThreads(void *ptr) {
     if (ptr == NULL) return C_OK;
     if (inline_reclaim_depth) return C_ERR; /* emergency reclaim frees inline */
@@ -2004,56 +1750,34 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
     return C_OK;
 }
 
-/* Route a terminal value free off the main thread, honoring the never-free
- * directive for every shape:
- *   - strings + audited aggregates -> IO thread (or pending list if full);
- *   - module / stream / (IO threads disabled) -> bio lazyfree, unconditionally
- *     (bio is not the main thread, so the directive is satisfied).
- * refcount > 1 objects are non-terminal and are decremented inline (no free).
- * key/dbid are forwarded to bio for the lazyfree effort estimate. */
+/* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
     if (inline_reclaim_depth) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
         return;
     }
     if (val->refcount > 1) {
-        /* Non-terminal: just drops a reference, does not free. */
         decrRefCount(val);
         return;
     }
 
     if (server.active_io_threads_num > 1) {
-        /* Offload substrate is live: enforce never-free-on-main. */
         armNoMainThreadFree();
         if (tryOffloadFreeObjToIOThreads(val) == C_OK) {
             disarmNoMainThreadFree();
             return;
         }
-        /* Declined by the IO path (module / stream): route to bio,
-         * unconditionally, so the free never lands on the main thread. */
         freeObjAsyncForce(val);
         disarmNoMainThreadFree();
         return;
     }
 
-    /* DOCUMENTED EXCEPTION: IO threads are disabled (io-threads <= 1). There is
-     * no cheap off-main worker for the common flat-object free, so forcing
-     * every free onto bio would be a severe regression on the default single-
-     * threaded configuration. We fall back to the pre-W5b behavior (bio for
-     * high-effort objects via freeObjAsync, inline for the rest). The
-     * never-free-on-main guarantee is only asserted with io-threads >= 2. */
+    /* Single-threaded mode preserves freeObjAsync behavior. */
     freeObjAsync(key, val, dbid);
 }
 
-/* Flush the accumulating slab and re-attempt parked slabs, from beforeSleep.
- * With IO threads live nothing is freed synchronously: slabs the ring still
- * rejects stay parked for the next cycle. With IO threads disabled, entries
- * settle to bio (objects) or the one documented inline zfree (raw buffers), so
- * the parked set cannot grow unbounded after io-threads is turned off. */
 void drainPendingMainFrees(void) {
-    /* A partial slab goes out when it is reasonably full or a millisecond
-     * old: one job per event-loop iteration would be thousands of tiny slabs
-     * per second for the IO threads to pick up one by one. */
+    /* Partial slabs wait up to one millisecond to avoid tiny free jobs. */
     if (cur_free_slab && (cur_free_slab->count >= 256 || cur_free_slab_ms != server.mstime)) {
         freeSlab *s = cur_free_slab;
         cur_free_slab = NULL;
@@ -2071,9 +1795,6 @@ void drainPendingMainFrees(void) {
         return;
     }
 
-    /* No IO threads: settle every parked entry off-main where possible. These
-     * bytes were counted at append; the IO-thread drain will not run, so the
-     * accounting is settled here. */
     for (size_t i = 0; i < pending_free_slabs_len; i++) {
         freeSlab *s = pending_free_slabs[i];
         for (size_t j = 0; j < s->count; j++) {
@@ -2088,9 +1809,7 @@ void drainPendingMainFrees(void) {
                     decrRefCount(o);
                 }
             } else {
-                /* Raw buffer with no off-main path available: bio has no
-                 * generic zfree job, so this is the one documented residual
-                 * inline free, reached only when IO threads are disabled. */
+                /* bio has no generic raw-buffer free. */
                 offloadFreeAccountSub(zmalloc_size(ptr));
                 zfree(ptr);
             }
@@ -2319,10 +2038,7 @@ static int processOutboxBatch(mpscQueue *outbox) {
             } else if (job_type == JOB_RES_FP_CLOSE || job_type == JOB_RES_FP_HANDOFF) {
                 fastpathHandoffDone((client *)data, job_type == JOB_RES_FP_CLOSE);
             } else if (job_type == JOB_RES_WRITE_SLAB) {
-                /* A whole slab came back as one response. Flush any per-client
-                 * writes collected so far first to keep completion order, then
-                 * reconcile the written clients in place; re-arm entries need
-                 * nothing from the main thread. */
+
                 if (write_count) {
                     handleWriteJobs(write_jobs, write_count);
                     write_count = 0;
@@ -2334,10 +2050,7 @@ static int processOutboxBatch(mpscQueue *outbox) {
                     if (!(e & SLAB_WRITE)) continue;
                     client *wc = (client *)(e & ~SLAB_TAGS);
                     if (e & SLAB_LAZY) {
-                        /* Only the entries the IO thread flagged need us; the
-                         * others reconcile lazily. A flagged one had its lazy
-                         * flag dropped before its state was published, so it is
-                         * still COMPLETED here and was never counted as pending. */
+
                         if (e & SLAB_NOTIFY) {
                             serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
                             server.stat_io_writes_processed++;
@@ -2376,23 +2089,12 @@ static int processOutboxBatch(mpscQueue *outbox) {
     return received_responses;
 }
 
-/* Process completed IO jobs from worker threads back onto the main thread.
- * Drains the high-priority outbox first to guarantee control-plane responsiveness,
- * and performs periodic preemptive polling of QoS events while consuming normal jobs.
- *
- * Fast-path batches come first: they are not counted as pending responses.
- * Partitioned clients re-arm themselves on IO threads, so under load the
- * normal outbox refills as fast as it drains; one call handles at most
- * IO_RESPONSE_BATCHES_PER_CALL batches and the rest waits for the next
- * iteration, which follows immediately since responses are still pending. */
+/* Response draining is bounded so main returns to the event loop under sustained load. */
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
     int fp_processed = fastpathDrain();
 
-    /* Quick check if any pending operations exist across any priority level.
-     * Fast-path clients report closes and hand-offs through the outbox without
-     * being counted, so the outbox is drained whenever any exist. */
     if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) return fp_processed;
 
     int total_processed = fp_processed + processCommandRing();
@@ -2410,7 +2112,6 @@ int processIOThreadsResponses(void) {
         total_processed += processed;
         if (processed == 0) break;
     }
-    /* Write-done handling may have re-staged clients with more output. */
     flushWriteSlab();
     return total_processed;
 }

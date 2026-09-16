@@ -52,10 +52,7 @@ int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
 void flushWriteSlab(void);
-/* Client partitioning (W6a): a regular TCP client's socket readiness is watched
- * by one IO thread's epoll set, which reads and parses on its own without a
- * dispatch from the main thread. Main re-arms the socket after it has drained
- * the client's commands, through the same slab that carries writes. */
+/* Partitioned client sockets remain owned by one IO thread. */
 int tryPartitionClient(client *c);
 void unpartitionClient(client *c);
 void unpartitionAllClients(void);
@@ -74,9 +71,7 @@ void endInlineReclaim(void);
 void freeValueNeverOnMain(robj *key, robj *val, int dbid);
 void drainPendingMainFrees(void);
 size_t pendingMainFreesLen(void);
-/* Bytes committed to an off-main free (IO-thread free job enqueued) but not yet
- * physically freed. Subtracted from used_memory by getMaxmemoryState so
- * eviction does not over-evict while async frees drain. */
+/* Bytes committed to off-main frees but not yet physically reclaimed. */
 size_t offloadPendingFreeBytes(void);
 void IOThreadsAfterSleep(int numevents);
 void IOThreadsBeforeSleep(long long current_time);

@@ -3276,8 +3276,6 @@ static sds ACLLoadFromFile(const char *filename) {
 
     /* Check if we found errors and react accordingly. */
     if (sdslen(errors) == 0) {
-        /* The whole ACL LOAD apply (default-user copy + per-client rebind +
-         * users-rax swap). */
         /* The default user pointer is referenced in different places: instead
          * of replacing such occurrences it is much simpler to copy the new
          * default user configuration in the old one. */

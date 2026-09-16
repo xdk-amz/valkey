@@ -115,8 +115,6 @@ typedef enum {
     RAW_STR_REF      /* raw string references, serialized as bare object bytes (no framing) */
 } payloadType;
 
-/* True for payload types that store bulkStrRef entries (object references) rather
- * than inline reply bytes. */
 static inline int isStrRefPayload(uint8_t type) {
     return type == BULK_STR_REF || type == RAW_STR_REF;
 }
@@ -233,9 +231,7 @@ void *dupClientReplyValue(void *o) {
 
 void freeClientReplyValue(void *o) {
     if (!o) return;
-    /* W5b: reply blocks are raw heap buffers on the reply hot path. Offload
-     * their free to an IO thread (zfree is thread-safe). Falls back to inline
-     * only when IO threads are unavailable (startup / shutdown). */
+    /* Reply blocks free off main while IO threads are active. */
     if (tryOffloadFreePtrToIOThreads(o) == C_OK) return;
     zfree_with_size(o, clientReplyAllocSize((clientReplyBlock *)o));
 }
@@ -327,20 +323,11 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     }
 
     if (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE) {
-        /* Adaptive: a main-thread pressure EMA drives the size floor (see
-         * updateCopyAvoidPressure). We deliberately skip the static
-         * min-io-threads any-size bypass here: an IO-thread-rich fleet with an
-         * idle main thread is exactly the regime where blind offload costs
-         * throughput, so we only offload values that clear the current floor,
-         * which the pressure loop lowers toward COPY_AVOID_ADAPTIVE_FLOOR_MIN
-         * when the main thread is the constraint.
-         * NULL obj = "may this buffer carry refs?": only encode buffers while
-         * engaged, so at low pressure small replies keep the plain fast path. */
+        /* NULL asks whether plain reply buffers may carry references. */
         if (!obj) return server.copy_avoid_engaged;
         return sdslen(objectGetVal(obj)) >= (size_t)server.copy_avoid_current_floor;
     }
 
-    /* Static mode (default, legacy behavior). */
     /* Copy avoidance is preferred for any string size starting certain number of I/O threads  */
     if (server.min_io_threads_copy_avoid && server.io_threads_num >= server.min_io_threads_copy_avoid) return 1;
 
@@ -547,8 +534,6 @@ int prepareClientToWrite(client *c) {
     if (c->flag.fake && c->id != CLIENT_ID_CACHED_RESPONSE) return C_ERR;
     serverAssert(c->conn);
 
-    /* New output for a client whose last write completed lazily: reclaim the
-     * written buffer first so the new reply is appended to a clean one. */
     if (c->io_write_state == CLIENT_COMPLETED_IO) {
         reconcileLazyWrite(c);
         if (c->flag.close_asap) return C_ERR;
@@ -644,7 +629,7 @@ static size_t upsertPayloadHeader(char *buf,
                                   int slot,
                                   int track_bytes,
                                   size_t available) {
-    /* Enforce min len for string-ref chunks as whole pointers must be written to the buffer */
+
     size_t min_len = (isStrRefPayload(type) ? len : 1);
     if (min_len > available) return 0;
     size_t allowed_len = min(available, len);
@@ -718,8 +703,6 @@ static size_t _addReplyToBuffer(client *c, const char *s, size_t len) {
     return _addReplyPayloadToBuffer(c, s, len, PLAIN_REPLY);
 }
 
-/* Adds bulk string reference (i.e. pointer to object and pointer to string itself) to static buffer
- * Returns non-zero value if succeeded to add */
 static size_t _addBulkStrRefToBuffer(client *c, const void *payload, size_t len, uint8_t payload_type) {
     if (!c->flag.buf_encoded) {
         /* If buffer is plain and not empty then can't add bulk string reference to it */
@@ -729,8 +712,6 @@ static size_t _addBulkStrRefToBuffer(client *c, const void *payload, size_t len,
     return _addReplyPayloadToBuffer(c, payload, len, payload_type);
 }
 
-/* Adds the payload to the reply linked list.
- * Note: some edits to this function need to be relayed to AddReplyFromClient. */
 static void _addReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
     listNode *ln = listLast(reply_list);
     clientReplyBlock *tail = ln ? listNodeValue(ln) : NULL;
@@ -796,7 +777,6 @@ void _addReplyProtoToList(client *c, list *reply_list, const char *s, size_t len
     _addReplyPayloadToList(c, reply_list, s, len, PLAIN_REPLY);
 }
 
-/* Adds a string reference (i.e. pointer to object and pointer to string itself) to reply list */
 static void _addStrRefToList(client *c, const void *payload, size_t len, uint8_t payload_type) {
     _addReplyPayloadToList(c, c->reply, payload, len, payload_type);
 }
@@ -845,10 +825,7 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     }
 }
 
-/* Increment reference to object and add pointer to object and
- * pointer to string itself to current reply buffer.
- * payload_type is BULK_STR_REF (serialized with $<len>\r\n...\r\n framing) or
- * RAW_STR_REF (serialized as bare object bytes with no framing). */
+/* payload_type selects RESP-framed or raw object bytes. */
 static void _addStrRefToBufferOrList(client *c, robj *obj, uint8_t payload_type) {
     if (c->flag.close_after_reply) return;
 
@@ -875,8 +852,7 @@ void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
     if (sdsEncodedObject(obj)) {
-        /* Raw string value: route through the copy-avoidance ref path when preferred,
-         * emitting the object bytes with no bulk framing. Otherwise copy inline. */
+
         if (isCopyAvoidPreferred(c, obj)) {
             _addStrRefToBufferOrList(c, obj, RAW_STR_REF);
             if (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1)
@@ -1957,10 +1933,6 @@ void clientAcceptHandler(connection *conn) {
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
 
-    /* A regular TCP client under strict offload is watched by an IO thread's
-     * epoll set instead of the main event loop; the read handler installed by
-     * createClient then comes off again. Only accepted clients get here, so
-     * the primary link and slot-migration clients are never partitioned. */
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
         connSetReadHandler(conn, NULL);
     } else if (!c->flag.close_asap && tryPartitionClient(c) == C_OK) {
@@ -2208,9 +2180,6 @@ void freeClientOriginalArgv(client *c) {
     /* We didn't rewrite this client */
     if (!c->original_argv) return;
 
-    /* Client does not own the original argv, it just borrowed it. The fast
-     * path executor's original argv is the batch entry's array: it goes back
-     * to the IO thread with the batch, references intact. */
     if (c->flag.argv_borrowed || c->flag.executor) {
         c->original_argv = NULL;
         c->original_argc = 0;
@@ -2228,19 +2197,14 @@ void freeClientOriginalArgv(client *c) {
 
 void freeClientArgv(client *c) {
     if ((c->flag.argv_borrowed || c->flag.executor) && !c->original_argv) {
-        /* Client does not own the argv, and there is no original argv, so just
-         * clear the fields. (Executor: the array belongs to the batch entry.) */
+
         goto clear;
     }
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
     if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
-        /* W5b: never free argv contents or the array on the main thread. Each
-         * arg's terminal free is routed off-main (non-terminal decrefs of
-         * shared args stay inline inside freeValueNeverOnMain); the argv array
-         * rides a FREE_PTR job (falls back to inline zfree only when IO threads
-         * are disabled). */
+        /* Shared arguments decrement here; terminal frees use the configured off-main path. */
         for (int j = 0; j < c->argc; j++) freeValueNeverOnMain(NULL, c->argv[j], -1);
         if (tryOffloadFreePtrToIOThreads(c->argv) == C_ERR) zfree(c->argv);
     }
@@ -2348,7 +2312,6 @@ void unlinkClient(client *c) {
         c->flag.pending_write = 0;
     }
 
-    /* Remove from the strict-offload deferred-read FIFO if needed. */
     if (c->flag.pending_read_deferred) {
         serverAssert(server.clients_pending_read->len > 0);
         listUnlinkNode(server.clients_pending_read, &c->clients_pending_read_node);
@@ -2429,18 +2392,13 @@ void clearClientConnectionState(client *c) {
 int freeClient(client *c) {
     listNode *ln;
 
-    /* A fast-path client belongs to its IO thread until that thread has
-     * stopped reading it and every command of it in flight has returned; the
-     * thread then reports JOB_RES_FP_CLOSE and main frees it for real. */
+    /* Fast-path teardown waits for every in-flight batch to return. */
     if (c->flag.fastpath) {
         fastpathRequestDetach(c);
         freeClientAsync(c);
         return 0;
     }
 
-    /* A partitioned client is first claimed back from its IO thread; with a
-     * read in flight the claim fails and the client is freed asynchronously
-     * once that read has landed. A lazily completed write is settled first. */
     reconcileLazyWrite(c);
     partitionedClientDetach(c);
 
@@ -2604,7 +2562,6 @@ void freeClientOrCloseLater(client *c, int async) {
     }
 }
 
-
 /* Log errors for invalid use and free the client in async way.
  * We will add additional information about the client to the message. */
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...) {
@@ -2706,16 +2663,13 @@ void beforeNextClient(client *c) {
         return;
     }
 
-    /* The ring epilogue runs right after the client's last command, whose
-     * own update already covered everything but the query buffer trim. */
     if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
         trySendWriteToIOThreads(c);
     }
-    /* Main is done with this client for now: let its IO thread watch the socket
-     * again. Staged after the write so the same slab entry carries both. */
+
     armPartitionedClientRead(c);
 }
 
@@ -2751,8 +2705,7 @@ int freeClientsInAsyncFreeQueue(void) {
         }
 
         if (c->flag.fastpath) continue; /* freed when its IO thread reports JOB_RES_FP_CLOSE */
-        /* Claim a partitioned client before judging its IO state: its IO thread
-         * may otherwise start a read between this check and freeClient's. */
+
         reconcileLazyWrite(c);
         partitionedClientDetach(c);
         if (c->flag.protected || clientHasPendingIO(c)) continue;
@@ -3168,9 +3121,7 @@ static void addBulkStringToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, 
     }
 }
 
-/* Like addBulkStringToReplyIOV but emits the object bytes with no bulk framing
- * (no $<len>\r\n prefix and no trailing \r\n). Used for RAW_STR_REF chunks that
- * back the copy-avoiding addReply() raw path. */
+/* RAW_STR_REF emits object bytes without RESP bulk framing. */
 static void addRawStrRefToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, bufWriteMetadata *metadata) {
     bulkStrRef *str_ref = (bulkStrRef *)buf;
     while (buf_len > 0 && !reply->limit_reached) {
@@ -3455,10 +3406,8 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
                     size_t str_len = sdslen(str_ref->str);
                     if (header->payload_type == BULK_STR_REF) {
                         uint32_t num_len = digits10(str_len);
-                        /* RESP encodes bulk strings as $<length>\r\n<data>\r\n */
                         total_reply_len += (num_len + 3) + str_len + 2;
                     } else {
-                        /* RAW_STR_REF: bare object bytes, no framing */
                         total_reply_len += str_len;
                     }
                     str_ref++;
@@ -3502,10 +3451,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
             bulkStrRef *str_ref = (bulkStrRef *)ptr;
             size_t len = header->payload_len;
             while (len > 0) {
-                /* W5b: releaseBufReferences runs on the main thread (see T6).
-                 * A referenced reply object whose last reference is this reply
-                 * (refcount == 1) would free inline here; route it off-main.
-                 * refcount > 1 objects are decremented inline (non-terminal). */
+                /* Last reply references free off main; shared references only decrement here. */
                 freeValueNeverOnMain(NULL, str_ref->obj, -1);
                 str_ref++;
                 len -= sizeof(bulkStrRef);
@@ -3639,9 +3585,7 @@ int postWriteToClient(client *c) {
             return C_ERR;
         }
     }
-    /* Update client's memory usage after writing. Not when this is a lazy
-     * completion reconciled just before the client's next command runs: that
-     * command's own update follows within the same drain. */
+
     if (!(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
     return C_OK;
 }
@@ -3672,11 +3616,7 @@ int writeToClient(client *c) {
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     if (trySendWriteToIOThreads(c) == C_OK) return;
-    /* Strict offload: never write a regular client on the main thread. The
-     * write offload declined transiently (a read is in flight, or the IO
-     * submission queue is momentarily full). Uninstall the write handler to
-     * avoid a busy re-fire and re-queue the client; beforeSleep will dispatch
-     * the write to an IO thread once the transient condition clears. */
+
     if (strictOffloadActive() && clientStrictDeferEligible(c) && clientHasPendingReplies(c)) {
         connSetWriteHandler(c->conn, NULL);
         putClientInPendingWriteQueue(c);
@@ -3751,7 +3691,6 @@ int handleReadResult(client *c) {
     }
     return C_OK;
 }
-
 
 void handleParseError(client *c) {
     int flags = c->read_flags;
@@ -3897,8 +3836,7 @@ int handleClientsWithPendingWrites(void) {
     listIter li;
     listNode *ln;
     listRewind(server.clients_pending_write, &li);
-    /* Bound the pass to the initial length so clients re-queued below (strict
-     * offload deferral) are not reprocessed within the same iteration. */
+    /* Requeued clients wait for the next pass. */
     int budget = pending_writes;
     while (budget-- > 0 && (ln = listNext(&li))) {
         client *c = listNodeValue(ln);
@@ -3908,9 +3846,6 @@ int handleClientsWithPendingWrites(void) {
          * that may trigger write error or recreate handler. */
         if (c->flag.protected) continue;
         reconcileLazyWrite(c);
-        if (c->flag.close_asap) continue;
-
-        /* Don't write to clients that are going to be closed anyway. */
         if (c->flag.close_asap) continue;
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
@@ -3926,9 +3861,6 @@ int handleClientsWithPendingWrites(void) {
         /* We can't write to the client while IO operation is in progress. */
         if (c->io_write_state != CLIENT_IDLE) continue;
 
-        /* Strict offload: never write a regular client on the main thread. The
-         * offload declined transiently (submission queue full), so re-queue the
-         * client (FIFO) and retry on the next iteration instead of writing here. */
         if (strictOffloadActive() && clientStrictDeferEligible(c)) {
             putClientInPendingWriteQueue(c);
             continue;
@@ -3945,7 +3877,6 @@ int handleClientsWithPendingWrites(void) {
             installClientWriteHandler(c);
         }
     }
-    /* Everything staged for the IO threads in this pass goes out as one job. */
     flushWriteSlab();
     return processed;
 }
@@ -4052,10 +3983,7 @@ void unprotectClient(client *c) {
         c->flag.protected = 0;
         if (c->conn) {
             if (c->flag.partitioned) {
-                /* The socket belongs to an IO thread; main never installs a
-                 * read handler for it. Inside the client's own command the read
-                 * epilogue resumes it; otherwise resume it here: input that
-                 * landed while protected is drained and the socket re-armed. */
+
                 if (!c->flag.pending_command && c->io_read_state == CLIENT_IDLE && !c->flag.pending_read) {
                     if (processPendingCommandAndInputBuffer(c) == C_ERR) return;
                     beforeNextClient(c);
@@ -4565,7 +4493,6 @@ int processCommandAndResetClient(client *c) {
     return deadclient ? C_ERR : C_OK;
 }
 
-
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
  * the command, and C_OK for all other cases. */
@@ -4883,12 +4810,7 @@ int processInputBuffer(client *c) {
     return C_OK;
 }
 
-/* Execute one command of a client whose read is being drained from the
- * command ring: the body of one processInputBuffer() iteration, for a command
- * that is already parsed. The client's read state stays COMPLETED_IO for the
- * whole drain, so it can never be freed synchronously underneath the remaining
- * ring entries; a client that cannot execute right now (blocked, closing,
- * paused) keeps its commands queued for the existing paths. */
+/* Ring commands execute only while the client remains runnable and IO-owned. */
 void ringExecuteOne(client *c) {
     if (c->io_read_state != CLIENT_COMPLETED_IO) return; /* its END already ran (re-entrancy) */
     if (c->flag.protected) return;                       /* left queued; unprotectClient resumes it */
@@ -5021,13 +4943,6 @@ void readQueryFromClient(connection *conn) {
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 
-    /* Strict offload: never read/parse a regular client on the main thread.
-     * Offload declined for a transient reason, so queue the client on the
-     * deferred-read FIFO and let beforeSleep dispatch it to an IO thread. The
-     * socket read is not consumed here, so the fd stays readable and the read
-     * eventually runs on an IO thread (at a small latency cost). Excluded
-     * clients (fake, replicas, blocked, slot-migration) fall through and read
-     * on main by design. */
     if (strictOffloadActive() && clientStrictDeferEligible(c)) {
         deferClientRead(c);
         return;
@@ -5174,7 +5089,6 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 
     p = events;
     if (client->conn) {
-        /* A partitioned client's readiness is watched from its IO thread's epoll set. */
         if (connHasReadHandler(client->conn) || client->flag.partitioned) *p++ = 'r';
         if (connHasWriteHandler(client->conn)) *p++ = 'w';
     }
@@ -5708,7 +5622,6 @@ static int validateClientFlagFilter(sds flag_filter) {
     return C_OK;
 }
 
-
 static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     /* Check each filter condition and return false if the client does not match. */
     if (client_filter->addr && strcmp(getClientPeerId(client), client_filter->addr) != 0) return 0;
@@ -5789,7 +5702,6 @@ static int clientMatchesCapaFilter(client *c, sds capa_filter) {
     /* If the loop completes, the client matches the capa filter */
     return 1;
 }
-
 
 static int clientMatchesFlagFilter(client *c, sds flag_filter) {
     /* Iterate through the provided flag filter string */
@@ -5885,7 +5797,6 @@ static int clientMatchesFlagFilter(client *c, sds flag_filter) {
     /* If the loop completes, the client matches the flag filter */
     return 1;
 }
-
 
 void clientHelpCommand(client *c) {
     const char *help[] = {
@@ -6189,7 +6100,6 @@ static void freeClientFilter(clientFilter *filter) {
         filter->not_lib_ver = NULL;
     }
 }
-
 
 void clientUnblockCommand(client *c) {
     /* CLIENT UNBLOCK <id> [timeout|error] */
@@ -7245,10 +7155,6 @@ void processEventsWhileBlocked(void) {
 int postponeClientRead(client *c) {
     if (ProcessingEventsWhileBlocked) return 0;
 
-    /* Strict offload: reads are dispatched from the deferred-read FIFO in
-     * beforeSleep; if this client is already queued there, keep it there.
-     * If strict offload ended meanwhile (io-threads lowered to 1) the FIFO is
-     * no longer drained: leave it and read on main like any other client. */
     if (c->flag.pending_read_deferred) {
         if (strictOffloadActive()) return 1;
         c->flag.pending_read_deferred = 0;
@@ -7258,34 +7164,14 @@ int postponeClientRead(client *c) {
     return (trySendReadToIOThreads(c) == C_OK);
 }
 
-/* Strict offload (W5c): when io-threads-strict-offload is set and at least two
- * IO threads are configured, no regular client's socket read/parse or write is
- * ever performed on the main thread. On an offload decline the socket op is
- * deferred to a FIFO retry list and re-dispatched to an IO thread on a later
- * loop iteration (at a latency cost), never executed inline on main.
- *
- * Scope exclusions (handled on main by design, unchanged): replication links,
- * AOF/loading fake clients, cluster-bus/slot-migration snapshot traffic, and
- * io-threads <= 1 (strict requires io-threads >= 2). */
+/* Strict offload retries regular client IO instead of falling back to main. */
 int strictOffloadActive(void) {
-    /* Loading / busy-script exception (F1): while ProcessingEventsWhileBlocked
-     * is set (RDB/AOF load, busy Lua), beforeSleep runs only its minimal
-     * re-entrant subset and never calls processDeferredReads, so a deferred
-     * read would never be dispatched and the client (e.g. one waiting on
-     * -LOADING) would hang. Fall back to inline read/parse/write on the main
-     * thread in this window. This mirrors the existing postponeClientRead
-     * ProcessingEventsWhileBlocked guard (redis#6988) and W5b's documented
-     * loading exclusion; it is a bounded, event-processing-only window. */
+    /* Re-entrant event processing cannot drain deferred reads. */
     if (ProcessingEventsWhileBlocked) return 0;
     return server.io_threads_strict_offload && server.io_threads_num >= 2;
 }
 
-/* A regular client whose read offload declined for a transient reason (IO
- * threads mid-scale, a completed read still awaiting main-thread drain, or a
- * momentarily full submission queue) is eligible for deferral. Clients whose
- * reads are main-owned by design (fake/teardown, replicas, Lua-debug, blocked,
- * slot-migration export) are NOT deferred: those are the documented exclusions
- * and are allowed to read on main. */
+/* Only regular clients whose offload failed transiently enter the retry FIFO. */
 static int clientStrictDeferEligible(client *c) {
     if (!c->conn) return 0;                                /* fake/AOF-loading client */
     if (c->flag.close_asap) return 0;                      /* being torn down */
@@ -7297,9 +7183,7 @@ static int clientStrictDeferEligible(client *c) {
     return 1;
 }
 
-/* Queue a regular client on the deferred-read FIFO (tail append) so its socket
- * read is re-attempted on a later loop iteration and dispatched to an IO
- * thread. Idempotent: a client is queued at most once. */
+/* A client appears at most once in the deferred-read FIFO. */
 static void deferClientRead(client *c) {
     if (c->flag.pending_read_deferred) return;
     c->flag.pending_read_deferred = 1;
@@ -7307,11 +7191,7 @@ static void deferClientRead(client *c) {
     server.stat_strict_deferred_reads++;
 }
 
-/* Drain the deferred-read FIFO: for each queued client re-attempt read offload
- * to an IO thread. On success the client leaves the queue; on a still-transient
- * decline it stays for the next iteration (FIFO order guarantees eventual
- * dispatch and no starvation). Bounded to the snapshot length so re-queued
- * clients are not reprocessed within the same pass. Called from beforeSleep. */
+/* Deferred reads retain FIFO order and are attempted at most once per pass. */
 int processDeferredReads(void) {
     int dispatched = 0;
     int budget = listLength(server.clients_pending_read);
@@ -7323,8 +7203,6 @@ int processDeferredReads(void) {
     while (budget-- > 0 && (ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
 
-        /* Client no longer deferral-eligible (e.g. became blocked or is closing):
-         * drop from the FIFO. The teardown/blocked path handles it on main. */
         if (!clientStrictDeferEligible(c)) {
             c->flag.pending_read_deferred = 0;
             listUnlinkNode(server.clients_pending_read, ln);
@@ -7336,7 +7214,6 @@ int processDeferredReads(void) {
             listUnlinkNode(server.clients_pending_read, ln);
             dispatched++;
         }
-        /* else: still declined transiently, keep in FIFO for next iteration. */
     }
     return dispatched;
 }
@@ -7460,9 +7337,6 @@ void evictClients(void) {
             sdsfree(ci);
             server.stat_evictedclients++;
 
-            /* Free the evicted client's memory synchronously: the eviction
-             * exists to reclaim memory now, and performEvictions reads
-             * used_memory immediately after. */
             beginInlineReclaim();
             int freed = freeClient(c);
             endInlineReclaim();
@@ -7536,8 +7410,7 @@ done:
 
     c->io_read_state = CLIENT_COMPLETED_IO;
     c->cur_tid = getCurTid();
-    /* A partitioned client's completion travels on its IO thread's own ring,
-     * published once per pass; dispatched reads answer on the shared outbox. */
+
     if (c->flag.partitioned) {
         ioThreadQueueReadCompletion(c);
     } else {
@@ -7545,8 +7418,6 @@ done:
     }
 }
 
-/* Write one client's fenced output on an IO thread. The caller signals the
- * main thread: per client (ioThreadWriteToClient) or once per slab. */
 int ioThreadWriteClientNoSignal(client *c, int publish) {
     serverAssert(c->io_write_state == CLIENT_PENDING_IO);
     c->nwritten = 0;
@@ -7556,9 +7427,7 @@ int ioThreadWriteClientNoSignal(client *c, int publish) {
         _writeToClient(c);
     }
 
-    /* A lazy write that failed or went out short needs the main thread after
-     * all: drop the lazy flag BEFORE publishing the state, so main can only
-     * ever reconcile a completion nobody is going to report. */
+    /* Publish lazy completion only after clearing failures that require an outbox response. */
     int needs_main = 1;
     if (c->write_flags & WRITE_FLAGS_LAZY) {
         if ((c->write_flags & WRITE_FLAGS_WRITE_ERROR) || c->io_last_written.data_len != c->io_last_bufpos) {
