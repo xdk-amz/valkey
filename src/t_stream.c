@@ -721,7 +721,7 @@ typedef struct {
 int64_t streamTrim(stream *s, streamAddTrimArgs *args) {
     size_t maxlen = args->maxlen;
     streamID *id = &args->minid;
-    size_t maxbytes = args->maxbytes;
+    uint64_t maxbytes = (uint64_t)args->maxbytes;
     int approx = args->approx_trim;
     int64_t limit = args->limit;
     int trim_strategy = args->trim_strategy;
