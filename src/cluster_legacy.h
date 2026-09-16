@@ -527,7 +527,7 @@ struct clusterState {
     /* The following fields are used to take the replica state on elections. */
     mstime_t failover_auth_time;      /* Time of previous or next election. */
     int failover_auth_count;          /* Number of votes received so far. */
-    int failover_auth_nack_count;     /* Number of rejected votes received so far. */
+    int failover_auth_nack_count;     /* Number of NACKs eligible for immediate retry. */
     int failover_auth_sent;           /* True if we already asked for votes. */
     int failover_auth_rank;           /* This replica rank for current auth request. */
     int failover_failed_primary_rank; /* The rank of this instance in the context of all failed primary list. */

@@ -5776,6 +5776,16 @@ static const char *clusterNackReasonString(uint8_t reason) {
     }
 }
 
+/* Return true when retrying immediately can change the rejection outcome.
+ * ALREADY_VOTED and REQ_EPOCH_OLD are resolved by moving to a new epoch.
+ * STALE_CONFIG is resolved by the UPDATE sent immediately before its NACK.
+ * The remaining reasons describe voter state that a new election cannot change. */
+static bool clusterNackReasonAllowsImmediateRetry(uint8_t reason) {
+    return reason == CLUSTERMSG_FAILOVER_AUTH_NACK_REASON_REQ_EPOCH_OLD ||
+           reason == CLUSTERMSG_FAILOVER_AUTH_NACK_REASON_ALREADY_VOTED ||
+           reason == CLUSTERMSG_FAILOVER_AUTH_NACK_REASON_STALE_CONFIG;
+}
+
 /* Send a FAILOVER_AUTH_NACK message to the specified node. */
 void clusterSendFailoverNack(clusterNode *node, uint8_t reason) {
     if (!node->link) return;
@@ -5923,18 +5933,30 @@ void clusterProcessFailoverAuthNack(clusterNode *sender, clusterMsg *request) {
         return;
     }
 
+    uint8_t reason = request->data.failover_nack.nack.reason;
+    if (!clusterNackReasonAllowsImmediateRetry(reason)) {
+        /* A new election cannot change persistent voter state. Keep the current
+         * election active so the normal auth_retry_time limits retry cadence. */
+        serverLog(LL_NOTICE,
+                  "Failover auth NACK [%s] from %.40s (%s) for epoch %llu "
+                  "is not eligible for an immediate retry",
+                  clusterNackReasonString(reason), sender->name, humanNodename(sender),
+                  (unsigned long long)server.cluster->failover_auth_epoch);
+        return;
+    }
+
     server.cluster->failover_auth_nack_count++;
 
     /* A voter that NACKed us in this epoch will not change its mind, so the
      * upper bound on the votes we can still collect is the voters that have
      * not NACKed, minus FAIL voters that will never reply (they count towards
      * size but neither ACK nor NACK). Fast-fail once that bound drops below
-     * the quorum we need to win.. */
+     * the quorum we need to win. */
     int needed_quorum = (server.cluster->size / 2) + 1;
     int max_possible_acks = server.cluster->size - server.cluster->size_fail - server.cluster->failover_auth_nack_count;
     serverLog(LL_NOTICE, "Failover auth NACK [%s] from %.40s (%s) for epoch %llu (NACKs %d, quorum %d)",
-              clusterNackReasonString(request->data.failover_nack.nack.reason), sender->name,
-              humanNodename(sender), (unsigned long long)server.cluster->failover_auth_epoch,
+              clusterNackReasonString(reason), sender->name, humanNodename(sender),
+              (unsigned long long)server.cluster->failover_auth_epoch,
               server.cluster->failover_auth_nack_count, needed_quorum);
     if (max_possible_acks < needed_quorum) {
         serverLog(LL_NOTICE,
