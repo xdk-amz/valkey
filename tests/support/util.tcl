@@ -566,12 +566,27 @@ proc roundFloat f {
 }
 
 set ::last_port_attempted 0
-proc find_available_port {start count} {
-    set port [expr $::last_port_attempted + 1]
-    for {set attempts 0} {$attempts < $count} {incr attempts} {
-        if {$port < $start || $port >= $start+$count} {
+proc next_test_port {start count} {
+    if {$count <= 0} {
+        error "Port range must contain at least one port."
+    }
+
+    set end [expr {$start+$count}]
+    if {$::last_port_attempted < $start || $::last_port_attempted >= $end} {
+        set port [expr {$start+([pid] % $count)}]
+    } else {
+        set port [expr {$::last_port_attempted+1}]
+        if {$port >= $end} {
             set port $start
         }
+    }
+    set ::last_port_attempted $port
+    return $port
+}
+
+proc find_available_port {start count} {
+    for {set attempts 0} {$attempts < $count} {incr attempts} {
+        set port [next_test_port $start $count]
         set fd1 -1
         if {[catch {set fd1 [socket -server 127.0.0.1 $port]}] ||
             [catch {set fd2 [socket -server 127.0.0.1 [expr $port+10000]]}]} {
@@ -581,10 +596,8 @@ proc find_available_port {start count} {
         } else {
             close $fd1
             close $fd2
-            set ::last_port_attempted $port
             return $port
         }
-        incr port
     }
     error "Can't find a non busy port in the $start-[expr {$start+$count-1}] range."
 }

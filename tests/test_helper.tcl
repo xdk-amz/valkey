@@ -351,13 +351,22 @@ proc cleanup {} {
 proc test_server_main {} {
     if {!$::dont_pre_clean} cleanup
     set tclsh [info nameofexecutable]
-    # Open a listening socket, trying different ports in order to find a
-    # non busy one.
-    set clientport [find_available_port [expr {$::baseport - 32}] 32]
+    set clientport_start [expr {$::baseport - 32}]
+    set ::test_server_socket {}
+    for {set attempts 0} {$attempts < 32} {incr attempts} {
+        set clientport [next_test_port $clientport_start 32]
+        if {![catch {
+            set ::test_server_socket [socket -server accept_test_clients -myaddr 127.0.0.1 $clientport]
+        }]} {
+            break
+        }
+    }
+    if {$::test_server_socket eq {}} {
+        error "Can't listen on a test server port in the $clientport_start-[expr {$::baseport-1}] range."
+    }
     if {!$::quiet} {
         puts "Starting test server at port $clientport"
     }
-    socket -server accept_test_clients  -myaddr 127.0.0.1 $clientport
 
     # Start the client instances
     set ::clients_pids {}

@@ -71,12 +71,34 @@ proc exec_instance {type dirname cfgfile} {
     return $pid
 }
 
+proc wait_instance_started {dirname pid} {
+    set logfile [file join $dirname log.txt]
+    for {set attempts 0} {$attempts < 1200} {incr attempts} {
+        if {[file exists $logfile]} {
+            set fd [open $logfile]
+            set log [read $fd]
+            close $fd
+            if {[regexp -line -- "^${pid}:.*(Server initialized|Sentinel ID is)" $log]} {
+                return started
+            }
+            if {[regexp -line -- "^${pid}:.*Failed listening on port" $log]} {
+                return port-busy
+            }
+        }
+        if {![is_alive $pid]} {
+            return failed
+        }
+        after 100
+    }
+    return failed
+}
+
 # Spawn a server or sentinel instance, depending on 'type'.
 proc spawn_instance {type base_port count {conf {}} {base_conf_file ""}} {
     set current_instances_count [llength [set ::${type}_instances]]
     for {set j 0} {$j < $count} {incr j} {
         set instance_id [expr $current_instances_count + $j]
-        set port [find_available_port $base_port $::valkey_port_count]
+        set port [next_test_port $base_port $::valkey_port_count]
         # plaintext port (only used for TLS cluster)
         set pport 0
         # Create a directory for this instance.
@@ -103,7 +125,7 @@ proc spawn_instance {type base_port count {conf {}} {base_conf_file ""}} {
             puts $cfg "tls-replication yes"
             puts $cfg "tls-cluster yes"
             # plaintext port, only used by plaintext clients in a TLS cluster
-            set pport [find_available_port $base_port $::valkey_port_count]
+            set pport [next_test_port $base_port $::valkey_port_count]
             puts $cfg "port $pport"
             puts $cfg [format "tls-cert-file %s/../../tls/server.crt" [pwd]]
             puts $cfg [format "tls-key-file %s/../../tls/server.key" [pwd]]
@@ -143,37 +165,49 @@ proc spawn_instance {type base_port count {conf {}} {base_conf_file ""}} {
         }
         close $cfg
 
-        # Finally exec it and remember the pid for later cleanup.
-        set retry 100
-        while {$retry} {
+        set retry $::valkey_port_count
+        set instance_started 0
+        while {$retry > 0} {
             set pid [exec_instance $type $dirname $cfgfile]
+            set startup [wait_instance_started $dirname $pid]
 
-            # Check availability
-            if {[server_is_up 127.0.0.1 $port 100] == 0} {
-                puts "Starting $type #$instance_id at port $port failed, try another"
+            if {$startup eq "port-busy"} {
+                if {[is_alive $pid]} {
+                    stop_instance $pid
+                }
                 incr retry -1
-                set port [find_available_port $base_port $::valkey_port_count]
+                if {$retry == 0} {
+                    break
+                }
+
+                puts "Starting $type #$instance_id at port $port failed, try another"
+                set port [next_test_port $base_port $::valkey_port_count]
                 set cfg [open $cfgfile a+]
                 if {$::tls} {
                     puts $cfg "tls-port $port"
-                    set pport [find_available_port $base_port $::valkey_port_count]
+                    set pport [next_test_port $base_port $::valkey_port_count]
                     puts $cfg "port $pport"
                 } else {
                     puts $cfg "port $port"
                 }
                 close $cfg
-            } else {
+                continue
+            }
+
+            if {$startup eq "started" && [server_is_up $::host $port 100]} {
                 puts "Starting $type #$instance_id at port $port"
                 lappend ::pids $pid
-                break
+                set instance_started 1
+            } elseif {[is_alive $pid]} {
+                stop_instance $pid
             }
+            break
         }
 
-        # Check availability finally
-        if {[server_is_up $::host $port 100] == 0} {
+        if {!$instance_started} {
             set logfile [file join $dirname log.txt]
             puts [exec tail $logfile]
-            abort_sentinel_test "Problem starting $type #$instance_id: ping timeout, maybe server start failed, check $logfile"
+            abort_sentinel_test "Problem starting $type #$instance_id: check $logfile"
         }
 
         # Push the instance into the right list

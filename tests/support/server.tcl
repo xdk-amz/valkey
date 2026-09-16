@@ -605,10 +605,9 @@ proc start_server {options {code undefined}} {
     # use a different directory every time a server is started
     dict set config dir [tmpdir server]
 
-    # start every server on a different port
-    set port [find_available_port $::baseport $::portcount]
+    set port [next_test_port $::baseport $::portcount]
     if {$::tls} {
-        set pport [find_available_port $::baseport $::portcount]
+        set pport [next_test_port $::baseport $::portcount]
         dict set config "port" $pport
         dict set config "tls-port" $port
         dict set config "tls-cluster" "yes"
@@ -659,9 +658,10 @@ proc start_server {options {code undefined}} {
     # to get the current count of ready logs
     set previous_ready_count [count_message_lines $stdout "Ready to accept"]
 
-    # We need a loop here to retry with different ports.
     set server_started 0
+    set port_attempts 0
     while {$server_started == 0} {
+        incr port_attempts
         if {$::verbose} {
             puts -nonewline "=== ($tags) Starting server on ${::host}:${port} "
         }
@@ -669,30 +669,33 @@ proc start_server {options {code undefined}} {
         send_data_packet $::test_server_fd "server-spawning" "port $port"
 
         set pid [spawn_server $executable $config_file $stdout $stderr $args]
-
-        # check that the server actually started
         set port_busy [wait_server_started $executable $config_file $stdout $stderr $pid]
 
-        # Sometimes we have to try a different port, even if we checked
-        # for availability. Other test clients may grab the port before we
-        # are able to do it for example.
         if {$port_busy} {
+            set failed_srv [dict create pid $pid stdout $stdout stderr $stderr config $config skipleaks 1]
+            kill_server $failed_srv
+
+            if {$port_attempts >= $::portcount} {
+                start_server_error $executable $config_file \
+                    "Valkey could not bind a port in the $::baseport-[expr {$::baseport+$::portcount-1}] range."
+                set ::singledb $old_singledb
+                set ::tags [lrange $::tags 0 end-[llength $tags]]
+                return
+            }
+
             puts "Port $port was already busy, trying another port..."
-            set port [find_available_port $::baseport $::portcount]
+            set port [next_test_port $::baseport $::portcount]
             if {$::tls} {
-                set pport [find_available_port $::baseport $::portcount]
+                set pport [next_test_port $::baseport $::portcount]
                 dict set config port $pport
                 dict set config "tls-port" $port
             } else {
                 dict set config port $port
             }
             create_server_config_file $config_file $config $config_lines
-
-            # Truncate log so wait_server_started will not be looking at
-            # output of the failed server.
             close [open $stdout "w"]
-
-            continue; # Try again
+            close [open $stderr "w"]
+            continue
         }
 
         if {$::valgrind} {set retrynum 1000} else {set retrynum 100}
