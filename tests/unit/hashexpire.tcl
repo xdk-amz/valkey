@@ -5358,14 +5358,16 @@ start_server {tags {"hashexpire needs:debug external:skip"}} {
             HDEL "hdel myhash expired live" "hdel myhash live" \
             HGETDEL "hgetdel myhash FIELDS 2 expired live" "hdel myhash live" \
             HPERSIST "hpersist myhash FIELDS 2 expired live" "hpersist myhash FIELDS 1 live" \
-            HEXPIREAT "hexpireat myhash $exat XX GT FIELDS 2 expired live" "hpexpireat myhash [expr {$exat * 1000}] XX GT FIELDS 1 live"] {
+            HEXPIREAT "hexpireat myhash $exat XX GT FIELDS 2 expired live" "hpexpireat myhash [expr {$exat * 1000}] XX GT FIELDS 1 live" \
+            {HPERSIST multiple} "hpersist myhash FIELDS 4 live expired missing live2" "hpersist myhash FIELDS 2 live live2" \
+            {HEXPIREAT multiple} "hexpireat myhash $exat XX GT FIELDS 4 live expired missing live2" "hpexpireat myhash [expr {$exat * 1000}] XX GT FIELDS 2 live live2"] {
             test "$name propagates only the fields it changed - $encoding" {
                 r flushall
-                r hsetex myhash PX 100000 FIELDS 1 live v
+                r hsetex myhash PX 100000 FIELDS 2 live v live2 v
                 r hsetex myhash PX 1 FIELDS 1 expired v
                 after 20
                 assert_equal 0 [r hexists myhash expired]
-                assert_equal 2 [r hlen myhash]
+                assert_equal 3 [r hlen myhash]
                 assert_encoding $encoding myhash
                 set repl [attach_to_replication_stream]
                 r {*}$cmd
