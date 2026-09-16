@@ -1186,7 +1186,10 @@ typedef struct {
 typedef enum {
     CLIENT_IDLE = 0,        /* Initial state: client is idle. */
     CLIENT_PENDING_IO = 1,  /* Main-thread sets this state when client is sent to IO-thread for read/write. */
-    CLIENT_COMPLETED_IO = 2 /* IO-thread sets this state after completing IO operation. */
+    CLIENT_COMPLETED_IO = 2, /* IO-thread sets this state after completing IO operation. */
+    CLIENT_CLOSING_IO = 3,  /* Main-thread claims a partitioned client for teardown; its IO thread starts no read. */
+    CLIENT_HELD_IO = 4,     /* Main-thread briefly holds a partitioned client's socket (cron buffer work). */
+    CLIENT_ARMING_IO = 5    /* A re-arm is staged: the IO thread will epoll_ctl the socket, then store IDLE. */
 } clientIOState;
 
 typedef struct ClientFlags {
@@ -1214,6 +1217,7 @@ typedef struct ClientFlags {
     uint64_t prevent_prop : 1;             /* Don't propagate to AOF or replicas. */
     uint64_t pending_write : 1;            /* Client has output to send but a write handler is yet not installed. */
     uint64_t pending_read : 1;             /* Client has output to send but a write handler is yet not installed. */
+    uint64_t pending_read_deferred : 1;    /* Strict offload: client is queued on clients_pending_read awaiting IO-thread read dispatch. */
     uint64_t buf_encoded : 1;              /* True if c->buf content is encoded (e.g. for copy avoidance) */
     uint64_t reply_off : 1;                /* Don't send replies to client. */
     uint64_t reply_skip_next : 1;          /* Set CLIENT_REPLY_SKIP for next cmd */
@@ -1276,6 +1280,11 @@ typedef struct ClientFlags {
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
+    uint64_t partitioned : 1;              /* Socket readiness is watched by the IO thread in io_tid, not by the main event loop. */
+    uint64_t ring_epilogue : 1; /* beforeNextClient called from the ring's read epilogue (main thread only) */
+    uint64_t fastpath : 1;       /* Owned by an IO thread end to end; main executes its commands from batches and never touches it. */
+    uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
+    uint64_t fp_detach_sent : 1; /* Main asked the owning IO thread to detach this fast-path client. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1443,6 +1452,7 @@ typedef struct client {
     LastWrittenBuf io_last_written;      /* Track state for last written buffer */
     unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
     listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
+    listNode clients_pending_read_node;  /* list node in clients_pending_read (strict-offload deferred reads) */
     size_t bufpos;
     payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
@@ -1463,6 +1473,11 @@ typedef struct client {
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
+    uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
+    uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
+    uint8_t fp_state;                     /* Fast path: FP_ACTIVE/LEAVING/CLOSING/DETACHED (IO thread, then main) */
+    uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
+    sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -1857,6 +1872,14 @@ typedef enum childInfoType {
     CHILD_INFO_TYPE_REPL_OUTPUT_BYTES
 } childInfoType;
 
+/* Reply copy-avoidance gate mode (avoid-copy-reply-mode config). */
+#define COPY_AVOID_MODE_STATIC 0   /* Fixed size gates (default, legacy behavior). */
+#define COPY_AVOID_MODE_ADAPTIVE 1 /* Main-thread pressure drives the size floor. */
+#define COPY_AVOID_MODE_OFF 2      /* Never copy-avoid; always serialize inline. */
+
+/* Adaptive mode: lowest size floor used when the main thread is the constraint. */
+#define COPY_AVOID_ADAPTIVE_FLOOR_MIN 1024
+
 struct valkeyServer {
     /* General */
     pid_t pid;                                        /* Main process pid. */
@@ -1925,6 +1948,8 @@ struct valkeyServer {
     list *clients;                         /* List of active clients */
     list *clients_to_close;                /* Clients to close asynchronously */
     list *clients_pending_write;           /* There is to write or install handler. */
+    list *clients_pending_read;            /* Strict offload: regular clients whose socket read was deferred
+                                            * off the main thread, awaiting re-dispatch to an IO thread (FIFO). */
     list *replicas, *monitors;             /* List of replicas and MONITORs */
     rax *replicas_waiting_psync;           /* Radix tree for tracking replicas awaiting partial synchronization.
                                             * Key: RDB client ID
@@ -1958,7 +1983,18 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
+                                               * client on the main thread: on offload decline the socket op is
+                                               * deferred to a FIFO retry list and re-dispatched to an IO thread. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
+    int prefetch_ring_stride;                 /* Command ring: prefetch keys of one command in N (1 = every command) */
+    int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
+    int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
+    int io_batch_inflight;                    /* Fast path: batches in flight per IO thread */
+    int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
+    int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
+    int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
@@ -1970,6 +2006,14 @@ struct valkeyServer {
     int min_io_threads_copy_avoid;           /* Minimum number of IO threads for copy avoidance in reply construction */
     int min_string_size_copy_avoid_threaded; /* Minimum bulk string size for copy avoidance in reply construction when IO threads enabled */
     int min_string_size_copy_avoid;          /* Minimum bulk string size for copy avoidance in reply construction when IO threads disabled */
+    int copy_avoid_mode;                     /* avoid-copy-reply-mode: COPY_AVOID_MODE_{STATIC,ADAPTIVE,OFF} */
+    int copy_avoid_current_floor;            /* Adaptive: current min RAW value size (bytes) that gets offloaded */
+    int copy_avoid_engaged;                  /* Adaptive: hysteresis state, 1 while offloading aggressively */
+    double copy_avoid_busy_ema;              /* Main-thread busy percent EMA (0..100) driving the adaptive floor */
+    monotime copy_avoid_last_sample_time;    /* Wall clock (us) of last pressure sample */
+    long long copy_avoid_last_active_time;   /* server.stat_active_time captured at last pressure sample */
+    int io_threads_free_min_size;            /* Minimum flat-object payload size to offload its free to an IO thread; smaller frees run inline */
+    int io_threads_free_min_effort;          /* Minimum lazyfreeGetFreeEffort() for an aggregate value to offload its free to an IO thread; smaller frees run inline */
     /* RDB / AOF loading information */
     volatile sig_atomic_t loading;       /* We are loading data from disk if true */
     volatile sig_atomic_t async_loading; /* We are loading data without blocking the db being served */
@@ -2020,6 +2064,7 @@ struct valkeyServer {
     struct malloc_stats cron_malloc_stats;         /* sampled in serverCron(). */
     long long stat_net_input_bytes;                /* Bytes read from network. */
     long long stat_net_output_bytes;               /* Bytes written to network. */
+    long long stat_reply_copy_avoided;             /* Count of value replies emitted via copy-avoiding object refs. */
     long long stat_net_repl_input_bytes;           /* Bytes read during replication, added to stat_net_input_bytes in 'info'. */
     /* Bytes written during replication, added to stat_net_output_bytes in 'info'. */
     long long stat_net_repl_output_bytes;
@@ -2051,6 +2096,7 @@ struct valkeyServer {
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
+    long long stat_strict_deferred_reads;              /* Strict offload: client reads deferred off main to the retry FIFO */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */
@@ -2352,6 +2398,13 @@ struct valkeyServer {
     int maxmemory_policy;                       /* Policy for key eviction */
     int maxmemory_samples;                      /* Precision of random sampling */
     int maxmemory_eviction_tenacity;            /* Aggressiveness of eviction processing */
+    int maxmemory_eviction_batch;               /* If true, run key/client eviction once per event loop
+                                                 * (beforeSleep) with a bounded mid-batch recheck, instead
+                                                 * of before every command. */
+    unsigned long long maxmemory_eviction_batch_slack; /* Max bytes allocated since the last eviction check
+                                                 * before a mid-batch recheck is forced. Effective bound is
+                                                 * capped at 1% of maxmemory. */
+    size_t evict_check_used_memory;             /* zmalloc_used_memory() at the last eviction check. */
     long long proto_max_bulk_len;               /* Protocol bulk length maximum size. */
     int oom_score_adj_values[CONFIG_OOM_COUNT]; /* Linux oom_score_adj configuration */
     int oom_score_adj;                          /* If true, oom_score_adj is managed */
@@ -3084,6 +3137,13 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
+/* Every parse error flag; also marks a queued command that is complete but bad. */
+#define READ_FLAGS_ERROR_MASK                                                                                     \
+    (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
+     READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN | READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN |                 \
+     READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN | READ_FLAGS_ERROR_BIG_BULK_COUNT |                                 \
+     READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER | READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_REPLICATED_CLIENT |   \
+     READ_FLAGS_ERROR_UNBALANCED_QUOTES | READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL | READ_FLAGS_ERROR_INVALID_CRLF)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3091,6 +3151,7 @@ void dictVanillaFree(void *val);
 /* Unlike a retryable socket write error, a compression error is fatal. The IO
  * thread reports it here for the main thread to disconnect the replica. */
 #define WRITE_FLAGS_COMPRESSION_ERROR (1 << 2)
+#define WRITE_FLAGS_LAZY (1 << 3) /* completion is reconciled lazily by main, no response */
 
 client *createClient(connection *conn);
 int freeClient(client *c);
@@ -3128,6 +3189,7 @@ void addReplyProto(client *c, const char *s, size_t len);
 void AddReplyFromClient(client *c, client *src);
 void commitDeferredReplyBuffer(client *c, int skip_if_blocked);
 void addReplyBulk(client *c, robj *obj);
+void addReplyBulkLen(client *c, robj *obj);
 void addReplyBulkCString(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
 void addWritePreparedReplyBulkCBuffer(writePreparedClient *c, const void *p, size_t len);
@@ -3226,12 +3288,24 @@ client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void clientSetUser(client *c, user *u, int authenticated);
 void putClientInPendingWriteQueue(client *c);
+void unpartitionClient(client *c); /* io_threads.c: return a partitioned client to the main event loop */
+int strictOffloadActive(void);
+int processDeferredReads(void);
 client *createCachedResponseClient(int resp);
 void deleteCachedResponseClient(client *recording_client);
 void waitForClientIO(client *c);
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
+bool consumeCommandQueue(client *c);
+bool readToQueryBuf(client *c);
+void parseInputBuffer(client *c);
+void trimClientQueryBuffer(client *c);
+void handleParseError(client *c);
+void ringExecuteOne(client *c);
+extern _Thread_local sds thread_shared_qb;
+int isParsingError(client *c);
+void resetSharedQueryBuf(client *c);
 int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
 void releaseReplyReferences(client *c);
@@ -3377,6 +3451,7 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
+robj *tryPrebuildStringEntry(robj *valobj, const_sds key);
 robj *objectSetExpire(robj *o, long long expire);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
@@ -4043,6 +4118,18 @@ size_t lazyfreeGetPendingObjectsCount(void);
 size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
+void freeObjAsyncForce(robj *obj);
+/* W5b never-free-on-main enforcement hooks (defined in io_threads.c). */
+void armNoMainThreadFree(void);
+void disarmNoMainThreadFree(void);
+int noMainThreadFreeArmed(void);
+int inMainThread(void);
+#ifdef DEBUG_NEVER_FREE_ON_MAIN
+#define assertNoMainThreadFree() serverAssert(!(inMainThread() && noMainThreadFreeArmed()))
+#else
+#define assertNoMainThreadFree() ((void)0)
+#endif
+size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o);

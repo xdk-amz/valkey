@@ -167,11 +167,11 @@ tags {"needs:debug"} {
         } else {
             fail "key wasn't expired"
         }
-        assert_match {*expire-cycle*} [r latency latest]
-
-        test {LATENCY GRAPH can output the expire event graph} {
-             assert_match {*expire-cycle*high*low*} [r latency graph expire-cycle]
-        }
+        # The expired value is never freed on the main thread (IO thread slab
+        # with io-threads >= 2, bio fallback with io-threads 1, regardless of
+        # lazyfree-lazy-expire), so the expire cycle stays under the latency
+        # threshold and no expire-cycle event is recorded.
+        assert_no_match {*expire-cycle*} [r latency latest]
 
         r config set latency-monitor-threshold 200
         r config set lazyfree-lazy-expire yes

@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "io_threads.h" /* inMainThread() for refcount-discipline asserts */
 #include "ordered_index.h"
 #include "serverassert.h"
 #include "functions.h"
@@ -396,6 +397,45 @@ robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, const_sds 
     }
 }
 
+/* T9: Build a store-ready string value object with the given key embedded and
+ * no expire, applying exactly the same encoding rules as
+ * setCommand's tryObjectEncoding() followed by dbAdd's objectSetKeyAndExpire().
+ *
+ * 'valobj' is the freshly parsed argv value object (RAW or EMBSTR, refcount 1).
+ * The returned object is a NEW allocation the caller owns (refcount 1); the
+ * source bytes are copied, so 'valobj' is untouched and freed normally.
+ *
+ * Returns NULL when the value is not eligible for prebuild (shared/non-string,
+ * or a large string that does not embed with the key). Those cases fall back to
+ * the existing main-thread path, which for large RAW values already reuses the
+ * argv sds. Because this only ever returns objects whose type/encoding match
+ * what the main-thread path would have produced, OBJECT ENCODING is identical. */
+robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
+    if (objectGetType(valobj) != OBJ_STRING) return NULL;
+    if (!sdsEncodedObject(valobj)) return NULL; /* already INT-encoded: rare for parsed argv */
+    if (objectGetRefcount(valobj) > 1) return NULL;
+
+    sds s = objectGetVal(valobj);
+    size_t len = sdslen(s);
+
+    /* Integer encoding (mirrors tryObjectEncodingEx). */
+    long value;
+    if (len <= 20 && string2l(s, len, &value)) {
+        robj *o = createUnembeddedObjectWithKeyAndExpire(OBJ_STRING, (void *)value, key, EXPIRY_NONE);
+        objectSetEncoding(o, OBJ_ENCODING_INT);
+        return o;
+    }
+
+    /* EMBSTR with embedded key when the key+value sum embeds. */
+    if (shouldEmbedStringObject(len, key, EXPIRY_NONE)) {
+        return createEmbeddedStringObjectWithKeyAndExpire(s, len, key, EXPIRY_NONE);
+    }
+
+    /* Large RAW value: fall back to the main-thread path (which reuses the argv
+     * sds without an extra copy). */
+    return NULL;
+}
+
 void *objectGetVal(const robj *o) {
     if (o->hasembval) {
         unsigned char *data = objectEmbeddedData(o);
@@ -494,6 +534,17 @@ void objectUnembedVal(robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
+    /* T9 fast path: if the object already carries the correct embedded key and
+     * a matching expire, it was built store-ready (e.g. at parse time on an IO
+     * thread) and can be installed with no allocation or copy. */
+    if (o->hasembkey && objectGetRefcount(o) == 1 && objectGetExpire(o) == expire) {
+        sds ekey = objectGetKey(o);
+        if (ekey != NULL && sdslen(ekey) == sdslen(key) &&
+            memcmp(ekey, key, sdslen(key)) == 0) {
+            return o;
+        }
+    }
+
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
@@ -757,7 +808,45 @@ void freeStreamObject(robj *o) {
     freeStream(objectGetVal(o));
 }
 
+/* ----------------------- Refcount discipline (Scheme C) -------------------
+ * All robj refcount mutation happens on the main thread. The robj header packs
+ * type/encoding/lru/refcount into one 64-bit word and lru is rewritten on every
+ * keyspace hit (db.c lookupKey), so an off-main refcount RMW would race that
+ * word and can be torn. Keeping refcount single-writer (main-thread) is what
+ * makes the zero-copy reply path (bulkStrRef) safe without atomics: the IO
+ * thread only serializes value bytes via writev and posts JOB_RES_WRITE_CLIENT
+ * back; the matching decrRefCount runs on the main thread in
+ * releaseBufReferences during postWriteToClient.
+ *
+ * There are exactly three off-main decrRefCount sites, and every one of them
+ * only ever touches an object whose refcount is already 1, i.e. the last,
+ * sole-owned reference that no other thread can reach and that is about to be
+ * freed (so the header word is never concurrently mutated):
+ *   1. io_threads.c JOB_REQ_FREE_OBJ  (guarded by refcount > 1 -> not offloaded)
+ *   2. io_threads.c ioThreadFreeArgv  (main drops shared refs first; only
+ *                                      refcount==1 args reach the IO thread)
+ *   3. lazyfree.c  lazyfreeFreeObject (bio thread; guarded by refcount == 1)
+ * incrRefCount is never called off the main thread.
+ *
+ * The immutable/stack specials (OBJ_SHARED_REFCOUNT / OBJ_STATIC_REFCOUNT) are
+ * never refcount-mutated and may be observed from any thread.
+ *
+ * Compile with -DDEBUG_REFCOUNT_DISCIPLINE to enforce; release builds pay
+ * nothing (the checks compile to no-ops). */
+#ifdef DEBUG_REFCOUNT_DISCIPLINE
+#define assertIncrRefCountThread(o)                                                                                     \
+    serverAssert(inMainThread() || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT ||                                       \
+                 objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
+#define assertDecrRefCountThread(o)                                                                                     \
+    serverAssert(inMainThread() || objectGetRefcount(o) == 1 || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT ||          \
+                 objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
+#else
+#define assertIncrRefCountThread(o) ((void)0)
+#define assertDecrRefCountThread(o) ((void)0)
+#endif
+
 void incrRefCount(robj *o) {
+    assertIncrRefCountThread(o);
     if (objectGetRefcount(o) < OBJ_FIRST_SPECIAL_REFCOUNT) {
         o->refcount++;
     } else {
@@ -770,7 +859,12 @@ void incrRefCount(robj *o) {
 }
 
 void decrRefCount(robj *o) {
+    assertDecrRefCountThread(o);
     if (objectGetRefcount(o) == 1) {
+        /* W5b: this is a TERMINAL free. Inside an armed never-free-on-main
+         * routing scope, reaching here on the main thread is a discipline
+         * violation (the value should have been handed to an IO/bio thread). */
+        assertNoMainThreadFree();
         if (objectGetVal(o) != NULL) {
             switch (objectGetType(o)) {
             case OBJ_STRING: freeStringObject(o); break;

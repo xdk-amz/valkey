@@ -103,6 +103,12 @@ configEnum aof_fsync_enum[] = {
     {"no", AOF_FSYNC_NO},
     {NULL, 0}};
 
+configEnum copy_avoid_mode_enum[] = {
+    {"static", COPY_AVOID_MODE_STATIC},
+    {"adaptive", COPY_AVOID_MODE_ADAPTIVE},
+    {"off", COPY_AVOID_MODE_OFF},
+    {NULL, 0}};
+
 configEnum shutdown_on_sig_enum[] = {
     {"default", SHUTDOWN_NOFLAGS},
     {"save", SHUTDOWN_SAVE},
@@ -2979,6 +2985,14 @@ static int applyTlsCfg(const char **err) {
     return 1;
 }
 
+/* Turning strict offload off returns partitioned clients to the main event
+ * loop, since IO threads may then park and stop polling their sockets. */
+static int applyIOThreadsStrictOffload(const char **err) {
+    UNUSED(err);
+    if (!server.io_threads_strict_offload) unpartitionAllClients();
+    return 1;
+}
+
 static int applyTLSPort(const char **err) {
     /* Configure TLS in case it wasn't enabled */
     if (connTypeConfigure(connectionTypeTls(), &server.tls_ctx_config, 0) == C_ERR) {
@@ -3495,6 +3509,8 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
+    createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3567,7 +3583,17 @@ standardConfig static_configs[] = {
     createIntConfig("min-io-threads-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_io_threads_copy_avoid, 7, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
+    createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
+    createIntConfig("io-threads-free-min-size", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.io_threads_free_min_size, 64, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-free-min-effort", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.io_threads_free_min_effort, 64, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
+    createIntConfig("prefetch-ring-stride", NULL, MODIFIABLE_CONFIG, 1, 64, server.prefetch_ring_stride, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-batch-inflight", NULL, MODIFIABLE_CONFIG, 1, 512, server.io_batch_inflight, 16, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-batch-drain-us", NULL, MODIFIABLE_CONFIG, 0, 1000, server.io_batch_drain_us, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-batch-hold-us", NULL, MODIFIABLE_CONFIG, 0, 10000, server.io_batch_hold_us, 50, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */
     createIntConfig("list-max-listpack-size", "list-max-ziplist-size", MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.list_max_listpack_size, -2, INTEGER_CONFIG, NULL, NULL),
@@ -3585,6 +3611,8 @@ standardConfig static_configs[] = {
     createIntConfig("repl-diskless-sync-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_diskless_sync_delay, 5, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-samples", NULL, MODIFIABLE_CONFIG, 1, 64, server.maxmemory_samples, 5, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-eviction-tenacity", NULL, MODIFIABLE_CONFIG, 0, 100, server.maxmemory_eviction_tenacity, 10, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("maxmemory-eviction-batch", NULL, MODIFIABLE_CONFIG, server.maxmemory_eviction_batch, 0, NULL, NULL),
+    createULongLongConfig("maxmemory-eviction-batch-slack", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.maxmemory_eviction_batch_slack, 16 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL),
     createIntConfig("timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.maxidletime, 0, INTEGER_CONFIG, NULL, NULL), /* Default client timeout: infinite */
     createIntConfig("replica-announce-port", "slave-announce-port", MODIFIABLE_CONFIG, 0, 65535, server.replica_announce_port, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("tcp-backlog", NULL, IMMUTABLE_CONFIG, 0, INT_MAX, server.tcp_backlog, 511, INTEGER_CONFIG, NULL, NULL), /* TCP listen backlog. */

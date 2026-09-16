@@ -150,7 +150,8 @@ static long long throttlerTimeProc(struct aeEventLoop *eventLoop, long long id, 
             consumeOtherThrottlers(c, t);
         }
         serverAssert(c->argc > 0 && c->flag.pending_command && !c->flag.throttled);
-        queueClientForReprocessing(c); // Read handler will be installed during reprocessing.
+        unpartitionClient(c); /* throttled clients read on main; the read handler is installed during reprocessing */
+        queueClientForReprocessing(c);
     }
 
     if (listLength(t->client_queue) == 0) {

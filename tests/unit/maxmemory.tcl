@@ -609,3 +609,90 @@ start_server {tags {"maxmemory" "external:skip"}} {
         assert_equal [r dbsize] {0}
     }
 }
+
+# --- T11: maxmemory-eviction-batch (consolidate per-command eviction into beforeSleep) ---
+foreach io_threads {1 6} {
+start_server {tags {"maxmemory external:skip"}} {
+    r config set io-threads $io_threads
+
+    test "maxmemory-eviction-batch: config off is the default and round-trips (io-threads $io_threads)" {
+        assert_equal {no} [lindex [r config get maxmemory-eviction-batch] 1]
+        assert_equal {16777216} [lindex [r config get maxmemory-eviction-batch-slack] 1]
+        r config set maxmemory-eviction-batch yes
+        assert_equal {yes} [lindex [r config get maxmemory-eviction-batch] 1]
+        r config set maxmemory-eviction-batch-slack 2mb
+        assert_equal {2097152} [lindex [r config get maxmemory-eviction-batch-slack] 1]
+        r config set maxmemory-eviction-batch no
+    }
+
+    # Pipeline `count` SETs of `vsize`-byte values through one deferring client,
+    # then drain replies. Returns the number of successful (non-OOM) writes.
+    proc pipelined_write_storm {count vsize} {
+        set val [string repeat x $vsize]
+        set rd [valkey_deferring_client]
+        for {set j 0} {$j < $count} {incr j} { $rd set stormkey:$j $val }
+        set ok 0
+        for {set j 0} {$j < $count} {incr j} {
+            catch {$rd read} res
+            if {$res eq {OK}} { incr ok }
+        }
+        $rd close
+        return $ok
+    }
+
+    foreach mode {off on} {
+        test "maxmemory-eviction-batch $mode: OOM denial still fires + overshoot bounded (io-threads $io_threads)" {
+            r flushall sync
+            r config set maxmemory 0
+            r config set appendonly no
+            r config set maxmemory-policy noeviction
+            r config set maxmemory-eviction-batch-slack 1mb
+            if {$mode eq {on}} {
+                r config set maxmemory-eviction-batch yes
+            } else {
+                r config set maxmemory-eviction-batch no
+            }
+            r config set maxmemory 20mb
+
+            # Storm ~32mb of 4kb writes against a 20mb noeviction limit.
+            set vsize 4096
+            set ok [pipelined_write_storm 8000 $vsize]
+
+            # The deny path must remain effective in both modes: some writes rejected.
+            assert {$ok < 8000}
+
+            # Effective overshoot slack = min(configured slack, 1% of maxmemory).
+            # maxmemory=20mb -> 1% = ~200kb; configured 1mb -> effective ~200kb.
+            set maxmemory [expr {20*1024*1024}]
+            set eff_slack [expr {$maxmemory/100}]
+            set margin [expr {1024*1024}] ;# allocator + eviction-exempt overhead
+            set used [s used_memory]
+
+            if {$mode eq {on}} {
+                # Batched: overshoot bounded by slack + one command's value.
+                set bound [expr {$maxmemory + $eff_slack + $vsize + $margin}]
+            } else {
+                # Per-command (today's behavior): overshoot bounded by one value.
+                set bound [expr {$maxmemory + $vsize + $margin}]
+            }
+            assert {$used <= $bound}
+        }
+    }
+
+    test "maxmemory-eviction-batch off: eviction behavior identical to default (io-threads $io_threads)" {
+        r flushall sync
+        r config set maxmemory 0
+        r config set appendonly no
+        r config set maxmemory-eviction-batch no
+        r config set maxmemory-policy allkeys-lru
+        r config resetstat
+        r config set maxmemory 8mb
+        # Pipeline ~16mb of 4kb writes against an 8mb allkeys-lru limit.
+        pipelined_write_storm 4000 4096
+        # With allkeys-lru the keyspace is capped near maxmemory and keys are evicted.
+        assert {[s evicted_keys] > 0}
+        assert {[s used_memory] <= [expr {8*1024*1024 + 4*1024*1024}]}
+        r config set maxmemory 0
+    }
+}
+}

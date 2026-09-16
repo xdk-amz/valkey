@@ -82,12 +82,24 @@ start_server {tags {"lazyfree"}} {
         r xgroup destroy s bla
         r unlink s
 
-        # make sure it was not lazy freed
+        # make sure it was freed off the main thread
         wait_for_condition 50 100 {
             [s lazyfree_pending_objects] == 0
         } else {
             fail "lazyfree isn't done"
         }
-        assert_equal [s lazyfreed_objects] 0
+        # W5b (never-free-on-main): streams can never be freed on the main
+        # thread (their rax/consumer-group teardown is not IO-thread safe), so
+        # freeObjAsyncForce always routes them to a bio lazyfree thread even
+        # when the object is small enough that pre-W5b freed it synchronously.
+        # The object is still actually freed (lazyfree_pending_objects drains to
+        # 0 above). With io-threads >= 2 the stream free routes off-main and is
+        # counted as one lazyfreed object; single-threaded config keeps the
+        # legacy synchronous free (counter stays 0).
+        if {[lindex [r config get io-threads] 1] >= 2} {
+            assert_equal [s lazyfreed_objects] 1
+        } else {
+            assert_equal [s lazyfreed_objects] 0
+        }
     } {} {needs:config-resetstat}
 }

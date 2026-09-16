@@ -261,6 +261,20 @@ void spscCommit(spscQueue *q) {
     atomic_store_explicit(&q->tail, q->tail_local, memory_order_release);
 }
 
+/* Producer side: slots available for enqueue right now. Refreshes the cached
+ * head, so the answer is exact at the time of the call and can only grow. */
+size_t spscFreeSlots(spscQueue *q) {
+    q->head_cache = atomic_load_explicit(&q->head, memory_order_acquire);
+    return q->queue_size - (q->tail_local - q->head_cache);
+}
+
+/* Consumer side: entries currently published and not yet dequeued. */
+size_t spscBacklog(spscQueue *q) {
+    size_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    return tail - head;
+}
+
 size_t spscDequeueBatch(spscQueue *q, void **jobs_out, size_t num_jobs) {
     size_t curr_head = atomic_load_explicit(&q->head, memory_order_relaxed);
     size_t curr_tail_cache = q->tail_cache;

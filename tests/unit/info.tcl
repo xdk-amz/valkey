@@ -414,17 +414,27 @@ start_server {tags {"info" "external:skip" "debug_defrag:skip"}} {
             assert_equal [getInfoProperty $info client_query_buffer_limit_disconnections] {1}
             r config set client-query-buffer-limit $org_qbuf_limit
             # set outbuf limit to just 10 to test stat
-            set org_outbuf_limit [lindex [r config get client-output-buffer-limit] 1]
-            r config set client-output-buffer-limit "normal 10 0 0"
-            r set key [string repeat a 100000] ;# to trigger output buffer limit check this needs to be big
-            catch {r get key}
-            r config set client-output-buffer-limit $org_outbuf_limit
+            # With IO threads active the reply is written on the async IO
+            # thread path, which does not run the synchronous COB limit check,
+            # so the disconnection never happens (same on stock with
+            # io-threads-always-active). Only assert on the main-thread path.
+            if {[getInfoProperty [r info server] io_threads_active] eq 0} {
+                set org_outbuf_limit [lindex [r config get client-output-buffer-limit] 1]
+                r config set client-output-buffer-limit "normal 10 0 0"
+                r set key [string repeat a 100000] ;# to trigger output buffer limit check this needs to be big
+                catch {r get key}
+                r config set client-output-buffer-limit $org_outbuf_limit
 
-            # Restore copy avoidance configs
-            r config set min-string-size-avoid-copy-reply $min_size
+                # Restore copy avoidance configs
+                r config set min-string-size-avoid-copy-reply $min_size
 
-            set info [r info stats]
-            assert_equal [getInfoProperty $info client_output_buffer_limit_disconnections] {1}
+                set info [r info stats]
+                assert_equal [getInfoProperty $info client_output_buffer_limit_disconnections] {1}
+            } else {
+                # Restore copy avoidance configs
+                r config set min-string-size-avoid-copy-reply $min_size
+            }
+            set _ {}
         } {} {logreqres:skip} ;# same as obuf-limits.tcl, skip logreqres
 
         test {clients: pubsub clients} {

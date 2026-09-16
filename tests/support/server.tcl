@@ -276,7 +276,15 @@ proc tags_acceptable {tags err_return} {
         return 0
     }
 
-    if {$::io_threads && [lsearch -exact $tags "io-threads:skip"] >= 0} {
+    # io-threads mode is enabled either by --io-threads or by a
+    # "--config io-threads N" (N > 1) override; honor the skip tag for both.
+    set io_threads_override 0
+    foreach {directive arguments} $::global_overrides {
+        if {$directive eq "io-threads" && $arguments > 1} {
+            set io_threads_override 1
+        }
+    }
+    if {($::io_threads || $io_threads_override) && [lsearch -exact $tags "io-threads:skip"] >= 0} {
         set err "Not supported in io-threads mode"
         return 0
     }

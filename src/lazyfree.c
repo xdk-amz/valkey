@@ -207,6 +207,20 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
     }
 }
 
+/* W5b (never-free-on-main): unconditionally free a sole-reference object on a
+ * bio thread, ignoring the LAZYFREE_THRESHOLD effort heuristic. Used for shapes
+ * that cannot run on an IO thread (module VM_Free, streams) so their free never
+ * lands on the main thread. If the object is still shared (refcount > 1) the
+ * decrement is non-terminal and is applied inline (no free occurs). */
+void freeObjAsyncForce(robj *obj) {
+    if (obj->refcount == 1) {
+        atomic_fetch_add_explicit(&lazyfree_objects, 1, memory_order_relaxed);
+        bioCreateLazyFreeJob(lazyfreeFreeObject, 1, obj);
+    } else {
+        decrRefCount(obj);
+    }
+}
+
 /* Empty a DB asynchronously. What the function does actually is to
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */

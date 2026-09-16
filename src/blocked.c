@@ -69,6 +69,7 @@
 #include "latency.h"
 #include "monotonic.h"
 #include "cluster_slot_stats.h"
+#include "io_threads.h"
 #include "module.h"
 
 /* forward declarations */
@@ -176,15 +177,30 @@ void processUnblockedClients(void) {
             continue;
         }
 
-        if (c->conn && !connHasReadHandler(c->conn)) {
+        /* A throttled client had its read handler removed; a client that reads
+         * on an IO thread (partitioned or fast path) has none by design. */
+        if (c->conn && !connHasReadHandler(c->conn) && !c->flag.partitioned && !c->flag.fastpath) {
             if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
                 freeClient(c);
                 continue;
             }
         }
-        /* If we have a queued command, execute it now. */
-        if (processPendingCommandAndInputBuffer(c) == C_ERR) {
-            continue;
+        /* Process remaining data in the input buffer, unless the client
+         * is blocked again. Actually processInputBuffer() checks that the
+         * client is not blocked before to proceed, but things may change and
+         * the code is conceptually more correct this way.
+         *
+         * A partitioned client kept reading while blocked. Its buffers are
+         * touched only with the socket held away from its IO thread; a read
+         * in flight or already landed drains through the read's own epilogue
+         * instead, now that the client is no longer blocked. */
+        if (!c->flag.blocked) {
+            if (c->io_read_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_COMPLETED_IO) continue;
+            if (!partitionedClientHold(c)) continue;
+            /* If we have a queued command, execute it now. */
+            int rc = processPendingCommandAndInputBuffer(c);
+            if (rc == C_ERR) continue;
+            partitionedClientRelease(c);
         }
         beforeNextClient(c);
     }

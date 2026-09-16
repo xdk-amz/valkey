@@ -12,6 +12,8 @@
 typedef enum {
     JOB_SPSC_FREE_ARGV = 0,
     JOB_SPSC_POLL = 1,
+    JOB_SPSC_WRITE_SLAB = 2, /* batch of clients to write, one job per event loop drain */
+    JOB_SPSC_FREE_SLAB = 3,  /* batch of terminal frees from main */
 } JobRequestSPSC;
 
 /* Tags for the SPMC shared inbox (main thread → any I/O thread). */
@@ -35,6 +37,9 @@ typedef enum {
     JOB_RES_CLUSTER_READ,
     JOB_RES_CLUSTER_WRITE,
     JOB_RES_CLUSTER_ACCEPT,
+    JOB_RES_WRITE_SLAB, /* the write slab coming back with every client written */
+    JOB_RES_FP_CLOSE,   /* fast path: the IO thread is done with a closing client, main frees it */
+    JOB_RES_FP_HANDOFF, /* fast path: the IO thread hands a client to the main path */
     JOB_RES_COUNT
 } JobResult;
 static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
@@ -46,8 +51,33 @@ void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
 int trySendWriteToIOThreads(client *c);
+void flushWriteSlab(void);
+/* Client partitioning (W6a): a regular TCP client's socket readiness is watched
+ * by one IO thread's epoll set, which reads and parses on its own without a
+ * dispatch from the main thread. Main re-arms the socket after it has drained
+ * the client's commands, through the same slab that carries writes. */
+int tryPartitionClient(client *c);
+void unpartitionClient(client *c);
+void unpartitionAllClients(void);
+void partitionedClientDetach(client *c);
+void armPartitionedClientRead(client *c);
+int partitionedClientHold(client *c);
+void ioThreadQueueReadCompletion(client *c);
+void reconcileLazyWrite(client *c);
+int ioThreadEpollFd(int tid);
+void partitionedClientRelease(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
+int tryOffloadFreePtrToIOThreads(void *ptr);
+void beginInlineReclaim(void);
+void endInlineReclaim(void);
+void freeValueNeverOnMain(robj *key, robj *val, int dbid);
+void drainPendingMainFrees(void);
+size_t pendingMainFreesLen(void);
+/* Bytes committed to an off-main free (IO-thread free job enqueued) but not yet
+ * physically freed. Subtracted from used_memory by getMaxmemoryState so
+ * eviction does not over-evict while async frees drain. */
+size_t offloadPendingFreeBytes(void);
 void IOThreadsAfterSleep(int numevents);
 void IOThreadsBeforeSleep(long long current_time);
 void drainIOThreadsQueue(void);

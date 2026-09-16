@@ -510,6 +510,11 @@ void debugCommand(client *c) {
             "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
             "SET-SKIP-CHECKSUM-VALIDATION <0|1>",
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
+            "REPLY-RAW <key>",
+            "    Reply with the string value of <key>, routing the value bytes through the",
+            "    copy-avoiding raw reply path (for testing reply offload).",
+            "COPY-AVOID <ENGAGE|RELEASE> [floor]",
+            "    Pin the adaptive reply copy-avoidance floor/engagement (for testing).",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
             "STRINGMATCH-TEST",
@@ -930,6 +935,47 @@ void debugCommand(client *c) {
             addReplyError(c, "Wrong protocol type name. Please use one of the following: "
                              "string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "reply-raw") && c->argc == 3) {
+        /* DEBUG REPLY-RAW <key>
+         * Emits the string value of <key> as a normal bulk reply, but routes the
+         * value bytes through addReply()'s raw arm (RAW_STR_REF copy-avoidance)
+         * instead of addReplyBulk(). Used to exercise and verify the raw
+         * reply-offload path end to end. */
+        robj *val;
+        if ((val = dbFind(c->db, objectGetVal(c->argv[2]))) == NULL) {
+            addReplyErrorObject(c, shared.nokeyerr);
+            return;
+        }
+        if (val->type != OBJ_STRING) {
+            addReplyError(c, "value is not a string");
+            return;
+        }
+        addReplyBulkLen(c, val);
+        addReply(c, val);
+        addReplyProto(c, "\r\n", 2);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "copy-avoid") && c->argc >= 3) {
+        /* DEBUG COPY-AVOID <ENGAGE|RELEASE> [floor]
+         * Pins the adaptive reply copy-avoidance hysteresis state so tests can
+         * exercise the adaptive gate deterministically without generating load.
+         * ENGAGE: aggressive offload (floor defaults to COPY_AVOID_ADAPTIVE_FLOOR_MIN).
+         * RELEASE: high floor (defaults to the threaded static gate). */
+        if (!strcasecmp(objectGetVal(c->argv[2]), "engage")) {
+            server.copy_avoid_engaged = 1;
+            server.copy_avoid_busy_ema = 100;
+            server.copy_avoid_current_floor =
+                (c->argc >= 4) ? atoi(objectGetVal(c->argv[3])) : COPY_AVOID_ADAPTIVE_FLOOR_MIN;
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "release")) {
+            server.copy_avoid_engaged = 0;
+            server.copy_avoid_busy_ema = 0;
+            server.copy_avoid_current_floor =
+                (c->argc >= 4) ? atoi(objectGetVal(c->argv[3])) : server.min_string_size_copy_avoid_threaded;
+        } else {
+            addReplyError(c, "Use DEBUG COPY-AVOID <ENGAGE|RELEASE> [floor]");
+            return;
+        }
+        /* Re-seed the sampler so the pinned state is not immediately overwritten. */
+        server.copy_avoid_last_sample_time = 0;
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "sleep") && c->argc == 3) {
         double dtime = valkey_strtod_sds(objectGetVal(c->argv[2]), NULL);
         long long utime = dtime * 1000000;

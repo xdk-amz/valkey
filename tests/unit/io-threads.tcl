@@ -6,6 +6,13 @@ proc wait_for_io_threads_to_go_idle {} {
         # policy disabled and then restore the original test setting.
         assert_equal {OK} [r config set io-threads-always-active no]
     }
+    set io_threads_strict_offload [dict get [r config get io-threads-strict-offload] io-threads-strict-offload]
+    if {$io_threads_strict_offload eq {yes}} {
+        # Strict offload keeps a floor of active IO threads (main never
+        # touches sockets), so io_threads_active can never reach 0. Observe
+        # the idle transition with strict offload disabled, then restore.
+        assert_equal {OK} [r config set io-threads-strict-offload no]
+    }
 
     set errcode [catch {
         wait_for_condition 1000 50 {
@@ -15,6 +22,9 @@ proc wait_for_io_threads_to_go_idle {} {
         }
     } result]
 
+    if {$io_threads_strict_offload eq {yes}} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+    }
     if {$io_threads_always_active eq {yes}} {
         assert_equal {OK} [r config set io-threads-always-active yes]
     }
@@ -169,5 +179,33 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         $rd close
 
         assert_equal {PONG} [r ping]
+    }
+
+    # A scale-up resets the active worker count to 1. Strict offload defers
+    # the reply until a worker is active again, and the always-active policy
+    # used to ignite workers only on a socket event. The client waiting on the
+    # reply produces no event, so the reply stalled until unrelated traffic
+    # arrived on another connection.
+    test {Scale-up reply is delivered under strict offload with always-active} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        assert_equal {OK} [r config set io-threads 1]
+
+        # Read without blocking so a missing reply fails instead of hanging.
+        # Nothing else may touch the server while waiting: any other
+        # connection's event would wake the workers and mask the stall.
+        set rd [valkey_deferring_client]
+        $rd config set io-threads 5
+        $rd flush
+        fconfigure [$rd channel] -blocking 0
+        set reply {}
+        for {set i 0} {$i < 50 && $reply ne "+OK\r\n"} {incr i} {
+            after 100
+            append reply [$rd rawread]
+        }
+        assert_equal "+OK\r\n" $reply
+        $rd close
+
+        assert_equal {io-threads 5} [r config get io-threads]
     }
 }

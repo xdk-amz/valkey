@@ -1187,6 +1187,7 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
      * 2) Set client state to make it a replica.
      * 3) Inform the client we can continue with +CONTINUE
      * 4) Send the backlog data (from the offset to the end) to the replica. */
+    unpartitionClient(c); /* replication links are main-owned */
     waitForClientIO(c);
     c->flag.replica = 1;
     if (c->repl_data->associated_rdb_client_id && lookupRdbClientByID(c->repl_data->associated_rdb_client_id)) {
@@ -1387,6 +1388,7 @@ void syncCommand(client *c) {
     initClientReplicationData(c);
 
     /* Wait for any IO pending operation to finish before changing the client state to replica */
+    unpartitionClient(c); /* replication links are main-owned */
     waitForClientIO(c);
 
     /* Check if this is a failover request to a replica with the same replid and

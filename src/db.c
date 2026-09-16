@@ -401,14 +401,9 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
-    if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
-        /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
-        freeObjAsync(key, old, db->id);
-    } else {
-        decrRefCount(old);
-    }
+    /* W5b: the overwritten value's terminal free never runs on the main thread
+     * (IO thread for strings/aggregates, bio for module/stream). */
+    freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
@@ -527,11 +522,19 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        if (async) {
-            freeObjAsync(key, val, db->id);
-        } else {
-            decrRefCount(val);
-        }
+        /* Physical value free: W5b routes EVERY terminal value free off the
+         * main thread. All keyspace-notification, signalDeletedKeyAsReady,
+         * module-unlink, dirty accounting, table deletes and volatile-hash
+         * un-tracking above have already run on the main thread; only the
+         * physical free is deferred here, so no ordering guarantee changes.
+         *
+         * freeValueNeverOnMain routes: strings + audited aggregates -> IO
+         * thread (or the main-side pending list on a full queue); module /
+         * stream / (IO threads disabled) -> bio lazyfree. The main thread never
+         * runs the terminal free. The `async` (lazyfree-lazy-*) config no longer
+         * gates this: off-main routing is now unconditional. */
+        UNUSED(async);
+        freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
