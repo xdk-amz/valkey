@@ -103,7 +103,8 @@ must read the `idx_` counters explicitly (the active-expiration tests do).
 Fixtures hold identical live members across `none` / `one` (one far-future TTL
 on `m0`) / `all` (every member far-future); `mostly_expired` and `all_expired`
 expire members outside any measured command with active expiration disabled
-(`wc_quiesce`). Hashtable sizes 2,000 / 20,000 / 200,000 (+1,000,000 extended),
+(`wc_quiesce`); `one_expired` expires only `m0`, leaving a large live population
+with a single hidden member that no selection path may reclaim. Hashtable sizes 2,000 / 20,000 / 200,000 (+1,000,000 extended),
 listpack 16 / 64 / 128, short (`m<i>`) and long (64-byte) payloads, intset
 conversions. Every measurement is one command through `wc_measure`, seeded.
 
@@ -120,6 +121,7 @@ both counters, the violated contract and an exact reproduction line.
 | Family | Baseline (parent path) | Counters gated | Contract | Tests |
 |---|---|---|---|---|
 | SPOP key, SPOP key k (small), SRANDMEMBER key / k / -k, hashtable | `hashtableFairRandomEntry` per pick (bounded scan), CASE 2 pops | `ht_iter_visits+ht_scan_visits+ht_bucket_probes`, `set_reservoir_passes`, `mem_max_alloc`, `str_objs_created` | plain <= 4096 examined; one/all <= 4x plain + 500; no reservoir pass; flat across sizes | setperf-random: "* hashtable, one future TTL adds no population scan" (x6), long payload |
+| Same, with one expired (hidden, unreclaimed) member among n live | per-pick validation rejects the one expired pick (probability 1/n) and re-samples | same counters; total over 10 repeated commands | same budget as one future TTL; no reservoir pass; 10 commands <= 10 x (4x plain + 500), i.e. no per-command population pass; `m0` never returned | setperf-random: "* hashtable, one expired member adds no population scan" (x6), "repeated * with one expired member" (x2), listpack (x3) |
 | SRANDMEMBER k >= card., large -k | CASE 2 stream / per-result sampling | examined, `mem_max_alloc`, `mem_peak_live_delta` | one traversal, no population array | setperf-random: "count >= cardinality", "large negative count" |
 | SPOP / SRANDMEMBER listpack, incl. -100 | `lpNextRandom` + `lpBatchDelete`, `lpRandomEntries` per <=1000 results | `lp_find_steps+lp_next_steps+lp_random_steps`, `str_objs_created`, `lp_deletes`, `lp_batch_deletes`, `lp_tail_bytes_moved`, `lp_find_calls` | <= 3x plain + 2n; one batch delete; tail bytes <= 2 x listpack bytes | setperf-random listpack (x5), setperf-memory "listpack SPOP removes ... one batch", "listpack SREM" |
 | Expired members during selection (primary) | reclaim on encounter | examined over N commands, `set_members_reclaimed`, physical/live after | <= 3n + N x request budget (one cleanup pass, not one per command) | setperf-random "mostly-expired ... reclaimed, not rescanned" (x4), "all-expired ... terminates", listpack expired |
@@ -220,6 +222,22 @@ Not yet verified:
   `ht_resizes`/`ht_rehash_steps`/`ht_rehash_entries` are counted).
 * Cluster-mode propagation and slot migration paths are out of scope of the
   fixtures.
+
+## Finding on f4475160e (the fix for the above; measured with the `one_expired` fixture)
+
+The fix restores the parent samplers for sets whose members carry only future
+TTLs, but selects the reservoir path with `setTypeHasExpiredMembers()`: as soon
+as one member is expired and still hidden, every `SPOP key k` / `SRANDMEMBER
+key k` / `SRANDMEMBER key -k` runs a full pass (200,000 `ht_iter_visits` and
+`set_reservoir_passes=1` per command at n=200,000; bench median 32.8 us ->
+7,110 us for `SPOP key 1`, x217). Expired members are hidden, not reclaimed on
+the selection path, so the same pass repeats on every following command until
+active expiration removes the member (1,999,985 entries examined over 10
+`SPOP key 1`). The no-count forms are request-sized (per-pick rejection).
+Removing the two gates in a probe build made all eight hashtable tests pass
+with `m0` never returned, so the budget is met by the existing per-pick
+validation; the gate itself is the regression. The `one` (future-TTL) fixture
+cannot see this, which is why the suite previously passed on f4475160e.
 
 ## Recorded run against da37a1d (instrumented build, seed 12345)
 
