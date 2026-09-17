@@ -2183,30 +2183,36 @@ start_server {tags {"stream needs:repl"} overrides {stream-node-max-entries 10}}
     }
 }
 
-start_server {tags {"stream needs:debug"} overrides {appendonly yes stream-node-max-entries 10}} {
-    test {MAXBYTES trims replay from the AOF with a different node size} {
-        streamFill mystream 100
-        r XADD mystream MAXBYTES 0 LIMIT 20 101-0 f v
-        assert_equal 20 [r XTRIM mystream MAXBYTES 0 LIMIT 20]
-        r XADD mystream MAXBYTES 1000000 102-0 f v
-        set range [r XRANGE mystream - +]
-        assert_equal 62 [llength $range]
+start_server {tags {"stream needs:debug"} overrides {appendonly yes}} {
+    foreach preamble {yes no} {
+        test "MAXBYTES trims replay from the AOF with a different node size, aof-use-rdb-preamble $preamble" {
+            r config set aof-use-rdb-preamble $preamble
+            r config set stream-node-max-entries 10
+            r del mystream
+            streamFill mystream 100
+            r XADD mystream MAXBYTES 0 LIMIT 20 101-0 f v
+            assert_equal 20 [r XTRIM mystream MAXBYTES 0 LIMIT 20]
+            r XADD mystream MAXBYTES 1000000 102-0 f v
+            set range [r XRANGE mystream - +]
+            assert_equal 62 [llength $range]
 
-        r config set stream-node-max-entries 3
-        r debug loadaof
-        assert_equal $range [r XRANGE mystream - +]
-        streamAssertBytes mystream
-        set total [streamAssertBytes mystream]
-        assert {[r XTRIM mystream MAXBYTES [expr {$total / 2}]] > 0}
-        streamAssertBytes mystream
-        set range [r XRANGE mystream - +]
+            r config set stream-node-max-entries 3
+            r debug loadaof
+            assert_equal $range [r XRANGE mystream - +]
+            set total [streamAssertBytes mystream]
+            assert {[r XTRIM mystream MAXBYTES [expr {$total / 2}]] > 0}
+            streamAssertBytes mystream
+            set range [r XRANGE mystream - +]
 
-        r bgrewriteaof
-        waitForBgrewriteaof r
-        r config set stream-node-max-entries 7
-        r debug loadaof
-        assert_equal $range [r XRANGE mystream - +]
-        streamAssertBytes mystream
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            r config set stream-node-max-entries 7
+            r debug loadaof
+            assert_equal $range [r XRANGE mystream - +]
+            set total [streamAssertBytes mystream]
+            assert {[r XTRIM mystream MAXBYTES [expr {$total / 2}]] > 0}
+            streamAssertBytes mystream
+        }
     }
 }
 
