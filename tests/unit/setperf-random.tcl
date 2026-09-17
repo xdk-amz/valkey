@@ -291,3 +291,139 @@ start_server {tags {"setperf set repl external:skip needs:debug"}} {
     }
     }
 }
+
+# One expired, unreclaimed member in an otherwise live population. Expired
+# members are hidden (like hash fields), so nothing on the selection path may
+# remove it and it stays in the set until active expiration runs. A small
+# request must still be request-sized: the sampler rejects the one expired
+# pick it may land on (probability 1/n) and re-samples. Any rule of the form
+# "the set holds an expired member, so take the full-traversal path" turns
+# every SPOP/SRANDMEMBER on a million-member set into O(n), and because the
+# member is never reclaimed, every subsequent command repeats that work.
+start_server {tags {"setperf set external:skip needs:debug"}} {
+    if {![wc_available]} {
+        test "setperf-random (one expired): skipped, server lacks WORK_COUNTERS" {
+            skip "build with: make WORK_COUNTERS=yes"
+        }
+    } else {
+    set saved [wc_quiesce]
+
+    foreach cmdspec {
+        {"SPOP key"            {spop $key}}
+        {"SPOP key 1"          {spop $key 1}}
+        {"SPOP key 2"          {spop $key 2}}
+        {"SRANDMEMBER key"     {srandmember $key}}
+        {"SRANDMEMBER key 2"   {srandmember $key 2}}
+        {"SRANDMEMBER key -5"  {srandmember $key -5}}
+    } {
+        lassign $cmdspec label cmdtpl
+        test "setperf-random: $label hashtable, one expired member adds no population scan" {
+            set sizes [wc_ht_sizes]
+            set none_vals {}
+            set exp_vals {}
+            foreach n $sizes {
+                foreach ttl {none one_expired} {
+                    set key "sp:$ttl"
+                    wc_fixture $key $n $ttl
+                    set cmda($ttl) [subst -nocommands $cmdtpl]
+                    set d($ttl) [wc_measure "r $cmda($ttl)"]
+                    set reply($ttl) $::wc_last_reply
+                    wc_record $::cur_test $cmda($ttl) [dict create n $n ttl $ttl enc hashtable] $d($ttl)
+                    assert_equal [dict get [wc_setinfo $key] encoding] hashtable
+                }
+                # Correctness first: the hidden member is never returned and the
+                # reply has the requested shape.
+                assert_equal [lsearch -exact $reply(one_expired) m0] -1
+                assert_equal [llength $reply(one_expired)] [llength $reply(none)]
+                set info [wc_setinfo sp:one_expired]
+                assert_equal [dict get $info live] [expr {$n - 1 - [llength $reply(one_expired)] * [string match spop* $cmda(one_expired)]}]
+
+                set ex_none [wc_ht_examined $d(none)]
+                set ex_exp [wc_ht_examined $d(one_expired)]
+                lappend none_vals $ex_none
+                lappend exp_vals $ex_exp
+                # Same budget as the one-future-TTL contract: the only extra work
+                # a single hidden member can add is one rejected pick.
+                wc_assert_ratio "hashtable entries examined (iter+scan+probes)" $ex_exp $ex_none 4 500 \
+                    "one expired member must not add population-sized traversal (n=$n)" $cmda(one_expired) sp:one_expired
+                wc_assert_ratio "full-iteration reservoir passes" [wc_get $d(one_expired) set_reservoir_passes] 0 1 0 \
+                    "a set with one hidden member must not be selected by a full reservoir pass (n=$n)" $cmda(one_expired) sp:one_expired
+                wc_assert_ratio "largest single allocation (bytes)" [wc_get $d(one_expired) mem_max_alloc] [wc_get $d(none) mem_max_alloc] 2 1024 \
+                    "one expired member must not add a population-sized temporary array (n=$n)" $cmda(one_expired) sp:one_expired
+                wc_assert_ratio "string objects created" [wc_get $d(one_expired) str_objs_created] [wc_get $d(none) str_objs_created] 3 8 \
+                    "one expired member must not multiply member copies (n=$n)" $cmda(one_expired) sp:one_expired
+            }
+            wc_assert_flat "hashtable entries examined (one expired member)" $sizes $exp_vals 4 500 \
+                "request-sized work must not grow with the population" $cmda(one_expired) sp:one_expired
+        } {} {slow}
+    }
+
+    # The hidden member persists across commands (no reclaim on the selection
+    # path), so the cost must be request-sized on every command, not just the
+    # first: no per-command population pass, and no cumulative pass either.
+    foreach cmdspec {
+        {"SPOP key 1"        {spop $key 1}}
+        {"SRANDMEMBER key 2" {srandmember $key 2}}
+    } {
+        lassign $cmdspec label cmdtpl
+        test "setperf-random: repeated $label on a hashtable with one expired member stays request-sized" {
+            set n 200000
+            set rounds 10
+            set key sp:none
+            wc_fixture $key $n none
+            set cmd [subst -nocommands $cmdtpl]
+            set base [wc_measure "r $cmd"]
+            set per_cmd [expr {[wc_ht_examined $base] * 4 + 500}]
+
+            set key sp:one_expired
+            wc_fixture $key $n one_expired
+            set cmd [subst -nocommands $cmdtpl]
+            set total 0
+            set passes 0
+            for {set i 0} {$i < $rounds} {incr i} {
+                set m [wc_measure "r $cmd"]
+                incr total [wc_ht_examined $m]
+                incr passes [wc_get $m set_reservoir_passes]
+                assert_equal [lsearch -exact $::wc_last_reply m0] -1
+                wc_record $::cur_test $cmd [dict create n $n ttl one_expired enc hashtable round $i] $m
+            }
+            set after [wc_setinfo $key]
+            wc_assert_le "hashtable entries examined over $rounds commands" $total [expr {$rounds * $per_cmd}] \
+                "a hidden member must not cost a population pass per command" $cmd $key "after: [list $after]"
+            wc_assert_le "full-iteration reservoir passes over $rounds commands" $passes 0 \
+                "a hidden member must not trigger reservoir passes" $cmd $key "after: [list $after]"
+        } {} {slow}
+    }
+
+    # Listpack: selection is O(n) per traversal by construction; one hidden
+    # member may add a validation step per entry, not a traversal per result.
+    foreach cmdspec {
+        {"SPOP key 3"           {spop $key 3}}
+        {"SRANDMEMBER key 3"    {srandmember $key 3}}
+        {"SRANDMEMBER key -100" {srandmember $key -100}}
+    } {
+        lassign $cmdspec label cmdtpl
+        test "setperf-random: $label listpack, one expired member keeps single-traversal selection" {
+            foreach n {16 64 128} {
+                foreach ttl {none one_expired} {
+                    set key "lp:$ttl"
+                    wc_fixture $key $n $ttl
+                    assert_equal [dict get [wc_setinfo $key] encoding] listpack
+                    set cmda($ttl) [subst -nocommands $cmdtpl]
+                    set d($ttl) [wc_measure "r $cmda($ttl)"]
+                    set reply($ttl) $::wc_last_reply
+                    wc_record $::cur_test $cmda($ttl) [dict create n $n ttl $ttl enc listpack] $d($ttl)
+                }
+                assert_equal [lsearch -exact $reply(one_expired) m0] -1
+                assert_equal [llength $reply(one_expired)] [llength $reply(none)]
+                wc_assert_ratio "listpack entries examined (find+next+random steps)" [wc_lp_examined $d(one_expired)] [wc_lp_examined $d(none)] 3 [expr {2 * $n}] \
+                    "one expired member must not add per-result traversals (n=$n)" $cmda(one_expired) lp:one_expired
+                wc_assert_ratio "string objects created" [wc_get $d(one_expired) str_objs_created] [wc_get $d(none) str_objs_created] 3 8 \
+                    "one expired member must not multiply member copies (n=$n)" $cmda(one_expired) lp:one_expired
+            }
+        }
+    }
+
+    wc_restore $saved
+    }
+}

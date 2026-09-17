@@ -121,6 +121,10 @@ def build_fixture(c, key, n, ttl, listpack=False):
     far = int(time.time() * 1000) + 86400 * 1000
     if ttl == "one":
         c.call("SPEXPIREAT", key, far, "MEMBERS", 1, ms[0])
+    elif ttl == "one_expired":
+        # one hidden member; active expiration is off for the whole run
+        c.call("SPEXPIRE", key, 1, "MEMBERS", 1, ms[0])
+        time.sleep(0.005)
     elif ttl == "all":
         for i in range(0, n, 4000):
             chunk = ms[i:i + 4000]
@@ -185,9 +189,10 @@ def run_binary(name, binary, port, n, reps, workdir, out):
         except RuntimeError:
             has_ttl = False
         c.call("DEL", "b:probe")
+        c.call("DEBUG", "SET-ACTIVE-EXPIRE", 0)
         out[name] = {"binary": binary, "workctr": wc, "member_ttl": has_ttl, "results": []}
         for enc, size in (("hashtable", n), ("listpack", 128)):
-            for ttl in ("none", "one", "all"):
+            for ttl in ("none", "one", "one_expired", "all"):
                 if ttl != "none" and not has_ttl:
                     continue
                 key = "b:%s:%s" % (enc, ttl)

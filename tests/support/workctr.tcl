@@ -127,7 +127,8 @@ proc wc_spexpire_batched {client key ms members {batch 4000}} {
 
 # Build a set fixture. Returns the list of live members (in insertion order).
 # Active expiration must already be disabled (wc_quiesce) for the expired
-# distributions; expiry happens outside any measured command.
+# distributions; expiry happens outside any measured command. `one_expired`
+# expires m0 only: a large live population with a single hidden member.
 proc wc_fixture {key n ttl {payload short} {live_keep 3} {client ""}} {
     if {$client eq ""} { set client [srv 0 client] }
     $client del $key
@@ -138,6 +139,11 @@ proc wc_fixture {key n ttl {payload short} {live_keep 3} {client ""}} {
         none {}
         one { $client spexpireat $key $far members 1 [lindex $members 0] }
         all { wc_spexpire_batched $client $key 86400000 $members }
+        one_expired {
+            $client spexpire $key 1 members 1 [lindex $members 0]
+            after 5
+            set members [lrange $members 1 end]
+        }
         mostly_expired {
             set expiring [lrange $members $live_keep end]
             wc_spexpire_batched $client $key 1 $expiring
