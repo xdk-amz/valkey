@@ -418,6 +418,7 @@ uint64_t dictObjHash(const void *key) {
 }
 
 uint64_t dictSdsHash(const void *key) {
+    WC_ADD(ht_hash_bytes, sdslen((sds)key));
     return dictGenHashFunction(key, sdslen(key));
 }
 
@@ -441,6 +442,7 @@ uint64_t genHashFunctionConfigurableSeed(const char *buf, size_t len) {
 }
 
 uint64_t sdsHashConfigurableSeed(const void *key) {
+    WC_ADD(ht_hash_bytes, sdslen((sds)key));
     return genHashFunctionConfigurableSeed(key, sdslen(key));
 }
 
@@ -703,6 +705,7 @@ hashtableType zsetHashtableType = {
 };
 
 uint64_t hashtableSdsHash(const void *key) {
+    WC_ADD(ht_hash_bytes, sdslen((sds)key));
     return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
 }
 
@@ -3689,6 +3692,9 @@ void serverOpArrayFree(serverOpArray *oa) {
 
         oa->numops--;
         op = oa->ops + oa->numops;
+#ifdef WORK_COUNTERS
+        for (j = 0; j < op->argc; j++) WC_SUB(prop_retained_bytes, stringObjectLen(op->argv[j]));
+#endif
         for (j = 0; j < op->argc; j++) decrRefCount(op->argv[j]);
         zfree(op->argv);
     }
@@ -3839,6 +3845,7 @@ static int shouldPropagate(int target) {
  */
 static void propagateNow(int dbid, robj **argv, int argc, int target, int slot) {
     if (!shouldPropagate(target)) return;
+    WC_INC(prop_now_cmds);
 
     /* This needs to be unreachable since the dataset should be fixed during
      * replica pause (otherwise data may be lost during a failover).
@@ -3949,7 +3956,14 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
     robj **argvcopy;
     int j;
 
-    if (!shouldPropagate(target)) return;
+    if (!shouldPropagate(target)) {
+        WC_INC(prop_cmds_dropped);
+#ifdef WORK_COUNTERS
+        WC_ADD(prop_dropped_args, argc);
+        for (j = 0; j < argc; j++) WC_ADD(prop_dropped_arg_bytes, stringObjectLen(argv[j]));
+#endif
+        return;
+    }
 
     /* Don't propagate commands on slot migration clients, these will be proxied
      * in replicationFeedStreamFromPrimaryStream().
@@ -3957,7 +3971,10 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
      * However, if we need to propagate to AOF, we should still do that. */
     bool propagate_aof = (target & PROPAGATE_AOF) && server.aof_state != AOF_OFF;
     if (server.current_client != NULL && server.current_client->slot_migration_job) {
-        if (!propagate_aof) return;
+        if (!propagate_aof) {
+            WC_INC(prop_cmds_dropped);
+            return;
+        }
         /* Disable propagation to replication (just do the AOF) */
         target &= ~PROPAGATE_REPL;
     }
@@ -3967,6 +3984,17 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
         argvcopy[j] = argv[j];
         incrRefCount(argv[j]);
     }
+    WC_INC(prop_cmds);
+    WC_ADD(prop_args, argc);
+#ifdef WORK_COUNTERS
+    {
+        int64_t bytes = 0;
+        for (j = 0; j < argc; j++) bytes += (int64_t)stringObjectLen(argv[j]);
+        WC_ADD(prop_arg_bytes, bytes);
+        WC_ADD(prop_retained_bytes, bytes);
+        WC_MAX(prop_peak_retained_bytes, WC_TARGET()->prop_retained_bytes);
+    }
+#endif
     serverOpArrayAppend(&server.also_propagate, dbid, argvcopy, argc, target, slot);
 }
 
@@ -4225,6 +4253,17 @@ void call(client *c, int flags) {
     const ustime_t call_timer = ustime();
     enterExecutionUnit(1, call_timer);
 
+#ifdef WORK_COUNTERS
+    /* DEBUG WORKCTR ARM measures the next top-level command of the arming
+     * client: the window spans the command proc plus the propagation of its
+     * execution unit, and excludes argument parsing and reply transmission. */
+    if (wc_armed && !wc_measuring && server.in_call == 1 && c->id == wc_armed_client) {
+        wc_armed = 0;
+        wc_measuring = 1;
+        wcReset();
+    }
+#endif
+
     /* setting the CLIENT_EXECUTING_COMMAND flag so we will avoid
      * sending client side caching message in the middle of a command reply.
      * In case of blocking commands, the flag will be un-set only after successfully
@@ -4362,8 +4401,12 @@ void call(client *c, int flags) {
     if (update_command_stats && !c->flag.blocked) {
         real_cmd->calls++;
         real_cmd->microseconds += c->duration;
-        if (server.latency_tracking_enabled)
+        if (server.latency_tracking_enabled) {
+            /* The first call of a command allocates its histogram: server bookkeeping, not command work. */
+            WC_SET_ALLOC_CLASS(WC_CLASS_IGNORE);
             updateCommandLatencyHistogram(&(real_cmd->latency_histogram), c->duration * 1000);
+            WC_SET_ALLOC_CLASS(WC_CLASS_APP);
+        }
         clusterSlotStatsAddCpuDuration(c, c->duration);
     }
 
@@ -4439,6 +4482,16 @@ void call(client *c, int flags) {
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
+
+#ifdef WORK_COUNTERS
+    /* After afterCommand(): the command's own argv propagation and the flush of
+     * every alsoPropagate()d command (AOF/replication bytes) are now inside the
+     * measured window. */
+    if (wc_measuring && server.in_call == 1) {
+        wcSnapshot();
+        wc_measuring = 0;
+    }
+#endif
 
     /* Remember the replication offset of the client, right after its last
      * command that resulted in propagation. */

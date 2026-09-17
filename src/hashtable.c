@@ -51,6 +51,7 @@
 #include "monotonic.h"
 #include "config.h"
 #include "util.h"
+#include "workctr.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -392,7 +393,12 @@ typedef struct {
 /* --- Access API --- */
 static inline bool validateElementIfNeeded(hashtable *ht, void *elem) {
     if (ht->type->validateEntry == NULL) return true;
-    return ht->type->validateEntry(ht, elem);
+    WC_INC(ht_validate_calls);
+    if (!ht->type->validateEntry(ht, elem)) {
+        WC_INC(ht_validate_rejected);
+        return false;
+    }
+    return true;
 }
 
 static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_bucket, int *table_index);
@@ -419,6 +425,7 @@ static inline const void *entryGetKey(hashtable *ht, const void *entry) {
 }
 
 static inline uint64_t hashKey(hashtable *ht, const void *key) {
+    WC_INC(ht_hash_calls);
     if (ht->type->hashFunction != NULL) {
         return ht->type->hashFunction(key);
     } else {
@@ -557,6 +564,7 @@ static bucket *bucketDefrag(bucket *prev, bucket *b, void *(*defragfn)(void *)) 
 /* Rehashes a single entry from the old table to the new table. */
 static void rehashEntry(hashtable *ht, void *entry, uint64_t hash, uint8_t h2) {
     int pos_in_dst_bucket;
+    WC_INC(ht_rehash_entries);
     bucket *dst = findBucketForInsert(ht, hash, &pos_in_dst_bucket, NULL);
     dst->entries[pos_in_dst_bucket] = entry;
     dst->hashes[pos_in_dst_bucket] = h2;
@@ -713,6 +721,7 @@ static void rehashStepShrink(hashtable *ht) {
  * (that may have more than one key as we use bucket and bucket chaining) from the
  * old to the new hash table. */
 static void rehashStep(hashtable *ht) {
+    WC_INC(ht_rehash_steps);
     assert(hashtableIsRehashing(ht));
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
@@ -792,6 +801,7 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
     } else {
         new_table = zcalloc(alloc_size);
     }
+    WC_INC(ht_resizes);
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, alloc_size);
     ht->bucket_exp[1] = exp;
     ht->tables[1] = new_table;
@@ -829,6 +839,7 @@ static inline int checkCandidateInBucket(hashtable *ht, bucket *b, int pos, cons
     /* It's a candidate. */
     void *entry = b->entries[pos];
     const void *elem_key = entryGetKey(ht, entry);
+    WC_INC(ht_key_compares);
     if (compareKeys(ht, key, elem_key)) {
         /* It's a match. */
         assert(pos_in_bucket != NULL);
@@ -906,6 +917,7 @@ static int findKeyInBucketNeon(hashtable *ht, bucket *b, uint8_t h2, const void 
  * If 'table_index' is provided, it is set to the index of the table (0 or 1)
  * the returned bucket belongs to. */
 static bucket *findBucket(hashtable *ht, uint64_t hash, const void *key, int *pos_in_bucket, int *table_index) {
+    WC_INC(ht_lookups);
     if (hashtableSize(ht) == 0) return 0;
     uint8_t h2 = highBits(hash);
     int table;
@@ -923,6 +935,7 @@ static bucket *findBucket(hashtable *ht, uint64_t hash, const void *key, int *po
         }
         bucket *b = &ht->tables[table][bucket_idx];
         do {
+            WC_INC(ht_bucket_probes);
 #if HAVE_X86_SIMD
             /* All x86-64 CPUs have SSE2. */
             if (findKeyInBucketSSE2(ht, b, h2, key, table, pos_in_bucket, table_index)) return b;
@@ -1062,6 +1075,7 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
 
 /* Find an empty position in the table for inserting an entry with the given hash. */
 static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_bucket, int *table_index) {
+    WC_INC(ht_insert_positions);
     int table = hashtableIsRehashing(ht) ? 1 : 0;
     assert(ht->tables[table]);
     size_t mask = expToMask(ht->bucket_exp[table]);
@@ -1090,6 +1104,7 @@ static bucket *findBucketForInsert(hashtable *ht, uint64_t hash, int *pos_in_buc
 /* Helper to insert an entry. Doesn't check if an entry with a matching key
  * already exists. This must be ensured by the caller. */
 static void insert(hashtable *ht, uint64_t hash, void *entry) {
+    WC_INC(ht_inserts);
     assert(ht->safe_iterators == NULL);
     hashtableExpandIfNeeded(ht);
     rehashStepOnWriteIfNeeded(ht);
@@ -1711,6 +1726,7 @@ bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition 
  * hashtableFindPositionForInsert() and hashtableInsertAtPosition(), since even a
  * hashtableFind() may cause incremental rehashing to move entries in memory. */
 void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *pos) {
+    WC_INC(ht_inserts);
     position *p = positionFromOpaque(pos);
     bucket *b = p->bucket;
     int pos_in_bucket = p->pos_in_bucket;
@@ -1732,6 +1748,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     int table_index = 0;
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
+        WC_INC(ht_pops);
         if (popped) *popped = b->entries[pos_in_bucket];
         b->presence &= ~(1 << pos_in_bucket);
         ht->used[table_index]--;
@@ -1851,6 +1868,7 @@ void **hashtableTwoPhasePopFindRef(hashtable *ht, const void *key, hashtablePosi
  * entry destructor is NOT called. The position is acquired using a preceding
  * call to hashtableTwoPhasePopFindRef(). */
 void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
+    WC_INC(ht_pops);
     /* Read position. */
     position *p = positionFromOpaque(pos);
     bucket *b = p->bucket;
@@ -1885,6 +1903,7 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
  */
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key) {
     incrementalFind *data = incrementalFindFromOpaque(state);
+    WC_INC(ht_lookups);
     if (hashtableSize(ht) == 0) {
         data->state = HASHTABLE_NOT_FOUND;
     } else {
@@ -1908,6 +1927,7 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
             hashtable *ht = data->hashtable;
             void *entry = data->bucket->entries[data->pos];
             const void *elem_key = entryGetKey(ht, entry);
+            WC_INC(ht_key_compares);
             if (compareKeys(ht, data->key, elem_key)) {
                 /* It's a match. */
                 data->state = validateElementIfNeeded(ht, entry) ? HASHTABLE_FOUND : HASHTABLE_NOT_FOUND;
@@ -1963,6 +1983,7 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
                 return false;
             }
             valkey_prefetch(data->bucket);
+            WC_INC(ht_bucket_probes);
             data->state = HASHTABLE_NEXT_ENTRY;
             data->pos = 0;
         }
@@ -2117,6 +2138,7 @@ bool hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor) {
  *   the hash table.
  */
 size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata, void *(*defragfn)(void *), int flags) {
+    WC_INC(ht_scan_calls);
     if (hashtableSize(ht) == 0) return 0;
 
     /* Prevent entries from being moved around during the scan call, as a
@@ -2133,12 +2155,18 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
         size_t used_before = ht->used[0];
         bucket *b = &ht->tables[0][idx];
         do {
+            WC_INC(ht_scan_buckets);
             if (fn && b->presence != 0) {
                 int pos;
                 for (pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
-                    if (isPositionFilled(b, pos) && validateElementIfNeeded(ht, b->entries[pos])) {
-                        void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
-                        fn(privdata, emit);
+                    if (isPositionFilled(b, pos)) {
+                        WC_INC(ht_scan_visits);
+                        if (validateElementIfNeeded(ht, b->entries[pos])) {
+                            void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
+                            fn(privdata, emit);
+                        } else {
+                            WC_INC(ht_scan_rejected);
+                        }
                     }
                 }
             }
@@ -2176,11 +2204,17 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
             size_t used_before = ht->used[table_small];
             bucket *b = &ht->tables[table_small][idx];
             do {
+                WC_INC(ht_scan_buckets);
                 if (fn && b->presence) {
                     for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
-                        if (isPositionFilled(b, pos) && validateElementIfNeeded(ht, b->entries[pos])) {
-                            void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
-                            fn(privdata, emit);
+                        if (isPositionFilled(b, pos)) {
+                            WC_INC(ht_scan_visits);
+                            if (validateElementIfNeeded(ht, b->entries[pos])) {
+                                void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
+                                fn(privdata, emit);
+                            } else {
+                                WC_INC(ht_scan_rejected);
+                            }
                         }
                     }
                 }
@@ -2206,11 +2240,17 @@ size_t hashtableScanDefrag(hashtable *ht, size_t cursor, hashtableScanFunction f
                 size_t used_before = ht->used[table_large];
                 bucket *b = &ht->tables[table_large][idx];
                 do {
+                    WC_INC(ht_scan_buckets);
                     if (fn && b->presence) {
                         for (int pos = 0; pos < ENTRIES_PER_BUCKET; pos++) {
-                            if (isPositionFilled(b, pos) && validateElementIfNeeded(ht, b->entries[pos])) {
-                                void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
-                                fn(privdata, emit);
+                            if (isPositionFilled(b, pos)) {
+                                WC_INC(ht_scan_visits);
+                                if (validateElementIfNeeded(ht, b->entries[pos])) {
+                                    void *emit = emit_ref ? &b->entries[pos] : b->entries[pos];
+                                    fn(privdata, emit);
+                                } else {
+                                    WC_INC(ht_scan_rejected);
+                                }
                             }
                         }
                     }
@@ -2361,6 +2401,7 @@ bool hashtableNext(hashtableIterator *iterator, void **elemptr) {
                 iter->index = iter->hashtable->rehash_idx;
             }
             iter->bucket = &iter->hashtable->tables[iter->table][iter->index];
+            WC_INC(ht_iter_buckets);
             iter->pos_in_bucket = 0;
         } else {
             /* Advance to the next position within the bucket, or to the next
@@ -2370,6 +2411,7 @@ bool hashtableNext(hashtableIterator *iterator, void **elemptr) {
             if (iter->bucket->chained && iter->pos_in_bucket >= ENTRIES_PER_BUCKET - 1) {
                 iter->pos_in_bucket = 0;
                 iter->bucket = getChildBucket(iter->bucket);
+                WC_INC(ht_iter_buckets);
             } else if (iter->pos_in_bucket >= ENTRIES_PER_BUCKET) {
                 /* Bucket index done. */
                 if (isSafe(iter)) {
@@ -2397,6 +2439,7 @@ bool hashtableNext(hashtableIterator *iterator, void **elemptr) {
                     }
                 }
                 iter->bucket = &iter->hashtable->tables[iter->table][iter->index];
+                WC_INC(ht_iter_buckets);
             }
         }
         bucket *b = iter->bucket;
@@ -2410,7 +2453,9 @@ bool hashtableNext(hashtableIterator *iterator, void **elemptr) {
             /* No entry here. */
             continue;
         }
+        WC_INC(ht_iter_visits);
         if (!(iter->flags & HASHTABLE_ITER_SKIP_VALIDATION) && !validateElementIfNeeded(iter->hashtable, b->entries[iter->pos_in_bucket])) {
+            WC_INC(ht_iter_rejected);
             continue;
         }
         /* Return the entry at this position. */
@@ -2440,6 +2485,7 @@ static unsigned sampleRandomBuckets(hashtable *ht, void **dst, unsigned count) {
     samples.seen = 0;
     samples.entries = dst;
     while (samples.seen < count) {
+        WC_INC(ht_random_scans);
         hashtableScan(ht, randomSizeT(), sampleEntriesScanFn, &samples);
     }
     rehashStepOnReadIfNeeded(ht);
@@ -2449,6 +2495,7 @@ static unsigned sampleRandomBuckets(hashtable *ht, void **dst, unsigned count) {
 /* Points 'found' to a random entry in the hash table and returns true. Returns false
  * if the table is empty. */
 bool hashtableRandomEntry(hashtable *ht, void **found) {
+    WC_INC(ht_random_calls);
     void *samples[WEAK_RANDOM_SAMPLE_SIZE];
     unsigned count = sampleRandomBuckets(ht, &samples[0], WEAK_RANDOM_SAMPLE_SIZE);
     if (count == 0) return false;
@@ -2460,6 +2507,7 @@ bool hashtableRandomEntry(hashtable *ht, void **found) {
 /* Points 'found' to a random entry in the hash table and returns true. Returns false
  * if the table is empty. This one is more fair than hashtableRandomEntry(). */
 bool hashtableFairRandomEntry(hashtable *ht, void **found) {
+    WC_INC(ht_random_calls);
     /* Sample less if it's very sparse. */
     size_t num_samples = hashtableSize(ht) >= hashtableBuckets(ht) ? FAIR_RANDOM_SAMPLE_SIZE : WEAK_RANDOM_SAMPLE_SIZE;
     void *samples[num_samples];
@@ -2479,6 +2527,7 @@ bool hashtableFairRandomEntry(hashtable *ht, void **found) {
  * The function returns the number of sampled entries, which is 'count' except
  * if 'count' is greater than the total number of entries in the hash table. */
 unsigned hashtableSampleEntries(hashtable *ht, void **dst, unsigned count) {
+    WC_INC(ht_random_calls);
     /* Adjust count. */
     if (count > hashtableSize(ht)) count = hashtableSize(ht);
     scan_samples samples;
@@ -2487,6 +2536,7 @@ unsigned hashtableSampleEntries(hashtable *ht, void **dst, unsigned count) {
     samples.entries = dst;
     size_t cursor = randomSizeT();
     while (samples.seen < count) {
+        WC_INC(ht_random_scans);
         cursor = hashtableScan(ht, cursor, sampleEntriesScanFn, &samples);
     }
     rehashStepOnReadIfNeeded(ht);

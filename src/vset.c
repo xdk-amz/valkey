@@ -1482,6 +1482,7 @@ static inline size_t vsetBucketRemoveExpired_NONE(vsetBucket **bucket, vsetGetEx
 
 static inline size_t vsetBucketRemoveExpired_SINGLE(vsetBucket **bucket, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx) {
     void *entry = vsetBucketSingle(*bucket);
+    WC_INC(vset_entry_visits);
     if (max_count && getExpiry(entry) <= now) {
         freeVsetBucket(*bucket);
         *bucket = vsetBucketFromNone();
@@ -1497,6 +1498,7 @@ static inline size_t vsetBucketRemoveExpired_VECTOR(vsetBucket **bucket, vsetGet
     uint32_t i = 0;
     for (; i < len; i++) {
         void *entry = pvGet(pv, i);
+        WC_INC(vset_entry_visits);
         /* break as soon as the expiryFunc stops us OR we reached an entry which is not expired */
         if (getExpiry(entry) > now)
             break;
@@ -1520,6 +1522,7 @@ static inline size_t vsetBucketRemoveExpired_HASHTABLE(vsetBucket **bucket, vset
     size_t count = 0;
     hashtableInitIterator(&it, ht, HASHTABLE_ITER_SAFE);
     while (count < max_count && hashtableNext(&it, &entry)) {
+        WC_INC(vset_entry_visits);
         assert(hashtableDelete(ht, entry));
         expiryFunc(entry, ctx);
         count++;
@@ -1573,6 +1576,7 @@ static inline size_t vsetBucketRemoveExpired_RAX(vsetBucket **bucket, vsetGetExp
         size_t key_len = it.key_len;
         raxNode *node = it.node;
         raxStop(&it);
+        WC_INC(vset_bucket_visits);
         if (time_bucket_ts > now)
             break;
         switch (time_bucket_type) {
@@ -1672,6 +1676,7 @@ static inline int vsetBucketNext_RAX(vsetInternalIterator *it, void **entryptr) 
         it->bucket_ts = decodeExpiryKey(it->riter.key);
         it->bucket = it->riter.data;
         it->iteration_state = VSET_BUCKET_NONE;
+        WC_INC(vset_bucket_visits);
         return vsetNext(opaqueFromIterator(it), entryptr);
     } else {
         /* We currently do not support nested RAX buckets */
@@ -1709,6 +1714,7 @@ static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
     raxStart(&it, r);
     assert(raxSeek(&it, "^", NULL, 0));
     while (raxNext(&it)) {
+        WC_INC(vset_bucket_visits);
         switch (vsetBucketType(it.data)) {
         case VSET_BUCKET_NONE:
             total_mem += vsetBucketMemUsage_NONE(it.data);
@@ -1779,6 +1785,7 @@ static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
  *
  *     // Internally, my_object is placed into the appropriate bucket. */
 bool vsetAddEntry(vset *set, vsetGetExpiryFunc getExpiry, void *entry) {
+    WC_INC(vset_adds);
     long long expiry = getExpiry(entry);
     vsetBucket *expiry_buckets = *set;
     assert(expiry_buckets);
@@ -1913,6 +1920,7 @@ static inline bool vsetRemoveEntryWithExpiry(vset *set, vsetGetExpiryFunc getExp
  *
  *     // my_object is removed from the appropriate bucket in myset BUT is not freed. */
 bool vsetRemoveEntry(vset *set, vsetGetExpiryFunc getExpiry, void *entry) {
+    WC_INC(vset_removes);
     return vsetRemoveEntryWithExpiry(set, getExpiry, entry, getExpiry(entry));
 }
 
@@ -2041,6 +2049,7 @@ static inline vsetBucket *vsetBucketUpdateEntry_RAX(vsetBucket *target, vsetGetE
  *     vsetUpdateEntry(myset, getExpiry, old_ptr, new_ptr, old_ts, new_ts);
  */
 bool vsetUpdateEntry(vset *set, vsetGetExpiryFunc getExpiry, void *old_entry, void *new_entry, long long old_expiry, long long new_expiry) {
+    WC_INC(vset_updates);
     assert(*set);
     /* Nothing to do */
     if (old_entry == new_entry && old_expiry == new_expiry)
@@ -2113,6 +2122,8 @@ bool vsetUpdateEntry(vset *set, vsetGetExpiryFunc getExpiry, void *old_entry, vo
  * Return:
  *     Number of expired entries removed (size_t). */
 size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx) {
+    WC_INC(vset_expire_calls);
+    WC_INC(vset_bucket_visits);
     vsetBucket *bucket = *set;
     int bucket_type = vsetBucketType(bucket);
     switch (bucket_type) {
@@ -2160,6 +2171,7 @@ size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc 
  * Return:
  *     Estimated earliest expiry time in milliseconds, or -1 if the set is empty. */
 long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) {
+    WC_INC(vset_bucket_visits);
     int set_type = vsetBucketType(*set);
     void *entry = NULL;
     long long expiry;
@@ -2179,6 +2191,7 @@ long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) {
          * RAX-encoded set is never empty, so the first advance always succeeds. */
         raxSeek(&it, "^", NULL, 0);
         assert(raxNext(&it));
+        WC_INC(vset_bucket_visits);
         expiry = decodeExpiryKey(it.key);
         raxStop(&it);
         break;
@@ -2242,12 +2255,15 @@ bool vsetNext(vsetIterator *iter, void **entryptr) {
         /* continue iterating the parent bucket */
         it->iteration_state = vsetBucketType(it->parent_bucket);
         it->bucket = it->parent_bucket;
+        WC_INC(vset_bucket_visits);
         return vsetNext(opaqueFromIterator(it), entryptr);
     }
+    if (ret == 1) WC_INC(vset_entry_visits);
     return ret == 1;
 }
 
 size_t vsetMemUsage(vset *set) {
+    WC_INC(vset_bucket_visits);
     int bucket_type = vsetBucketType(*set);
     switch (bucket_type) {
     case VSET_BUCKET_NONE:
@@ -2511,6 +2527,7 @@ static size_t vsetBucketDefrag_RAX(vsetBucket **bucket, size_t cursor, void *(*d
     }
     raxStop(&ri);
     vsetBucket *time_bucket = ri.data;
+    WC_INC(vset_bucket_visits);
     switch (vsetBucketType(time_bucket)) {
     case VSET_BUCKET_NONE:
     case VSET_BUCKET_SINGLE:
@@ -2547,6 +2564,7 @@ static int defragRaxNode(raxNode **noderef) {
 }
 
 size_t vsetScanDefrag(vset *set, size_t cursor, void *(*defragfn)(void *)) {
+    WC_INC(vset_bucket_visits);
     switch (vsetBucketType(*set)) {
     case VSET_BUCKET_NONE:
     case VSET_BUCKET_SINGLE:

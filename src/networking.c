@@ -725,7 +725,9 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
         size_t min_reply_size = isDeferredReplyEnabled(c) ? PROTO_REPLY_MIN_BYTES : PROTO_REPLY_CHUNK_BYTES;
         size_t required_size = encoded ? len + sizeof(payloadHeader) : len;
         size_t size = required_size < min_reply_size ? min_reply_size : required_size;
+        WC_SET_ALLOC_CLASS(WC_CLASS_REPLY);
         tail = zmalloc_usable(size + sizeof(clientReplyBlock), &usable_size);
+        WC_SET_ALLOC_CLASS(WC_CLASS_APP);
         /* take over the allocation's internal fragmentation */
         tail->size = usable_size - sizeof(clientReplyBlock);
         tail->used = 0;
@@ -1248,7 +1250,9 @@ void setDeferredReply(client *c, void *node, const char *s, size_t length) {
     } else {
         /* Create a new node */
         size_t usable_size;
+        WC_SET_ALLOC_CLASS(WC_CLASS_REPLY);
         clientReplyBlock *buf = zmalloc_usable(length + sizeof(clientReplyBlock), &usable_size);
+        WC_SET_ALLOC_CLASS(WC_CLASS_APP);
         /* Take over the allocation's internal fragmentation */
         buf->size = usable_size - sizeof(clientReplyBlock);
         buf->used = length;
