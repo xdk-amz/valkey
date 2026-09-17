@@ -1482,6 +1482,7 @@ void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
      * positive reply about the operation performed. */
     if (server.aof_state == AOF_ON || (server.aof_state == AOF_WAIT_REWRITE && server.child_type == CHILD_TYPE_AOF)) {
         server.aof_buf = sdscatlen(server.aof_buf, buf, sdslen(buf));
+        WC_ADD(aof_bytes, sdslen(buf));
     }
 
     sdsfree(buf);
@@ -2006,6 +2007,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
                 setTypeIgnoreTTL(o, false);
                 return 0;
             }
+            WC_INC(aof_rewrite_cmds);
         }
         setTypeReleaseIterator(si);
         setTypeIgnoreTTL(o, false);
@@ -2021,6 +2023,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
                 setTypeReleaseIterator(si);
                 return 0;
             }
+            WC_INC(aof_rewrite_cmds);
         }
         size_t written = str ? rioWriteBulkString(r, str, len) : rioWriteBulkLongLong(r, llval);
         if (!written) {
@@ -2158,6 +2161,7 @@ int rewriteHashObject(rio *r, robj *key, robj *o) {
                 if (rioWriteBulkLongLong(r, 1) == 0) goto werr;
                 if (rioWriteBulkString(r, field, sdslen(field)) == 0) goto werr;
                 if (rioWriteBulkString(r, value, sdslen(value)) == 0) goto werr;
+                WC_INC(aof_rewrite_cmds);
             }
             sdsfree(field);
             sdsfree(value);
@@ -2181,6 +2185,7 @@ int rewriteHashObject(rio *r, robj *key, robj *o) {
                 hashTypeResetIterator(&hi);
                 return 0;
             }
+            WC_INC(aof_rewrite_cmds);
         }
 
         /* Iterate till we reach the batch size */
@@ -2609,6 +2614,7 @@ int rewriteAppendOnlyFile(char *filename) {
     } else {
         if (rewriteAppendOnlyFileRio(&aof) == C_ERR) goto werr;
     }
+    WC_ADD(aof_rewrite_bytes, aof.processed_bytes);
 
     /* Make sure data will not remain on the OS's output buffers */
     if (fflush(fp)) goto werr;
@@ -2699,6 +2705,10 @@ int rewriteAppendOnlyFileBackground(void) {
     if ((childpid = serverFork(CHILD_TYPE_AOF)) == 0) {
         char tmpfile[256];
 
+#ifdef WORK_COUNTERS
+        wcReset();
+#endif
+
         /* Child */
         if (strstr(server.exec_argv[0], "redis-server") != NULL) {
             serverSetProcTitle("redis-aof-rewrite");
@@ -2709,6 +2719,9 @@ int rewriteAppendOnlyFileBackground(void) {
         snprintf(tmpfile, 256, "temp-rewriteaof-bg-%d.aof", (int)getpid());
         if (rewriteAppendOnlyFile(tmpfile) == C_OK) {
             serverLog(LL_NOTICE, "Successfully created the temporary AOF base file %s", tmpfile);
+#ifdef WORK_COUNTERS
+            wcDumpToFile("workctr-aofrw-child.txt");
+#endif
             sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
             exitFromChild(0);
         } else {

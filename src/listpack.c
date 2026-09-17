@@ -45,6 +45,7 @@
 #include "serverassert.h"
 #include "util.h"
 #include "config.h"
+#include "workctr.h"
 
 #define LP_HDR_SIZE 6 /* 32 bit total len + 16 bit number of elements. */
 #define LP_HDR_NUMELE_UNKNOWN UINT16_MAX
@@ -192,6 +193,8 @@ void lpFreeVoid(void *lp) {
 unsigned char *lpShrinkToFit(unsigned char *lp) {
     size_t size = lpGetTotalBytes(lp);
     if (size < lp_malloc_size(lp)) {
+        WC_INC(lp_reallocs);
+        WC_ADD(lp_realloc_bytes, size);
         return lp_realloc(lp, size);
     } else {
         return lp;
@@ -418,6 +421,7 @@ unsigned char *lpSkip(unsigned char *p) {
  * already pointed to the last element of the listpack. */
 unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
     assert(p);
+    WC_INC(lp_next_steps);
     do {
         p = lpSkip(p);
         if (unlikely(p[0] == LP_EOF)) {
@@ -440,6 +444,7 @@ unsigned char *lpNext(unsigned char *lp, unsigned char *p) {
  * already pointed to the first element of the listpack. */
 unsigned char *lpPrev(unsigned char *lp, unsigned char *p) {
     assert(p);
+    WC_INC(lp_next_steps);
     while (p - lp != LP_HDR_SIZE) {
         p--; /* Seek the first backlen byte of the last element. */
         uint64_t prevlen = lpDecodeBacklen(p);
@@ -677,8 +682,10 @@ unsigned char *lpFind(unsigned char *lp, unsigned char *p, unsigned char *s, uin
     uint64_t entry_size = 123456789; /* initialized to avoid warning. */
     uint32_t lp_bytes = lpBytes(lp);
 
+    WC_INC(lp_find_calls);
     assert(p);
     while (p) {
+        WC_INC(lp_find_steps);
         /* Check if we are reading a metadata entry if so skip it */
         if (lpIsMetadata(p)) {
             p = lpSkip(p);
@@ -856,6 +863,11 @@ static unsigned char *lpInsertImpl(unsigned char *lp,
     uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size - replaced_len;
     if (new_listpack_bytes > UINT32_MAX) return NULL;
 
+    if (del_ele)
+        WC_INC(lp_deletes);
+    else
+        WC_INC(lp_inserts);
+
     /* We now need to reallocate in order to make space or shrink the
      * allocation (in case 'when' value is LP_REPLACE and the new element is
      * smaller). However we do that before memmoving the memory to
@@ -866,6 +878,8 @@ static unsigned char *lpInsertImpl(unsigned char *lp,
 
     /* Realloc before: we need more room. */
     if (new_listpack_bytes > old_listpack_bytes && new_listpack_bytes > lp_malloc_size(lp)) {
+        WC_INC(lp_reallocs);
+        WC_ADD(lp_realloc_bytes, new_listpack_bytes);
         if ((lp = lp_realloc(lp, new_listpack_bytes)) == NULL) return NULL;
         dst = lp + poff;
     }
@@ -873,13 +887,17 @@ static unsigned char *lpInsertImpl(unsigned char *lp,
     /* Set up the listpack relocating the elements to make the exact room
      * we need to store the new one. */
     if (where == LP_BEFORE) {
+        WC_ADD(lp_tail_bytes_moved, old_listpack_bytes - poff);
         memmove(dst + enclen + backlen_size, dst, old_listpack_bytes - poff);
     } else { /* LP_REPLACE. */
+        WC_ADD(lp_tail_bytes_moved, old_listpack_bytes - poff - replaced_len);
         memmove(dst + enclen + backlen_size, dst + replaced_len, old_listpack_bytes - poff - replaced_len);
     }
 
     /* Realloc after: we need to free space. */
     if (new_listpack_bytes < old_listpack_bytes) {
+        WC_INC(lp_reallocs);
+        WC_ADD(lp_realloc_bytes, new_listpack_bytes);
         if ((lp = lp_realloc(lp, new_listpack_bytes)) == NULL) return NULL;
         dst = lp + poff;
     }
@@ -1054,6 +1072,8 @@ unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsi
 
     if (num == 0) return lp; /* Nothing to delete, return ASAP. */
 
+    WC_INC(lp_deletes);
+
     /* Find the next entry to the last entry that needs to be deleted.
      * 'num' counts real elements; metadata (tagged) entries trailing a real
      * element are logically coupled to it and are deleted along with it
@@ -1063,6 +1083,7 @@ unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsi
     while (num--) {
         deleted++;
         tail = lpSkip(tail);
+        WC_INC(lp_next_steps);
         /* Consume metadata entries trailing the deleted element. */
         while (tail[0] != LP_EOF && LP_ENCODING_IS_TAGGED(tail[0])) tail = lpSkip(tail);
         if (unlikely(tail[0] == LP_EOF)) {
@@ -1077,6 +1098,7 @@ unsigned char *lpDeleteRangeWithEntry(unsigned char *lp, unsigned char **p, unsi
     unsigned long poff = first - lp;
 
     /* Move tail to the front of the listpack */
+    WC_ADD(lp_tail_bytes_moved, eofptr - tail + 1);
     memmove(first, tail, eofptr - tail + 1);
     lpSetTotalBytes(lp, bytes - (tail - first));
     uint32_t numele = lpGetNumElements(lp);
@@ -1107,6 +1129,7 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
      * use it no overflow happens. */
     if (numele != LP_HDR_NUMELE_UNKNOWN && index < 0) index = (long)numele + index;
     if (numele != LP_HDR_NUMELE_UNKNOWN && (numele - (unsigned long)index) <= num) {
+        WC_INC(lp_deletes);
         p[0] = LP_EOF;
         lpSetTotalBytes(lp, p - lp + 1);
         lpSetNumElements(lp, index);
@@ -1123,6 +1146,7 @@ unsigned char *lpDeleteRange(unsigned char *lp, long index, unsigned long num) {
  * as they appear in the listpack. */
 unsigned char *lpBatchDelete(unsigned char *lp, unsigned char **ps, unsigned long count) {
     if (count == 0) return lp;
+    WC_INC(lp_batch_deletes);
     unsigned char *dst = ps[0];
     size_t total_bytes = lpGetTotalBytes(lp);
     unsigned char *lp_end = lp + total_bytes; /* After the EOF element. */
@@ -1143,8 +1167,12 @@ unsigned char *lpBatchDelete(unsigned char *lp, unsigned char **ps, unsigned lon
         unsigned char *skip = ps[i];
         assert(skip != NULL && skip[0] != LP_EOF);
         unsigned char *keep_start = lpSkip(skip);
+        WC_INC(lp_next_steps);
         /* Metadata entries are logically coupled to the selected element. */
-        while (keep_start[0] != LP_EOF && LP_ENCODING_IS_TAGGED(keep_start[0])) keep_start = lpSkip(keep_start);
+        while (keep_start[0] != LP_EOF && LP_ENCODING_IS_TAGGED(keep_start[0])) {
+            keep_start = lpSkip(keep_start);
+            WC_INC(lp_next_steps);
+        }
         unsigned char *keep_end;
         if (i + 1 < count) {
             keep_end = ps[i + 1];
@@ -1156,6 +1184,7 @@ unsigned char *lpBatchDelete(unsigned char *lp, unsigned char **ps, unsigned lon
         }
         assert(keep_end > keep_start);
         size_t bytes_to_keep = keep_end - keep_start;
+        WC_ADD(lp_tail_bytes_moved, bytes_to_keep);
         memmove(dst, keep_start, bytes_to_keep);
         dst += bytes_to_keep;
     }
@@ -1228,18 +1257,23 @@ unsigned char *lpMerge(unsigned char **first, unsigned char **second) {
     lplength = lplength < UINT16_MAX ? lplength : UINT16_MAX;
 
     /* Extend target to new lpbytes then append or prepend source. */
+    WC_INC(lp_reallocs);
+    WC_ADD(lp_realloc_bytes, lpbytes);
     target = lp_realloc(target, lpbytes);
     if (append) {
         /* append == appending to target */
         /* Copy source after target (copying over original [END]):
          *   [TARGET - END, SOURCE - HEADER] */
+        WC_ADD(lp_blob_bytes_copied, source_bytes - LP_HDR_SIZE);
         memcpy(target + target_bytes - 1, source + LP_HDR_SIZE, source_bytes - LP_HDR_SIZE);
     } else {
         /* !append == prepending to target */
         /* Move target *contents* exactly size of (source - [END]),
          * then copy source into vacated space (source - [END]):
          *   [SOURCE - END, TARGET - HEADER] */
+        WC_ADD(lp_blob_bytes_copied, target_bytes - LP_HDR_SIZE);
         memmove(target + source_bytes - 1, target + LP_HDR_SIZE, target_bytes - LP_HDR_SIZE);
+        WC_ADD(lp_blob_bytes_copied, source_bytes - 1);
         memcpy(target, source, source_bytes - 1);
     }
 
@@ -1263,6 +1297,7 @@ unsigned char *lpMerge(unsigned char **first, unsigned char **second) {
 unsigned char *lpDup(unsigned char *lp) {
     size_t lpbytes = lpBytes(lp);
     unsigned char *newlp = lp_malloc(lpbytes);
+    WC_ADD(lp_blob_bytes_copied, lpbytes);
     memcpy(newlp, lp, lpbytes);
     return newlp;
 }
@@ -1488,12 +1523,15 @@ void lpRandomPair(unsigned char *lp, unsigned long total_count, listpackEntry *k
     /* Avoid div by zero on corrupt listpack */
     assert(total_count);
 
+    WC_INC(lp_random_calls);
+
     /* Generate even numbers, because listpack saved K-V pair */
     int r = (rand() % total_count) * 2;
     assert((p = lpSeek(lp, r)));
     key->sval = lpGetValue(p, &(key->slen), &(key->lval));
 
     if (!val) return;
+    WC_INC(lp_random_steps);
     assert((p = lpNext(lp, p)));
     val->sval = lpGetValue(p, &(val->slen), &(val->lval));
 }
@@ -1508,6 +1546,7 @@ void lpRandomEntries(unsigned char *lp, unsigned int count, listpackEntry *entri
     } *picks = lp_malloc(count * sizeof(struct pick));
     unsigned int total_size = lpLength(lp);
     assert(total_size);
+    WC_INC(lp_random_calls);
     for (unsigned int i = 0; i < count; i++) {
         picks[i].index = rand() % total_size;
         picks[i].order = i;
@@ -1523,6 +1562,7 @@ void lpRandomEntries(unsigned char *lp, unsigned int count, listpackEntry *entri
     for (unsigned int i = 0; i < count; i++) {
         /* Advance listpack pointer to until we reach 'index' listpack. */
         while (j < picks[i].index) {
+            WC_INC(lp_random_steps);
             p = lpNext(lp, p);
             j++;
         }
@@ -1555,6 +1595,8 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
     /* Avoid div by zero on corrupt listpack */
     assert(total_size);
 
+    WC_INC(lp_random_calls);
+
     /* create a pool of random indexes (some may be duplicate). */
     for (unsigned int i = 0; i < count; i++) {
         picks[i].index = (rand() % total_size) * 2; /* Generate even indexes */
@@ -1570,6 +1612,7 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
     p = lpSeek(lp, lpindex);
     while (p && pickindex < count) {
         key = lpGetValue(p, &klen, &klval);
+        WC_INC(lp_random_steps);
         assert((p = lpNext(lp, p)));
         value = lpGetValue(p, &vlen, &vlval);
         while (pickindex < count && lpindex == picks[pickindex].index) {
@@ -1579,6 +1622,7 @@ void lpRandomPairs(unsigned char *lp, unsigned int count, listpackEntry *keys, l
             pickindex++;
         }
         lpindex += 2;
+        WC_INC(lp_random_steps);
         p = lpNext(lp, p);
     }
 
@@ -1599,18 +1643,22 @@ unsigned int lpRandomPairsUnique(unsigned char *lp, unsigned int count, listpack
     unsigned int index = 0;
     if (count > total_size) count = total_size;
 
+    WC_INC(lp_random_calls);
+
     p = lpFirst(lp);
     unsigned int picked = 0, remaining = count;
     while (picked < count && p) {
         assert((p = lpNextRandom(lp, p, &index, remaining, 1)));
         key = lpGetValue(p, &klen, &klval);
         lpSaveValue(key, klen, klval, &keys[picked]);
+        WC_INC(lp_random_steps);
         assert((p = lpNext(lp, p)));
         index++;
         if (vals) {
             key = lpGetValue(p, &klen, &klval);
             lpSaveValue(key, klen, klval, &vals[picked]);
         }
+        WC_INC(lp_random_steps);
         p = lpNext(lp, p);
         remaining--;
         picked++;
@@ -1651,7 +1699,9 @@ lpNextRandom(unsigned char *lp, unsigned char *p, unsigned int *index, unsigned 
      * equally likely to be picked. */
     unsigned int i = *index;
     unsigned int total_size = lpLength(lp);
+    WC_INC(lp_random_calls);
     while (i < total_size && p != NULL) {
+        WC_INC(lp_random_steps);
         if (even_only && i % 2 != 0) {
             p = lpNext(lp, p);
             i++;
