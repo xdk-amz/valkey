@@ -88,7 +88,9 @@ static vset *setTypeGetVolatileSet(robj *o) {
 static setVolatileIndex *setTypeGetOrCreateVolatileIndex(robj *o) {
     setVolatileIndex *idx = setTypeVolatileIndex(o);
     if (!vsetIsValid(&idx->index)) {
+        WC_INDEX_BEGIN();
         vsetInit(&idx->index);
+        WC_INDEX_END();
         idx->volatile_count = 0;
         hashtableSetType(objectGetVal(o), &setWithVolatileMembersHashtableType);
     }
@@ -97,14 +99,20 @@ static setVolatileIndex *setTypeGetOrCreateVolatileIndex(robj *o) {
 
 void setTypeFreeVolatileSet(robj *o) {
     setVolatileIndex *idx = hashtableMetadata(objectGetVal(o));
-    if (vsetIsValid(&idx->index)) vsetRelease(&idx->index);
+    if (vsetIsValid(&idx->index)) {
+        WC_INDEX_BEGIN();
+        vsetRelease(&idx->index);
+        WC_INDEX_END();
+    }
     idx->volatile_count = 0;
     hashtableSetType(objectGetVal(o), &setHashtableType);
 }
 
 void setTypeTrackMember(robj *o, smember *m) {
     setVolatileIndex *idx = setTypeGetOrCreateVolatileIndex(o);
+    WC_INDEX_BEGIN();
     serverAssert(vsetAddEntry(&idx->index, smemberGetExpiryVsetFunc, m));
+    WC_INDEX_END();
     idx->volatile_count++;
 }
 
@@ -112,7 +120,9 @@ void setTypeTrackMember(robj *o, smember *m) {
 static void setTypeTrackUpdateMember(robj *o, smember *old, smember *new, mstime_t old_expiry, mstime_t new_expiry) {
     if (old_expiry == EXPIRY_NONE && new_expiry == EXPIRY_NONE) return;
     setVolatileIndex *idx = setTypeGetOrCreateVolatileIndex(o);
+    WC_INDEX_BEGIN();
     serverAssert(vsetUpdateEntry(&idx->index, smemberGetExpiryVsetFunc, old, new, old_expiry, new_expiry));
+    WC_INDEX_END();
     if (old_expiry == EXPIRY_NONE)
         idx->volatile_count++;
     else if (new_expiry == EXPIRY_NONE)
@@ -125,7 +135,9 @@ static void setTypeUntrackMember(robj *o, smember *m) {
     if (!smemberHasExpiry(m)) return;
     setVolatileIndex *idx = setTypeVolatileIndex(o);
     debugServerAssert(vsetIsValid(&idx->index));
+    WC_INDEX_BEGIN();
     serverAssert(vsetRemoveEntry(&idx->index, smemberGetExpiryVsetFunc, m));
+    WC_INDEX_END();
     idx->volatile_count--;
     if (vsetIsEmpty(&idx->index)) setTypeFreeVolatileSet(o);
 }
@@ -173,8 +185,12 @@ bool setTypeHasVolatileMembers(robj *o) {
 bool setTypeHasExpiredMembers(robj *o) {
     if (!setTypeHasVolatileMembers(o) || getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE) return false;
 
-    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
-        return vsetHasHidden(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc, commandTimeSnapshot());
+    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        WC_INDEX_BEGIN();
+        bool hidden = vsetHasHidden(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc, commandTimeSnapshot());
+        WC_INDEX_END();
+        return hidden;
+    }
 
     serverAssert(objectGetEncoding(o) == OBJ_ENCODING_LISTPACK);
     unsigned char *lp = objectGetVal(o);
@@ -317,6 +333,7 @@ expiryModificationResult setTypeSetExpiry(robj *o, sds member, mstime_t expiry, 
     if (expiry == EXPIRY_NONE && current == EXPIRY_NONE) return EXPIRATION_MODIFICATION_FAILED;
     if (expiry != EXPIRY_NONE && checkAlreadyExpired(expiry)) {
         serverAssert(setTypeRemove(o, member));
+        WC_INC(set_members_reclaimed);
         return EXPIRATION_MODIFICATION_EXPIRE_ASAP;
     }
 
@@ -399,6 +416,7 @@ static int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags,
             if (!expired && ttl_changed) *ttl_changed = true;
         }
         setTypeIgnoreTTL(o, false);
+        if (expired) WC_INC(set_members_reclaimed);
         if (expired && replaced_expired) *replaced_expired = true;
         return expired;
     }
@@ -445,9 +463,12 @@ typedef struct {
 static int setTypeExpireMember(void *entry, void *c) {
     setExpiryContext *ctx = c;
     smember *m = entry;
+    /* Called from inside the vsetRemoveExpired bracket: the pop is set work. */
+    WC_INDEX_SUSPEND();
     serverAssert(hashtablePop(objectGetVal(ctx->o), m, NULL));
     if (ctx->members) ctx->members[ctx->nmembers++] = createStringObjectFromSds(m);
     smemberFree(m);
+    WC_INDEX_RESUME();
     return 1;
 }
 
@@ -478,6 +499,7 @@ size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_memb
 
         listpackObjectUpdateVolatileCount(o, -(long)expired);
         server.stat_expiredsetmembers += expired;
+        WC_ADD(set_members_reclaimed, expired);
         return expired;
     }
 
@@ -487,7 +509,9 @@ size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_memb
     /* The pops must see the expired members they remove. */
     setTypeIgnoreTTL(o, true);
     setExpiryContext ctx = {.o = o, .members = out_members, .nmembers = 0};
+    WC_INDEX_BEGIN();
     size_t expired = vsetRemoveExpired(set, smemberGetExpiryVsetFunc, setTypeExpireMember, now, max_members, &ctx);
+    WC_INDEX_END();
     serverAssert(ctx.nmembers <= max_members);
     setTypeVolatileIndex(o)->volatile_count -= expired;
     if (vsetIsEmpty(set))
@@ -495,6 +519,7 @@ size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_memb
     else
         setTypeIgnoreTTL(o, false);
     server.stat_expiredsetmembers += expired;
+    WC_ADD(set_members_reclaimed, expired);
     return expired;
 }
 
@@ -549,7 +574,9 @@ size_t setTypeScanDefrag(robj *o, size_t cursor, void *(*defragfn)(void *)) {
         /* SPERSIST, SREM, replacement or recreation can release the volatile-member
          * index between deferred active-defrag steps; resuming is then done. */
         if (set == NULL) return 0;
+        WC_INDEX_BEGIN();
         st->cursor = vsetScanDefrag(set, st->cursor, defragfn);
+        WC_INDEX_END();
         if (st->cursor == 0) return 0;
     }
     return (size_t)st;
@@ -912,7 +939,10 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
         } else {
             lpi = lpNext(lp, lpi);
         }
-        while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) lpi = lpNext(lp, lpi);
+        while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) {
+            WC_INC(set_lp_skipped_expired);
+            lpi = lpNext(lp, lpi);
+        }
         if (lpi == NULL) return -1;
         si->lpi = lpi;
         unsigned int l;
@@ -921,6 +951,7 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
     } else {
         serverPanic("Wrong set encoding in setTypeNext");
     }
+    WC_INC(set_iter_next);
     return si->encoding;
 }
 
@@ -1039,6 +1070,7 @@ static smember *setLiveSamplerDraw(setLiveSampler *s) {
     setTypeIgnoreTTL(s->set, true);
     while (hashtableFairRandomEntry(objectGetVal(s->set), &entry)) {
         if (!s->hides || !smemberIsExpired(entry)) break;
+        WC_INC(set_random_expired_seen);
         entry = NULL;
         if (s->budget == 0) break;
         s->budget--;
@@ -1054,6 +1086,7 @@ static listpackEntry *setTypeCollectLive(robj *set, unsigned long *count) {
     int64_t llele = 0;
     unsigned long cap = 16, held = 0;
     listpackEntry *buf = zmalloc(sizeof(*buf) * cap);
+    WC_INC(set_reservoir_passes);
     setTypeIterator *si = setTypeInitIterator(set);
     while (setTypeNext(si, &str, &len, &llele) != -1) {
         if (held == cap) {
@@ -1112,6 +1145,7 @@ static int setTypePickLiveByPass(robj *set, char **str, size_t *len, int64_t *ll
     int64_t v = 0;
     int encoding, picked = -1;
     unsigned long seen = 0;
+    WC_INC(set_reservoir_passes);
     setTypeIterator *si = setTypeInitIterator(set);
     while ((encoding = setTypeNext(si, &s, &l, &v)) != -1) {
         if ((unsigned long)rand() % ++seen != 0) continue;
@@ -1168,6 +1202,7 @@ static int setLiveSamplerPick(setLiveSampler *s, char **str, size_t *len, int64_
  *
  * Returns -1 when the set has volatile members and none of them is live. */
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    WC_INC(set_random_calls);
     bool volatile_set = setTypeHasVolatileMembers(setobj);
     if (volatile_set) {
         setLiveSampler sampler;
@@ -1863,6 +1898,7 @@ void spopWithCountCommand(client *c) {
         unsigned char *lp = objectGetVal(set);
         unsigned char **live = zmalloc(sizeof(*live) * lpLength(lp));
         unsigned long live_count = 0;
+        WC_INC(set_reservoir_passes);
         for (unsigned char *p = lpFirst(lp); p != NULL; p = lpNext(lp, p)) {
             if (setTypeListpackIsValidAt(lp, p)) live[live_count++] = p;
         }

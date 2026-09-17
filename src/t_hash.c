@@ -859,6 +859,7 @@ int hashTypeNext(hashTypeIterator *hi) {
     } else {
         serverPanic("Unknown hash encoding");
     }
+    WC_INC(hash_iter_next);
     return C_OK;
 }
 

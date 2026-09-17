@@ -979,6 +979,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                 nwritten += n;
                 if ((n = rdbSaveMillisecondTime(rdb, expiry)) == -1) return -1;
                 nwritten += n;
+                WC_INC(rdb_members_saved);
 
                 p = lpNext(lp, p);
             }
@@ -1007,6 +1008,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
                     }
                     nwritten += n;
                 }
+                WC_INC(rdb_members_saved);
             }
             hashtableCleanupIterator(&iterator);
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
@@ -1018,6 +1020,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid, unsigned char rdbt
             size_t l = lpBytes((unsigned char *)objectGetVal(o));
             if ((n = rdbSaveRawString(rdb, objectGetVal(o), l)) == -1) return -1;
             nwritten += n;
+            WC_ADD(rdb_members_saved, lpLength((unsigned char *)objectGetVal(o)));
         } else {
             serverPanic("Unknown set encoding");
         }
@@ -1900,6 +1903,10 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if ((childpid = serverFork(CHILD_TYPE_RDB)) == 0) {
         int retval;
 
+#ifdef WORK_COUNTERS
+        wcReset();
+#endif
+
         /* Child */
         if (strstr(server.exec_argv[0], "redis-server") != NULL) {
             serverSetProcTitle("redis-rdb-bgsave");
@@ -1909,6 +1916,9 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         serverSetCpuAffinity(server.bgsave_cpulist);
         retval = rdbSave(req, filename, rsi, rdbflags);
         if (retval == C_OK) {
+#ifdef WORK_COUNTERS
+            wcDumpToFile("workctr-rdb-child.txt");
+#endif
             sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
         }
         exitFromChild((retval == C_OK) ? 0 : 1);
@@ -2301,6 +2311,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             } else {
                 sdsfree(sdsele);
             }
+            WC_INC(rdb_members_loaded);
         }
     } else if (rdbtype == RDB_TYPE_SET_2) {
         if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
@@ -2333,6 +2344,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
+            WC_INC(rdb_members_loaded);
 
             if (iAmPrimary() && !(rdbflags & RDBFLAGS_AOF_PREAMBLE) && now != 0 && itemexpiry != EXPIRY_NONE &&
                 itemexpiry < now) {
@@ -2957,6 +2969,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
             objectSetType(o, OBJ_SET);
             objectSetEncoding(o, OBJ_ENCODING_INTSET);
+            WC_ADD(rdb_members_loaded, intsetLen(objectGetVal(o)));
             if (intsetLen(objectGetVal(o)) > server.set_max_intset_entries) setTypeConvert(o, OBJ_ENCODING_HASHTABLE);
             break;
         case RDB_TYPE_SET_LISTPACK:
@@ -2970,6 +2983,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
             objectSetType(o, OBJ_SET);
             objectSetEncoding(o, OBJ_ENCODING_LISTPACK);
+            WC_ADD(rdb_members_loaded, setTypeSize(o));
 
             if (setTypeSize(o) == 0) {
                 zfree(encoded);

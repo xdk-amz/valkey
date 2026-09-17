@@ -52,6 +52,7 @@ void zlibc_free(void *ptr) {
 
 #include <string.h>
 #include "zmalloc.h"
+#include "workctr.h"
 #include <stdatomic.h>
 
 #define UNUSED(x) ((void)(x))
@@ -141,6 +142,11 @@ static inline void update_zmalloc_stat_free(size_t size) {
     }
 }
 
+#ifdef WORK_COUNTERS
+/* Only the main thread (the first thread to allocate) feeds the work counters. */
+#define WC_MAIN_THREAD() (thread_index == 0)
+#endif
+
 static void zmalloc_default_oom(size_t size) {
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n", size);
     fflush(stderr);
@@ -175,15 +181,24 @@ static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {
     void *ptr = malloc(MALLOC_MIN_SIZE(size) + PREFIX_SIZE);
 
     if (!ptr) return NULL;
+#ifdef WORK_COUNTERS
+    size_t wc_requested = size;
+#endif
 #ifdef HAVE_MALLOC_SIZE
     size = zmalloc_size(ptr);
     update_zmalloc_stat_alloc(size);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemAlloc(wc_requested, size);
+#endif
     if (usable) *usable = size;
     return ptr;
 #else
     size = MALLOC_MIN_SIZE(size);
     *((size_t *)ptr) = size;
     update_zmalloc_stat_alloc(size + PREFIX_SIZE);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemAlloc(wc_requested, size + PREFIX_SIZE);
+#endif
     if (usable) *usable = size;
     return (char *)ptr + PREFIX_SIZE;
 #endif
@@ -284,16 +299,25 @@ static inline void *ztrycalloc_usable_internal(size_t size, size_t *usable) {
     if (size >= SIZE_MAX / 2) return NULL;
     void *ptr = calloc(1, MALLOC_MIN_SIZE(size) + PREFIX_SIZE);
     if (ptr == NULL) return NULL;
+#ifdef WORK_COUNTERS
+    size_t wc_requested = size;
+#endif
 
 #ifdef HAVE_MALLOC_SIZE
     size = zmalloc_size(ptr);
     update_zmalloc_stat_alloc(size);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemAlloc(wc_requested, size);
+#endif
     if (usable) *usable = size;
     return ptr;
 #else
     size = MALLOC_MIN_SIZE(size);
     *((size_t *)ptr) = size;
     update_zmalloc_stat_alloc(size + PREFIX_SIZE);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemAlloc(wc_requested, size + PREFIX_SIZE);
+#endif
     if (usable) *usable = size;
     return (char *)ptr + PREFIX_SIZE;
 #endif
@@ -374,6 +398,9 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
         return NULL;
     }
 
+#ifdef WORK_COUNTERS
+    size_t wc_requested = size;
+#endif
 #ifdef HAVE_MALLOC_SIZE
     oldsize = zmalloc_size(ptr);
     newptr = realloc(ptr, size);
@@ -385,6 +412,9 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     update_zmalloc_stat_free(oldsize);
     size = zmalloc_size(newptr);
     update_zmalloc_stat_alloc(size);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemRealloc(wc_requested, oldsize, size);
+#endif
     if (usable) *usable = size;
     return newptr;
 #else
@@ -399,6 +429,9 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     *((size_t *)newptr) = size;
     update_zmalloc_stat_free(oldsize);
     update_zmalloc_stat_alloc(size);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemRealloc(wc_requested, oldsize, size);
+#endif
     if (usable) *usable = size;
     return (char *)newptr + PREFIX_SIZE;
 #endif
@@ -465,6 +498,9 @@ size_t zmalloc_usable_size(void *ptr) {
 static inline void zfree_internal(void *ptr, size_t size) {
     assert(ptr != NULL);
     update_zmalloc_stat_free(size);
+#ifdef WORK_COUNTERS
+    if (WC_MAIN_THREAD()) wcMemFree(size);
+#endif
 
 #ifdef USE_JEMALLOC
     je_sdallocx(ptr, size, 0);

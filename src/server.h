@@ -86,6 +86,7 @@
 #include "trace/trace.h"
 #include "entry.h"
 #include "smember.h"
+#include "workctr.h"
 #include "lrulfu.h"
 
 /*
