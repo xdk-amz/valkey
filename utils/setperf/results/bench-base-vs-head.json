@@ -1,0 +1,794 @@
+{
+ "n": 200000,
+ "reps": 100,
+ "servers": {
+  "base": {
+   "binary": "/home/xdk/.kiro/crew/scratch/runtime-3c88af72/spb/src/valkey-server",
+   "workctr": false,
+   "member_ttl": false,
+   "results": [
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key",
+     "median_us": 29.176007956266403,
+     "p99_us": 37.86711022257805,
+     "min_us": 28.45493145287037
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key 1",
+     "median_us": 31.490693800151348,
+     "p99_us": 34.258002415299416,
+     "min_us": 30.3490087389946
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key 2",
+     "median_us": 35.312375985085964,
+     "p99_us": 44.354936107993126,
+     "min_us": 34.17208790779114
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key",
+     "median_us": 27.79893111437559,
+     "p99_us": 69.38888691365719,
+     "min_us": 26.973197236657143
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 35.248580388724804,
+     "p99_us": 39.149075746536255,
+     "min_us": 34.386059269309044
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 41.91906191408634,
+     "p99_us": 47.963811084628105,
+     "min_us": 40.09413532912731
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SISMEMBER key m1",
+     "median_us": 25.868997909128666,
+     "p99_us": 32.72294998168945,
+     "min_us": 25.271903723478317
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SADD key absent",
+     "median_us": 26.102992706000805,
+     "p99_us": 28.342008590698242,
+     "min_us": 25.645829737186432
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.658992283046246,
+     "p99_us": 30.53806722164154,
+     "min_us": 26.223016902804375
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SCARD key",
+     "median_us": 24.881912395358086,
+     "p99_us": 32.04517997801304,
+     "min_us": 24.346867576241493
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key",
+     "median_us": 29.526534490287304,
+     "p99_us": 47.86602221429348,
+     "min_us": 27.799047529697418
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key 1",
+     "median_us": 31.99651837348938,
+     "p99_us": 34.92995165288448,
+     "min_us": 30.469847843050957
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key 2",
+     "median_us": 34.35858525335789,
+     "p99_us": 38.12182694673538,
+     "min_us": 32.59396180510521
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key",
+     "median_us": 26.165391318500042,
+     "p99_us": 32.79303200542927,
+     "min_us": 25.727087631821632
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 31.926902011036873,
+     "p99_us": 36.038924008607864,
+     "min_us": 30.078226700425148
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 35.81109922379255,
+     "p99_us": 40.37003964185715,
+     "min_us": 35.356031730771065
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SISMEMBER key m1",
+     "median_us": 25.75560938566923,
+     "p99_us": 28.589973226189613,
+     "min_us": 25.373883545398712
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SADD key absent",
+     "median_us": 26.139547117054462,
+     "p99_us": 28.365058824419975,
+     "min_us": 25.650952011346817
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.674941182136536,
+     "p99_us": 30.966009944677353,
+     "min_us": 26.140129193663597
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SCARD key",
+     "median_us": 24.90147016942501,
+     "p99_us": 28.2281544059515,
+     "min_us": 24.449080228805542
+    }
+   ]
+  },
+  "head": {
+   "binary": "/home/xdk/.kiro/crew/scratch/runtime-3c88af72/spw-chk/src/valkey-server",
+   "workctr": false,
+   "member_ttl": true,
+   "results": [
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key",
+     "median_us": 29.521994292736053,
+     "p99_us": 35.631004720926285,
+     "min_us": 28.519192710518837
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key 1",
+     "median_us": 31.523522920906544,
+     "p99_us": 38.76909613609314,
+     "min_us": 30.585099011659622
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SPOP key 2",
+     "median_us": 35.33798735588789,
+     "p99_us": 44.865068048238754,
+     "min_us": 34.07103940844536
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key",
+     "median_us": 27.812551707029343,
+     "p99_us": 33.27801823616028,
+     "min_us": 27.073081582784653
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 35.646953620016575,
+     "p99_us": 43.26715134084225,
+     "min_us": 34.33902747929096
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 42.2940356656909,
+     "p99_us": 47.544948756694794,
+     "min_us": 40.97307100892067
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.18145663291216,
+     "p99_us": 71.9709787517786,
+     "min_us": 25.66911280155182
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SADD key absent",
+     "median_us": 26.34699922055006,
+     "p99_us": 30.742958188056946,
+     "min_us": 25.815097615122795
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 31.30605909973383,
+     "p99_us": 36.47501580417156,
+     "min_us": 30.722934752702713
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.875059120357037,
+     "p99_us": 34.23099406063557,
+     "min_us": 26.164110749959946
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "none",
+     "command": "SCARD key",
+     "median_us": 25.189830921590328,
+     "p99_us": 27.440953999757767,
+     "min_us": 24.595996364951134
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SPOP key",
+     "median_us": 29.26646266132593,
+     "p99_us": 32.698968425393105,
+     "min_us": 28.35993655025959
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SPOP key 1",
+     "median_us": 6463.192054070532,
+     "p99_us": 6753.827910870314,
+     "min_us": 6432.977970689535
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SPOP key 2",
+     "median_us": 6460.096454247832,
+     "p99_us": 6761.013064533472,
+     "min_us": 6430.327892303467
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SRANDMEMBER key",
+     "median_us": 27.54107117652893,
+     "p99_us": 32.35391341149807,
+     "min_us": 26.696128770709038
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 6514.341104775667,
+     "p99_us": 6800.74910633266,
+     "min_us": 6482.865894213319
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 40.44652450829744,
+     "p99_us": 51.36104300618172,
+     "min_us": 39.20914605259895
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.506022550165653,
+     "p99_us": 35.11202521622181,
+     "min_us": 25.735003873705864
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SADD key absent",
+     "median_us": 26.9194133579731,
+     "p99_us": 31.679868698120117,
+     "min_us": 26.389025151729584
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 31.790114007890224,
+     "p99_us": 41.86900332570076,
+     "min_us": 30.877068638801575
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "MEMORY USAGE key",
+     "median_us": 27.13850699365139,
+     "p99_us": 36.8170440196991,
+     "min_us": 26.496127247810364
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "one",
+     "command": "SCARD key",
+     "median_us": 25.469460524618626,
+     "p99_us": 29.28590402007103,
+     "min_us": 24.8828437179327
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SPOP key",
+     "median_us": 30.648079700767994,
+     "p99_us": 113.10214176774025,
+     "min_us": 29.491959139704704
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SPOP key 1",
+     "median_us": 6912.6494927331805,
+     "p99_us": 7214.209996163845,
+     "min_us": 6854.297826066613
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SPOP key 2",
+     "median_us": 6895.455997437239,
+     "p99_us": 7163.896923884749,
+     "min_us": 6812.151987105608
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SRANDMEMBER key",
+     "median_us": 27.622445486485958,
+     "p99_us": 35.44311039149761,
+     "min_us": 26.904046535491943
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 6880.496512167156,
+     "p99_us": 7165.893912315369,
+     "min_us": 6837.893044576049
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 39.978884160518646,
+     "p99_us": 47.15495742857456,
+     "min_us": 39.174919947981834
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.399968191981316,
+     "p99_us": 32.55205228924751,
+     "min_us": 25.94594843685627
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SADD key absent",
+     "median_us": 26.680994778871536,
+     "p99_us": 28.650974854826927,
+     "min_us": 26.13919787108898
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 36.8430046364665,
+     "p99_us": 44.13002170622349,
+     "min_us": 35.98211333155632
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "MEMORY USAGE key",
+     "median_us": 27.583562768995762,
+     "p99_us": 29.695918783545494,
+     "min_us": 27.102185413241386
+    },
+    {
+     "encoding": "hashtable",
+     "n": 200000,
+     "ttl": "all",
+     "command": "SCARD key",
+     "median_us": 25.276443921029568,
+     "p99_us": 28.757844120264053,
+     "min_us": 24.751992896199226
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key",
+     "median_us": 29.721413739025593,
+     "p99_us": 35.54206341505051,
+     "min_us": 27.92198210954666
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key 1",
+     "median_us": 32.193027436733246,
+     "p99_us": 46.68207839131355,
+     "min_us": 30.579976737499237
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SPOP key 2",
+     "median_us": 34.726457670331,
+     "p99_us": 39.95583392679691,
+     "min_us": 32.92597830295563
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key",
+     "median_us": 26.344438083469868,
+     "p99_us": 32.32387825846672,
+     "min_us": 25.758985430002213
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 32.18860365450382,
+     "p99_us": 36.23892553150654,
+     "min_us": 30.392780900001526
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 36.03601362556219,
+     "p99_us": 40.31602293252945,
+     "min_us": 35.425880923867226
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.450143195688725,
+     "p99_us": 32.02701918780804,
+     "min_us": 25.92196688055992
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SADD key absent",
+     "median_us": 26.38762816786766,
+     "p99_us": 28.650974854826927,
+     "min_us": 25.799032300710678
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 31.268573366105556,
+     "p99_us": 39.02893513441086,
+     "min_us": 30.573923140764236
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.896479539573193,
+     "p99_us": 29.724091291427612,
+     "min_us": 26.278197765350342
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "none",
+     "command": "SCARD key",
+     "median_us": 25.24442970752716,
+     "p99_us": 28.20114605128765,
+     "min_us": 24.756183847784996
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SPOP key",
+     "median_us": 32.45263360440731,
+     "p99_us": 36.0109843313694,
+     "min_us": 31.796982511878014
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SPOP key 1",
+     "median_us": 33.1441406160593,
+     "p99_us": 46.82806320488453,
+     "min_us": 30.437950044870377
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SPOP key 2",
+     "median_us": 34.72389653325081,
+     "p99_us": 44.84015516936779,
+     "min_us": 33.01887772977352
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SRANDMEMBER key",
+     "median_us": 26.269000954926014,
+     "p99_us": 31.93691372871399,
+     "min_us": 25.94897523522377
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 32.046460546553135,
+     "p99_us": 35.498058423399925,
+     "min_us": 30.193012207746506
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 35.98094917833805,
+     "p99_us": 39.40588794648647,
+     "min_us": 35.451026633381844
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.38495061546564,
+     "p99_us": 34.321099519729614,
+     "min_us": 25.867018848657608
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SADD key absent",
+     "median_us": 26.511959731578827,
+     "p99_us": 29.354821890592575,
+     "min_us": 26.003923267126083
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 31.215487979352474,
+     "p99_us": 37.310877814888954,
+     "min_us": 30.777184292674065
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.88099630177021,
+     "p99_us": 31.128060072660446,
+     "min_us": 26.501016691327095
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "one",
+     "command": "SCARD key",
+     "median_us": 25.184941478073597,
+     "p99_us": 27.8400257229805,
+     "min_us": 24.823006242513657
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SPOP key",
+     "median_us": 33.317599445581436,
+     "p99_us": 39.261067286133766,
+     "min_us": 32.35111944377422
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SPOP key 1",
+     "median_us": 38.515543565154076,
+     "p99_us": 48.58686588704586,
+     "min_us": 36.43403761088848
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SPOP key 2",
+     "median_us": 43.21953747421503,
+     "p99_us": 66.75394251942635,
+     "min_us": 40.01101478934288
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SRANDMEMBER key",
+     "median_us": 30.193012207746506,
+     "p99_us": 36.697834730148315,
+     "min_us": 29.75109964609146
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SRANDMEMBER key 2",
+     "median_us": 34.46254413574934,
+     "p99_us": 39.85990770161152,
+     "min_us": 33.77092070877552
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SRANDMEMBER key -5",
+     "median_us": 54.34011109173298,
+     "p99_us": 63.7939665466547,
+     "min_us": 53.67700941860676
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SISMEMBER key m1",
+     "median_us": 26.39112062752247,
+     "p99_us": 28.903130441904068,
+     "min_us": 25.886809453368187
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SADD key absent",
+     "median_us": 26.673078536987305,
+     "p99_us": 32.502925023436546,
+     "min_us": 26.17109566926956
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SADDEX key EX 1000 MEMBERS 1 absent",
+     "median_us": 32.47999120503664,
+     "p99_us": 40.18982872366905,
+     "min_us": 31.869160011410713
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "MEMORY USAGE key",
+     "median_us": 26.99834294617176,
+     "p99_us": 33.19396637380123,
+     "min_us": 26.52290277183056
+    },
+    {
+     "encoding": "listpack",
+     "n": 128,
+     "ttl": "all",
+     "command": "SCARD key",
+     "median_us": 25.289016775786877,
+     "p99_us": 28.816983103752136,
+     "min_us": 24.775974452495575
+    }
+   ]
+  }
+ }
+}

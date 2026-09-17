@@ -450,6 +450,15 @@ static int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags,
     return 1;
 }
 
+#ifdef WORK_COUNTERS
+/* src/unit/test_set_workctr.cpp reaches the insertion primitive behind SADD,
+ * SADDEX and SMOVE through this; production builds do not export it. */
+int setTypeAddWithExpiryWc(robj *o, sds member, mstime_t expiry, bool keep_expiry, bool *replaced_expired, bool *ttl_changed);
+int setTypeAddWithExpiryWc(robj *o, sds member, mstime_t expiry, bool keep_expiry, bool *replaced_expired, bool *ttl_changed) {
+    return setTypeAddWithExpiry(o, member, expiry, keep_expiry ? SET_ADD_KEEP_EXPIRY : 0, replaced_expired, ttl_changed);
+}
+#endif
+
 /*-----------------------------------------------------------------------------
  * Active expiration
  *----------------------------------------------------------------------------*/
