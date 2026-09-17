@@ -269,6 +269,8 @@ robj *makeObjectShared(robj *o) {
 /* Create a string object with encoding OBJ_ENCODING_RAW, that is a plain
  * string object where o->ptr points to a proper sds string. */
 robj *createRawStringObject(const char *ptr, size_t len) {
+    WC_INC(str_objs_created);
+    WC_ADD(str_obj_bytes, len);
     return createObject(OBJ_STRING, sdsnewlen(ptr, len));
 }
 
@@ -357,6 +359,8 @@ static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
  * an object where the sds string is actually an unmodifiable string
  * allocated in the same chunk as the object itself. */
 static robj *createEmbeddedStringObject(const char *ptr, size_t len) {
+    WC_INC(str_objs_created);
+    WC_ADD(str_obj_bytes, len);
     return createEmbeddedStringObjectWithKeyAndExpire(ptr, len, NULL, EXPIRY_NONE);
 }
 
@@ -556,6 +560,7 @@ robj *createStringObjectFromLongLongWithOptions(long long value, int flag) {
         o = shared.integers[value];
     } else {
         if ((value >= LONG_MIN && value <= LONG_MAX) && flag != LL2STROBJ_NO_INT_ENC) {
+            WC_INC(str_objs_created);
             o = createObject(OBJ_STRING, NULL);
             objectSetEncoding(o, OBJ_ENCODING_INT);
             o->val_ptr = (void *)((long)value);
@@ -1374,7 +1379,11 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
-            if (vsetIsValid(volatile_members)) asize += vsetMemUsage(volatile_members);
+            if (vsetIsValid(volatile_members)) {
+                WC_INDEX_BEGIN();
+                asize += vsetMemUsage(volatile_members);
+                WC_INDEX_END();
+            }
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
             asize += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {

@@ -38,7 +38,9 @@ static vset *setTypeGetOrCreateVolatileSet(robj *o) {
     hashtable *ht = objectGetVal(o);
     vset *set = (vset *)hashtableMetadata(ht);
     if (!vsetIsValid(set)) {
+        WC_INDEX_BEGIN();
         vsetInit(set);
+        WC_INDEX_END();
         hashtableSetType(ht, &setWithVolatileMembersHashtableType);
     }
     return set;
@@ -46,12 +48,18 @@ static vset *setTypeGetOrCreateVolatileSet(robj *o) {
 
 void setTypeFreeVolatileSet(robj *o) {
     vset *set = (vset *)hashtableMetadata(objectGetVal(o));
-    if (vsetIsValid(set)) vsetRelease(set);
+    if (vsetIsValid(set)) {
+        WC_INDEX_BEGIN();
+        vsetRelease(set);
+        WC_INDEX_END();
+    }
     hashtableSetType(objectGetVal(o), &setHashtableType);
 }
 
 void setTypeTrackMember(robj *o, smember *m) {
+    WC_INDEX_BEGIN();
     serverAssert(vsetAddEntry(setTypeGetOrCreateVolatileSet(o), smemberGetExpiryVsetFunc, m));
+    WC_INDEX_END();
 }
 
 /* Call before freeing 'm': vsetRemoveEntry reads its expiry. */
@@ -59,7 +67,9 @@ void setTypeUntrackMember(robj *o, smember *m) {
     if (!smemberHasExpiry(m)) return;
     vset *set = setTypeGetVolatileSet(o);
     debugServerAssert(set);
+    WC_INDEX_BEGIN();
     serverAssert(vsetRemoveEntry(set, smemberGetExpiryVsetFunc, m));
+    WC_INDEX_END();
     if (vsetIsEmpty(set)) setTypeFreeVolatileSet(o);
 }
 
@@ -228,6 +238,7 @@ setTypeSetExpiryInternal(robj *o, sds member, mstime_t expiry, int flags, mstime
     if (expiry == EXPIRY_NONE && *current == EXPIRY_NONE) return EXPIRATION_MODIFICATION_FAILED;
     if (expiry != EXPIRY_NONE && checkAlreadyExpired(expiry)) {
         serverAssert(setTypeRemove(o, member));
+        WC_INC(set_members_reclaimed);
         return EXPIRATION_MODIFICATION_EXPIRE_ASAP;
     }
 
@@ -257,7 +268,9 @@ setTypeSetExpiryInternal(robj *o, sds member, mstime_t expiry, int flags, mstime
     if (*current == EXPIRY_NONE) {
         setTypeTrackMember(o, updated);
     } else {
+        WC_INDEX_BEGIN();
         serverAssert(vsetUpdateEntry(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc, m, updated, *current, expiry));
+        WC_INDEX_END();
     }
     return EXPIRATION_MODIFICATION_SUCCESSFUL;
 }
@@ -314,7 +327,10 @@ int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags, bool *
         setTypeIgnoreTTL(o, true);
         int removed = setTypeRemove(o, member);
         setTypeIgnoreTTL(o, false);
-        if (removed) *replaced_expired = true;
+        if (removed) {
+            WC_INC(set_members_reclaimed);
+            *replaced_expired = true;
+        }
     }
 
     setTypeAddNewWithExpiry(o, member, expiry);
@@ -334,9 +350,12 @@ typedef struct {
 static int setTypeExpireMember(void *entry, void *c) {
     setExpiryContext *ctx = c;
     smember *m = entry;
+    /* Called from inside the vsetRemoveExpired bracket: the pop is set work. */
+    WC_INDEX_SUSPEND();
     serverAssert(hashtablePop(objectGetVal(ctx->o), m, NULL));
     if (ctx->members) ctx->members[ctx->nmembers++] = createStringObjectFromSds(m);
     smemberFree(m);
+    WC_INDEX_RESUME();
     return 1;
 }
 
@@ -367,6 +386,7 @@ size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_memb
 
         listpackObjectUpdateVolatileCount(o, -(long)expired);
         server.stat_expiredsetmembers += expired;
+        WC_ADD(set_members_reclaimed, expired);
         return expired;
     }
 
@@ -376,13 +396,16 @@ size_t setTypeDeleteExpiredMembers(robj *o, mstime_t now, unsigned long max_memb
     /* The pops must see the expired members they remove. */
     setTypeIgnoreTTL(o, true);
     setExpiryContext ctx = {.o = o, .members = out_members, .nmembers = 0};
+    WC_INDEX_BEGIN();
     size_t expired = vsetRemoveExpired(set, smemberGetExpiryVsetFunc, setTypeExpireMember, now, max_members, &ctx);
+    WC_INDEX_END();
     serverAssert(ctx.nmembers <= max_members);
     if (vsetIsEmpty(set))
         setTypeFreeVolatileSet(o);
     else
         setTypeIgnoreTTL(o, false);
     server.stat_expiredsetmembers += expired;
+    WC_ADD(set_members_reclaimed, expired);
     return expired;
 }
 
@@ -404,7 +427,9 @@ static void defragSetMemberCallback(void *privdata, void *element_ref) {
     if (smemberHasExpiry(new_m)) {
         /* The vset indexes members by pointer. */
         mstime_t expiry = smemberGetExpiry(new_m);
+        WC_INDEX_BEGIN();
         serverAssert(vsetUpdateEntry(setTypeGetVolatileSet(ctx->o), smemberGetExpiryVsetFunc, m, new_m, expiry, expiry));
+        WC_INDEX_END();
     }
     *member_ref = new_m;
 }
@@ -434,7 +459,9 @@ size_t setTypeScanDefrag(robj *o, size_t cursor, void *(*defragfn)(void *)) {
     } else {
         vset *set = setTypeGetVolatileSet(o);
         if (set == NULL) return 0;
+        WC_INDEX_BEGIN();
         st->cursor = vsetScanDefrag(set, st->cursor, defragfn);
+        WC_INDEX_END();
         if (st->cursor == 0) return 0;
     }
     return (size_t)st;

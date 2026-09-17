@@ -272,12 +272,15 @@ int listTypeNext(listTypeIterator *li, listTypeEntry *entry) {
 
     entry->li = li;
     if (li->encoding == OBJ_ENCODING_QUICKLIST) {
-        return quicklistNext(li->iter, &entry->entry);
+        int has_next = quicklistNext(li->iter, &entry->entry);
+        if (has_next) WC_INC(list_iter_next);
+        return has_next;
     } else if (li->encoding == OBJ_ENCODING_LISTPACK) {
         entry->lpe = li->lpi;
         if (entry->lpe != NULL) {
             li->lpi =
                 (li->direction == LIST_TAIL) ? lpNext(objectGetVal(li->subject), li->lpi) : lpPrev(objectGetVal(li->subject), li->lpi);
+            WC_INC(list_iter_next);
             return 1;
         }
     } else {

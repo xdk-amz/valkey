@@ -402,6 +402,34 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+#ifdef WORK_COUNTERS
+#include "mt19937-64.h"
+#include "intset.h"
+#include "listpack.h"
+
+/* Flat name/value map of every counter (RESP2 clients receive a flat array):
+ * the object's own account first, then the expiry-index account as idx_<name>. */
+static void debugAddReplyWorkCounters(client *c, const workCounters *snap, const workCounters *idx) {
+    int n = 0;
+#define WC_COUNT(name, desc) n++;
+    WC_COUNTERS(WC_COUNT)
+#undef WC_COUNT
+    addReplyMapLen(c, 2 * n + 1);
+    addReplyBulkCString(c, "generation");
+    addReplyLongLong(c, wcGeneration());
+#define WC_REPLY(name, desc)         \
+    addReplyBulkCString(c, #name); \
+    addReplyLongLong(c, snap->name);
+    WC_COUNTERS(WC_REPLY)
+#undef WC_REPLY
+#define WC_REPLY_IDX(name, desc)           \
+    addReplyBulkCString(c, "idx_" #name); \
+    addReplyLongLong(c, idx->name);
+    WC_COUNTERS(WC_REPLY_IDX)
+#undef WC_REPLY_IDX
+}
+#endif
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
@@ -432,6 +460,10 @@ void debugCommand(client *c) {
             "    Return hash table statistics of the specified database.",
             "HTSTATS-KEY <key> [full]",
             "    Like HTSTATS but for the hash table stored at <key>'s value.",
+#ifdef WORK_COUNTERS
+            "WORKCTR ARM|GET|RESET|CURRENT|SEED <n>|SETINFO <key>",
+            "    Test-only work counters (build with WORK_COUNTERS=yes).",
+#endif
             "LOADAOF",
             "    Flush the AOF buffers on disk and reload the AOF in memory.",
             "REPLICATE <string>",
@@ -1033,6 +1065,65 @@ void debugCommand(client *c) {
             addReplyError(c, "The value stored at the specified key is not "
                              "represented using an hash table");
         }
+#ifdef WORK_COUNTERS
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "workctr") && c->argc >= 3) {
+        char *sub = objectGetVal(c->argv[2]);
+        if (!strcasecmp(sub, "arm") && c->argc == 3) {
+            wc_armed = 1;
+            wc_armed_client = c->id;
+            /* The generation GET will report once the armed command was measured. */
+            addReplyLongLong(c, wcGeneration() + 1);
+        } else if (!strcasecmp(sub, "get") && c->argc == 3) {
+            debugAddReplyWorkCounters(c, wcLast(), wcIndexLast());
+        } else if (!strcasecmp(sub, "current") && c->argc == 3) {
+            /* Copy before replying so the reply allocations stay out of the window. */
+            workCounters snap = wc;
+            workCounters idx = wc_index;
+            debugAddReplyWorkCounters(c, &snap, &idx);
+        } else if (!strcasecmp(sub, "reset") && c->argc == 3) {
+            addReply(c, shared.ok);
+            wcReset();
+        } else if (!strcasecmp(sub, "seed") && c->argc == 4) {
+            long long seed;
+            if (getLongLongFromObjectOrReply(c, c->argv[3], &seed, NULL) != C_OK) return;
+            srand((unsigned)seed);
+            srandom((unsigned)seed);
+            init_genrand64((unsigned long long)seed);
+            addReply(c, shared.ok);
+        } else if (!strcasecmp(sub, "setinfo") && c->argc == 4) {
+            robj *o = objectCommandLookupOrReply(c, c->argv[3], shared.nokeyerr);
+            if (o == NULL) return;
+            if (objectGetType(o) != OBJ_SET) {
+                addReplyError(c, "The value stored at the specified key is not a set");
+                return;
+            }
+            long long live = 0;
+            setTypeIterator *si = setTypeInitIterator(o);
+            char *str;
+            size_t len;
+            int64_t llele;
+            while (setTypeNext(si, &str, &len, &llele) != -1) live++;
+            setTypeReleaseIterator(si);
+            addReplyMapLen(c, 5);
+            addReplyBulkCString(c, "encoding");
+            addReplyBulkCString(c, strEncoding(objectGetEncoding(o)));
+            addReplyBulkCString(c, "physical");
+            addReplyLongLong(c, setTypeSize(o));
+            addReplyBulkCString(c, "volatile");
+            addReplyLongLong(c, setTypeVolatileCount(o));
+            addReplyBulkCString(c, "live");
+            addReplyLongLong(c, live);
+            addReplyBulkCString(c, "bytes");
+            if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK)
+                addReplyLongLong(c, lpBytes(objectGetVal(o)));
+            else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET)
+                addReplyLongLong(c, intsetBlobLen(objectGetVal(o)));
+            else
+                addReplyLongLong(c, hashtableMemUsage(objectGetVal(o)));
+        } else {
+            addReplySubcommandSyntaxError(c);
+        }
+#endif
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "change-repl-id") && c->argc == 2) {
         serverLog(LL_NOTICE, "Changing replication IDs after receiving DEBUG change-repl-id");
         changeReplicationId();

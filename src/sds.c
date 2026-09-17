@@ -38,6 +38,7 @@
 #include "sds.h"
 #include "sdsalloc.h"
 #include "util.h"
+#include "workctr.h"
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
@@ -160,7 +161,11 @@ sds sdswrite(char *buf, size_t bufsize, char type, const char *init, size_t init
         init = NULL;
     else if (!init)
         memset(s, 0, initlen);
-    if (initlen && init) memcpy(s, init, initlen);
+    if (initlen && init) {
+        WC_INC(sds_copies);
+        WC_ADD(sds_copy_bytes, initlen);
+        memcpy(s, init, initlen);
+    }
     s[initlen] = '\0';
     return s;
 }

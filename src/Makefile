@@ -136,6 +136,14 @@ ifeq ($(DEBUG_FORCE_DEFRAG), yes)
 	SERVER_CFLAGS +=-DHAVE_DEFRAG -DDEBUG_FORCE_DEFRAG
 endif
 
+# Test-only deterministic work counters (see workctr.h); never on by default.
+# .make-settings persists SERVER_CFLAGS, so drop the flag again unless asked for.
+ifeq ($(WORK_COUNTERS), yes)
+	SERVER_CFLAGS +=-DWORK_COUNTERS
+else
+	SERVER_CFLAGS := $(filter-out -DWORK_COUNTERS,$(SERVER_CFLAGS))
+endif
+
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(SERVER_CFLAGS) $(CPPFLAGS)
 FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(SERVER_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm
@@ -590,6 +598,7 @@ ENGINE_SERVER_OBJ = \
     valkey_strtod.o \
     vector.o \
     vset.o \
+    workctr.o \
     ziplist.o \
     zipmap.o \
     zmalloc.o \
@@ -622,6 +631,7 @@ ENGINE_CLI_OBJ = \
     util.o \
     valkey-cli.o \
     valkey_strtod.o \
+    workctr.o \
     zmalloc.o
 ENGINE_BENCHMARK_NAME=$(ENGINE_NAME)-benchmark$(PROG_SUFFIX)
 ENGINE_BENCHMARK_OBJ = \
@@ -649,6 +659,7 @@ ENGINE_BENCHMARK_OBJ = \
     valkey-benchmark.o \
     valkey-benchmark-dataset.o \
     valkey_strtod.o \
+    workctr.o \
     zmalloc.o
 ENGINE_CHECK_RDB_NAME=$(ENGINE_NAME)-check-rdb$(PROG_SUFFIX)
 ENGINE_CHECK_AOF_NAME=$(ENGINE_NAME)-check-aof$(PROG_SUFFIX)

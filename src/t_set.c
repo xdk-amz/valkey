@@ -391,7 +391,10 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
         } else {
             lpi = lpNext(lp, lpi);
         }
-        while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) lpi = lpNext(lp, lpi);
+        while (lpi != NULL && !setTypeListpackIsValidAt(lp, lpi)) {
+            WC_INC(set_lp_skipped_expired);
+            lpi = lpNext(lp, lpi);
+        }
         if (lpi == NULL) return -1;
         si->lpi = lpi;
         unsigned int l;
@@ -400,6 +403,7 @@ int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele) {
     } else {
         serverPanic("Wrong set encoding in setTypeNext");
     }
+    WC_INC(set_iter_next);
     return si->encoding;
 }
 
@@ -438,6 +442,7 @@ static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64
         for (int tries = 0; tries < 100; tries++) {
             hashtableFairRandomEntry(objectGetVal(setobj), &entry);
             if (!smemberIsExpired(entry)) break;
+            WC_INC(set_random_expired_seen);
             entry = NULL;
         }
         setTypeIgnoreTTL(setobj, false);
@@ -456,6 +461,7 @@ static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64
     size_t l;
     int64_t ll;
     int enc;
+    WC_INC(set_reservoir_passes);
     setTypeIterator *si = setTypeInitIterator(setobj);
     while ((enc = setTypeNext(si, &s, &l, &ll)) != -1) {
         if (rand() % ++seen == 0) {
@@ -485,6 +491,7 @@ static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64
  *
  * Returns -1 when the set has volatile members and none of them is live. */
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    WC_INC(set_random_calls);
     if (setTypeHasVolatileMembers(setobj)) return setTypeRandomLiveElement(setobj, str, len, llele);
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
         void *entry = NULL;
@@ -1052,6 +1059,7 @@ void spopWithCountCommand(client *c) {
          * the removals below invalidate the pointers the iterator handed out. */
         robj **selected = zmalloc(sizeof(robj *) * count);
         unsigned long seen = 0, held = 0;
+        WC_INC(set_reservoir_passes);
         setTypeIterator *si = setTypeInitIterator(set);
         while (setTypeNext(si, &str, &len, &llele) != -1) {
             unsigned long slot = held < count ? held : (unsigned long)rand() % (seen + 1);
@@ -1256,6 +1264,7 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
     unsigned long cap = count < size ? count : size;
     listpackEntry *res = zmalloc(sizeof(listpackEntry) * cap);
     unsigned long seen = 0, held = 0;
+    WC_INC(set_reservoir_passes);
     setTypeIterator *si = setTypeInitIterator(set);
     while (setTypeNext(si, &str, &len, &llele) != -1) {
         listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};

@@ -17,6 +17,11 @@ DEPENDS := $(patsubst %.cpp,%.d,$(SOURCES))
 
 # Inherit CFLAGS from parent Makefile
 TEST_CFLAGS := $(CFLAGS)
+# The work counters (src/workctr.h) change struct layouts only in the test-only
+# WORK_COUNTERS build; mirror the server's setting recorded in .make-settings.
+ifneq (,$(findstring -DWORK_COUNTERS,$(SERVER_CFLAGS)))
+	TEST_CFLAGS += -DWORK_COUNTERS
+endif
 
 # Hold new gtest test to a high standard
 # The -Wframe-larger-than cap must accommodate the compiler-generated static

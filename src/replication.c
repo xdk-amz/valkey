@@ -626,6 +626,7 @@ void feedReplicationBuffer(char *s, size_t len) {
     static long long repl_block_id = 0;
 
     if (server.repl_backlog == NULL) return;
+    WC_ADD(repl_bytes, len);
 
     clusterSlotStatsIncrNetworkBytesOutForReplication(len);
 

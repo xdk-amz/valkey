@@ -32,6 +32,8 @@ mstime_t smemberGetExpiry(const smember *m) {
 
 /* The sds header records only the space that follows the prefix. */
 smember *smemberCreate(const char *str, size_t len, mstime_t expiry) {
+    WC_INC(smember_created);
+    WC_ADD(smember_bytes, len);
     if (expiry == EXPIRY_NONE) return sdsnewlen(str, len);
 
     char type = sdsReqType(len);
