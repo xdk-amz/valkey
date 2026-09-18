@@ -209,3 +209,44 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         assert_equal {io-threads 5} [r config get io-threads]
     }
 }
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    proc fastpath_clients {} {
+        regexp {fastpath_clients:(\d+)} [r info fastpath] -> n
+        return $n
+    }
+    # The default test client selects db 9 first; SELECT leaves the fast path.
+    proc fastpath_client {} {
+        return [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+    }
+
+    # Clients typically open with a connectivity PING. It carries no key and
+    # used to hand the connection off to the main-thread path for good.
+    test {PING keeps a client on the fast path} {
+        set base [fastpath_clients]
+        set rd [fastpath_client]
+        assert_equal {PONG} [$rd ping]
+        assert_equal {hello} [$rd ping hello]
+        assert_equal {OK} [$rd set fpkey v]
+        assert_equal {v} [$rd get fpkey]
+        after 200
+        assert_equal [expr {$base + 1}] [fastpath_clients]
+        $rd close
+    }
+
+    # The parser accumulates the request byte count; the fast path never went
+    # through resetClient, so it grew for the life of the connection and every
+    # command was logged as a large request once it passed the threshold.
+    test {Fast-path commands do not accumulate into the large-request log} {
+        r config set commandlog-request-larger-than 200
+        r commandlog reset large-request
+        set rd [fastpath_client]
+        assert_equal {OK} [$rd set fpkey v]
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal {v} [$rd get fpkey]
+        }
+        assert_equal 0 [r commandlog len large-request]
+        $rd close
+        r config set commandlog-request-larger-than 1048576
+    }
+}

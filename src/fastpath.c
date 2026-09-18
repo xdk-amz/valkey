@@ -119,6 +119,7 @@ int fastpathAttach(client *c) {
 
 static int fpCommandAllowed(struct serverCommand *cmd) {
     if (!cmd) return 0; /* unknown command: the main path replies (and runs the host:/post check) */
+    if (cmd->proc == pingCommand) return 1; /* fast-path clients are never in pubsub mode */
     if (!(cmd->flags & (CMD_WRITE | CMD_READONLY))) return 0;
     if (cmd->flags & (CMD_BLOCKING | CMD_PUBSUB | CMD_ADMIN | CMD_NOSCRIPT | CMD_NO_MULTI | CMD_NO_ASYNC_LOADING |
                       CMD_ALLOW_BUSY | CMD_TOUCHES_ARBITRARY_KEYS))
@@ -190,6 +191,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             c->argv_len_sum = 0;
             c->parsed_cmd = NULL;
             c->read_flags = 0;
+            c->net_input_bytes_curr_cmd = 0; /* the parser accumulates; resetClient never runs for this client */
             if (t->cur->count >= max) fpSubmit(t);
         }
     } else if (c->read_flags & READ_FLAGS_ERROR_MASK) {
