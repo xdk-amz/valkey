@@ -371,6 +371,16 @@ start_server {tags {"setexpire"}} {
         assert_morethan [set_member_ttl r myset a] $::live_member_ttl
     }
 
+    test {SADDEX EX - an existing intset member receives the TTL} {
+        r FLUSHALL
+        use_set_encoding listpack
+        r SADD myset 1
+        assert_encoding intset myset
+        assert_equal 0 [r SADDEX myset EX $::live_member_ttl MEMBERS 1 1]
+        assert_encoding listpack myset
+        assert_morethan [set_member_ttl r myset 1] 0
+    }
+
     test {SADDEX EX - a past expiration removes existing members and adds none} {
         r FLUSHALL
         assert_equal 0 [r SADDEX myset EX 0 MEMBERS 1 a]
@@ -545,32 +555,29 @@ start_server {tags {"setexpire"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
-    test "SPOP without a count that pops nothing raises no mutation signal" {
+    test "SPOP without a count reclaims an all-expired set" {
         flush_and_disable_active_expiry
         r SADD myset a b c
         make_members_expired r myset {a b c}
-        assert_equal {{} 0 0} [capture_mutation_signals myset {
+        assert_equal {{{sexpired myset} {del myset}} 1 1} [capture_mutation_signals myset {
             assert_equal {} [r SPOP myset]
         }]
-        assert_equal 1 [r EXISTS myset]
-        assert_equal 3 [r SCARD myset]
+        assert_equal 0 [r EXISTS myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
-    test "SPOP with a count that pops nothing raises no mutation signal" {
+    test "SPOP with a count reclaims an all-expired set" {
         flush_and_disable_active_expiry
-        # Below SCARD, so the whole-set path that deletes the key is not taken.
         r SADD myset a b c
         make_members_expired r myset {a b c}
-        assert_equal {{} 0 0} [capture_mutation_signals myset {
+        assert_equal {{{sexpired myset} {del myset}} 1 1} [capture_mutation_signals myset {
             assert_equal {} [r SPOP myset 2]
         }]
-        assert_equal 1 [r EXISTS myset]
-        assert_equal 3 [r SCARD myset]
+        assert_equal 0 [r EXISTS myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
-    test "SPOP that pops a live member raises every mutation signal" {
+    test "SPOP reclaims expired members before popping a live member" {
         flush_and_disable_active_expiry
         r SADD myset a b c
         make_members_expired r myset {a b c}
@@ -579,14 +586,14 @@ start_server {tags {"setexpire"}} {
         set signals [capture_mutation_signals myset {
             assert {[lsearch -exact {live1 live2} [r SPOP myset]] != -1}
         }]
-        assert_equal {{spop myset}} [lindex $signals 0]
-        assert_equal 1 [lindex $signals 1]
+        assert_equal {{sexpired myset} {spop myset}} [lindex $signals 0]
+        assert_equal 4 [lindex $signals 1]
         assert_equal 1 [lindex $signals 2]
 
         set signals [capture_mutation_signals myset {
             assert {[lsearch -exact {live1 live2} [r SPOP myset 1]] != -1}
         }]
-        assert_equal {{spop myset}} [lindex $signals 0]
+        assert_equal {{spop myset} {del myset}} [lindex $signals 0]
         assert_equal 1 [lindex $signals 1]
         assert_equal 1 [lindex $signals 2]
         r DEBUG SET-ACTIVE-EXPIRE 1
@@ -883,8 +890,7 @@ start_server {tags {"setexpire"}} {
 
             set popped [r SPOP myset 8]
             assert_equal {m4 m5 m6 m7 m8 m9} [lsort $popped]
-            # PING detects an array length exceeding the returned element count.
-            assert_equal 4 [r SCARD myset]
+            assert_equal 0 [r EXISTS myset]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
@@ -897,31 +903,49 @@ start_server {tags {"setexpire"}} {
             assert_equal 3 [llength $popped]
             assert_equal 3 [llength [lsort -unique $popped]]
             assert_none_of $popped {m0 m1 m2 m3}
-            assert_equal 7 [r SCARD myset]
+            assert_equal 3 [r SCARD myset]
             assert_equal 3 [llength [r SMEMBERS myset]]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
-        test "SPOP on a set of only expired members returns nothing - $encoding" {
+        test "SPOP on a set of only expired members reclaims the key - $encoding" {
             flush_and_disable_active_expiry
             use_set_encoding $encoding
             r SADD myset a b c
             make_members_expired r myset {a b c}
             assert_equal 3 [r SCARD myset]
             assert_equal {} [r SPOP myset 2]
-            # The single-member form must reply nil promptly rather than loop
-            # looking for a live member.
+            assert_equal 0 [r EXISTS myset]
             assert_equal {} [r SPOP myset]
-            assert_equal 1 [r EXISTS myset]
-            assert_equal 3 [r SCARD myset]
             assert_equal {} [r SPOP myset 3]
-            # Selection hides expired members but does not reclaim them; active
-            # expiration remains responsible for physical removal.
-            assert_equal 1 [r EXISTS myset]
-            assert_equal 3 [r SCARD myset]
-            assert_equal {} [r SMEMBERS myset]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
+
+        test "SPOP with a huge count allocates by cardinality - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD myset live1 live2 live3 expired
+            make_members_expired r myset {expired}
+            assert_equal {live1 live2 live3} [lsort [r SPOP myset 1000000000]]
+            assert_equal 0 [r EXISTS myset]
+            assert_equal PONG [r PING]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        test "SPOP with a count untracks the last volatile member - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD myset plain1 plain2 volatile
+            assert_equal {1} [r SEXPIRE myset $::live_member_ttl MEMBERS 1 volatile]
+            for {set i 0} {$i < 100 && [r SISMEMBER myset volatile]} {incr i} {
+                set popped [lindex [r SPOP myset 1] 0]
+                if {$popped ne "volatile"} { r SADD myset $popped }
+            }
+            assert_equal 0 [r SISMEMBER myset volatile]
+            assert_equal 0 [get_keys_with_volatile_items r]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+            assert_equal PONG [r PING]
+        } {} {needs:debug}
 
         test "SPOP without a count never returns an expired member - $encoding" {
             flush_and_disable_active_expiry
@@ -1058,6 +1082,21 @@ start_server {tags {"setexpire"}} {
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
     }
+
+    test "SRANDMEMBER with a negative count samples the full population" {
+        flush_and_disable_active_expiry
+        use_set_encoding hashtable
+        set members {}
+        for {set i 0} {$i < 1500} {incr i} { lappend members m$i }
+        r SADD myset {*}$members expired
+        make_members_expired r myset {expired}
+
+        set got [r SRANDMEMBER myset -20000]
+        assert_equal 20000 [llength $got]
+        assert_none_of $got {expired}
+        assert {[llength [lsort -unique $got]] > 1200}
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
 
     test "SINTERSTORE with the destination equal to a volatile source" {
         flush_and_disable_active_expiry
@@ -1300,6 +1339,23 @@ start_server {tags {"setexpire external:skip"}} {
         close_replication_stream $repl
     }
 
+    test {SREM with expired and live arguments propagates only removed members} {
+        flush_and_disable_active_expiry
+        r SADD myset live expired keep
+        make_members_expired r myset {expired}
+        set repl [attach_to_replication_stream]
+
+        assert_equal 1 [r SREM myset live expired missing]
+        assert_replication_stream $repl {
+            {select *}
+            {srem myset live}
+        }
+        assert_equal {} [read_from_replication_stream $repl]
+        close_replication_stream $repl
+        assert_equal {keep} [r SMEMBERS myset]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
     test {SADD over an expired member propagates SREM before SADD} {
         flush_and_disable_active_expiry
         r SADD myset m1 keepme
@@ -1364,6 +1420,73 @@ start_server {tags {"setexpire external:skip"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
+    test {SADD replacement preserves the containing key TTL during replay} {
+        flush_and_disable_active_expiry
+        r SADD myset m1
+        r PEXPIRE myset 60000
+        make_members_expired r myset {m1}
+        set repl [attach_to_replication_stream]
+
+        assert_equal 1 [r SADD myset m1]
+        assert_replication_stream $repl {
+            {multi}
+            {select *}
+            {srem myset m1}
+            {sadd myset m1}
+            {pexpireat myset *}
+            {exec}
+        }
+        assert_equal {} [read_from_replication_stream $repl]
+        close_replication_stream $repl
+        assert_morethan [r PTTL myset] 0
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test {SADDEX KEEPTTL replacement preserves the containing key TTL during replay} {
+        flush_and_disable_active_expiry
+        r SADD myset m1
+        r PEXPIRE myset 60000
+        make_members_expired r myset {m1}
+        set repl [attach_to_replication_stream]
+
+        assert_equal 1 [r SADDEX myset KEEPTTL MEMBERS 1 m1]
+        assert_replication_stream $repl {
+            {multi}
+            {select *}
+            {srem myset m1}
+            {saddex myset KEEPTTL MEMBERS 1 m1}
+            {pexpireat myset *}
+            {exec}
+        }
+        assert_equal {} [read_from_replication_stream $repl]
+        close_replication_stream $repl
+        assert_morethan [r PTTL myset] 0
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test {SMOVE replacement preserves the destination key TTL during replay} {
+        flush_and_disable_active_expiry
+        r SADD src{t} m1
+        r SADD dst{t} m1
+        r PEXPIRE dst{t} 60000
+        make_members_expired r dst{t} {m1}
+        set repl [attach_to_replication_stream]
+
+        assert_equal 1 [r SMOVE src{t} dst{t} m1]
+        assert_replication_stream $repl {
+            {multi}
+            {select *}
+            {srem dst{t} m1}
+            {smove src{t} dst{t} m1}
+            {pexpireat dst{t} *}
+            {exec}
+        }
+        assert_equal {} [read_from_replication_stream $repl]
+        close_replication_stream $repl
+        assert_morethan [r PTTL dst{t}] 0
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
     test {Active expiry propagates one SREM per batch and no DEL while members remain} {
         r FLUSHALL
         r SADD myset keepme
@@ -1411,7 +1534,7 @@ start_server {tags {"setexpire external:skip"}} {
         close_replication_stream $repl
     }
 
-    test {SPOP with a count propagates only the popped members} {
+    test {SPOP with a count propagates reclaimed and popped members} {
         flush_and_disable_active_expiry
         r SADD myset live e1 e2
         make_members_expired r myset {e1 e2}
@@ -1419,13 +1542,16 @@ start_server {tags {"setexpire external:skip"}} {
         set repl [attach_to_replication_stream]
         assert_equal {live} [r SPOP myset 2]
 
-        # Expired members remain stored and keep the key alive.
         assert_replication_stream $repl {
+            {multi}
             {select *}
-            {srem myset live}
+            {srem myset e1 e2}
+            {unlink myset}
+            {exec}
         }
         assert_equal {} [read_from_replication_stream $repl]
         close_replication_stream $repl
+        assert_equal 0 [r EXISTS myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
@@ -1945,7 +2071,7 @@ tags {"aof external:skip"} {
                     r BGREWRITEAOF
                     waitForBgrewriteaof r
                     if {"$rdb_preamble" eq "no"} {
-                        validate_aof_content [get_base_aof_path r] 10 0 SREM
+                        validate_aof_content [get_base_aof_path r] 20 0 SREM
                     }
 
                     restart_server 0 true false
@@ -1956,6 +2082,42 @@ tags {"aof external:skip"} {
                         assert_equal -1 [set_member_ttl r myset p$i]
                     }
                     assert_equal 1 [get_keys_with_volatile_items r]
+                } {} {needs:debug}
+
+                test "SPOP keeps AOF framing valid, preamble $rdb_preamble - $encoding" {
+                    flush_and_disable_active_expiry
+                    use_set_encoding $encoding
+                    set long_expire [expr {[clock milliseconds] + 1000000000}]
+                    assert_equal 3 [r SADDEX myset PXAT $long_expire MEMBERS 3 a b c]
+                    assert_equal 1 [llength [r SPOP myset 1]]
+                    r SADD myset persistent
+                    set before [lsort [r SMEMBERS myset]]
+
+                    waitForBgrewriteaof r
+                    r BGREWRITEAOF
+                    waitForBgrewriteaof r
+                    restart_server 0 true false
+
+                    assert_equal $before [lsort [r SMEMBERS myset]]
+                    assert_equal -1 [set_member_ttl r myset persistent]
+                    assert_equal 1 [get_keys_with_volatile_items r]
+                } {} {needs:debug}
+
+                test "An expired-only AOF base preserves the key TTL for later writes, preamble $rdb_preamble - $encoding" {
+                    flush_and_disable_active_expiry
+                    use_set_encoding $encoding
+                    r SADD myset expired
+                    r PEXPIRE myset 600000
+                    make_members_expired r myset {expired}
+
+                    waitForBgrewriteaof r
+                    r BGREWRITEAOF
+                    waitForBgrewriteaof r
+                    r SADD myset persistent
+                    restart_server 0 true false
+
+                    assert_equal {persistent} [r SMEMBERS myset]
+                    assert_morethan [r PTTL myset] 0
                 } {} {needs:debug}
             }
         }

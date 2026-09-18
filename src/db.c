@@ -2106,6 +2106,16 @@ int propagateItemsDeletion(serverDb *db, robj *o, size_t n_items, robj *items[],
     return n_items;
 }
 
+void propagateCommandAndKeyExpiration(client *c, robj *key, mstime_t when) {
+    alsoPropagate(c->db->id, c->argv, c->argc, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+
+    robj *whenobj = createStringObjectFromLongLong(when);
+    robj *argv[] = {shared.pexpireat, key, whenobj};
+    alsoPropagate(c->db->id, argv, 3, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+    decrRefCount(whenobj);
+    preventCommandPropagation(c);
+}
+
 /* Replace a STORE command by DEL dst plus the stored members, so a replica cannot recompute
  * over members that were expired here. */
 void propagateStoreAsEffects(client *c, robj *dstkey, robj *dst) {

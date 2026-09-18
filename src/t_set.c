@@ -428,6 +428,12 @@ mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str) {
     }
 }
 
+static robj *setTypeReclaimExpiredMembers(client *c, robj *set) {
+    if (getExpirationPolicyWithFlags(0) != POLICY_DELETE_EXPIRED || !setTypeHasExpiredMembers(set)) return set;
+    dbReclaimExpiredItems(set, c->db, commandTimeSnapshot(), setTypeSize(set), c->slot);
+    return lookupKeyWrite(c->db, c->argv[1]);
+}
+
 /* Return a uniformly selected live member, or -1 if none exists. */
 static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
     if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
@@ -695,9 +701,11 @@ void saddCommand(client *c) {
         setTypeMaybeConvert(set, c->argc - 2);
     }
 
+    size_t original_size = setTypeSize(set);
+    mstime_t key_expire = objectGetExpire(set);
+    size_t num_expired = 0;
     if (setTypeHasVolatileMembers(set)) {
         robj **expired_members = NULL;
-        size_t num_expired = 0;
         for (j = 2; j < c->argc; j++) {
             bool replaced_expired = false;
             if (setTypeAddWithExpiry(set, objectGetVal(c->argv[j]), EXPIRY_NONE, SET_ADD_KEEP_EXPIRY, &replaced_expired, NULL))
@@ -728,6 +736,8 @@ void saddCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[1], c->db->id);
         server.dirty += added;
     }
+    if (num_expired == original_size && key_expire != EXPIRY_NONE)
+        propagateCommandAndKeyExpiration(c, c->argv[1], key_expire);
     addReplyLongLong(c, added);
 }
 
@@ -738,9 +748,22 @@ void sremCommand(client *c) {
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.czero)) == NULL || checkType(c, set, OBJ_SET)) return;
 
     bool was_volatile = setTypeHasVolatileMembers(set);
+    robj **prop_argv = NULL;
+    int prop_argc = 0;
     if (set->encoding == OBJ_ENCODING_HASHTABLE) hashtablePauseAutoShrink(objectGetVal(set));
     for (j = 2; j < c->argc; j++) {
         if (setTypeRemove(set, objectGetVal(c->argv[j]))) {
+            if (was_volatile) {
+                if (prop_argv == NULL) {
+                    prop_argv = zmalloc(sizeof(robj *) * c->argc);
+                    prop_argv[prop_argc++] = shared.srem;
+                    prop_argv[prop_argc++] = c->argv[1];
+                    incrRefCount(shared.srem);
+                    incrRefCount(c->argv[1]);
+                }
+                prop_argv[prop_argc++] = c->argv[j];
+                incrRefCount(c->argv[j]);
+            }
             deleted++;
             if (setTypeSize(set) == 0) {
                 if (was_volatile) dbUntrackKeyWithVolatileItems(c->db, set);
@@ -759,6 +782,14 @@ void sremCommand(client *c) {
         notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         server.dirty += deleted;
+    }
+    if (prop_argv != NULL) {
+        if (deleted != c->argc - 2) {
+            replaceClientCommandVector(c, prop_argc, prop_argv);
+        } else {
+            for (int i = 0; i < prop_argc; i++) decrRefCount(prop_argv[i]);
+            zfree(prop_argv);
+        }
     }
     addReplyLongLong(c, deleted);
 }
@@ -789,6 +820,8 @@ void smoveCommand(client *c) {
     mstime_t expiry = EXPIRY_NONE;
     bool src_volatile = setTypeHasVolatileMembers(srcset);
     if (src_volatile) setTypeGetExpiry(srcset, objectGetVal(ele), &expiry);
+    unsigned long dst_original_size = dstset ? setTypeSize(dstset) : 0;
+    mstime_t dst_key_expire = dstset ? objectGetExpire(dstset) : EXPIRY_NONE;
 
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset, objectGetVal(ele))) {
@@ -831,6 +864,8 @@ void smoveCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[2]);
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[2], c->db->id);
     }
+    if (replaced_expired && dst_original_size == 1 && dst_key_expire != EXPIRY_NONE)
+        propagateCommandAndKeyExpiration(c, c->argv[2], dst_key_expire);
     addReply(c, shared.cone);
 }
 
@@ -957,6 +992,12 @@ void spopWithCountCommand(client *c) {
         return;
     }
 
+    set = setTypeReclaimExpiredMembers(c, set);
+    if (set == NULL) {
+        addReply(c, shared.emptyset[c->resp]);
+        return;
+    }
+
     size = setTypeSize(set);
     bool volatile_set = setTypeHasVolatileMembers(set);
     bool has_expired = volatile_set && setTypeHasExpiredMembers(set);
@@ -999,6 +1040,7 @@ void spopWithCountCommand(client *c) {
     else
         addReplySetLen(c, count);
     unsigned long popped = 0;
+    bool set_replaced = false;
 
     /* Common iteration vars. */
     char *str;
@@ -1018,11 +1060,13 @@ void spopWithCountCommand(client *c) {
         unsigned char *lp = objectGetVal(set);
         unsigned char *p = lpFirst(lp);
         unsigned int index = 0;
+        unsigned long volatile_deleted = 0;
         unsigned char **ps = zmalloc(sizeof(char *) * count);
         for (unsigned long i = 0; i < count; i++) {
             p = lpNextRandom(lp, p, &index, count - i, 0);
             unsigned int len;
             str = (char *)lpGetValue(p, &len, (long long *)&llele);
+            if (setTypeListpackGetExpiry(lp, p) != EXPIRY_NONE) volatile_deleted++;
 
             if (str) {
                 addReplyBulkCBuffer(c, str, len);
@@ -1048,19 +1092,20 @@ void spopWithCountCommand(client *c) {
         lp = lpBatchDelete(lp, ps, count);
         zfree(ps);
         objectSetVal(set, lp);
+        if (volatile_deleted) listpackObjectUpdateVolatileCount(set, -(long)volatile_deleted);
         popped = count;
     } else if (has_expired) {
-        /* Hidden members are never reclaimed by selection. If bounded random
-         * retries need a fallback, select all requested live members in one
-         * reservoir pass for this command, then remove only those members. */
-        robj **selected = zmalloc(sizeof(robj *) * count);
+        /* Expiration-restricted contexts cannot reclaim hidden members. */
+        unsigned long cap = count < size ? count : size;
+        serverAssert(cap <= SIZE_MAX / sizeof(robj *));
+        robj **selected = zmalloc(sizeof(robj *) * cap);
         unsigned long seen = 0, held = 0;
         setTypeIterator *si = setTypeInitIterator(set);
         while (setTypeNext(si, &str, &len, &llele) != -1) {
-            unsigned long slot = held < count ? held : (unsigned long)rand() % (seen + 1);
+            unsigned long slot = held < cap ? held : (unsigned long)rand() % (seen + 1);
             seen++;
-            if (slot >= count) continue;
-            if (held < count)
+            if (slot >= cap) continue;
+            if (held < cap)
                 held++;
             else
                 decrRefCount(selected[slot]);
@@ -1114,12 +1159,14 @@ void spopWithCountCommand(client *c) {
             unsigned char *lp = objectGetVal(set);
             unsigned char *p = lpFirst(lp);
             unsigned int index = 0;
+            unsigned long volatile_moved = 0;
             unsigned char **ps = zmalloc(sizeof(char *) * remaining);
             for (unsigned long i = 0; i < remaining; i++) {
                 p = lpNextRandom(lp, p, &index, remaining - i, 0);
                 unsigned int len;
                 str = (char *)lpGetValue(p, &len, (long long *)&llele);
                 mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+                if (expiry != EXPIRY_NONE) volatile_moved++;
                 sds member = str ? sdsnewlen(str, len) : sdsfromlonglong(llele);
                 bool replaced = false;
                 setTypeAddWithExpiry(newset, member, expiry, 0, &replaced, NULL);
@@ -1131,6 +1178,7 @@ void spopWithCountCommand(client *c) {
             lp = lpBatchDelete(lp, ps, remaining);
             zfree(ps);
             objectSetVal(set, lp);
+            if (volatile_moved) listpackObjectUpdateVolatileCount(set, -(long)volatile_moved);
         } else {
             while (remaining--) {
                 int encoding = setTypeRandomElement(set, &str, &len, &llele);
@@ -1168,8 +1216,12 @@ void spopWithCountCommand(client *c) {
         setTypeReleaseIterator(si);
 
         /* Assign the new set as the key value. */
+        if (volatile_set) dbUntrackKeyWithVolatileItems(c->db, set);
         dbReplaceValue(c->db, c->argv[1], &newset);
+        set_replaced = true;
     }
+    if (!set_replaced && volatile_set && !setTypeHasVolatileMembers(set))
+        dbUpdateObjectWithVolatileItemsTracking(c->db, set);
     if (volatile_set) setDeferredSetLen(c, replylen, popped);
     server.dirty += popped;
 
@@ -1210,6 +1262,12 @@ void spopCommand(client *c) {
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
 
+    set = setTypeReclaimExpiredMembers(c, set);
+    if (set == NULL) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
+
     bool was_volatile = setTypeHasVolatileMembers(set);
     ele = setTypePopRandom(set);
     if (ele == NULL) {
@@ -1249,8 +1307,7 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
     size_t len;
     int64_t llele;
     unsigned long size = setTypeSize(set);
-    unsigned long cap = uniq ? (count < size ? count : size)
-                             : (count < SRANDFIELD_RANDOM_SAMPLE_LIMIT ? count : SRANDFIELD_RANDOM_SAMPLE_LIMIT);
+    unsigned long cap = uniq ? (count < size ? count : size) : size;
     if (cap == 0) {
         addReply(c, shared.emptyarray);
         return;
@@ -1285,6 +1342,7 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
             addReplyBulkCBuffer(c, res[idx].sval, res[idx].slen);
         else
             addReplyBulkLongLong(c, res[idx].lval);
+        if (!uniq && c->flag.close_asap) break;
     }
     zfree(res);
 }
@@ -1317,13 +1375,19 @@ void srandmemberWithCountCommand(client *c) {
     }
 
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.emptyarray)) == NULL || checkType(c, set, OBJ_SET)) return;
-    size = setTypeSize(set);
 
     /* If count is zero, serve it ASAP to avoid special cases later. */
     if (count == 0) {
         addReply(c, shared.emptyarray);
         return;
     }
+
+    set = setTypeReclaimExpiredMembers(c, set);
+    if (set == NULL) {
+        addReply(c, shared.emptyarray);
+        return;
+    }
+    size = setTypeSize(set);
 
     if (setTypeHasExpiredMembers(set)) {
         srandmemberWithCountFromVolatileSet(c, set, count, uniq);
@@ -1514,6 +1578,12 @@ void srandmemberCommand(client *c) {
 
     /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET)) return;
+
+    set = setTypeReclaimExpiredMembers(c, set);
+    if (set == NULL) {
+        addReply(c, shared.null[c->resp]);
+        return;
+    }
 
     if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
         addReply(c, shared.null[c->resp]);

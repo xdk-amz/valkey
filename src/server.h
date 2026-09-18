@@ -3787,6 +3787,7 @@ expiryModificationResult setTypeSetExpiry(robj *o, sds member, mstime_t expiry, 
 #define SET_ADD_KEEP_EXPIRY (1 << 0)
 #define SET_ADD_USE_INSERT_POSITION (1 << 1)
 int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags, bool *replaced_expired, bool *ttl_changed);
+void setTypeUpdateHashtableMemberExpiry(robj *o, hashtable *ht, smember *m, mstime_t current, mstime_t expiry);
 
 /* Hash data type */
 #define HASH_SET_TAKE_FIELD (1 << 0)
@@ -3956,6 +3957,7 @@ void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
 void propagateStoreAsEffects(client *c, robj *dstkey, robj *dst);
 int propagateItemsDeletion(serverDb *db, robj *o, size_t n_items, robj *items[], int slot);
+void propagateCommandAndKeyExpiration(client *c, robj *key, mstime_t when);
 
 /* Membership test for db->keys_with_volatile_items. */
 static inline bool objectHasVolatileItems(robj *o) {

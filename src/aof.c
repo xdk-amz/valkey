@@ -1979,7 +1979,6 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
         setTypeInitVolatileIterator(o, &iter);
         while (setTypeNextVolatile(&iter, &member)) {
             mstime_t expiry = smemberGetExpiry(member);
-            if (timestampIsExpired(expiry)) continue;
             if (!rioWriteBulkCount(r, '*', 7) || !rioWriteBulkString(r, "SADDEX", 6) ||
                 !rioWriteBulkObject(r, key) || !rioWriteBulkString(r, "PXAT", 4) ||
                 !rioWriteBulkLongLong(r, expiry) || !rioWriteBulkString(r, "MEMBERS", 7) ||
@@ -1990,6 +1989,7 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
         }
         setTypeResetVolatileIterator(&iter);
     } else if (volatile_set) {
+        setTypeIgnoreTTL(o, true);
         si = setTypeInitIterator(o);
         while (setTypeNext(si, &str, &len, &llval) != -1) {
             mstime_t expiry = setTypeCurrentExpiry(si, str);
@@ -2000,10 +2000,12 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
                 !rioWriteBulkLongLong(r, 1) ||
                 !(str ? rioWriteBulkString(r, str, len) : rioWriteBulkLongLong(r, llval))) {
                 setTypeReleaseIterator(si);
+                setTypeIgnoreTTL(o, false);
                 return 0;
             }
         }
         setTypeReleaseIterator(si);
+        setTypeIgnoreTTL(o, false);
     }
 
     si = setTypeInitIterator(o);

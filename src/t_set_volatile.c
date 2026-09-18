@@ -325,7 +325,7 @@ static void setTypeAddNewWithExpiry(robj *o, sds member, mstime_t expiry) {
     if (expiry != EXPIRY_NONE) setTypeTrackMember(o, m);
 }
 
-static void setTypeUpdateHashtableMemberExpiry(robj *o, hashtable *ht, smember *m, mstime_t current, mstime_t expiry) {
+void setTypeUpdateHashtableMemberExpiry(robj *o, hashtable *ht, smember *m, mstime_t current, mstime_t expiry) {
     if (current == expiry) return;
 
     if (expiry == EXPIRY_NONE) {
@@ -418,9 +418,14 @@ int setTypeAddWithExpiry(robj *o, sds member, mstime_t expiry, int flags, bool *
         return 1;
     }
 
-    /* Intsets cannot carry TTLs. A live member is a no-op; an absent member is
-     * inserted by the existing conversion-aware path. */
-    if (setTypeIsMember(o, member)) return 0;
+    /* Intsets cannot carry TTLs. Convert only when an existing member's TTL changes. */
+    if (setTypeIsMember(o, member)) {
+        if (!(flags & SET_ADD_KEEP_EXPIRY) && expiry != EXPIRY_NONE) {
+            serverAssert(setTypeSetExpiry(o, member, expiry, 0) == EXPIRATION_MODIFICATION_SUCCESSFUL);
+            if (ttl_changed) *ttl_changed = true;
+        }
+        return 0;
+    }
     setTypeAddNewWithExpiry(o, member, expiry);
     return 1;
 }
