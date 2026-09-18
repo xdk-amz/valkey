@@ -316,7 +316,7 @@ tags {"check-rdb network external:skip logreqres:skip"} {
             } result]
             assert_equal 0 $failed
             assert_match {*RDB looks OK!*} $result
-            assert_match "*db.9.type.set.keys.total:1*" $result
+            assert {[regexp -lineanchor {^\[info\] db\.9\.type\.set\.keys\.total:1$} $result]}
         }
     }
 }

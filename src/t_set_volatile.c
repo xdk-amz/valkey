@@ -107,6 +107,10 @@ bool setTypeHasExpiredMembers(robj *o) {
     if (!setTypeHasVolatileMembers(o) || getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE) return false;
 
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        /* A lower bound: a bucketed index only knows the start of the time
+         * window holding its earliest deadline, so this answers true for the
+         * rest of that window. Every caller that may not miss a hidden member
+         * gates on it, which forbids the opposite error. */
         mstime_t earliest = vsetEstimatedEarliestExpiry(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc);
         return timestampIsExpired(earliest);
     }

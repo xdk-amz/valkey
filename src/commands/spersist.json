@@ -3,7 +3,7 @@
         "summary": "Removes expiration times from set members.",
         "complexity": "O(N) where N is the number of specified members.",
         "group": "set",
-        "since": "9.2.0",
+        "since": "9.3.0",
         "arity": -5,
         "function": "spersistCommand",
         "command_flags": [

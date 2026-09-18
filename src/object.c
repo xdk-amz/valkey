@@ -783,6 +783,7 @@ void decrRefCount(robj *o) {
             case OBJ_HASH: freeHashObject(o); break;
             case OBJ_MODULE: freeModuleObject(o); break;
             case OBJ_STREAM: freeStreamObject(o); break;
+            case OBJ_PATH_HASH: freePathHashObject(o); break;
             default: serverPanic("Unknown object type"); break;
             }
         }
@@ -1322,6 +1323,7 @@ char *strEncoding(int encoding) {
     case OBJ_ENCODING_BTREE: return "btree";
     case OBJ_ENCODING_EMBSTR: return "embstr";
     case OBJ_ENCODING_STREAM: return "stream";
+    case OBJ_ENCODING_PATH_HASH: return "pathhash";
     default: return "unknown";
     }
 }
@@ -1374,7 +1376,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
-            if (vsetIsValid(volatile_members)) asize += vsetMemUsage(volatile_members);
+            if (vsetIsValid(volatile_members)) asize += vsetMemUsage(volatile_members, sample_size);
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
             asize += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
@@ -1420,7 +1422,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
-            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields);
+            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields, sample_size);
         } else {
             serverPanic("Unknown hash encoding");
         }
@@ -1495,6 +1497,8 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             raxStop(&ri);
             if (samples) asize += (double)elesize / samples * raxSize(s->cgroups);
         }
+    } else if (objectGetType(o) == OBJ_PATH_HASH) {
+        asize += pathHashTypeMemUsage(o, sample_size);
     } else if (objectGetType(o) == OBJ_MODULE) {
         asize += moduleGetMemUsage(key, o, sample_size, dbid);
     } else {

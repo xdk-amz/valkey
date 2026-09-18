@@ -3,7 +3,7 @@
         "summary": "Returns the remaining time to live in milliseconds of a set key's member(s) that have an associated expiration.",
         "complexity": "O(N) where N is the number of specified members.",
         "group": "set",
-        "since": "9.2.0",
+        "since": "9.3.0",
         "arity": -5,
         "function": "spttlCommand",
         "command_flags": [

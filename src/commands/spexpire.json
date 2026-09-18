@@ -3,7 +3,7 @@
         "summary": "Sets the expiration time of set members in milliseconds.",
         "complexity": "O(N) where N is the number of specified members.",
         "group": "set",
-        "since": "9.2.0",
+        "since": "9.3.0",
         "arity": -6,
         "function": "spexpireCommand",
         "command_flags": [

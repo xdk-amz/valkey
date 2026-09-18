@@ -3,7 +3,7 @@
         "summary": "Adds one or more members to a set and optionally sets their expiration time.",
         "complexity": "O(N) where N is the number of specified members.",
         "group": "set",
-        "since": "9.2.0",
+        "since": "9.3.0",
         "arity": -5,
         "function": "saddexCommand",
         "command_flags": [

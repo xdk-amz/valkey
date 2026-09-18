@@ -573,6 +573,7 @@ ENGINE_SERVER_OBJ = \
     syscheck.o \
     t_hash.o \
     t_list.o \
+    t_path_hash.o \
     t_set.o \
     t_set_expire.o \
     t_set_volatile.o \

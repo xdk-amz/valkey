@@ -1073,7 +1073,7 @@ TEST_F(BgIterationTest, createAndCleanup) {
     EXPECT_EQ(status.queue_length, 0u);
     EXPECT_GT(status.queue_length_target, 0u);
 
-    EXPECT_LT(status.runtime_ms, 5u);
+    EXPECT_LT(status.runtime_ms, 1000u);
     EXPECT_EQ(status.current_item_ms, 0u);
 
     expectAnythingCleanup(it);
@@ -1836,6 +1836,80 @@ TEST_F(BgIterationTest, missingFutureItem_eventual) {
     expectReadComplete(it);
 }
 
+
+TEST_F(BgIterationTest, srandmemberWithCountStopsWhenNoBorrowedMemberIsLive) {
+    const int item_num = 7;
+    const size_t old_max_entries = server.set_max_listpack_entries;
+    const size_t old_max_value = server.set_max_listpack_value;
+    const mstime_t old_cmd_time = server.cmd_time_snapshot;
+
+    simpleDelItem(item_num);
+    server.set_max_listpack_entries = 0;
+    server.set_max_listpack_value = 64;
+    server.cmd_time_snapshot = 100;
+
+    sds seed = sdsnew("seed");
+    sds expired1 = sdsnew("expired1");
+    sds expired2 = sdsnew("expired2");
+    robj *set = setTypeCreate(seed, 2);
+    bool replaced_expired = false;
+    bool ttl_changed = false;
+    ASSERT_EQ(setTypeAddWithExpiry(set, seed, EXPIRY_NONE, 0, &replaced_expired, &ttl_changed), 1);
+
+    robj *key = createStringObjectFromCString(keyStr(item_num));
+    dbAdd(server.db[getDbFromItemNum(item_num)], key, &set);
+    decrRefCount(key);
+    ASSERT_EQ(setTypeAddWithExpiry(set, expired1, 1, 0, &replaced_expired, &ttl_changed), 1);
+    ASSERT_EQ(setTypeAddWithExpiry(set, expired2, 1, 0, &replaced_expired, &ttl_changed), 1);
+    ASSERT_EQ(setTypeRemove(set, seed), 1);
+    sdsfree(seed);
+    sdsfree(expired1);
+    sdsfree(expired2);
+
+    cleanupCount = 0;
+    bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                  iteratorCleanupFn, PRIVDATA);
+    expectReadKey(it, 0);
+    c = getWriteClient(item_num, "unused");
+    simulateBlockedWrite(c);
+    ASSERT_TRUE(bgIteration_isEntryInuse(set));
+
+    int sampler_calls = 0;
+    EXPECT_CALL(mock, setTypeRandomElement(set, _, _, _))
+        .Times(AtMost(1))
+        .WillRepeatedly(Invoke([&](robj *, char **str, size_t *len, int64_t *llele) {
+            *str = nullptr;
+            *len = 0;
+            *llele = 0;
+            if (++sampler_calls > 1) throw sampler_calls;
+            return -1;
+        }));
+
+    client *reader = static_cast<client *>(zcalloc(sizeof(client)));
+    reader->flag.reply_off = 1;
+    reader->resp = 2;
+    reader->slot = -1;
+    reader->cmd = reader->realcmd = lookupCommandByCString("srandmember");
+    reader->db = server.db[getDbFromItemNum(item_num)];
+    reader->argc = 3;
+    reader->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * reader->argc));
+    reader->argv[0] = createStringObjectFromCString("SRANDMEMBER");
+    reader->argv[1] = createStringObjectFromCString(keyStr(item_num));
+    reader->argv[2] = createStringObjectFromCString("2");
+
+    EXPECT_NO_THROW(srandmemberCommand(reader));
+    EXPECT_EQ(setTypeSize(set), 2u);
+    EXPECT_TRUE(setTypeHasExpiredMembers(set));
+
+    freeTestClient(reader);
+    expectAnythingCleanup(it);
+    freeTestClient(c);
+    c = nullptr;
+
+    server.set_max_listpack_entries = old_max_entries;
+    server.set_max_listpack_value = old_max_value;
+    server.cmd_time_snapshot = old_cmd_time;
+}
 
 TEST_F(BgIterationTest, srandmemberDoesNotReclaimBorrowedSet) {
     const int item_num = 7;

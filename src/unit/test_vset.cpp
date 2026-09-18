@@ -236,10 +236,10 @@ TEST_F(VsetTest, TestVsetGetSize) {
  * encoding: NONE, SINGLE, VECTOR, and RAX (both a single time-bucket and
  * multiple time-buckets).
  *
- * Note on RAX: the estimate is the timestamp of the earliest time-bucket
- * (the entry's expiry rounded up to a bucket-interval boundary), not the
- * exact entry expiry. raxSeek("^") already positions the iterator on the
- * smallest key and populates it.key, so the RAX case reads the earliest
+ * Note on RAX: the estimate is the start of the earliest time-bucket's window
+ * (the bucket key rounds the entry's expiry up to a bucket-interval boundary),
+ * not the exact entry expiry. raxSeek("^") already positions the iterator on
+ * the smallest key and populates it.key, so the RAX case reads the earliest
  * bucket directly.
  *
  * A top-level HT bucket is intentionally not tested: vsetAddEntry() always
@@ -295,10 +295,10 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
 
     /* --- VSET_BUCKET_RAX, single time-bucket: > 127 entries with the same
      * expiry force a vector -> RAX conversion (one HT sub-bucket). The
-     * estimate is the earliest bucket's timestamp: the bucket key rounds the
-     * expiry up to a bucket-interval boundary, so it lies in
-     * [expiry, expiry + BUCKET_MAX]. With the raxNext() bug it instead reads
-     * an unpopulated key (typically 0), which fails the lower bound. --- */
+     * estimate is the start of the earliest bucket's window: the bucket key
+     * rounds the expiry up to a bucket-interval boundary, so the window start
+     * lies in (expiry - BUCKET_MAX, expiry]. With the raxNext() bug it instead
+     * reads an unpopulated key (typically 0), which fails the lower bound. --- */
     {
         vset set;
         vsetInit(&set);
@@ -312,8 +312,8 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
             ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries[i]));
         }
         long long est = vsetEstimatedEarliestExpiry(&set, mockGetExpiry);
-        ASSERT_GE(est, expiry);
-        ASSERT_LE(est, expiry + BUCKET_MAX);
+        ASSERT_GT(est, expiry - BUCKET_MAX);
+        ASSERT_LE(est, expiry);
         vsetRelease(&set);
         for (int i = 0; i < n; i++) mockFreeEntry(entries[i]);
     }
@@ -347,8 +347,8 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
         }
         long long est = vsetEstimatedEarliestExpiry(&set, mockGetExpiry);
         /* Must reflect the early bucket, not the late one. */
-        ASSERT_GE(est, early);
-        ASSERT_LE(est, early + BUCKET_MAX);
+        ASSERT_GT(est, early - BUCKET_MAX);
+        ASSERT_LE(est, early);
         ASSERT_LT(est, late);
         vsetRelease(&set);
         for (int i = 0; i < idx; i++) mockFreeEntry(entries[i]);
@@ -809,15 +809,15 @@ TEST_F(VsetTest, TestVsetMemUsage) {
 
     /* NONE: memory usage should be 0 */
     vsetInit(&set);
-    ASSERT_EQ(vsetMemUsage(&set), 0u);
+    ASSERT_EQ(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     /* SINGLE: memory usage should be 0 (entry pointer stored inline) */
     insert_mock_entry_with_expiry(&set, 100);
-    ASSERT_EQ(vsetMemUsage(&set), 0u);
+    ASSERT_EQ(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     /* VECTOR: second entry forces SINGLE → VECTOR, memory now non-zero */
     insert_mock_entry_with_expiry(&set, 200);
-    ASSERT_GT(vsetMemUsage(&set), 0u);
+    ASSERT_GT(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     vsetRelease(&set);
 
@@ -828,8 +828,10 @@ TEST_F(VsetTest, TestVsetMemUsage) {
     for (int i = 0; i < 200; i++) {
         insert_mock_entry_with_expiry(&set, 1000LL);
     }
-    size_t mem_one_bucket = vsetMemUsage(&set);
+    size_t mem_one_bucket = vsetMemUsage(&set, SIZE_MAX);
     ASSERT_GT(mem_one_bucket, 0u);
+    /* The estimate scales one sampled bucket by the bucket count. */
+    ASSERT_EQ(vsetMemUsage(&set, 1), mem_one_bucket);
     vsetRelease(&set);
 
     /* RAX with multiple buckets: spread entries across many time windows
@@ -839,7 +841,7 @@ TEST_F(VsetTest, TestVsetMemUsage) {
         long long expiry = 1000LL + i * 10000LL;
         insert_mock_entry_with_expiry(&set, expiry);
     }
-    size_t mem_multi_bucket = vsetMemUsage(&set);
+    size_t mem_multi_bucket = vsetMemUsage(&set, SIZE_MAX);
     ASSERT_GT(mem_multi_bucket, 0u);
     ASSERT_GT(mem_multi_bucket, mem_one_bucket);
 

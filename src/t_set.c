@@ -429,34 +429,69 @@ mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str) {
     }
 }
 
-static robj *setTypeReclaimExpiredMembers(client *c, robj *set) {
-    if (getExpirationPolicyWithFlags(0) != POLICY_DELETE_EXPIRED ||
-        bgIteration_isEntryInuse(set) ||
-        !setTypeHasExpiredMembers(set))
-        return set;
-    dbReclaimExpiredItems(set, c->db, commandTimeSnapshot(), setTypeSize(set), c->slot);
-    return lookupKeyWrite(c->db, c->argv[1]);
+/* Draws a single-member request may spend on rejection sampling before reading
+ * the live members with one pass instead. */
+#define SET_LIVE_PROBE_LIMIT 100
+
+/* Draws each member of a multi-member request contributes to that request's
+ * rejection-sampling budget. */
+#define SET_LIVE_PROBES_PER_MEMBER 8
+
+/* Rejection-sample a live member, spending at most '*probes' draws and
+ * deducting the ones it spent. Returns NULL when no draw landed on a live
+ * member, which is also the answer for a set with no live member and for the
+ * encodings without O(1) random access, whose callers pass over the set
+ * instead. */
+static void *setTypeProbeLiveMember(robj *setobj, unsigned long *probes) {
+    if (setobj->encoding != OBJ_ENCODING_HASHTABLE) return NULL;
+
+    /* Bracketed: under the validating type hashtableFairRandomEntry loops until it has sampled
+     * enough live members, forever when fewer remain than its sample size. */
+    void *entry = NULL;
+    setTypeIgnoreTTL(setobj, true);
+    while (*probes > 0) {
+        (*probes)--;
+        hashtableFairRandomEntry(objectGetVal(setobj), &entry);
+        if (!smemberIsExpired(entry)) break;
+        entry = NULL;
+    }
+    setTypeIgnoreTTL(setobj, false);
+    return entry;
+}
+
+/* Copy up to 'cap' live members into 'entries', reservoir sampling so the copy
+ * is a uniform sample of them when the set holds more. Returns how many it
+ * copied. The members are borrowed from the set, so the caller must not mutate
+ * it before it is done with them. */
+static unsigned long setTypeSampleLiveMembers(robj *set, listpackEntry *entries, unsigned long cap) {
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long seen = 0, held = 0;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};
+        if (held < cap) {
+            entries[held++] = e;
+        } else {
+            unsigned long r = (unsigned long)rand() % (seen + 1);
+            if (r < cap) entries[r] = e;
+        }
+        seen++;
+    }
+    setTypeReleaseIterator(si);
+    return held;
 }
 
 /* Return a uniformly selected live member, or -1 if none exists. */
 static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
-    if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
-        /* Bracketed: under the validating type hashtableFairRandomEntry loops until it has sampled
-         * enough live members, forever when fewer remain than its sample size. */
-        void *entry = NULL;
-        setTypeIgnoreTTL(setobj, true);
-        for (int tries = 0; tries < 100; tries++) {
-            hashtableFairRandomEntry(objectGetVal(setobj), &entry);
-            if (!smemberIsExpired(entry)) break;
-            entry = NULL;
-        }
-        setTypeIgnoreTTL(setobj, false);
-        if (entry != NULL) {
-            *str = entry;
-            *len = sdslen((sds)entry);
-            *llele = -123456789; /* Not needed. Defensive. */
-            return OBJ_ENCODING_HASHTABLE;
-        }
+    unsigned long probes = SET_LIVE_PROBE_LIMIT;
+    void *entry = setTypeProbeLiveMember(setobj, &probes);
+    if (entry != NULL) {
+        *str = entry;
+        *len = sdslen((sds)entry);
+        *llele = -123456789; /* Not needed. Defensive. */
+        return OBJ_ENCODING_HASHTABLE;
     }
 
     /* Reservoir sampling preserves uniformity when expired members are dense. */
@@ -996,12 +1031,6 @@ void spopWithCountCommand(client *c) {
         return;
     }
 
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.emptyset[c->resp]);
-        return;
-    }
-
     size = setTypeSize(set);
     bool volatile_set = setTypeHasVolatileMembers(set);
     bool has_expired = volatile_set && setTypeHasExpiredMembers(set);
@@ -1098,37 +1127,57 @@ void spopWithCountCommand(client *c) {
         objectSetVal(set, lp);
         if (volatile_deleted) listpackObjectUpdateVolatileCount(set, -(long)volatile_deleted);
         popped = count;
-    } else if (has_expired) {
-        /* Expiration-restricted contexts cannot reclaim hidden members. */
-        unsigned long cap = count < size ? count : size;
-        serverAssert(cap <= SIZE_MAX / sizeof(robj *));
-        robj **selected = zmalloc(sizeof(robj *) * cap);
-        unsigned long seen = 0, held = 0;
-        setTypeIterator *si = setTypeInitIterator(set);
-        while (setTypeNext(si, &str, &len, &llele) != -1) {
-            unsigned long slot = held < cap ? held : (unsigned long)rand() % (seen + 1);
-            seen++;
-            if (slot >= cap) continue;
-            if (held < cap)
-                held++;
-            else
-                decrRefCount(selected[slot]);
-            selected[slot] = str ? createStringObject(str, len) : createStringObjectFromLongLong(llele);
-        }
-        setTypeReleaseIterator(si);
-
-        for (unsigned long i = 0; i < held; i++) {
-            serverAssert(setTypeRemove(set, objectGetVal(selected[i])));
-            addReplyBulk(c, selected[i]);
-            propargv[propindex++] = selected[i];
+    } else if (has_expired && remaining > count / SPOP_MOVE_STRATEGY_MUL) {
+        /* Hidden members must survive the command, so every pop has to land on a
+         * live member. Probing for one costs what the request pays for; only a
+         * set dense enough in hidden members to exhaust that budget reads its
+         * live members with a pass. */
+        unsigned long probes = count > ULONG_MAX / SET_LIVE_PROBES_PER_MEMBER
+                                   ? ULONG_MAX
+                                   : count * SET_LIVE_PROBES_PER_MEMBER;
+        if (probes > size) probes = size;
+        while (popped < count) {
+            void *entry = setTypeProbeLiveMember(set, &probes);
+            if (entry == NULL) break;
+            robj *member = createStringObject(entry, sdslen((sds)entry));
+            serverAssert(setTypeRemove(set, objectGetVal(member)));
+            addReplyBulk(c, member);
+            propargv[propindex++] = member;
+            popped++;
             if (propindex == 2 + batchsize) {
                 alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
                 for (unsigned long j = 2; j < propindex; j++) decrRefCount(propargv[j]);
                 propindex = 2;
             }
         }
-        popped = held;
-        zfree(selected);
+
+        unsigned long left = count - popped;
+        if (left > 0) {
+            unsigned long cap = left < setTypeSize(set) ? left : setTypeSize(set);
+            listpackEntry *sampled = zmalloc(sizeof(listpackEntry) * cap);
+            unsigned long held = setTypeSampleLiveMembers(set, sampled, cap);
+            /* The members are borrowed from the set, so copy them all before the
+             * first removal invalidates the rest. */
+            robj **selected = zmalloc(sizeof(robj *) * held);
+            for (unsigned long i = 0; i < held; i++) {
+                selected[i] = sampled[i].sval ? createStringObject((char *)sampled[i].sval, sampled[i].slen)
+                                              : createStringObjectFromLongLong(sampled[i].lval);
+            }
+            zfree(sampled);
+
+            for (unsigned long i = 0; i < held; i++) {
+                serverAssert(setTypeRemove(set, objectGetVal(selected[i])));
+                addReplyBulk(c, selected[i]);
+                propargv[propindex++] = selected[i];
+                if (propindex == 2 + batchsize) {
+                    alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+                    for (unsigned long j = 2; j < propindex; j++) decrRefCount(propargv[j]);
+                    propindex = 2;
+                }
+            }
+            popped += held;
+            zfree(selected);
+        }
     } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count) {
         for (unsigned long i = 0; i < count; i++) {
             propargv[propindex] = setTypePopRandom(set);
@@ -1156,8 +1205,56 @@ void spopWithCountCommand(client *c) {
          * release it. */
         robj *newset = NULL;
 
+        /* A volatile set's physical remainder includes hidden members that must
+         * survive. Move the live remainder selected by CASE 3 and every hidden
+         * member into the replacement set, leaving only returned live members
+         * in the old set for the common reply/propagation loop below. */
+        if (has_expired) {
+            unsigned long live_size = 0;
+            setTypeIterator *si = setTypeInitIterator(set);
+            while (setTypeNext(si, &str, &len, &llele) != -1) live_size++;
+            setTypeReleaseIterator(si);
+
+            unsigned long remaining_live = live_size > count ? live_size - count : 0;
+            newset = createSetListpackObject();
+            while (remaining_live--) {
+                int encoding = setTypeRandomElement(set, &str, &len, &llele);
+                serverAssert(encoding != -1);
+                robj *member = str ? createStringObject(str, len) : createStringObjectFromLongLong(llele);
+                mstime_t expiry;
+                serverAssert(setTypeGetExpiry(set, objectGetVal(member), &expiry) == C_OK);
+                setTypeAddWithExpiry(newset, objectGetVal(member), expiry, 0, NULL, NULL);
+                serverAssert(setTypeRemove(set, objectGetVal(member)));
+                decrRefCount(member);
+            }
+
+            unsigned long hidden_count = size - live_size;
+            robj **hidden = zmalloc(sizeof(robj *) * hidden_count);
+            mstime_t *hidden_expiries = zmalloc(sizeof(mstime_t) * hidden_count);
+            unsigned long hidden_index = 0;
+            setTypeIgnoreTTL(set, true);
+            si = setTypeInitIterator(set);
+            while (setTypeNext(si, &str, &len, &llele) != -1) {
+                mstime_t expiry = setTypeCurrentExpiry(si, str);
+                if (expiry != EXPIRY_NONE && timestampIsExpired(expiry)) {
+                    hidden[hidden_index] = str ? createStringObject(str, len) : createStringObjectFromLongLong(llele);
+                    hidden_expiries[hidden_index++] = expiry;
+                }
+            }
+            setTypeReleaseIterator(si);
+            serverAssert(hidden_index == hidden_count);
+            for (unsigned long i = 0; i < hidden_count; i++) {
+                setTypeAddWithExpiry(newset, objectGetVal(hidden[i]), hidden_expiries[i], 0, NULL, NULL);
+                serverAssert(setTypeRemove(set, objectGetVal(hidden[i])));
+                decrRefCount(hidden[i]);
+            }
+            setTypeIgnoreTTL(set, false);
+            zfree(hidden_expiries);
+            zfree(hidden);
+        }
+
         /* Create a new set with just the remaining elements. */
-        if (set->encoding == OBJ_ENCODING_LISTPACK && !has_expired) {
+        else if (set->encoding == OBJ_ENCODING_LISTPACK) {
             /* Specialized case for listpack. Traverse it only once. */
             newset = createSetListpackObject();
             unsigned char *lp = objectGetVal(set);
@@ -1224,7 +1321,12 @@ void spopWithCountCommand(client *c) {
         dbReplaceValue(c->db, c->argv[1], &newset);
         set_replaced = true;
     }
-    if (!set_replaced && volatile_set && !setTypeHasVolatileMembers(set))
+    /* Popping every live member of a set whose index only reported its hidden
+     * members as possible empties it, which no key may be left as. */
+    bool set_emptied = !set_replaced && setTypeSize(set) == 0;
+    if (set_emptied)
+        dbDelete(c->db, c->argv[1]);
+    else if (!set_replaced && volatile_set && !setTypeHasVolatileMembers(set))
         dbUpdateObjectWithVolatileItemsTracking(c->db, set);
     if (volatile_set) setDeferredSetLen(c, replylen, popped);
     server.dirty += popped;
@@ -1246,6 +1348,7 @@ void spopWithCountCommand(client *c) {
     preventCommandPropagation(c);
     if (popped) {
         notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        if (set_emptied) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         signalModifiedKey(c, c->db, c->argv[1]);
     }
 }
@@ -1265,12 +1368,6 @@ void spopCommand(client *c) {
      * indeed a set */
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
-
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.null[c->resp]);
-        return;
-    }
 
     bool was_volatile = setTypeHasVolatileMembers(set);
     ele = setTypePopRandom(set);
@@ -1305,60 +1402,102 @@ void spopCommand(client *c) {
  * the number of randoms per time. */
 #define SRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
 
-/* setTypeSize() counts expired members and a random position may hold one, so the plain samplers do not apply. */
-static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
-    char *str;
-    size_t len;
-    int64_t llele;
-    unsigned long size = setTypeSize(set);
-    unsigned long cap = uniq ? (count < size ? count : size) : size;
-    if (cap == 0) {
-        addReply(c, shared.emptyarray);
-        return;
-    }
-
-    listpackEntry *res = zmalloc(sizeof(listpackEntry) * cap);
-    unsigned long seen = 0, held = 0;
-    setTypeIterator *si = setTypeInitIterator(set);
-    while (setTypeNext(si, &str, &len, &llele) != -1) {
-        listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};
-        if (held < cap) {
-            res[held++] = e;
-        } else {
-            unsigned long r = (unsigned long)rand() % (seen + 1);
-            if (r < cap) res[r] = e;
-        }
-        seen++;
-    }
-    setTypeReleaseIterator(si);
-
-    if (held == 0) {
-        zfree(res);
-        addReply(c, shared.emptyarray);
-        return;
-    }
-
-    unsigned long reply_count = uniq ? held : count;
-    addReplyArrayLen(c, reply_count);
-    for (unsigned long i = 0; i < reply_count; i++) {
-        unsigned long idx = uniq ? i : (unsigned long)rand() % held;
-        if (res[idx].sval)
-            addReplyBulkCBuffer(c, res[idx].sval, res[idx].slen);
-        else
-            addReplyBulkLongLong(c, res[idx].lval);
-        if (!uniq && c->flag.close_asap) break;
-    }
-    zfree(res);
-}
-
-/* handle the "SRANDMEMBER key <count>" variant. The normal version of the
- * command is handled by the srandmemberCommand() function itself. */
-
 /* How many times bigger should be the set compared to the requested size
  * for us to don't use the "remove elements" strategy? Read later in the
  * implementation for more info. */
 #define SRANDMEMBER_SUB_STRATEGY_MUL 3
 
+/* SRANDMEMBER over a set that may hold hidden members: setTypeSize() counts them
+ * and a random position may hold one, so neither the size comparisons nor the
+ * samplers of the paths below apply.
+ *
+ * The reply is drawn from the live members only, by rejection sampling at a
+ * budget the request pays for, and by one pass over the live members when they
+ * are too sparse for that budget or the request is large enough against the set
+ * that the plain path passes over it too. */
+static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
+    unsigned long size = setTypeSize(set);
+
+    if (!uniq) {
+        listpackEntry *live = NULL;
+        unsigned long live_count = 0, emitted = 0;
+        void *replylen = addReplyDeferredLen(c);
+        while (emitted < count && !c->flag.close_asap) {
+            listpackEntry selected;
+            if (live == NULL) {
+                unsigned long probes = SET_LIVE_PROBES_PER_MEMBER;
+                void *entry = setTypeProbeLiveMember(set, &probes);
+                if (entry != NULL) {
+                    selected = (listpackEntry){.sval = entry, .slen = sdslen((sds)entry)};
+                } else {
+                    live = zmalloc(sizeof(listpackEntry) * size);
+                    live_count = setTypeSampleLiveMembers(set, live, size);
+                    if (live_count == 0) break;
+                    selected = live[(unsigned long)rand() % live_count];
+                }
+            } else {
+                selected = live[(unsigned long)rand() % live_count];
+            }
+
+            if (selected.sval)
+                addReplyBulkCBuffer(c, selected.sval, selected.slen);
+            else
+                addReplyBulkLongLong(c, selected.lval);
+            emitted++;
+        }
+        setDeferredArrayLen(c, replylen, emitted);
+        zfree(live);
+        return;
+    }
+
+    /* Distinct members. Rejection sampling cannot tell when it has collected
+     * every live member, so it is only tried for a request small against the
+     * set - the same ratio at which the plain path stops passing over it. */
+    if (count <= size / SRANDMEMBER_SUB_STRATEGY_MUL) {
+        unsigned long probes = count > ULONG_MAX / SET_LIVE_PROBES_PER_MEMBER
+                                   ? ULONG_MAX
+                                   : count * SET_LIVE_PROBES_PER_MEMBER;
+        if (probes > size) probes = size;
+        hashtable *ht = hashtableCreate(&sdsReplyHashtableType);
+        hashtableExpand(ht, count);
+        while (hashtableSize(ht) < count) {
+            void *entry = setTypeProbeLiveMember(set, &probes);
+            if (entry == NULL) break;
+            sds member = sdsnewlen(entry, sdslen((sds)entry));
+            if (!hashtableAdd(ht, member)) sdsfree(member);
+        }
+
+        hashtableIterator iter;
+        hashtableInitIterator(&iter, ht, 0);
+        bool served = hashtableSize(ht) == count;
+        if (served) addReplyArrayLen(c, count);
+        void *element;
+        while (hashtableNext(&iter, &element)) {
+            if (served)
+                addReplyBulkSds(c, (sds)element);
+            else
+                sdsfree((sds)element);
+        }
+        hashtableCleanupIterator(&iter);
+        hashtableRelease(ht);
+        if (served) return;
+    }
+
+    unsigned long cap = count < size ? count : size;
+    listpackEntry *sampled = zmalloc(sizeof(listpackEntry) * cap);
+    unsigned long held = setTypeSampleLiveMembers(set, sampled, cap);
+    addReplyArrayLen(c, held);
+    for (unsigned long i = 0; i < held; i++) {
+        if (sampled[i].sval)
+            addReplyBulkCBuffer(c, sampled[i].sval, sampled[i].slen);
+        else
+            addReplyBulkLongLong(c, sampled[i].lval);
+    }
+    zfree(sampled);
+}
+
+/* handle the "SRANDMEMBER key <count>" variant. The normal version of the
+ * command is handled by the srandmemberCommand() function itself. */
 void srandmemberWithCountCommand(client *c) {
     long l;
     unsigned long count, size;
@@ -1386,11 +1525,6 @@ void srandmemberWithCountCommand(client *c) {
         return;
     }
 
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.emptyarray);
-        return;
-    }
     size = setTypeSize(set);
 
     if (setTypeHasExpiredMembers(set)) {
@@ -1582,12 +1716,6 @@ void srandmemberCommand(client *c) {
 
     /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET)) return;
-
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.null[c->resp]);
-        return;
-    }
 
     if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
         addReply(c, shared.null[c->resp]);

@@ -205,7 +205,7 @@ static void sttlGenericCommand(client *c, mstime_t basetime, int unit) {
     if (getLongLongFromObjectOrReply(c, c->argv[members_index - 1], &num_members, NULL) != C_OK) return;
 
     if (!num_members || num_members != (c->argc - members_index)) {
-        addReplyErrorObject(c, shared.syntaxerr);
+        addReplyError(c, nummembers_err);
         return;
     }
 
@@ -290,6 +290,7 @@ void saddexCommand(client *c) {
     robj **new_argv = NULL;
     int new_argc = 0;
     robj **expired_members = NULL;
+    smember **mxx_cached = NULL;
 
     int members_index = 2;
     for (; members_index < c->argc - 1; members_index++) {
@@ -327,13 +328,28 @@ void saddexCommand(client *c) {
     }
 
     if (flags & (ARGS_SET_FNX | ARGS_SET_FXX)) {
+        bool cache_safe = (flags & ARGS_SET_FXX) && o && objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE;
+        if (cache_safe) mxx_cached = zmalloc(sizeof(smember *) * num_members);
         if (o) {
             for (i = members_index; i < c->argc; i++) {
-                if (((flags & ARGS_SET_FNX) && setTypeIsMember(o, objectGetVal(c->argv[i]))) ||
-                    ((flags & ARGS_SET_FXX) && !setTypeIsMember(o, objectGetVal(c->argv[i])))) {
+                if (mxx_cached) {
+                    smember *member = NULL;
+                    if (!hashtableFind(objectGetVal(o), objectGetVal(c->argv[i]), (void **)&member)) {
+                        zfree(mxx_cached);
+                        addReply(c, shared.czero);
+                        return;
+                    }
+                    mxx_cached[i - members_index] = member;
+                    if (smemberHasExpiry(member) != (when != EXPIRY_NONE)) cache_safe = false;
+                } else if (((flags & ARGS_SET_FNX) && setTypeIsMember(o, objectGetVal(c->argv[i]))) ||
+                           ((flags & ARGS_SET_FXX) && !setTypeIsMember(o, objectGetVal(c->argv[i])))) {
                     addReply(c, shared.czero);
                     return;
                 }
+            }
+            if (!cache_safe) {
+                zfree(mxx_cached);
+                mxx_cached = NULL;
             }
         } else if (flags & ARGS_SET_FXX) {
             addReply(c, shared.czero);
@@ -385,6 +401,16 @@ void saddexCommand(client *c) {
     } else {
         int add_flags = (flags & ARGS_KEEPTTL) ? SET_ADD_KEEP_EXPIRY : 0;
         for (i = members_index; i < c->argc; i++) {
+            if (mxx_cached) {
+                smember *member = mxx_cached[i - members_index];
+                mstime_t current = smemberGetExpiry(member);
+                if (!(add_flags & SET_ADD_KEEP_EXPIRY) && current != when) {
+                    setTypeUpdateHashtableMemberExpiry(o, objectGetVal(o), member, current, when);
+                    changes++;
+                }
+                continue;
+            }
+
             bool replaced_expired = false;
             bool ttl_changed = false;
             if (setTypeAddWithExpiry(o, objectGetVal(c->argv[i]), when, add_flags, &replaced_expired, &ttl_changed)) {
@@ -402,6 +428,8 @@ void saddexCommand(client *c) {
                 num_expired++;
             }
         }
+        if (mxx_cached) zfree(mxx_cached);
+        mxx_cached = NULL;
 
         if (changes) {
             if (has_volatile_members != setTypeHasVolatileMembers(o)) {

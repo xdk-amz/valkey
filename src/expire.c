@@ -1042,11 +1042,15 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
  * encoding hangs this state on the object itself (by swapping the hashtable
  * type); a listpack has nowhere to put it, so a file-scope flag consulted by
  * listpackObjectItemIsValid() serves both types. Safe: an ignore-TTL bracket
- * never outlives the command that opened it. */
+ * never outlives the command that opened it. Returns the state it replaced, so
+ * a bracket that can run with another already open restores what it found
+ * instead of clearing unconditionally. */
 static bool listpack_ttl_ignored = false;
 
-void listpackObjectIgnoreTTL(bool ignore) {
+bool listpackObjectIgnoreTTL(bool ignore) {
+    bool previous = listpack_ttl_ignored;
     listpack_ttl_ignored = ignore;
+    return previous;
 }
 
 /* Maintain the aggregate volatile-count header of a listpack-encoded object.
