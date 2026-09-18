@@ -485,6 +485,8 @@ static user *ACLCreateUser(const char *name, size_t namelen) {
     u->flags = USER_FLAG_DISABLED;
     u->passwords = listCreate();
     u->acl_string = NULL;
+    u->successor = NULL;
+    u->fp_refs = 0;
     listSetMatchMethod(u->passwords, ACLListMatchSds);
     listSetFreeMethod(u->passwords, sdsfreeVoid);
     listSetDupMethod(u->passwords, ACLListDupSds);
@@ -571,6 +573,45 @@ static void ACLFreeUserVoid(void *u) {
     ACLFreeUser(u);
 }
 
+/* A retired user stands for the user of its name now in Users, or for a deleted user (NULL). */
+user *ACLResolveUser(user *u) {
+    while (u && (u->flags & USER_FLAG_RETIRED)) u = u->successor;
+    return u;
+}
+
+/* Frees the user now, or once the last fast-path client naming it hands off. */
+static void ACLReleaseUser(user *u, user *successor) {
+    if (u->fp_refs == 0) {
+        ACLFreeUser(u);
+        return;
+    }
+    u->flags |= USER_FLAG_RETIRED;
+    u->successor = successor;
+    ACLUserClearRoles(u); /* the roles may be freed before the last client returns */
+}
+
+static void ACLReleaseUserVoid(void *v) {
+    user *u = v;
+    ACLReleaseUser(u, ACLGetUserByName(u->name, sdslen(u->name)));
+}
+
+/* Main owns the client again: retired principals resolve and drop their reference. */
+void ACLFastpathClientReturned(client *c) {
+    user *u = c->user;
+    if (!u || !(u->flags & USER_FLAG_RETIRED)) return;
+    user *live = ACLResolveUser(u);
+    while (u && (u->flags & USER_FLAG_RETIRED)) {
+        user *next = u->successor;
+        if (--u->fp_refs == 0) ACLFreeUser(u);
+        u = next;
+    }
+    if (live) {
+        c->user = live;
+    } else {
+        clientSetUser(c, DefaultUser, 0); /* the client is closing */
+    }
+}
+
 /* When a user is deleted we need to cycle the active
  * connections in order to kill all the pending ones that
  * are authenticated with such user. */
@@ -580,7 +621,13 @@ void ACLFreeUserAndKillClients(user *u) {
     listRewind(server.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (c->user == u) {
+        if (ACLResolveUser(c->user) == u) {
+            if (c->flag.fastpath) {
+                /* IO-owned: not rewritten; its queued commands are dropped by main. */
+                u->fp_refs++;
+                freeClient(c);
+                continue;
+            }
             /* We'll free the connection asynchronously, so
              * in theory to set a different user is not needed.
              * However if there are bugs in the server, soon or later
@@ -593,7 +640,7 @@ void ACLFreeUserAndKillClients(user *u) {
             freeClientOrCloseLater(c, 1);
         }
     }
-    ACLFreeUser(u);
+    ACLReleaseUser(u, NULL);
 }
 
 /* Copy the user ACL rules from the source user 'src' to the destination
@@ -2012,6 +2059,7 @@ static int checkPasswordBasedAuth(client *c, robj *username, robj *password) {
     if (ACLCheckUserCredentials(username, password) == C_OK) {
         user *user = ACLGetUserByName(objectGetVal(username), sdslen(objectGetVal(username)));
         clientSetUser(c, user, 1);
+        c->flag.fp_readmit = 1;
         moduleNotifyUserChanged(c);
         result = AUTH_OK;
     } else {
@@ -3304,15 +3352,21 @@ static sds ACLLoadFromFile(const char *filename) {
             /* Some clients, e.g. the one from the primary to replica, don't have a user
              * associated with them. */
             if (!c->user) continue;
-            user *original = c->user;
+            user *original = ACLResolveUser(c->user);
             list *channels = NULL;
-            user *new_user = ACLGetUserByName(c->user->name, sdslen(c->user->name));
+            user *new_user = ACLGetUserByName(original->name, sdslen(original->name));
             if (new_user && user_channels) {
                 if (!raxFind(user_channels, (unsigned char *)(new_user->name), sdslen(new_user->name),
                              (void **)&channels)) {
                     channels = getUpcomingChannelList(new_user, original);
                     raxInsert(user_channels, (unsigned char *)(new_user->name), sdslen(new_user->name), channels, NULL);
                 }
+            }
+            if (c->flag.fastpath) {
+                /* IO-owned: its principal is retired and resolves to new_user until the client returns. */
+                if (original != DefaultUser) original->fp_refs++;
+                if (!new_user) freeClient(c);
+                continue;
             }
             /* When the new channel list is NULL, it means the new user's channel list is a superset of the old user's
              * list. */
@@ -3325,7 +3379,7 @@ static sds ACLLoadFromFile(const char *filename) {
         }
 
         if (user_channels) raxFreeWithCallback(user_channels, listReleaseVoid);
-        raxFreeWithCallback(old_users, ACLFreeUserVoid);
+        raxFreeWithCallback(old_users, ACLReleaseUserVoid);
         ACLRemapSurvivingRoleMembers(old_roles);
         raxFreeWithCallback(old_roles, ACLFreeUserVoid);
         sdsfree(errors);

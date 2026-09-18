@@ -87,14 +87,37 @@ void fastpathFreeThread(int tid) {
     t->leaving = NULL;
 }
 
-int fastpathEligible(client *c) {
+/* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
+static int fpSessionEligible(client *c) {
     if (!server.io_threads_fast_path) return 0;
     if (!strictOffloadActive() || server.io_threads_num < 2) return 0;
     if (!c->conn || c->flag.fake) return 0;
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
-    if (authRequired(c)) return 0; /* fast path runs as the default user without AUTH */
+    if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
     if (server.cluster_enabled) return 0;
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
+    if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
+    if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
+    if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
+    if (c->mstate || c->flag.pubsub || c->flag.tracking || c->name) return 0;
+    if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
+    if (c->flag.import_source) return 0;
     return 1;
+}
+
+int fastpathEligible(client *c) {
+    return fpSessionEligible(c) && !c->flag.pending_read && !c->flag.partitioned;
+}
+
+/* Both addresses are fixed for the life of the connection; a transport they cannot represent is not admitted. */
+static int fpCaptureAddrs(client *c) {
+    struct sockaddr_storage sa;
+    socklen_t salen = sizeof(sa);
+    if (getpeername(c->conn->fd, (struct sockaddr *)&sa, &salen) != 0) return C_ERR;
+    if (peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, salen) != C_OK) return C_ERR;
+    salen = sizeof(sa);
+    if (getsockname(c->conn->fd, (struct sockaddr *)&sa, &salen) != 0) return C_ERR;
+    return peerIdentityFromSockaddr(&c->fp_local, (struct sockaddr *)&sa, salen);
 }
 
 /* Publish all client state before level-triggered epoll can expose the socket. */
@@ -102,10 +125,12 @@ int fastpathAttach(client *c) {
     int tid = 1 + (int)(fp_rr++ % (unsigned)(server.io_threads_num - 1));
     int epfd = ioThreadEpollFd(tid);
     if (epfd <= 0) return C_ERR;
+    if (c->fp_peer.family == 0 && fpCaptureAddrs(c) != C_OK) return C_ERR;
     c->io_tid = tid;
     c->flag.fastpath = 1;
     c->fp_state = FP_ACTIVE;
     c->fp_inflight = 0;
+    c->fp_held = 0;
     c->fp_out = NULL;
     struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
@@ -155,7 +180,7 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
                           unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
-    e->c = c;
+    e->io_client = c;
     e->argv = argv;
     e->argc = argc;
     e->argv_len = argv_len;
@@ -166,9 +191,15 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->read_flags = read_flags;
     e->db = c->db;
     e->resp = (uint8_t)c->resp;
+    e->origin.client_id = c->id;
+    e->origin.principal = c->user;
+    e->origin.authenticated = c->flag.authenticated;
+    e->origin.peer = c->fp_peer;
+    e->origin.local = c->fp_local;
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
+    e->requeued = 0;
     c->fp_inflight++;
 }
 
@@ -243,7 +274,7 @@ void fastpathClientReadable(int tid, client *c) {
      * readable (level triggered) and is served on a later pass. */
     if (t->inflight >= server.io_batch_inflight || c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
 
-    c->read_flags = 0; /* default user, not replicated; parse state lives in multibulklen/bulklen */
+    c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     readToQueryBuf(c);
     t->reads++;
     if (c->nread <= 0) {
@@ -257,6 +288,8 @@ void fastpathClientReadable(int tid, client *c) {
         return;
     }
     t->net_input_bytes += c->nread;
+    c->net_input_bytes += c->nread;
+    c->last_interaction = server.unixtime;
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
         trimClientQueryBuffer(c);
         fpBeginLeave(t, c, FP_LEAVING);
@@ -282,6 +315,7 @@ static int fpFlushOut(fpThread *t, client *c) {
             return 0;
         }
         t->net_output_bytes += n;
+        c->net_output_bytes += n;
         t->writes++;
         sdsrange(c->fp_out, n, -1);
     }
@@ -304,6 +338,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
         n = 0;
     }
     t->net_output_bytes += n;
+    c->net_output_bytes += n;
     t->writes++;
     for (int i = 0; i < iovcnt; i++) {
         if ((size_t)n >= iov[i].iov_len) {
@@ -322,17 +357,74 @@ void fastpathClientWritable(int tid, client *c) {
     if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
 }
 
+static parsedCommand fpEntryToParsed(cmdEntry *e) {
+    parsedCommand p = {.read_flags = e->read_flags,
+                       .argc = e->argc,
+                       .argv = e->argv,
+                       .argv_len = e->argv_len,
+                       .slot = e->slot,
+                       .argv_len_sum = e->argv_len_sum,
+                       .input_bytes = e->input_bytes,
+                       .cmd = e->cmd};
+    e->argv = NULL; /* the queue owns it now */
+    return p;
+}
+
+/* Entries main returned unexecuted go back in front of anything parsed since, after any
+ * already held; the client then leaves so the main path runs them with its own semantics. */
+static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
+    cmdQueue *q = &c->cmd_queue;
+    int qheld = c->fp_held ? c->fp_held - 1 : 0; /* held commands queued behind c->argv */
+    int rest = q->len - q->off - qheld;
+    int first = c->fp_held ? 0 : 1; /* with nothing held, e[0] becomes c->argv */
+    parsedCommand cur;
+    int has_cur = !c->fp_held && c->argc > 0; /* a promoted command or a trailing partial, parsed after the entries */
+    if (has_cur) {
+        cur = (parsedCommand){.read_flags = c->read_flags,
+                              .argc = c->argc,
+                              .argv = c->argv,
+                              .argv_len = c->argv_len,
+                              .slot = c->slot,
+                              .argv_len_sum = c->argv_len_sum,
+                              .input_bytes = c->net_input_bytes_curr_cmd,
+                              .cmd = c->parsed_cmd};
+    }
+    parsedCommand *cmds = zmalloc(sizeof(parsedCommand) * (qheld + (n - first) + has_cur + rest));
+    int k = 0;
+    if (qheld) memcpy(cmds, q->cmds + q->off, sizeof(parsedCommand) * qheld);
+    k += qheld;
+    for (int i = first; i < n; i++) cmds[k++] = fpEntryToParsed(&e[i]);
+    if (has_cur) cmds[k++] = cur;
+    if (rest) memcpy(cmds + k, q->cmds + q->off + qheld, sizeof(parsedCommand) * rest);
+    k += rest;
+    zfree(q->cmds);
+    q->cmds = cmds;
+    q->off = 0;
+    q->len = q->cap = k;
+    if (first) {
+        parsedCommand head = fpEntryToParsed(&e[0]);
+        c->argv = head.argv, c->argc = head.argc, c->argv_len = head.argv_len, c->argv_len_sum = head.argv_len_sum;
+        c->net_input_bytes_curr_cmd = head.input_bytes, c->parsed_cmd = head.cmd, c->slot = head.slot;
+        c->read_flags = head.read_flags;
+    }
+    c->fp_held += n;
+    fpBeginLeave(t, c, FP_LEAVING);
+}
+
 /* Consecutive entries for one client share a writev. */
 static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
     int i = 0;
     while (i < b->count) {
-        client *c = b->e[i].c;
+        client *c = b->e[i].io_client;
         int n = 0;
         int j = i;
-        while (j < b->count && b->e[j].c == c) {
+        int requeued = 0;
+        while (j < b->count && b->e[j].io_client == c) {
             cmdEntry *e = &b->e[j];
-            if (e->reply_big) {
+            if (e->requeued) {
+                requeued++;
+            } else if (e->reply_big) {
                 iov[n].iov_base = e->reply_big, iov[n].iov_len = e->reply_big_len, n++;
             } else if (e->reply_len) {
                 iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
@@ -341,6 +433,8 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         }
         if (n) fpSend(t, c, iov, n);
         c->fp_inflight -= (j - i);
+        c->commands_processed += (j - i) - requeued;
+        if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
         i = j;
     }
     for (int k = 0; k < b->count; k++) {
@@ -408,10 +502,30 @@ static client *fpExecutor(int tid) {
     return ec;
 }
 
+/* Cookies of clients main asked to close; their queued commands must not run, as with close_asap. */
+static rax *fp_detaching = NULL;
+
+static int fpClientDetaching(client *io_client) {
+    return fp_detaching && raxSize(fp_detaching) > 0 &&
+           raxFind(fp_detaching, (unsigned char *)&io_client, sizeof(io_client), NULL);
+}
+
 /* The executor borrows argv and writes replies into the batch arena. */
 static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     char *saved_buf = ec->buf;
     size_t saved_usable = ec->buf_usable_size;
+    user *principal = e->origin.principal;
+
+    if (fpClientDetaching(e->io_client)) goto release_argv; /* no reply: the IO thread is closing it */
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
+        e->requeued = 1; /* the main path postpones it like any other client's command */
+        return;
+    }
+
+    if (principal->flags & USER_FLAG_RETIRED) principal = ACLResolveUser(principal);
+    serverAssert(principal); /* a deleted user's clients are detaching */
+    ec->user = principal;
+    ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
 
     ec->argv = e->argv;
     ec->argc = e->argc;
@@ -423,6 +537,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->read_flags = e->read_flags;
     ec->db = e->db;
     ec->resp = e->resp;
+    ec->origin = &e->origin;
     ec->buf = b->arena + b->arena_used;
     ec->buf_usable_size = b->arena_cap - b->arena_used;
     ec->bufpos = 0;
@@ -460,6 +575,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->bufpos = 0;
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
+release_argv:
     /* IO threads receive only sole-reference argv objects for terminal frees. */
     for (int j = 0; j < e->argc; j++) {
         robj *o = e->argv[j];
@@ -474,8 +590,8 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
 int fastpathDrain(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    /* CLIENT PAUSE must not block the executor client. */
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0;
+    /* While clients are paused every entry is handed back for the main path to postpone. */
+    int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
     /* io-batch-drain-us bounds how long a thin batch waits for amortization. */
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
@@ -489,7 +605,7 @@ again:
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
-            if (use_prefetch) {
+            if (use_prefetch && !paused) {
                 getKeysResult result;
                 initGetKeysResult(&result);
                 int room = 1;
@@ -503,6 +619,8 @@ again:
                 prefetchBatchReset();
             }
             for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
+            ec->origin = NULL;
+            clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
             spscEnqueue(&t->ret, b, false);
         }
@@ -517,13 +635,61 @@ void fastpathRequestDetach(client *c) {
     fpThread *t = &fp_threads[c->io_tid];
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
+    if (!fp_detaching) fp_detaching = raxNew();
+    raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), NULL, NULL);
     spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
+}
+
+/* A client that left to authenticate returns once main has nothing further to do for it;
+ * any other unsupported command keeps it on the main path, as before. */
+static int fpQuiescent(client *c) {
+    if (c->argc > 0 || c->flag.pending_command || c->cmd_queue.off < c->cmd_queue.len) return 0;
+    if (c->querybuf && sdslen(c->querybuf) > c->qb_pos) return 0;
+    if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) return 0;
+    return 1;
+}
+
+static int fpReadmit(client *c) {
+    if (!fpQuiescent(c)) return 0;
+    if (clientHasPendingReplies(c) && (writeToClient(c) != C_OK || clientHasPendingReplies(c))) return 0;
+    if (!fastpathEligible(c)) return 0;
+    if (c->flag.pending_write) {
+        c->flag.pending_write = 0;
+        listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
+    }
+    trimClientQueryBuffer(c);
+    connSetReadHandler(c->conn, NULL);
+    if (fastpathAttach(c) == C_OK) return 1;
+    connSetReadHandler(c->conn, readQueryFromClient);
+    return 0;
+}
+
+/* Called by main for a client it owns (partitioned or event-loop) after AUTH ran on it. Returns 1 once the
+ * client is on the fast path; a client that is not yet quiescent keeps the flag and is retried next time. */
+int fastpathReadmitAuthenticated(client *c) {
+    if (c->flag.fastpath || c->flag.executor) {
+        c->flag.fp_readmit = 0;
+        return 0;
+    }
+    if (!fpQuiescent(c) || (c->flag.partitioned && c->flag.pending_read)) return 0;
+    c->flag.fp_readmit = 0;
+    if (!fpSessionEligible(c)) return 0;
+    int was_partitioned = c->flag.partitioned;
+    if (was_partitioned) unpartitionClient(c);
+    if (fpReadmit(c)) return 1;
+    if (was_partitioned && tryPartitionClient(c) == C_OK) connSetReadHandler(c->conn, NULL);
+    return 0;
 }
 
 void fastpathHandoffDone(client *c, int closing) {
     c->flag.fastpath = 0;
     c->fp_state = FP_DETACHED;
     fastpath_clients--;
+    if (c->flag.fp_detach_sent) {
+        c->flag.fp_detach_sent = 0;
+        raxRemove(fp_detaching, (unsigned char *)&c, sizeof(c), NULL);
+    }
+    ACLFastpathClientReturned(c);
     if (c->fp_out) {
         sdsfree(c->fp_out);
         c->fp_out = NULL;
@@ -533,13 +699,19 @@ void fastpathHandoffDone(client *c, int closing) {
         return;
     }
     connSetReadHandler(c->conn, readQueryFromClient);
+    int authenticating = c->parsed_cmd && (c->parsed_cmd->proc == authCommand || c->parsed_cmd->proc == helloCommand);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;
     if (c->read_flags & READ_FLAGS_ERROR_MASK) {
         handleParseError(c); /* replies, sets close_after_reply; the write path closes it */
         return;
     }
-    if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
+    if (processPendingCommandAndInputBuffer(c) != C_OK) return;
+    if (authenticating || c->flag.fp_readmit) {
+        c->flag.fp_readmit = 0;
+        if (fpReadmit(c)) return;
+    }
+    beforeNextClient(c);
 }
 
 void fastpathInfo(sds *info) {

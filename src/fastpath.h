@@ -8,7 +8,7 @@
 
 /* Ring publication transfers each entry from its IO thread to main and back. */
 typedef struct cmdEntry {
-    client *c; /* IO-thread use only */
+    client *io_client; /* IO-thread-only return cookie; main never dereferences it. */
     robj **argv;
     int argc;
     int argv_len;
@@ -19,10 +19,12 @@ typedef struct cmdEntry {
     int read_flags;
     serverDb *db;
     uint8_t resp;
+    uint8_t requeued; /* Main did not execute it; the IO thread hands it back for the main path. */
     uint32_t reply_off;
     uint32_t reply_len;
     char *reply_big;
     uint32_t reply_big_len;
+    CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
 } cmdEntry;
 
 typedef struct cmdBatch {
@@ -42,6 +44,7 @@ typedef struct cmdBatch {
 
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
+int fastpathReadmitAuthenticated(client *c);
 int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
 void fastpathHandoffDone(client *c, int closing);
