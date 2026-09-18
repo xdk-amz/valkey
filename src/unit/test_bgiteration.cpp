@@ -1837,6 +1837,73 @@ TEST_F(BgIterationTest, missingFutureItem_eventual) {
 }
 
 
+TEST_F(BgIterationTest, srandmemberDoesNotReclaimBorrowedSet) {
+    const int item_num = 7;
+    const size_t old_max_entries = server.set_max_listpack_entries;
+    const size_t old_max_value = server.set_max_listpack_value;
+    const mstime_t old_cmd_time = server.cmd_time_snapshot;
+
+    for (int encoding : {OBJ_ENCODING_LISTPACK, OBJ_ENCODING_HASHTABLE}) {
+        simpleDelItem(item_num);
+        server.set_max_listpack_entries = encoding == OBJ_ENCODING_LISTPACK ? 128 : 0;
+        server.set_max_listpack_value = 64;
+        server.cmd_time_snapshot = 100;
+
+        sds live = sdsnew("live");
+        sds expired = sdsnew("expired");
+        robj *set = setTypeCreate(live, 2);
+        bool replaced_expired = false;
+        bool ttl_changed = false;
+        ASSERT_EQ(setTypeAddWithExpiry(set, live, EXPIRY_NONE, 0, &replaced_expired, &ttl_changed), 1);
+
+        robj *key = createStringObjectFromCString(keyStr(item_num));
+        dbAdd(server.db[getDbFromItemNum(item_num)], key, &set);
+        decrRefCount(key);
+        ASSERT_EQ(setTypeAddWithExpiry(set, expired, 1, 0, &replaced_expired, &ttl_changed), 1);
+        ASSERT_EQ(objectGetEncoding(set), encoding);
+        sdsfree(live);
+        sdsfree(expired);
+
+        cleanupCount = 0;
+        bgIterator *it = bgIteratorCreateFullScanIter("iter", BGITERATOR_CONSISTENCY_START, NULL,
+                                                      iteratorCleanupFn, PRIVDATA);
+        expectReadKey(it, 0);
+        c = getWriteClient(item_num, "unused");
+        simulateBlockedWrite(c);
+        ASSERT_TRUE(bgIteration_isEntryInuse(set));
+
+        for (bool with_count : {false, true}) {
+            client *reader = static_cast<client *>(zcalloc(sizeof(client)));
+            reader->flag.reply_off = 1;
+            reader->resp = 2;
+            reader->slot = -1;
+            reader->cmd = reader->realcmd = lookupCommandByCString("srandmember");
+            reader->db = server.db[getDbFromItemNum(item_num)];
+            reader->argc = with_count ? 3 : 2;
+            reader->argv = static_cast<robj **>(zcalloc(sizeof(robj *) * reader->argc));
+            reader->argv[0] = createStringObjectFromCString("SRANDMEMBER");
+            reader->argv[1] = createStringObjectFromCString(keyStr(item_num));
+            if (with_count) reader->argv[2] = createStringObjectFromCString("2");
+
+            srandmemberCommand(reader);
+            freeTestClient(reader);
+
+            ASSERT_EQ(dbFind(server.db[getDbFromItemNum(item_num)], objectGetKey(set)), set);
+            ASSERT_EQ(setTypeSize(set), 2u);
+            ASSERT_TRUE(setTypeHasExpiredMembers(set));
+        }
+
+        expectAnythingCleanup(it);
+        freeTestClient(c);
+        c = nullptr;
+    }
+
+    server.set_max_listpack_entries = old_max_entries;
+    server.set_max_listpack_value = old_max_value;
+    server.cmd_time_snapshot = old_cmd_time;
+}
+
+
 /////////////////////////////////////////////////////
 // TESTS RELATED TO EXPIRATION
 // Expiration can be tricky.  When pre-evaluating a command with bgIteration_blockClientIfRequired,

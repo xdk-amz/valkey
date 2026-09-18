@@ -290,7 +290,6 @@ void saddexCommand(client *c) {
     robj **new_argv = NULL;
     int new_argc = 0;
     robj **expired_members = NULL;
-    smember **mxx_members = NULL;
 
     int members_index = 2;
     for (; members_index < c->argc - 1; members_index++) {
@@ -329,24 +328,11 @@ void saddexCommand(client *c) {
 
     if (flags & (ARGS_SET_FNX | ARGS_SET_FXX)) {
         if (o) {
-            if ((flags & ARGS_SET_FXX) && !set_expired && objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
-                mxx_members = zmalloc(sizeof(smember *) * num_members);
-                for (i = members_index; i < c->argc; i++) {
-                    void *found = NULL;
-                    if (!hashtableFind(objectGetVal(o), objectGetVal(c->argv[i]), &found)) {
-                        zfree(mxx_members);
-                        addReply(c, shared.czero);
-                        return;
-                    }
-                    mxx_members[i - members_index] = found;
-                }
-            } else {
-                for (i = members_index; i < c->argc; i++) {
-                    if (((flags & ARGS_SET_FNX) && setTypeIsMember(o, objectGetVal(c->argv[i]))) ||
-                        ((flags & ARGS_SET_FXX) && !setTypeIsMember(o, objectGetVal(c->argv[i])))) {
-                        addReply(c, shared.czero);
-                        return;
-                    }
+            for (i = members_index; i < c->argc; i++) {
+                if (((flags & ARGS_SET_FNX) && setTypeIsMember(o, objectGetVal(c->argv[i]))) ||
+                    ((flags & ARGS_SET_FXX) && !setTypeIsMember(o, objectGetVal(c->argv[i])))) {
+                    addReply(c, shared.czero);
+                    return;
                 }
             }
         } else if (flags & ARGS_SET_FXX) {
@@ -401,14 +387,7 @@ void saddexCommand(client *c) {
         for (i = members_index; i < c->argc; i++) {
             bool replaced_expired = false;
             bool ttl_changed = false;
-            if (mxx_members != NULL) {
-                smember *m = mxx_members[i - members_index];
-                mstime_t current = smemberGetExpiry(m);
-                if (!(add_flags & SET_ADD_KEEP_EXPIRY) && current != when) {
-                    setTypeUpdateHashtableMemberExpiry(o, objectGetVal(o), m, current, when);
-                    ttl_changed = true;
-                }
-            } else if (setTypeAddWithExpiry(o, objectGetVal(c->argv[i]), when, add_flags, &replaced_expired, &ttl_changed)) {
+            if (setTypeAddWithExpiry(o, objectGetVal(c->argv[i]), when, add_flags, &replaced_expired, &ttl_changed)) {
                 added++;
                 changes++;
             }
@@ -455,7 +434,6 @@ void saddexCommand(client *c) {
         }
     }
 
-    zfree(mxx_members);
     if (setTypeSize(o) == 0) {
         dbDelete(c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);

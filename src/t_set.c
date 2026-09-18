@@ -33,6 +33,7 @@
  */
 
 #include "server.h"
+#include "bgiteration.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
 
@@ -429,7 +430,10 @@ mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str) {
 }
 
 static robj *setTypeReclaimExpiredMembers(client *c, robj *set) {
-    if (getExpirationPolicyWithFlags(0) != POLICY_DELETE_EXPIRED || !setTypeHasExpiredMembers(set)) return set;
+    if (getExpirationPolicyWithFlags(0) != POLICY_DELETE_EXPIRED ||
+        bgIteration_isEntryInuse(set) ||
+        !setTypeHasExpiredMembers(set))
+        return set;
     dbReclaimExpiredItems(set, c->db, commandTimeSnapshot(), setTypeSize(set), c->slot);
     return lookupKeyWrite(c->db, c->argv[1]);
 }

@@ -2173,3 +2173,20 @@ start_cluster 2 0 {tags {external:skip cluster}} {
         R 0 DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 }
+
+start_server {overrides {set-max-listpack-entries 0}} {
+    test {SADDEX MXX safely applies a TTL to duplicate persistent members} {
+        r SADD ttl-review member
+        assert_equal 0 [r SADDEX ttl-review MXX EX 60 MEMBERS 2 member member]
+        assert_equal 1 [r SCARD ttl-review]
+        assert_morethan [set_member_ttl r ttl-review member] 0
+    }
+
+    test {SADDEX MXX safely removes a TTL from duplicate volatile members} {
+        r FLUSHALL
+        assert_equal 1 [r SADDEX ttl-review EX 60 MEMBERS 1 member]
+        assert_equal 0 [r SADDEX ttl-review MXX MEMBERS 2 member member]
+        assert_equal 1 [r SCARD ttl-review]
+        assert_equal -1 [set_member_ttl r ttl-review member]
+    }
+}
