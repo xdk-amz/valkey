@@ -185,3 +185,34 @@ start_server {} {
         assert_equal [r lrange mylist 0 -1] {elem1 @delme elem2}
     }
 }
+
+test {Filtering based on the fast-path origin client id} {
+    start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+        r module load $testmodule log-key 0
+        r client setname control ;# named clients stay on the main path
+        r select 0
+
+        set rr [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        set sock [fconfigure [$rr channel] -sockname]
+        set peer "[lindex $sock 0]:[lindex $sock 2]"
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] == 1
+        } else {
+            fail "client did not attach to the fast path"
+        }
+        set cid ""
+        foreach line [split [string trim [r client list]] "\n"] {
+            if {[string match "*addr=$peer *" $line]} { regexp {id=(\d+)} $line -> cid }
+        }
+        assert {$cid ne ""}
+        r unfilter_clientid $cid
+
+        set batches [getInfoProperty [r info fastpath] fastpath_batches]
+        $rr rpush mylist elem1 @replaceme elem2
+        assert_equal 3 [$rr read]
+        assert_equal [expr {$batches + 1}] [getInfoProperty [r info fastpath] fastpath_batches]
+        assert_equal {elem1 @replaceme elem2} [r lrange mylist 0 -1]
+
+        $rr close
+    }
+}

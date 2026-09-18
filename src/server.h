@@ -1087,6 +1087,8 @@ typedef struct readyList {
 #define USER_FLAG_ROLE (1 << 3)      /* This user entry represents a role, \
                                         not a regular user. Stored in the  \
                                         Roles rax instead of Users. */
+#define USER_FLAG_RETIRED (1 << 4)   /* Removed from Users but still named by \
+                                        fast-path clients; see `successor`. */
 
 #define SELECTOR_FLAG_ROOT (1 << 0)        /* This is the root user permission \
                                             * selector. */
@@ -1109,6 +1111,10 @@ typedef struct user {
     dict *members;    /* For roles: the users holding this role, keyed by their
                          `user *` pointer (NULL for users). */
     robj *acl_string; /* cached string represent of ACLs */
+    /* Retired only: the user of this name now in Users (NULL if deleted), and the
+     * fast-path clients still pointing here; the struct is freed when they reach zero. */
+    struct user *successor;
+    uint32_t fp_refs;
 } user;
 
 /* With multiplexing we need to take per-client state.
@@ -1276,6 +1282,7 @@ typedef struct ClientFlags {
     uint64_t fastpath : 1;       /* Owned by an IO thread end to end; main executes its commands from batches and never touches it. */
     uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
     uint64_t fp_detach_sent : 1; /* Main asked the owning IO thread to detach this fast-path client. */
+    uint64_t fp_readmit : 1;     /* Authenticated on main; joins the fast path once main has nothing further to do for it. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1394,6 +1401,26 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+/* Fixed-size peer address; formats to the same text as getClientPeerId(). */
+typedef struct {
+    uint8_t family; /* AF_INET or AF_INET6 */
+    uint16_t port;
+    union {
+        struct in_addr v4;
+        struct in6_addr v6;
+    } addr;
+} PeerIdentity;
+
+/* Originating-client identity carried by value with every fast-path command.
+ * The IO thread copies fields that only main writes, and only while the client is detached. */
+typedef struct {
+    uint64_t client_id;
+    user *principal; /* Live or retired user; main resolves a retired one through its successor. */
+    PeerIdentity peer;
+    PeerIdentity local;
+    uint8_t authenticated; /* flag.authenticated of the origin; authRequired() is evaluated live by main. */
+} CommandOrigin;
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
@@ -1462,7 +1489,11 @@ typedef struct client {
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
     uint8_t fp_state;                     /* Fast path: FP_ACTIVE/LEAVING/CLOSING/DETACHED (IO thread, then main) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
+    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
+    PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
+    PeerIdentity fp_local;                /* Fast path: local address captured at admission */
+    const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -3221,6 +3252,10 @@ void *dupClientReplyValue(void *o);
 char *getClientPeerId(client *c);
 char *getClientSockname(client *c);
 int isClientConnIpV6(client *c);
+int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, socklen_t salen);
+int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len);
+int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port);
+uint64_t getClientOriginId(client *c);
 sds catClientInfoString(sds s, client *client, int hide_user_data);
 sds catClientInfoShortString(sds s, client *client, int hide_user_data);
 sds getAllClientsInfoString(int type, int hide_user_data);
@@ -3641,6 +3676,8 @@ void ACLLoadUsersAtStartup(void);
 void addReplyCommandCategories(client *c, struct serverCommand *cmd);
 user *ACLCreateUnlinkedUser(void);
 void ACLFreeUserAndKillClients(user *u);
+user *ACLResolveUser(user *u);
+void ACLFastpathClientReturned(client *c);
 void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
 sds getAclErrorMessage(int acl_res, user *user, struct serverCommand *cmd, sds errored_val, int verbose);
 void ACLUpdateDefaultUserPassword(sds password);

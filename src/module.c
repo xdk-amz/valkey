@@ -3950,8 +3950,13 @@ int modulePopulateClientInfoStructure(void *ci, client *client, int structver) {
     if (client->flag.ever_authenticated) ci1->flags |= VALKEYMODULE_CLIENTINFO_FLAG_EVER_AUTHENTICATED;
     if (client->flag.fake) ci1->flags |= VALKEYMODULE_CLIENTINFO_FLAG_FAKE;
 
-    int port;
-    connAddrPeerName(client->conn, ci1->addr, sizeof(ci1->addr), &port);
+    int port = 0;
+    if (client->flag.fastpath) {
+        /* The socket belongs to an IO thread; the peer was fixed at admission. */
+        if (peerIdentityToIp(&client->fp_peer, ci1->addr, sizeof(ci1->addr), &port) != C_OK) ci1->addr[0] = '\0';
+    } else {
+        connAddrPeerName(client->conn, ci1->addr, sizeof(ci1->addr), &port);
+    }
     ci1->port = port;
     ci1->db = client->db->id;
     ci1->id = client->id;
@@ -10436,6 +10441,10 @@ void revokeClientAuthentication(client *c) {
      * is eventually freed we don't rely on the module to still exist. */
     moduleNotifyUserChanged(c);
 
+    if (c->flag.fastpath) {
+        freeClient(c); /* IO-owned: not rewritten; its queued commands are dropped by main */
+        return;
+    }
     clientSetUser(c, DefaultUser, 0);
     /* We will write replies to this client later, so we can't close it
      * directly even if async. */
@@ -11846,7 +11855,7 @@ int VM_CommandFilterArgDelete(ValkeyModuleCommandFilterCtx *fctx, int pos) {
 
 /* Get Client ID for client that issued the command we are filtering */
 unsigned long long VM_CommandFilterGetClientId(ValkeyModuleCommandFilterCtx *fctx) {
-    return fctx->c->id;
+    return getClientOriginId(fctx->c);
 }
 
 /* --------------------------------------------------------------------------
@@ -11902,7 +11911,7 @@ void moduleFireCommandResultEvent(client *c,
         .command_name = cmd ? cmd->fullname : NULL,
         .duration_us = duration,
         .dirty = dirty,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = argc,
         .argv = (ValkeyModuleString **)decoded_argv,
@@ -11934,7 +11943,7 @@ void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
         .command_name = c->cmd ? c->cmd->fullname : NULL,
         .duration_us = 0,
         .dirty = 0,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = c->argc,
         .argv = (ValkeyModuleString **)c->argv,
@@ -11971,7 +11980,7 @@ void moduleFireCommandACLRejectedEvent(client *c, uint64_t subevent, int errpos)
         .command_name = c->cmd ? c->cmd->fullname : NULL,
         .duration_us = 0,
         .dirty = 0,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = c->argc,
         .argv = (ValkeyModuleString **)c->argv,

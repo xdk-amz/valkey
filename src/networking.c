@@ -420,6 +420,9 @@ client *createClient(connection *conn) {
     c->mstate = NULL;
     c->woff = 0;
     c->peerid = NULL;
+    c->origin = NULL;
+    memset(&c->fp_peer, 0, sizeof(c->fp_peer));
+    memset(&c->fp_local, 0, sizeof(c->fp_local));
     c->sockname = NULL;
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
@@ -2663,6 +2666,7 @@ void beforeNextClient(client *c) {
     }
 
     if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
+    if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
@@ -4980,6 +4984,14 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
     connFormatAddr(client->conn, addr, addr_len, remote);
 }
 
+/* An executor reports the identity of the entry it is running. */
+static char *originAddrString(const PeerIdentity *id, sds *cache) {
+    char buf[CONN_ADDR_STR_LEN];
+    if (peerIdentityFormat(id, buf, sizeof(buf)) < 0) memcpy(buf, "?:0", 4);
+    *cache = *cache ? sdscpy(*cache, buf) : sdsnew(buf);
+    return *cache;
+}
+
 /* This function returns the client peer id, by creating and caching it
  * if client->peerid is NULL, otherwise returning the cached value.
  * The Peer ID never changes during the life of the client, however it
@@ -4987,11 +4999,61 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
 char *getClientPeerId(client *c) {
     char peerid[CONN_ADDR_STR_LEN] = {0};
 
+    if (c->origin) return originAddrString(&c->origin->peer, &c->peerid);
     if (c->peerid == NULL) {
         genClientAddrString(c, peerid, sizeof(peerid), 1);
         c->peerid = sdsnew(peerid);
     }
     return c->peerid;
+}
+
+/* Returns C_ERR for an address family the fast path cannot represent. */
+int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, socklen_t salen) {
+    memset(peer, 0, sizeof(*peer));
+    switch (sa->sa_family) {
+    case AF_INET: {
+        if (salen < sizeof(struct sockaddr_in)) return C_ERR;
+        const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+        peer->family = AF_INET;
+        peer->port = ntohs(s->sin_port);
+        peer->addr.v4 = s->sin_addr;
+        return C_OK;
+    }
+    case AF_INET6: {
+        if (salen < sizeof(struct sockaddr_in6)) return C_ERR;
+        const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+        peer->family = AF_INET6;
+        peer->port = ntohs(s->sin6_port);
+        peer->addr.v6 = s->sin6_addr;
+        return C_OK;
+    }
+    default: return C_ERR;
+    }
+}
+
+int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port) {
+    const void *src;
+    switch (peer->family) {
+    case AF_INET: src = &peer->addr.v4; break;
+    case AF_INET6: src = &peer->addr.v6; break;
+    default: return C_ERR;
+    }
+    if (!inet_ntop(peer->family, src, ip, ip_len)) return C_ERR;
+    if (port) *port = peer->port;
+    return C_OK;
+}
+
+/* Same text as getClientPeerId() for the connection the identity was taken from. */
+int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len) {
+    char ip[NET_IP_STR_LEN];
+    if (peerIdentityToIp(peer, ip, sizeof(ip), NULL) != C_OK) return -1;
+    if (peer->family == AF_INET6) return snprintf(buf, buf_len, "[%s]:%d", ip, peer->port);
+    return snprintf(buf, buf_len, "%s:%d", ip, peer->port);
+}
+
+/* Identity of the client a command came from: the origin while an executor runs a fast-path entry. */
+uint64_t getClientOriginId(client *c) {
+    return c->origin ? c->origin->client_id : c->id;
 }
 
 /* This function returns the client bound socket name, by creating and caching
@@ -5001,6 +5063,7 @@ char *getClientPeerId(client *c) {
 char *getClientSockname(client *c) {
     char sockname[CONN_ADDR_STR_LEN] = {0};
 
+    if (c->origin) return originAddrString(&c->origin->local, &c->sockname);
     if (c->sockname == NULL) {
         genClientAddrString(c, sockname, sizeof(sockname), 0);
         c->sockname = sdsnew(sockname);
@@ -5016,6 +5079,7 @@ int isClientConnIpV6(client *c) {
         c = server.current_client;
     }
 
+    if (c->origin) return c->origin->peer.family == AF_INET6;
     if (c->flag.fake || !c->conn) {
         /* If we still don't have a client with a real connection (e.g., called
          * from module timer with no real current client), default to IPv4 to
@@ -5086,7 +5150,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     sds ret = sdscatfmt(
         s,
         FMTARGS(
-            "id=%U", (unsigned long long)client->id,
+            "id=%U", (unsigned long long)getClientOriginId(client),
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
@@ -5136,7 +5200,7 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     sds ret = sdscatfmt(
         s,
         FMTARGS(
-            "id=%U", (unsigned long long)client->id,
+            "id=%U", (unsigned long long)getClientOriginId(client),
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
@@ -6863,7 +6927,8 @@ int checkClientOutputBufferLimits(client *c) {
  *
  * Returns 1 if client was (flagged) closed. */
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
-    if (c->flag.fake) return 0; /* It is unsafe to free fake clients. */
+    if (c->flag.fake) return 0;     /* It is unsafe to free fake clients. */
+    if (c->flag.executor) return 0; /* replies return to the IO thread with the batch */
     serverAssert(c->conn);
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
