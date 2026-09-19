@@ -2334,6 +2334,199 @@ size_t vsetSize(vset *set) {
     return 0;
 }
 
+/* Expiration is strict: a deadline equal to command time remains live. */
+static inline bool vsetEntryIsHidden(long long expiry, mstime_t now) {
+    return expiry < now;
+}
+
+static size_t vsetBucketSizeOf(vsetBucket *bucket) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return vsetBucketSize_NONE(bucket);
+    case VSET_BUCKET_SINGLE:
+        return vsetBucketSize_SINGLE(bucket);
+    case VSET_BUCKET_VECTOR:
+        return vsetBucketSize_VECTOR(bucket);
+    case VSET_BUCKET_HT:
+        return vsetBucketSize_HASHTABLE(bucket);
+    default:
+        panic("Unknown bucket type encountered in vsetBucketSizeOf");
+    }
+    return 0;
+}
+
+/* Vector buckets are expiry-sorted, so hidden entries form a prefix. */
+static uint32_t vsetVectorHiddenCount(vsetGetExpiryFunc getExpiry, pVector *pv, mstime_t now) {
+    uint32_t left = 0, right = pvLen(pv);
+    while (left < right) {
+        uint32_t mid = left + (right - left) / 2;
+        if (vsetEntryIsHidden(getExpiry(pvGet(pv, mid)), now))
+            left = mid + 1;
+        else
+            right = mid;
+    }
+    return left;
+}
+
+static size_t vsetBucketCountHidden(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+        return vsetEntryIsHidden(getExpiry(vsetBucketSingle(bucket)), now) ? 1 : 0;
+    case VSET_BUCKET_VECTOR:
+        return vsetVectorHiddenCount(getExpiry, vsetBucketVector(bucket), now);
+    case VSET_BUCKET_HT: {
+        hashtableIterator it;
+        void *entry;
+        size_t hidden = 0;
+        hashtableInitIterator(&it, vsetBucketHashtable(bucket), 0);
+        while (hashtableNext(&it, &entry)) {
+            if (vsetEntryIsHidden(getExpiry(entry), now)) hidden++;
+        }
+        hashtableCleanupIterator(&it);
+        return hidden;
+    }
+    default:
+        panic("Unknown bucket type encountered in vsetBucketCountHidden");
+    }
+    return 0;
+}
+
+/* Select within one bucket or deduct its live entries from the rank. */
+static bool
+vsetBucketSelectLive(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now, size_t *rank, void **entry) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return false;
+    case VSET_BUCKET_SINGLE: {
+        void *e = vsetBucketSingle(bucket);
+        if (vsetEntryIsHidden(getExpiry(e), now)) return false;
+        if (*rank == 0) {
+            *entry = e;
+            return true;
+        }
+        (*rank)--;
+        return false;
+    }
+    case VSET_BUCKET_VECTOR: {
+        pVector *pv = vsetBucketVector(bucket);
+        uint32_t first = vsetVectorHiddenCount(getExpiry, pv, now);
+        size_t live = pvLen(pv) - first;
+        if (*rank < live) {
+            *entry = pvGet(pv, first + (uint32_t)*rank);
+            return true;
+        }
+        *rank -= live;
+        return false;
+    }
+    case VSET_BUCKET_HT: {
+        hashtableIterator it;
+        void *e;
+        bool found = false;
+        hashtableInitIterator(&it, vsetBucketHashtable(bucket), 0);
+        while (hashtableNext(&it, &e)) {
+            if (vsetEntryIsHidden(getExpiry(e), now)) continue;
+            if (*rank == 0) {
+                *entry = e;
+                found = true;
+                break;
+            }
+            (*rank)--;
+        }
+        hashtableCleanupIterator(&it);
+        return found;
+    }
+    default:
+        panic("Unknown bucket type encountered in vsetBucketSelectLive");
+    }
+    return false;
+}
+
+/* RAX keys are window ends and splits preserve expiry order. Hidden entries
+ * therefore occupy complete prefix buckets plus at most the next boundary bucket. */
+size_t vsetCountHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t *hidden) {
+    *hidden = 0;
+    vsetBucket *bucket = *set;
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+    case VSET_BUCKET_VECTOR:
+        *hidden = vsetBucketCountHidden(bucket, getExpiry, now);
+        return vsetBucketSizeOf(bucket);
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        size_t total = 0;
+        bool boundary_seen = false;
+        raxIterator it;
+        raxStart(&it, vsetBucketRax(bucket));
+        assert(raxSeek(&it, "^", NULL, 0));
+        while (raxNext(&it)) {
+            size_t size = vsetBucketSizeOf(it.data);
+            total += size;
+            if (boundary_seen) continue;
+            if (decodeExpiryKey(it.key) <= now) {
+                *hidden += size;
+            } else {
+                *hidden += vsetBucketCountHidden(it.data, getExpiry, now);
+                boundary_seen = true;
+            }
+        }
+        raxStop(&it);
+        return total;
+    }
+    default:
+        panic("Unknown set type encountered in vsetCountHidden");
+    }
+    return 0;
+}
+
+/* Map a live rank through bucket order; buckets after the boundary are skipped
+ * by size without examining their entries. */
+bool vsetSelectLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t rank, void **entry) {
+    vsetBucket *bucket = *set;
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return false;
+    case VSET_BUCKET_SINGLE:
+    case VSET_BUCKET_VECTOR:
+        return vsetBucketSelectLive(bucket, getExpiry, now, &rank, entry);
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        bool found = false, boundary_seen = false;
+        raxIterator it;
+        raxStart(&it, vsetBucketRax(bucket));
+        assert(raxSeek(&it, "^", NULL, 0));
+        while (raxNext(&it)) {
+            if (!boundary_seen) {
+                if (decodeExpiryKey(it.key) <= now) continue;
+                boundary_seen = true;
+                if (vsetBucketSelectLive(it.data, getExpiry, now, &rank, entry)) {
+                    found = true;
+                    break;
+                }
+                continue;
+            }
+            size_t size = vsetBucketSizeOf(it.data);
+            if (rank >= size) {
+                rank -= size;
+                continue;
+            }
+            found = vsetBucketSelectLive(it.data, getExpiry, now, &rank, entry);
+            break;
+        }
+        raxStop(&it);
+        return found;
+    }
+    default:
+        panic("Unknown set type encountered in vsetSelectLive");
+    }
+    return false;
+}
+
 /* Initializes a volatile set iterator.
  *
  * This function prepares the iterator for scanning a volatile set from the beginning.

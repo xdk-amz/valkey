@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <iterator>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -732,6 +733,75 @@ TEST_F(VsetTest, TestVsetLargeExpiryBucketOverflow) {
 
     vsetRelease(&set);
     for (int i = 0; i < total_entries; i++) mockFreeEntry(entries[i]);
+}
+
+TEST_F(VsetTest, TestVsetHiddenCountAndLiveSelection) {
+    vset set;
+    vsetInit(&set);
+
+    const long long expiries[] = {90, 99, 100, 101, 200};
+    mock_entry *entries[sizeof(expiries) / sizeof(expiries[0])];
+    for (size_t i = 0; i < std::size(expiries); i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "boundary_%zu", i);
+        entries[i] = mockCreateEntry(key, expiries[i]);
+        ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries[i]));
+    }
+
+    size_t hidden = 0;
+    ASSERT_EQ(vsetCountHidden(&set, mockGetExpiry, 100, &hidden), std::size(entries));
+    ASSERT_EQ(hidden, 2u);
+
+    void *selected = nullptr;
+    ASSERT_TRUE(vsetSelectLive(&set, mockGetExpiry, 100, 0, &selected));
+    ASSERT_EQ(mockGetExpiry(selected), 100);
+    ASSERT_TRUE(vsetSelectLive(&set, mockGetExpiry, 100, 1, &selected));
+    ASSERT_EQ(mockGetExpiry(selected), 101);
+    ASSERT_TRUE(vsetSelectLive(&set, mockGetExpiry, 100, 2, &selected));
+    ASSERT_EQ(mockGetExpiry(selected), 200);
+    ASSERT_FALSE(vsetSelectLive(&set, mockGetExpiry, 100, 3, &selected));
+
+    vsetRelease(&set);
+    for (mock_entry *entry : entries) mockFreeEntry(entry);
+}
+
+TEST_F(VsetTest, TestVsetMixedHashtableBucketSelection) {
+    vset set;
+    vsetInit(&set);
+
+    constexpr size_t hidden_count = 100;
+    constexpr size_t live_count = 100;
+    mock_entry *entries[hidden_count + live_count];
+    for (size_t i = 0; i < std::size(entries); i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "mixed_%zu", i);
+        long long expiry = i < hidden_count ? 9000 : 9001;
+        entries[i] = mockCreateEntry(key, expiry);
+        ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries[i]));
+    }
+
+    size_t hidden = 0;
+    ASSERT_EQ(vsetCountHidden(&set, mockGetExpiry, 9001, &hidden), std::size(entries));
+    ASSERT_EQ(hidden, hidden_count);
+
+    bool seen[live_count] = {};
+    for (size_t rank = 0; rank < live_count; rank++) {
+        void *selected = nullptr;
+        ASSERT_TRUE(vsetSelectLive(&set, mockGetExpiry, 9001, rank, &selected));
+        ASSERT_EQ(mockGetExpiry(selected), 9001);
+        for (size_t i = hidden_count; i < std::size(entries); i++) {
+            if (entries[i] == selected) {
+                seen[i - hidden_count] = true;
+                break;
+            }
+        }
+    }
+    for (bool was_seen : seen) ASSERT_TRUE(was_seen);
+    void *selected = nullptr;
+    ASSERT_FALSE(vsetSelectLive(&set, mockGetExpiry, 9001, live_count, &selected));
+
+    vsetRelease(&set);
+    for (mock_entry *entry : entries) mockFreeEntry(entry);
 }
 
 TEST_F(VsetTest, TestVsetDefrag) {

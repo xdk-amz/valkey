@@ -2447,6 +2447,272 @@ start_server {tags {"setexpire external:skip"} overrides {set-max-listpack-entri
         assert_equal 350 [r SCARD myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
+
+    # Inside the window the hidden members' bucket key is still ahead of the
+    # clock, so it is the one bucket a census cannot settle from its key alone.
+    test "SRANDMEMBER with a negative count draws only live members inside the window" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set live_members [make_rax_window_set r myset 200 150]
+
+        set got [r SRANDMEMBER myset -600]
+        assert_inside_rax_window
+        assert_equal 600 [llength $got]
+        assert_all_live $got $live_members
+        assert_equal 350 [r SCARD myset]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+}
+
+# A hidden-dense hashtable set: 'hidden' members kept past their deadline, plus
+# live members that either carry a TTL of their own or carry none. Those are the
+# two halves a draw is split into -- the expiry index can name the first by rank
+# and holds nothing at all about the second -- so both must be covered, together
+# with the mix that takes one of each within a single reply.
+proc make_hidden_dense_set {r key hidden live live_has_ttl} {
+    $r DEL $key
+    set hidden_members {}
+    for {set i 0} {$i < $hidden} {incr i} { lappend hidden_members h$i }
+    $r SADD $key {*}$hidden_members
+    make_members_expired $r $key $hidden_members
+
+    set live_members {}
+    for {set i 0} {$i < $live} {incr i} { lappend live_members live$i }
+    if {$live > 0} {
+        if {$live_has_ttl} {
+            $r SADDEX $key EX 3600 MEMBERS $live {*}$live_members
+        } else {
+            $r SADD $key {*}$live_members
+        }
+    }
+    assert_equal [expr {$hidden + $live}] [$r SCARD $key]
+    assert_equal $live [llength [$r SMEMBERS $key]]
+    return $live_members
+}
+
+start_server {tags {"setexpire external:skip"} overrides {set-max-listpack-entries 0}} {
+    foreach {live_kind live_has_ttl} {volatile 1 persistent 0} {
+        test "SRANDMEMBER draws only live members of a hidden-dense set - $live_kind live" {
+            flush_and_disable_active_expiry
+            set live_members [make_hidden_dense_set r myset 400 20 $live_has_ttl]
+            assert_encoding hashtable myset
+
+            for {set i 0} {$i < 50} {incr i} {
+                assert_all_live [list [r SRANDMEMBER myset]] $live_members
+                assert_all_live [r SRANDMEMBER myset 1] $live_members
+                assert_all_live [r SRANDMEMBER myset -1] $live_members
+            }
+            foreach count {2 7 19 20 25 500} {
+                assert_all_live [r SRANDMEMBER myset $count] $live_members
+                set got [r SRANDMEMBER myset -$count]
+                assert_equal $count [llength $got]
+                assert_all_live $got $live_members
+            }
+
+            # A read reclaims nothing, so every hidden member is still stored.
+            assert_equal 420 [r SCARD myset]
+            assert_equal 20 [llength [r SMEMBERS myset]]
+            assert_equal 1 [get_keys_with_volatile_items r]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        test "SRANDMEMBER with a negative count is unbiased over a hidden-dense set - $live_kind live" {
+            flush_and_disable_active_expiry
+            set live_members [make_hidden_dense_set r myset 400 20 $live_has_ttl]
+
+            set draws 4000
+            set got [r SRANDMEMBER myset -$draws]
+            assert_equal $draws [llength $got]
+            assert_all_live $got $live_members
+
+            # 200 expected per member, sd ~14. The band is wide enough that no run
+            # trips it by chance and narrow enough that a rank the draw cannot
+            # reach, or one it favours, fails.
+            foreach m $live_members {
+                set seen [llength [lsearch -all -exact $got $m]]
+                assert_equal 1 [expr {$seen >= 100 && $seen <= 320}] \
+                    "member $m drawn $seen times out of $draws over 20 live members"
+            }
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
+
+    test "SRANDMEMBER draws from both halves of a hidden-dense set" {
+        flush_and_disable_active_expiry
+        r DEL myset
+        set hidden_members {}
+        for {set i 0} {$i < 400} {incr i} { lappend hidden_members h$i }
+        r SADD myset {*}$hidden_members
+        make_members_expired r myset $hidden_members
+        set with_ttl {}
+        set without_ttl {}
+        for {set i 0} {$i < 10} {incr i} {
+            lappend with_ttl t$i
+            lappend without_ttl p$i
+        }
+        r SADDEX myset EX 3600 MEMBERS 10 {*}$with_ttl
+        r SADD myset {*}$without_ttl
+
+        set got [r SRANDMEMBER myset -3000]
+        assert_equal 3000 [llength $got]
+        assert_all_live $got [concat $with_ttl $without_ttl]
+        foreach m [concat $with_ttl $without_ttl] {
+            assert_equal 1 [expr {[lsearch -exact $got $m] != -1}] "member $m was never drawn"
+        }
+        assert_equal 420 [r SCARD myset]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test "SRANDMEMBER returns the one live member of a hidden-dense set" {
+        flush_and_disable_active_expiry
+        foreach live_has_ttl {1 0} {
+            set live_members [make_hidden_dense_set r myset 400 1 $live_has_ttl]
+            assert_equal {live0} [r SRANDMEMBER myset]
+            assert_equal {live0} [r SRANDMEMBER myset 1]
+            assert_equal {live0} [r SRANDMEMBER myset 5]
+            assert_equal [lrepeat 5 live0] [r SRANDMEMBER myset -5]
+            assert_equal 401 [r SCARD myset]
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test "SRANDMEMBER over an all-hidden set answers empty without reclaiming" {
+        flush_and_disable_active_expiry
+        make_hidden_dense_set r myset 400 0 0
+        assert_equal {} [r SRANDMEMBER myset]
+        assert_equal {} [r SRANDMEMBER myset 1]
+        assert_equal {} [r SRANDMEMBER myset 500]
+        assert_equal {} [r SRANDMEMBER myset -500]
+        assert_equal 400 [r SCARD myset]
+        assert_equal 1 [get_keys_with_volatile_items r]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test "SRANDMEMBER with a count at or above the live population returns exactly it" {
+        flush_and_disable_active_expiry
+        foreach live_has_ttl {1 0} {
+            set live_members [make_hidden_dense_set r myset 400 20 $live_has_ttl]
+            foreach count {20 21 420 500} {
+                assert_equal [lsort $live_members] [lsort [r SRANDMEMBER myset $count]]
+            }
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    foreach {live_kind live_has_ttl} {volatile 1 persistent 0} {
+        test "SPOP with a small count over a hidden-dense set pops live members only - $live_kind live" {
+            flush_and_disable_active_expiry
+            foreach count {1 2} {
+                set live_members [make_hidden_dense_set r myset 400 20 $live_has_ttl]
+                set popped [r SPOP myset $count]
+                assert_equal $count [llength $popped]
+                assert_equal $count [llength [lsort -unique $popped]]
+                assert_all_live $popped $live_members
+
+                # Only the returned live members left; the hidden ones are still
+                # stored and still hidden.
+                assert_equal [expr {420 - $count}] [r SCARD myset]
+                assert_equal [expr {20 - $count}] [llength [r SMEMBERS myset]]
+                foreach m $popped { assert_equal 0 [r SISMEMBER myset $m] }
+                assert_equal 1 [r EXISTS myset]
+                assert_equal 1 [get_keys_with_volatile_items r]
+            }
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
+
+    test "SPOP over an all-hidden set returns empty and keeps every hidden member" {
+        flush_and_disable_active_expiry
+        make_hidden_dense_set r myset 400 0 0
+        assert_equal {{} 0 0} [capture_mutation_signals myset {
+            assert_equal {} [r SPOP myset 1]
+            assert_equal {} [r SPOP myset 2]
+            assert_equal {} [r SPOP myset 500]
+        }]
+        assert_equal 400 [r SCARD myset]
+        assert_equal 1 [r EXISTS myset]
+        assert_equal 1 [get_keys_with_volatile_items r]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    test "SPOP with a count of 1 pops the one live member of a hidden-dense set" {
+        flush_and_disable_active_expiry
+        foreach live_has_ttl {1 0} {
+            make_hidden_dense_set r myset 400 1 $live_has_ttl
+            assert_equal {live0} [r SPOP myset 1]
+            assert_equal 400 [r SCARD myset]
+            assert_equal {} [r SMEMBERS myset]
+            assert_equal {} [r SPOP myset 1]
+        }
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    # Pops taken from both halves of the census must leave the other half, and the
+    # hidden members, exactly as they were.
+    test "SPOP over a hidden-dense set keeps the remaining TTLs and hidden members" {
+        flush_and_disable_active_expiry
+        r DEL myset
+        set hidden_members {}
+        for {set i 0} {$i < 400} {incr i} { lappend hidden_members h$i }
+        r SADD myset {*}$hidden_members
+        make_members_expired r myset $hidden_members
+        set with_ttl {}
+        set without_ttl {}
+        for {set i 0} {$i < 10} {incr i} {
+            lappend with_ttl t$i
+            lappend without_ttl p$i
+        }
+        r SADDEX myset EX 3600 MEMBERS 10 {*}$with_ttl
+        r SADD myset {*}$without_ttl
+
+        set popped [r SPOP myset 12]
+        assert_equal 12 [llength $popped]
+        assert_equal 12 [llength [lsort -unique $popped]]
+        assert_all_live $popped [concat $with_ttl $without_ttl]
+        assert_equal 408 [r SCARD myset]
+        set left [r SMEMBERS myset]
+        assert_equal 8 [llength $left]
+        foreach m $left {
+            if {[lsearch -exact $with_ttl $m] != -1} {
+                assert_range [set_member_ttl r myset $m] 1 3600
+            } else {
+                assert_equal -1 [set_member_ttl r myset $m]
+            }
+        }
+        # Only live members left, so every hidden member is still stored.
+        assert_equal 400 [expr {408 - [llength $left]}]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+}
+
+start_server {tags {"setexpire needs:repl external:skip"} overrides {set-max-listpack-entries 0}} {
+    start_server {overrides {set-max-listpack-entries 0}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "SRANDMEMBER on a replica draws only live members and reclaims nothing" {
+            $primary FLUSHALL
+            $primary DEBUG SET-ACTIVE-EXPIRE 0
+            $replica DEBUG SET-ACTIVE-EXPIRE 0
+            set live_members [make_hidden_dense_set $primary myset 400 20 1]
+            attach_replica $primary $replica $primary_host $primary_port
+
+            # A replica read sees POLICY_KEEP_EXPIRED, so the members are hidden
+            # there too and only the primary's SREM ever removes them.
+            assert_equal 420 [$replica SCARD myset]
+            set got [$replica SRANDMEMBER myset -200]
+            assert_equal 200 [llength $got]
+            assert_all_live $got $live_members
+            assert_all_live [$replica SRANDMEMBER myset 20] $live_members
+            assert_equal [lsort $live_members] [lsort [$replica SMEMBERS myset]]
+            assert_equal 420 [$replica SCARD myset]
+
+            $primary DEBUG SET-ACTIVE-EXPIRE 1
+            $replica DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
 }
 
 # A set operand of a sorted set operation is iterated, and its members are handed

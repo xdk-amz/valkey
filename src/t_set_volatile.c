@@ -132,6 +132,25 @@ void setTypeResetVolatileIterator(vsetIterator *iter) {
     vsetResetIterator(iter);
 }
 
+/* Return the indexed-member count and report how many are hidden. */
+size_t setTypeVolatileCensus(robj *o, mstime_t now, size_t *hidden) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+    vset *set = setTypeGetVolatileSet(o);
+    if (set == NULL) {
+        *hidden = 0;
+        return 0;
+    }
+    return vsetCountHidden(set, smemberGetExpiryVsetFunc, now, hidden);
+}
+
+/* Select a live indexed member by rank. */
+bool setTypeSelectLiveVolatileMember(robj *o, mstime_t now, size_t rank, smember **member) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+    vset *set = setTypeGetVolatileSet(o);
+    if (set == NULL) return false;
+    return vsetSelectLive(set, smemberGetExpiryVsetFunc, now, rank, (void **)member);
+}
+
 long long setTypeVolatileCount(robj *o) {
     serverAssert(objectGetType(o) == OBJ_SET);
 

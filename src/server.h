@@ -3789,6 +3789,8 @@ void setTypeResetVolatileIterator(vsetIterator *iter);
 void setTypeFreeVolatileSet(robj *o);
 void setTypeTrackVolatileMembers(robj *o);
 long long setTypeVolatileCount(robj *o);
+size_t setTypeVolatileCensus(robj *o, mstime_t now, size_t *hidden);
+bool setTypeSelectLiveVolatileMember(robj *o, mstime_t now, size_t rank, smember **member);
 long long setTypeListpackGetExpiry(unsigned char *lp, unsigned char *p);
 void setTypeIgnoreTTL(robj *o, bool ignore);
 void setTypeTrackMember(robj *o, smember *m);
