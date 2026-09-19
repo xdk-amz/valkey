@@ -13,23 +13,36 @@ extern int ProcessingEventsWhileBlocked; /* networking.c */
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
 #define FP_CLIENT_INFLIGHT_MAX 256 /* commands of one client on main at once */
-#define FP_TAG_DETACH ((uintptr_t)1) /* return-ring entry is a client to detach, not a batch */
+#define FP_TAG_DETACH ((uintptr_t)1) /* return-ring entry is a client to close, not a batch */
+#define FP_TAG_ATTACH ((uintptr_t)2) /* return-ring entry is a client the IO thread takes ownership of */
+#define FP_TAGS (FP_TAG_DETACH | FP_TAG_ATTACH)
+#define FP_RET_RESERVE 64 /* ring slots admission leaves free so returned batches and detaches never block */
 
 typedef struct fpThread {
     spscQueue submit; /* IO thread -> main: cmdBatch * */
-    spscQueue ret;    /* main -> IO thread: cmdBatch *, or client * | FP_TAG_DETACH */
+    spscQueue ret;    /* main -> IO thread: cmdBatch *, or client * | FP_TAG_ATTACH / FP_TAG_DETACH */
     cmdBatch *cur;    /* batch being assembled */
     cmdBatch *freelist[FP_FREELIST_MAX];
     int nfree;
     int inflight;     /* batches submitted, not yet returned */
-    list *leaving;    /* clients waiting for their entries to return before hand-off or close */
+    int cur_hold;     /* cur holds entries of a client that left behind held commands; cancelled once nothing is in flight */
+    int quiescing;    /* IO thread only: quiesce observed, every owned client marked leaving */
+    list owned;       /* IO thread only: clients this thread reads; registry with leaving */
+    list leaving;     /* IO thread only: clients whose entries must return before hand-off or close */
+    rax *registry;    /* IO thread only: owned + leaving keyed by pointer value, so a detach request needs no dereference */
+    _Atomic int role; /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
+    size_t main_clients;   /* main only: clients routed here and not yet taken back */
+    size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
+    list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
     long long reads, net_input_bytes, net_output_bytes, writes, batches;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
 static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per IO thread */
 static size_t fastpath_clients = 0;                 /* main thread only */
+static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
+static long long fp_retired[5]; /* main thread only: counters of threads since retired */
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -65,12 +78,20 @@ void fastpathInitThread(int tid) {
     memset(t, 0, sizeof(*t));
     spscInit(&t->submit, FP_RING_SIZE);
     spscInit(&t->ret, FP_RING_SIZE);
-    t->leaving = listCreate();
+    t->registry = raxNew();
+    t->ret_overflow = listCreate();
+    atomic_init(&t->role, FP_ROLE_OPEN);
+    if (tid + 1 > fp_slots) fp_slots = tid + 1;
 }
 
+/* Destruction preconditions: no client, batch, ring entry or request may still name this thread. */
 void fastpathFreeThread(int tid) {
     fpThread *t = &fp_threads[tid];
     if (t->submit.buffer == NULL) return;
+    serverAssert(listLength(&t->owned) == 0 && listLength(&t->leaving) == 0 && raxSize(t->registry) == 0);
+    serverAssert(t->inflight == 0 && t->cur == NULL);
+    serverAssert(spscBacklog(&t->submit) == 0 && spscIsEmpty(&t->ret));
+    serverAssert(t->main_clients == 0 && t->detach_pending == 0 && listLength(t->ret_overflow) == 0);
     spscFree(&t->submit);
     spscFree(&t->ret);
     while (t->nfree > 0) {
@@ -78,13 +99,50 @@ void fastpathFreeThread(int tid) {
         zfree(b->arena);
         zfree(b);
     }
-    if (t->cur) {
-        zfree(t->cur->arena);
-        zfree(t->cur);
-        t->cur = NULL;
-    }
-    listRelease(t->leaving);
-    t->leaving = NULL;
+    raxFree(t->registry);
+    t->registry = NULL;
+    listRelease(t->ret_overflow);
+    t->ret_overflow = NULL;
+    fp_retired[0] += t->reads;
+    fp_retired[1] += t->net_input_bytes;
+    fp_retired[2] += t->net_output_bytes;
+    fp_retired[3] += t->writes;
+    fp_retired[4] += t->batches;
+    while (fp_slots > 0 && fp_threads[fp_slots - 1].submit.buffer == NULL) fp_slots--;
+}
+
+int fastpathWorkerRole(int tid) {
+    return atomic_load_explicit(&fp_threads[tid].role, memory_order_acquire);
+}
+
+size_t fastpathWorkerOwnedClients(int tid) {
+    return fp_threads[tid].main_clients;
+}
+
+void fastpathWorkerQuiesce(int tid) {
+    fpThread *t = &fp_threads[tid];
+    if (t->submit.buffer == NULL) return;
+    int expected = FP_ROLE_OPEN;
+    atomic_compare_exchange_strong_explicit(&t->role, &expected, FP_ROLE_QUIESCING, memory_order_release,
+                                            memory_order_relaxed);
+}
+
+/* Drained for main: the thread published DRAINED and main holds no reference or request for it. */
+int fastpathWorkerDrained(int tid) {
+    fpThread *t = &fp_threads[tid];
+    if (t->submit.buffer == NULL) return 1;
+    if (fastpathWorkerRole(tid) != FP_ROLE_DRAINED) return 0;
+    if (t->main_clients || t->detach_pending || listLength(t->ret_overflow)) return 0;
+    return spscBacklog(&t->submit) == 0 && spscIsEmpty(&t->ret);
+}
+
+int fastpathWorkerReopen(int tid) {
+    fpThread *t = &fp_threads[tid];
+    if (t->submit.buffer == NULL) return 0;
+    if (fastpathWorkerRole(tid) == FP_ROLE_OPEN) return 1;
+    if (!fastpathWorkerDrained(tid)) return 0;
+    atomic_store_explicit(&t->role, FP_ROLE_OPEN, memory_order_release);
+    return 1;
 }
 
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
@@ -109,6 +167,16 @@ int fastpathEligible(client *c) {
     return fpSessionEligible(c) && !c->flag.pending_read && !c->flag.partitioned;
 }
 
+/* Main publishes a return-ring request; a full ring parks detaches for the next drain pass. */
+static void fpRetPublish(fpThread *t, client *c, uintptr_t tag) {
+    if (listLength(t->ret_overflow) > 0 || spscFreeSlots(&t->ret) == 0) {
+        serverAssert(tag == FP_TAG_DETACH);
+        listAddNodeTail(t->ret_overflow, c);
+        return;
+    }
+    spscEnqueue(&t->ret, (void *)((uintptr_t)c | tag), true);
+}
+
 /* Both addresses are fixed for the life of the connection; a transport they cannot represent is not admitted. */
 static int fpCaptureAddrs(client *c) {
     struct sockaddr_storage sa;
@@ -120,11 +188,20 @@ static int fpCaptureAddrs(client *c) {
     return peerIdentityFromSockaddr(&c->fp_local, (struct sockaddr *)&sa, salen);
 }
 
-/* Publish all client state before level-triggered epoll can expose the socket. */
+/* Ownership passes with the ring entry: after it main touches nothing of the client until it is handed back. */
 int fastpathAttach(client *c) {
-    int tid = 1 + (int)(fp_rr++ % (unsigned)(server.io_threads_num - 1));
-    int epfd = ioThreadEpollFd(tid);
-    if (epfd <= 0) return C_ERR;
+    int n = ioThreadsReadyNum() - 1;
+    fpThread *t = NULL;
+    int tid = 0;
+    for (int i = 0; i < n; i++) {
+        tid = 1 + (int)(fp_rr++ % (unsigned)n);
+        t = &fp_threads[tid];
+        if (t->submit.buffer && fastpathWorkerRole(tid) == FP_ROLE_OPEN && listLength(t->ret_overflow) == 0 &&
+            spscFreeSlots(&t->ret) > FP_RET_RESERVE)
+            break;
+        t = NULL;
+    }
+    if (!t) return C_ERR;
     if (c->fp_peer.family == 0 && fpCaptureAddrs(c) != C_OK) return C_ERR;
     c->io_tid = tid;
     c->flag.fastpath = 1;
@@ -132,13 +209,10 @@ int fastpathAttach(client *c) {
     c->fp_inflight = 0;
     c->fp_held = 0;
     c->fp_out = NULL;
-    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
-        c->flag.fastpath = 0;
-        c->io_tid = 0;
-        return C_ERR;
-    }
+    listInitNode(&c->io_owner_node, c);
     fastpath_clients++;
+    t->main_clients++;
+    fpRetPublish(t, c, FP_TAG_ATTACH);
     return C_OK;
 }
 
@@ -163,18 +237,39 @@ static void fpSubmit(fpThread *t) {
 
 void fastpathSubmitPending(int tid) {
     fpThread *t = &fp_threads[tid];
-    if (!t->cur || t->cur->count == 0 || spscBacklog(&t->submit) != 0) return;
+    if (!t->cur || t->cur->count == 0 || t->cur_hold || t->quiescing || spscBacklog(&t->submit) != 0) return;
     /* The hold amortizes per-batch work while bounding latency. */
     if (server.io_batch_hold_us > 0 && getMonotonicUs() - t->cur->opened_us < (monotime)server.io_batch_hold_us) return;
     fpSubmit(t);
 }
 
-/* Handoff waits until every published command for the client returns. */
-static void fpBeginLeave(fpThread *t, client *c, int state) {
+/* Registry membership changes only with ownership: taken here, dropped when the client is handed back. */
+static void fpRegister(fpThread *t, client *c) {
+    listLinkNodeTail(&t->owned, &c->io_owner_node);
+    raxInsert(t->registry, (unsigned char *)&c, sizeof(c), NULL, NULL);
+}
+
+static void fpUnregister(fpThread *t, client *c) {
+    listUnlinkNode(&t->leaving, &c->io_owner_node);
+    raxRemove(t->registry, (unsigned char *)&c, sizeof(c), NULL);
+}
+
+static int fpCurHasClient(fpThread *t, client *c) {
+    if (!t->cur) return 0;
+    for (int i = 0; i < t->cur->count; i++)
+        if (t->cur->e[i].io_client == c) return 1;
+    return 0;
+}
+
+/* Handoff waits until every published command for the client returns. Entries of the client still
+ * in the unpublished batch may only follow commands it holds, so hold_cur keeps them from publishing. */
+static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->fp_state != FP_ACTIVE) return;
     c->fp_state = state;
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
-    listAddNodeTail(t->leaving, c);
+    listUnlinkNode(&t->owned, &c->io_owner_node);
+    listLinkNodeTail(&t->leaving, &c->io_owner_node);
+    if (hold_cur && fpCurHasClient(t, c)) t->cur_hold = 1;
 }
 
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
@@ -252,7 +347,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             c->net_input_bytes_curr_cmd = p->input_bytes, c->parsed_cmd = p->cmd, c->slot = p->slot;
             c->read_flags |= p->read_flags;
         }
-        fpBeginLeave(t, c, FP_LEAVING);
+        fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
 
@@ -284,7 +379,7 @@ void fastpathClientReadable(int tid, client *c) {
         if (c->nread < 0 && connGetState(c->conn) == CONN_STATE_CONNECTED) return; /* EAGAIN */
         /* EOF or error: the client closes. Nothing more is read; entries in
          * flight return first, then the main thread frees the client. */
-        fpBeginLeave(t, c, FP_CLOSING);
+        fpBeginLeave(t, c, FP_CLOSING, 0);
         return;
     }
     t->net_input_bytes += c->nread;
@@ -292,7 +387,7 @@ void fastpathClientReadable(int tid, client *c) {
     c->last_interaction = server.unixtime;
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
         trimClientQueryBuffer(c);
-        fpBeginLeave(t, c, FP_LEAVING);
+        fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
     parseInputBuffer(c);
@@ -311,7 +406,7 @@ static int fpFlushOut(fpThread *t, client *c) {
         ssize_t n = write(c->conn->fd, c->fp_out, sdslen(c->fp_out));
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
-            fpBeginLeave(t, c, FP_CLOSING);
+            fpBeginLeave(t, c, FP_CLOSING, 0);
             return 0;
         }
         t->net_output_bytes += n;
@@ -332,7 +427,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     ssize_t n = writev(c->conn->fd, iov, iovcnt);
     if (n < 0) {
         if (errno != EAGAIN && errno != EINTR) {
-            fpBeginLeave(t, c, FP_CLOSING);
+            fpBeginLeave(t, c, FP_CLOSING, 0);
             return;
         }
         n = 0;
@@ -408,7 +503,7 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
         c->read_flags = head.read_flags;
     }
     c->fp_held += n;
-    fpBeginLeave(t, c, FP_LEAVING);
+    fpBeginLeave(t, c, FP_LEAVING, 1);
 }
 
 /* Consecutive entries for one client share a writev. */
@@ -453,19 +548,91 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
 
 /* Clients that stopped reading and now have nothing in flight are handed to
  * the main thread: to be freed (closing) or taken over (leaving). Buffered
- * output goes out first. */
+ * output goes out first while the role is open; a quiescing thread hands the
+ * residue over with the client so a slow reader cannot hold it. */
 static void fpFinishLeaving(fpThread *t) {
-    if (listLength(t->leaving) == 0) return;
-    listIter li;
-    listNode *ln;
-    listRewind(t->leaving, &li);
-    while ((ln = listNext(&li))) {
+    if (listLength(&t->leaving) == 0) return;
+    int open = atomic_load_explicit(&t->role, memory_order_relaxed) == FP_ROLE_OPEN;
+    listNode *ln = t->leaving.head;
+    while (ln) {
+        listNode *next = ln->next;
         client *c = listNodeValue(ln);
+        ln = next;
         if (c->fp_inflight > 0) continue;
-        if (c->fp_state == FP_LEAVING && !fpFlushOut(t, c)) continue; /* still draining output */
-        listDelNode(t->leaving, ln);
+        if (c->fp_state == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
+        fpUnregister(t, c);
         sendToMainThread(c, c->fp_state == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
     }
+}
+
+/* Unpublished entries of clients that left go back to them in order; a closing client's are dropped.
+ * Only valid with nothing in flight, since anything published for those clients precedes them. */
+static void fpCancelLeavingInCur(fpThread *t) {
+    cmdBatch *b = t->cur;
+    serverAssert(t->inflight == 0);
+    t->cur_hold = 0;
+    if (!b) return;
+    cmdEntry grp[IO_BATCH_MAX];
+    int kept = 0;
+    for (int i = 0; i < b->count; i++) {
+        client *c = b->e[i].io_client;
+        if (c == NULL) continue; /* already moved into its client's queue */
+        if (c->fp_state == FP_ACTIVE) {
+            b->e[kept++] = b->e[i];
+            continue;
+        }
+        int n = 0;
+        for (int j = i; j < b->count; j++) {
+            if (b->e[j].io_client != c) continue;
+            grp[n++] = b->e[j];
+            b->e[j].io_client = NULL;
+        }
+        c->fp_inflight -= n;
+        if (c->fp_state == FP_CLOSING) {
+            for (int k = 0; k < n; k++) {
+                for (int a = 0; a < grp[k].argc; a++) decrRefCount(grp[k].argv[a]);
+                zfree(grp[k].argv);
+            }
+        } else {
+            fpRequeue(t, c, grp, n);
+        }
+    }
+    b->count = kept;
+    if (kept == 0) {
+        fpRecycleBatch(t, b);
+        t->cur = NULL;
+    }
+}
+
+/* Quiesce, observed once: every reading client leaves; the batch under assembly is
+ * cancelled once nothing is in flight; DRAINED follows the last hand-off. */
+static void fpQuiesceStep(fpThread *t) {
+    if (!t->quiescing) {
+        t->quiescing = 1;
+        listNode *ln = t->owned.head;
+        while (ln) {
+            listNode *next = ln->next;
+            fpBeginLeave(t, listNodeValue(ln), FP_LEAVING, 1);
+            ln = next;
+        }
+    }
+    if (t->inflight == 0 && t->cur) fpCancelLeavingInCur(t);
+    fpFinishLeaving(t);
+    if (t->inflight == 0 && t->cur == NULL && listLength(&t->owned) == 0 && listLength(&t->leaving) == 0) {
+        t->quiescing = 0;
+        atomic_store_explicit(&t->role, FP_ROLE_DRAINED, memory_order_release);
+    }
+}
+
+/* Attach and detach requests name clients by pointer only until the registry confirms ownership. */
+static void fpTakeClient(fpThread *t, client *c) {
+    fpRegister(t, c);
+    if (atomic_load_explicit(&t->role, memory_order_relaxed) != FP_ROLE_OPEN) {
+        fpBeginLeave(t, c, FP_LEAVING, 0); /* admitted as the role closed: straight back to main */
+        return;
+    }
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};
+    if (epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) fpBeginLeave(t, c, FP_LEAVING, 0);
 }
 
 int fastpathProcessReturns(int tid) {
@@ -477,8 +644,14 @@ int fastpathProcessReturns(int tid) {
     while ((n = spscDequeueBatch(&t->ret, items, 16)) > 0) {
         for (size_t i = 0; i < n; i++) {
             uintptr_t v = (uintptr_t)items[i];
-            if (v & FP_TAG_DETACH) {
-                fpBeginLeave(t, (client *)(v & ~FP_TAG_DETACH), FP_CLOSING);
+            if (v & FP_TAGS) {
+                client *c = (client *)(v & ~FP_TAGS);
+                if (v & FP_TAG_ATTACH) {
+                    fpTakeClient(t, c);
+                } else if (raxFind(t->registry, (unsigned char *)&c, sizeof(c), NULL)) {
+                    if (c->fp_state == FP_LEAVING) c->fp_state = FP_CLOSING; /* no reason left to flush its output */
+                    fpBeginLeave(t, c, FP_CLOSING, 0);
+                } /* else already handed back: main frees it once this request is consumed */
                 continue;
             }
             cmdBatch *b = (cmdBatch *)v;
@@ -488,6 +661,11 @@ int fastpathProcessReturns(int tid) {
         }
         total += (int)n;
     }
+    if (atomic_load_explicit(&t->role, memory_order_acquire) == FP_ROLE_QUIESCING) {
+        fpQuiesceStep(t);
+        return total;
+    }
+    if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
     return total;
 }
@@ -587,6 +765,17 @@ release_argv:
     }
 }
 
+/* Overflowed detach requests take ring slots as they free up; the request's position is recorded then. */
+static void fpRetFlushOverflow(fpThread *t) {
+    while (listLength(t->ret_overflow) > 0 && spscFreeSlots(&t->ret) > 0) {
+        listNode *ln = listFirst(t->ret_overflow);
+        client *c = listNodeValue(ln);
+        listDelNode(t->ret_overflow, ln);
+        spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
+        raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), (void *)t->ret.tail_local, NULL);
+    }
+}
+
 int fastpathDrain(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
@@ -596,9 +785,10 @@ int fastpathDrain(void) {
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
 again:
-    for (int tid = 1; tid < server.io_threads_num; tid++) {
+    for (int tid = 1; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (t->submit.buffer == NULL) continue;
+        if (unlikely(listLength(t->ret_overflow) > 0)) fpRetFlushOverflow(t);
         void *items[8];
         size_t n = spscDequeueBatch(&t->submit, items, 8);
         if (n == 0) continue;
@@ -630,14 +820,31 @@ again:
     return total;
 }
 
-/* Main requests detach through the IO-owned return ring. */
+/* Main requests a close through the IO-owned return ring; the client stays allocated until the
+ * ring's consumer passed the request, so the IO thread never meets a recycled pointer. */
 void fastpathRequestDetach(client *c) {
     fpThread *t = &fp_threads[c->io_tid];
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
+    t->detach_pending++;
     if (!fp_detaching) fp_detaching = raxNew();
     raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), NULL, NULL);
-    spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
+    fpRetPublish(t, c, FP_TAG_DETACH);
+    if (listLength(t->ret_overflow) == 0)
+        raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), (void *)t->ret.tail_local, NULL);
+}
+
+/* True once the IO thread consumed the detach request; only then may main free the client. */
+int fastpathDetachConsumed(client *c) {
+    void *pos = NULL;
+    if (!c->flag.fp_detach_sent) return 1;
+    if (!raxFind(fp_detaching, (unsigned char *)&c, sizeof(c), &pos) || pos == NULL) return 0;
+    fpThread *t = &fp_threads[c->io_tid];
+    if (atomic_load_explicit(&t->ret.head, memory_order_acquire) < (size_t)pos) return 0;
+    raxRemove(fp_detaching, (unsigned char *)&c, sizeof(c), NULL);
+    t->detach_pending--;
+    c->flag.fp_detach_sent = 0;
+    return 1;
 }
 
 /* A client that left to authenticate returns once main has nothing further to do for it;
@@ -682,23 +889,31 @@ int fastpathReadmitAuthenticated(client *c) {
 }
 
 void fastpathHandoffDone(client *c, int closing) {
+    fpThread *t = &fp_threads[c->io_tid];
+    serverAssert(t->main_clients > 0);
+    t->main_clients--;
     c->flag.fastpath = 0;
     c->fp_state = FP_DETACHED;
     fastpath_clients--;
-    if (c->flag.fp_detach_sent) {
-        c->flag.fp_detach_sent = 0;
-        raxRemove(fp_detaching, (unsigned char *)&c, sizeof(c), NULL);
-    }
     ACLFastpathClientReturned(c);
-    if (c->fp_out) {
-        sdsfree(c->fp_out);
-        c->fp_out = NULL;
+    sds out = c->fp_out;
+    c->fp_out = NULL;
+    /* A detach still in the ring keeps the client allocated: freeClientsInAsyncFreeQueue frees it once consumed. */
+    if (c->flag.fp_detach_sent) {
+        sdsfree(out);
+        return;
     }
     if (closing || c->flag.close_asap) {
+        sdsfree(out);
         freeClient(c); /* removes it from clients_to_close itself when close_asap is set */
         return;
     }
     connSetReadHandler(c->conn, readQueryFromClient);
+    if (out) {
+        /* Replies the IO thread could not write yet precede anything main produces for this client. */
+        if (sdslen(out) > 0) addReplyProto(c, out, sdslen(out));
+        sdsfree(out);
+    }
     int authenticating = c->parsed_cmd && (c->parsed_cmd->proc == authCommand || c->parsed_cmd->proc == helloCommand);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;
@@ -715,8 +930,14 @@ void fastpathHandoffDone(client *c, int closing) {
 }
 
 void fastpathInfo(sds *info) {
-    long long reads = 0, in = 0, out = 0, writes = 0, batches = 0;
-    for (int i = 1; i < server.io_threads_num; i++) {
+    long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
+              batches = fp_retired[4];
+    int open = 0, quiescing = 0;
+    for (int i = 1; i < fp_slots; i++) {
+        if (fp_threads[i].submit.buffer == NULL) continue;
+        int role = fastpathWorkerRole(i);
+        open += role == FP_ROLE_OPEN;
+        quiescing += role == FP_ROLE_QUIESCING;
         reads += fp_threads[i].reads;
         in += fp_threads[i].net_input_bytes;
         out += fp_threads[i].net_output_bytes;
@@ -725,10 +946,12 @@ void fastpathInfo(sds *info) {
     }
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
+                         "fastpath_workers_open:%d\r\n"
+                         "fastpath_workers_quiescing:%d\r\n"
                          "fastpath_reads:%lld\r\n"
                          "fastpath_writes:%lld\r\n"
                          "fastpath_batches:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, reads, writes, batches, in, out);
+                         fastpath_clients, open, quiescing, reads, writes, batches, in, out);
 }

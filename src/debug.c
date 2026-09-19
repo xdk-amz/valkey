@@ -517,6 +517,8 @@ void debugCommand(client *c) {
             "    Pin the adaptive reply copy-avoidance floor/engagement (for testing).",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+            "IO-THREADS-FAIL-CREATE <id>",
+            "    Make the next attempt to create IO thread <id> fail (for testing rollback).",
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -590,6 +592,15 @@ void debugCommand(client *c) {
         serverAssertWithInfo(c, c->argv[0], 1 == 2);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char *)objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "io-threads-fail-create") && c->argc == 3) {
+        long long id;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &id, NULL) != C_OK) return;
+        if (id < 1 || id >= IO_THREADS_MAX_NUM) {
+            addReplyError(c, "IO thread id out of range");
+            return;
+        }
+        ioThreadsDebugFailCreate((int)id);
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));

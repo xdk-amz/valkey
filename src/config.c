@@ -2965,12 +2965,10 @@ static int applyTlsCfg(const char **err) {
     return 1;
 }
 
-/* Turning strict offload off returns partitioned clients to the main event
- * loop, since IO threads may then park and stop polling their sockets. */
+/* Turning strict offload or the fast path off returns the clients IO threads own to the
+ * main event loop, since IO threads may then park and stop polling their sockets. */
 static int applyIOThreadsStrictOffload(const char **err) {
-    UNUSED(err);
-    if (!server.io_threads_strict_offload) unpartitionAllClients();
-    return 1;
+    return applyIOThreadsFastpathConfig(err);
 }
 
 static int applyTLSPort(const char **err) {
@@ -3490,7 +3488,7 @@ standardConfig static_configs[] = {
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
-    createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, NULL),
+    createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

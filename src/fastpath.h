@@ -42,11 +42,17 @@ typedef struct cmdBatch {
 #define FP_CLOSING 2  /* stopped reading; main frees it once nothing is in flight */
 #define FP_DETACHED 3 /* main owns it again */
 
+/* Fast-path role of one IO thread: main opens and quiesces it, the thread publishes drained. */
+#define FP_ROLE_OPEN 0      /* admits clients, publishes batches */
+#define FP_ROLE_QUIESCING 1 /* admits nothing, publishes nothing; hands off or closes every owned client */
+#define FP_ROLE_DRAINED 2   /* owns no client, batch or ring entry; main may reopen or destroy it */
+
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);
 int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
+int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
@@ -57,5 +63,12 @@ void fastpathClientReadable(int tid, client *c);
 void fastpathClientWritable(int tid, client *c);
 void fastpathSubmitPending(int tid);
 int fastpathProcessReturns(int tid);
+
+/* Role transitions driven by main; a quiesce is idempotent and never restarts publication. */
+void fastpathWorkerQuiesce(int tid);
+int fastpathWorkerReopen(int tid);
+int fastpathWorkerDrained(int tid);
+int fastpathWorkerRole(int tid);
+size_t fastpathWorkerOwnedClients(int tid);
 
 #endif
