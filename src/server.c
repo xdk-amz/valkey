@@ -2192,6 +2192,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     if (strictOffloadActive()) processDeferredReads();
 
+    ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
 
     /* Before we are going to sleep, let the threads access the dataset by
@@ -5456,7 +5457,7 @@ int finishShutdown(void) {
     moduleUnloadAllModules();
 
     /* Module unloading may drain IO queues, so stop workers afterward. */
-    killIOThreads();
+    ioThreadsStopForExit();
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
@@ -6657,6 +6658,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "executable:%s\r\n", server.executable ? server.executable : "",
                 "config_file:%s\r\n", server.configfile ? server.configfile : "",
                 "io_threads_active:%i\r\n", server.active_io_threads_num > 1,
+                "io_threads_running:%i\r\n", ioThreadsRunningNum(),
+                "io_threads_retiring:%i\r\n", ioThreadsRetiringNum(),
                 "availability_zone:%s\r\n", server.availability_zone));
 
         /* Conditional properties */

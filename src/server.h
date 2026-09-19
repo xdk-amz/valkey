@@ -1502,6 +1502,7 @@ typedef struct client {
     uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
+    listNode io_owner_node;               /* Registry link of the IO thread that owns the socket: linked by that thread for fast-path clients, by main for partitioned ones */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */

@@ -2401,6 +2401,11 @@ int freeClient(client *c) {
         freeClientAsync(c);
         return 0;
     }
+    /* Handed back with a detach still in its IO thread's ring: the pointer must stay valid until consumed. */
+    if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) {
+        freeClientAsync(c);
+        return 0;
+    }
 
     reconcileLazyWrite(c);
     partitionedClientDetach(c);
@@ -2709,6 +2714,7 @@ int freeClientsInAsyncFreeQueue(void) {
         }
 
         if (c->flag.fastpath) continue; /* freed when its IO thread reports JOB_RES_FP_CLOSE */
+        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue; /* its IO thread may still meet the pointer */
 
         reconcileLazyWrite(c);
         partitionedClientDetach(c);
