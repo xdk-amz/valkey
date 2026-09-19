@@ -1605,22 +1605,27 @@ typedef struct zset {
  * a lookup with a plain sds key, we mark it so the hash/compare callbacks
  * can distinguish it from a packed stored item. */
 #define ZSET_LOOKUP_TYPE5_MARKER 6
+/* A borrowed set member or hash field is marked in place, so this bit may not
+ * be one the owning type stores in the same header: an smember keeps its expiry
+ * flag in bit 0 and an entry owns bits 0..2. */
+#define ZSET_SDS_AUX_BIT_LOOKUP_KEY 3
+static_assert(ZSET_SDS_AUX_BIT_LOOKUP_KEY < CHAR_BIT - SDS_TYPE_BITS, "sds header has no aux bit left to mark a lookup key");
 static inline void zsetMarkLookupKey(sds s) {
     if (sdsType(s) == SDS_TYPE_5)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | ZSET_LOOKUP_TYPE5_MARKER;
     else
-        sdsSetAuxBit(s, 0, 1);
+        sdsSetAuxBit(s, ZSET_SDS_AUX_BIT_LOOKUP_KEY, 1);
 }
 static inline void zsetUnmarkLookupKey(sds s) {
     unsigned char type = s[-1] & SDS_TYPE_MASK;
     if (type == ZSET_LOOKUP_TYPE5_MARKER)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | SDS_TYPE_5;
     else
-        sdsSetAuxBit(s, 0, 0);
+        sdsSetAuxBit(s, ZSET_SDS_AUX_BIT_LOOKUP_KEY, 0);
 }
 static inline int zsetIsLookupKey(const_sds s) {
     unsigned char type = s[-1] & SDS_TYPE_MASK;
-    return type == ZSET_LOOKUP_TYPE5_MARKER || sdsGetAuxBit(s, 0);
+    return type == ZSET_LOOKUP_TYPE5_MARKER || sdsGetAuxBit(s, ZSET_SDS_AUX_BIT_LOOKUP_KEY);
 }
 
 typedef struct clientBufferLimitsConfig {

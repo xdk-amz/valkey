@@ -9,6 +9,8 @@
 #include "smember.h"
 
 #define SMEMBER_SDS_AUX_BIT_HAS_EXPIRY 0
+static_assert(SMEMBER_SDS_AUX_BIT_HAS_EXPIRY < ZSET_SDS_AUX_BIT_LOOKUP_KEY,
+              "smember metadata overlaps the zset lookup-key bit");
 
 bool smemberHasExpiry(const smember *m) {
     return sdsGetAuxBit(m, SMEMBER_SDS_AUX_BIT_HAS_EXPIRY);

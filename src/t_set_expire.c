@@ -328,7 +328,7 @@ void saddexCommand(client *c) {
     }
 
     if (flags & (ARGS_SET_FNX | ARGS_SET_FXX)) {
-        bool cache_safe = (flags & ARGS_SET_FXX) && o && objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE;
+        bool cache_safe = (flags & ARGS_SET_FXX) && !set_expired && o && objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE;
         if (cache_safe) mxx_cached = zmalloc(sizeof(smember *) * num_members);
         if (o) {
             for (i = members_index; i < c->argc; i++) {
