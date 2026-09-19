@@ -102,6 +102,54 @@ proc seed_expired_member {r key} {
     make_members_expired $r $key expired
 }
 
+# Build a set whose expired members are hidden but not yet reclaimable. Above 127
+# volatile members the expiry index is a RAX whose bucket key is the deadline
+# rounded up to an 8192 ms window, and it reports that key as the earliest
+# expiry, so for the rest of the window the index claims nothing has expired
+# while every hidden member is still there. Returns the live member names.
+proc make_rax_window_set {r key hidden live} {
+    # Enter a window with room left for the deadline to pass and the test body to
+    # run before the window ends, which is what keeps the index's answer stale.
+    while {[clock milliseconds] % 8192 >= 1024} { after 50 }
+
+    set hidden_members {}
+    for {set i 0} {$i < $hidden} {incr i} { lappend hidden_members h$i }
+    set deadline [expr {[clock milliseconds] + 300}]
+    # The index files the deadline under the end of the window containing it.
+    set ::rax_window_end [expr {($deadline / 8192) * 8192 + 8192}]
+    $r SADDEX $key PXAT $deadline MEMBERS [llength $hidden_members] {*}$hidden_members
+
+    set live_members {}
+    for {set i 0} {$i < $live} {incr i} { lappend live_members live$i }
+    if {$live > 0} { $r SADD $key {*}$live_members }
+
+    wait_for_condition 100 10 {
+        [$r SISMEMBER $key [lindex $hidden_members 0]] == 0 &&
+        [$r SISMEMBER $key [lindex $hidden_members end]] == 0
+    } else {
+        fail "the hidden members of $key did not expire"
+    }
+    assert_equal [expr {$hidden + $live}] [$r SCARD $key]
+    assert_equal $live [llength [$r SMEMBERS $key]]
+    assert_inside_rax_window
+    return $live_members
+}
+
+# Outside the window the index answers correctly and proves nothing, so a run
+# that drifts past it must fail rather than pass for the wrong reason.
+proc assert_inside_rax_window {} {
+    set remaining [expr {$::rax_window_end - [clock milliseconds]}]
+    assert_equal 1 [expr {$remaining > 0}] \
+        "the expiry-index window ended [expr {-$remaining}] ms ago, so this run proves nothing"
+}
+
+# Every returned member must be one of the live ones the fixture created.
+proc assert_all_live {got live_members} {
+    foreach m $got {
+        assert_equal 1 [expr {[lsearch -exact $live_members $m] != -1}] "returned hidden member $m"
+    }
+}
+
 # The primary stays populated so pre-sync setup is included in the full sync.
 proc attach_replica {primary replica primary_host primary_port} {
     $replica replicaof $primary_host $primary_port
@@ -303,9 +351,11 @@ start_server {tags {"setexpire"}} {
     test {Set TTL readers - MEMBERS count validation} {
         r FLUSHALL
         r SADD myset a b
-        assert_error "*ERR syntax error" {r STTL myset MEMBERS 1 a b}
-        assert_error "*ERR syntax error" {r STTL myset MEMBERS 0 a}
-        assert_error "*not an integer or out of range" {r STTL myset MEMBERS a b}
+        foreach reader {STTL SPTTL SEXPIRETIME SPEXPIRETIME} {
+            assert_error "*greater than 0 and match the provided number*" {r $reader myset MEMBERS 1 a b}
+            assert_error "*greater than 0 and match the provided number*" {r $reader myset MEMBERS 0 a}
+            assert_error "*not an integer or out of range" {r $reader myset MEMBERS a b}
+        }
     }
 
     test {SPERSIST - -2 for a missing key} {
@@ -555,47 +605,66 @@ start_server {tags {"setexpire"}} {
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
-    test "SPOP without a count reclaims an all-expired set" {
+    test "SPOP without a count leaves an all-expired set to active expiry" {
         flush_and_disable_active_expiry
         r SADD myset a b c
         make_members_expired r myset {a b c}
-        assert_equal {{{sexpired myset} {del myset}} 1 1} [capture_mutation_signals myset {
+        assert_equal {{} 0 0} [capture_mutation_signals myset {
             assert_equal {} [r SPOP myset]
         }]
-        assert_equal 0 [r EXISTS myset]
-        r DEBUG SET-ACTIVE-EXPIRE 1
-    } {OK} {needs:debug}
+        assert_equal 3 [r SCARD myset]
+        assert_equal 1 [r EXISTS myset]
 
-    test "SPOP with a count reclaims an all-expired set" {
+        r DEBUG SET-ACTIVE-EXPIRE 1
+        wait_for_condition 100 100 {
+            [r EXISTS myset] == 0
+        } else {
+            fail "active expiry did not delete the all-expired set"
+        }
+    } {} {needs:debug}
+
+    test "SPOP with a count leaves an all-expired set to active expiry" {
         flush_and_disable_active_expiry
         r SADD myset a b c
         make_members_expired r myset {a b c}
-        assert_equal {{{sexpired myset} {del myset}} 1 1} [capture_mutation_signals myset {
+        assert_equal {{} 0 0} [capture_mutation_signals myset {
             assert_equal {} [r SPOP myset 2]
         }]
-        assert_equal 0 [r EXISTS myset]
-        r DEBUG SET-ACTIVE-EXPIRE 1
-    } {OK} {needs:debug}
+        assert_equal 3 [r SCARD myset]
+        assert_equal 1 [r EXISTS myset]
 
-    test "SPOP reclaims expired members before popping a live member" {
+        r DEBUG SET-ACTIVE-EXPIRE 1
+        wait_for_condition 100 100 {
+            [r EXISTS myset] == 0
+        } else {
+            fail "active expiry did not delete the all-expired set"
+        }
+    } {} {needs:debug}
+
+    test "SPOP removes only the live member it returns" {
         flush_and_disable_active_expiry
         r SADD myset a b c
         make_members_expired r myset {a b c}
         r SADD myset live1 live2
 
         set signals [capture_mutation_signals myset {
-            assert {[lsearch -exact {live1 live2} [r SPOP myset]] != -1}
+            set popped [r SPOP myset]
         }]
-        assert_equal {{sexpired myset} {spop myset}} [lindex $signals 0]
-        assert_equal 4 [lindex $signals 1]
-        assert_equal 1 [lindex $signals 2]
-
-        set signals [capture_mutation_signals myset {
-            assert {[lsearch -exact {live1 live2} [r SPOP myset 1]] != -1}
-        }]
-        assert_equal {{spop myset} {del myset}} [lindex $signals 0]
+        assert {[lsearch -exact {live1 live2} $popped] != -1}
+        assert_equal {{spop myset}} [lindex $signals 0]
         assert_equal 1 [lindex $signals 1]
         assert_equal 1 [lindex $signals 2]
+        assert_equal 4 [r SCARD myset]
+
+        set signals [capture_mutation_signals myset {
+            set popped [r SPOP myset 1]
+        }]
+        assert {[lsearch -exact {live1 live2} $popped] != -1}
+        assert_equal {{spop myset}} [lindex $signals 0]
+        assert_equal 1 [lindex $signals 1]
+        assert_equal 1 [lindex $signals 2]
+        assert_equal 3 [r SCARD myset]
+        assert_equal {} [r SMEMBERS myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
 
@@ -890,7 +959,8 @@ start_server {tags {"setexpire"}} {
 
             set popped [r SPOP myset 8]
             assert_equal {m4 m5 m6 m7 m8 m9} [lsort $popped]
-            assert_equal 0 [r EXISTS myset]
+            assert_equal 4 [r SCARD myset]
+            assert_equal {} [r SMEMBERS myset]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
@@ -903,32 +973,41 @@ start_server {tags {"setexpire"}} {
             assert_equal 3 [llength $popped]
             assert_equal 3 [llength [lsort -unique $popped]]
             assert_none_of $popped {m0 m1 m2 m3}
-            assert_equal 3 [r SCARD myset]
+            assert_equal 7 [r SCARD myset]
             assert_equal 3 [llength [r SMEMBERS myset]]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
-        test "SPOP on a set of only expired members reclaims the key - $encoding" {
+        test "SPOP on a set of only expired members mutates nothing - $encoding" {
             flush_and_disable_active_expiry
             use_set_encoding $encoding
             r SADD myset a b c
             make_members_expired r myset {a b c}
             assert_equal 3 [r SCARD myset]
-            assert_equal {} [r SPOP myset 2]
-            assert_equal 0 [r EXISTS myset]
-            assert_equal {} [r SPOP myset]
-            assert_equal {} [r SPOP myset 3]
-            r DEBUG SET-ACTIVE-EXPIRE 1
-        } {OK} {needs:debug}
+            assert_equal {{} 0 0} [capture_mutation_signals myset {
+                assert_equal {} [r SPOP myset 2]
+                assert_equal {} [r SPOP myset]
+                assert_equal {} [r SPOP myset 3]
+            }]
+            assert_equal 3 [r SCARD myset]
+            assert_equal 1 [r EXISTS myset]
 
-        test "SPOP with a huge count allocates by cardinality - $encoding" {
+            r DEBUG SET-ACTIVE-EXPIRE 1
+            wait_for_condition 100 100 {
+                [r EXISTS myset] == 0
+            } else {
+                fail "active expiry did not delete the all-expired set"
+            }
+        } {} {needs:debug}
+
+        test "SPOP with a huge count returns the live members and keeps the hidden ones - $encoding" {
             flush_and_disable_active_expiry
             use_set_encoding $encoding
             r SADD myset live1 live2 live3 expired
             make_members_expired r myset {expired}
             assert_equal {live1 live2 live3} [lsort [r SPOP myset 1000000000]]
-            assert_equal 0 [r EXISTS myset]
-            assert_equal PONG [r PING]
+            assert_equal 1 [r SCARD myset]
+            assert_equal {} [r SMEMBERS myset]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
@@ -975,32 +1054,67 @@ start_server {tags {"setexpire"}} {
             }
         }
 
-        test "SRANDMEMBER never returns an expired member - $encoding" {
+        test "SRANDMEMBER without a count is a read - $encoding" {
             flush_and_disable_active_expiry
             use_set_encoding $encoding
             create_numbered_set myset 10
             make_members_expired r myset {m0 m1 m2 m3}
+            set expired_before [s expired_set_members]
 
-            # A positive count above the live size returns every live member
-            # once, with no duplicates and no expired member padding the reply.
-            set got [r SRANDMEMBER myset 20]
-            assert_equal {m4 m5 m6 m7 m8 m9} [lsort $got]
-
-            # Below the live size: no duplicates either.
-            set got [r SRANDMEMBER myset 4]
-            assert_equal 4 [llength $got]
-            assert_equal 4 [llength [lsort -unique $got]]
+            set got {}
+            set signals [capture_mutation_signals myset {
+                for {set i 0} {$i < 20} {incr i} { lappend got [r SRANDMEMBER myset] }
+            }]
+            assert_equal 20 [llength $got]
             assert_none_of $got {m0 m1 m2 m3}
+            assert_equal {{} 0 0} $signals
+            assert_equal 10 [r SCARD myset]
+            assert_equal $expired_before [s expired_set_members]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
 
-            # A negative count returns exactly the requested number of
-            # elements, repeats allowed, drawn only from the live members.
-            set got [r SRANDMEMBER myset -50]
+        test "SRANDMEMBER with a positive count is a read - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            create_numbered_set myset 10
+            make_members_expired r myset {m0 m1 m2 m3}
+            set expired_before [s expired_set_members]
+
+            set signals [capture_mutation_signals myset {
+                # Above the live size every live member comes back exactly once.
+                set above [r SRANDMEMBER myset 20]
+                # Below it, still without duplicates.
+                set below [r SRANDMEMBER myset 4]
+                set single [r SRANDMEMBER myset 1]
+            }]
+            assert_equal {m4 m5 m6 m7 m8 m9} [lsort $above]
+            assert_equal 4 [llength [lsort -unique $below]]
+            assert_none_of $below {m0 m1 m2 m3}
+            assert_equal 1 [llength $single]
+            assert_none_of $single {m0 m1 m2 m3}
+            assert_equal {{} 0 0} $signals
+            assert_equal 10 [r SCARD myset]
+            assert_equal $expired_before [s expired_set_members]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        test "SRANDMEMBER with a negative count is a read - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            create_numbered_set myset 10
+            make_members_expired r myset {m0 m1 m2 m3}
+            set expired_before [s expired_set_members]
+
+            set signals [capture_mutation_signals myset {
+                # A negative count returns exactly the requested number of
+                # elements, repeats allowed, drawn only from the live members.
+                set got [r SRANDMEMBER myset -50]
+            }]
             assert_equal 50 [llength $got]
             assert_none_of $got {m0 m1 m2 m3}
-
-            set got [r SRANDMEMBER myset 1]
-            assert_equal 1 [llength $got]
-            assert_none_of $got {m0 m1 m2 m3}
+            assert_equal {{} 0 0} $signals
+            assert_equal 10 [r SCARD myset]
+            assert_equal $expired_before [s expired_set_members]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
@@ -1012,6 +1126,7 @@ start_server {tags {"setexpire"}} {
             for {set i 0} {$i < 20} {incr i} {
                 assert_equal m9 [r SRANDMEMBER myset]
             }
+            assert_equal 10 [r SCARD myset]
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
@@ -1020,11 +1135,22 @@ start_server {tags {"setexpire"}} {
             use_set_encoding $encoding
             r SADD myset a b c
             make_members_expired r myset {a b c}
-            assert_equal {} [r SRANDMEMBER myset -20]
-            assert_equal {} [r SRANDMEMBER myset 20]
-            assert_equal {} [r SRANDMEMBER myset]
+            assert_equal {{} 0 0} [capture_mutation_signals myset {
+                assert_equal {} [r SRANDMEMBER myset]
+                assert_equal {} [r SRANDMEMBER myset 20]
+                assert_equal {} [r SRANDMEMBER myset 2]
+                assert_equal {} [r SRANDMEMBER myset -20]
+            }]
+            assert_equal 3 [r SCARD myset]
+            assert_equal 1 [r EXISTS myset]
+
             r DEBUG SET-ACTIVE-EXPIRE 1
-        } {OK} {needs:debug}
+            wait_for_condition 100 100 {
+                [r EXISTS myset] == 0
+            } else {
+                fail "active expiry did not delete the all-expired set"
+            }
+        } {} {needs:debug}
 
         test "SSCAN skips expired members - $encoding" {
             flush_and_disable_active_expiry
@@ -1534,26 +1660,71 @@ start_server {tags {"setexpire external:skip"}} {
         close_replication_stream $repl
     }
 
-    test {SPOP with a count propagates reclaimed and popped members} {
+    test {SRANDMEMBER propagates nothing} {
         flush_and_disable_active_expiry
-        r SADD myset live e1 e2
+        r SADD myset live1 live2 e1 e2
         make_members_expired r myset {e1 e2}
 
         set repl [attach_to_replication_stream]
-        assert_equal {live} [r SPOP myset 2]
+        r SRANDMEMBER myset
+        r SRANDMEMBER myset 2
+        r SRANDMEMBER myset 20
+        r SRANDMEMBER myset -20
+        r SADD marker x
 
         assert_replication_stream $repl {
-            {multi}
             {select *}
-            {srem myset e1 e2}
-            {unlink myset}
-            {exec}
+            {sadd marker x}
         }
-        assert_equal {} [read_from_replication_stream $repl]
         close_replication_stream $repl
-        assert_equal 0 [r EXISTS myset]
+        assert_equal 4 [r SCARD myset]
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
+
+    test {SPOP without a count propagates only the member it returned} {
+        flush_and_disable_active_expiry
+        r SADD myset live1 live2 e1 e2
+        make_members_expired r myset {e1 e2}
+
+        set repl [attach_to_replication_stream]
+        set popped [r SPOP myset]
+        r SADD marker x
+
+        assert_replication_stream $repl [subst {
+            {select *}
+            {srem myset $popped}
+            {sadd marker x}
+        }]
+        close_replication_stream $repl
+        assert {[lsearch -exact {live1 live2} $popped] != -1}
+        assert_equal 3 [r SCARD myset]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+
+    foreach encoding {listpack hashtable} {
+        test "SPOP with a count propagates only the live members it returned - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD myset live1 live2 live3 e1 e2
+            make_members_expired r myset {e1 e2}
+
+            set repl [attach_to_replication_stream]
+            set popped [r SPOP myset 2]
+            r SADD marker x
+
+            assert_replication_stream $repl {{select *}}
+            set line [read_from_replication_stream $repl]
+            assert_equal {srem myset} [lrange $line 0 1]
+            assert_equal [lsort $popped] [lsort [lrange $line 2 end]]
+            assert_equal {sadd marker x} [read_from_replication_stream $repl]
+            close_replication_stream $repl
+
+            assert_equal 2 [llength [lsort -unique $popped]]
+            assert_none_of $popped {e1 e2}
+            assert_equal 3 [r SCARD myset]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
 
     # Every replaced expired member's SREM precedes the single SADD, however
     # many members one SADD replaces.
@@ -1891,8 +2062,9 @@ start_server {tags {"setexpire external:skip"}} {
     } {OK} {singledb:skip}
 
     set RDB_TYPE_SET 2
-    set RDB_TYPE_SET_2 23
     set RDB_TYPE_SET_LISTPACK 20
+    # Type 23 is upstream's RDB_TYPE_PATH_HASH, so volatile sets take the next one.
+    set RDB_TYPE_SET_2 24
 
     foreach {encoding rdb_type} [list listpack $RDB_TYPE_SET_LISTPACK hashtable $RDB_TYPE_SET] {
         test "DUMP of a $encoding set uses SET_2 only while a member has a TTL" {
@@ -2188,5 +2360,414 @@ start_server {overrides {set-max-listpack-entries 0}} {
         assert_equal 0 [r SADDEX ttl-review MXX MEMBERS 2 member member]
         assert_equal 1 [r SCARD ttl-review]
         assert_equal -1 [set_member_ttl r ttl-review member]
+    }
+}
+
+# The blocks below all run inside one 8192 ms expiry-index window, where the
+# index reports the earliest expiry as the window end while every hidden member
+# is still present and still unreclaimable. Each block is separate because a
+# path that trusts the index either aborts the server or never returns.
+start_server {tags {"setexpire needs:repl external:skip"} overrides {set-max-listpack-entries 0}} {
+    start_server {overrides {set-max-listpack-entries 0}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "SPOP with a count keeps hidden members while removing live ones" {
+            $primary FLUSHALL
+            $primary DEBUG SET-ACTIVE-EXPIRE 0
+            $replica DEBUG SET-ACTIVE-EXPIRE 0
+            attach_replica $primary $replica $primary_host $primary_port
+            set live_members [make_rax_window_set $primary myset 200 60]
+            wait_for_ofs_sync $primary $replica
+            assert_equal 260 [$replica SCARD myset]
+
+            # Volatile sets remove live members in place so hidden members stay untouched.
+            set popped [$primary SPOP myset 230]
+            assert_inside_rax_window
+            assert_equal [llength $popped] [llength [lsort -unique $popped]]
+            assert_all_live $popped $live_members
+
+            # Only the returned members left the set, so the hidden ones are
+            # still there, and the replica was told exactly the same.
+            assert_equal [expr {260 - [llength $popped]}] [$primary SCARD myset]
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary SCARD myset] [$replica SCARD myset]
+            assert_equal [lsort [$primary SMEMBERS myset]] [lsort [$replica SMEMBERS myset]]
+
+            $primary DEBUG SET-ACTIVE-EXPIRE 1
+            $replica DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        foreach cmd {SINTERSTORE SUNIONSTORE SDIFFSTORE} {
+            test "$cmd over a source with hidden members stores the same set on the replica" {
+                $primary FLUSHALL
+                $primary DEBUG SET-ACTIVE-EXPIRE 0
+                $replica DEBUG SET-ACTIVE-EXPIRE 0
+                attach_replica $primary $replica $primary_host $primary_port
+                make_rax_window_set $primary src{t} 200 60
+                # Live and hidden members of the source, so every set operation
+                # has a result that depends on which of them are visible.
+                $primary SADD other{t} live0 live1 live2 h0 h1
+                wait_for_ofs_sync $primary $replica
+                # The comparison only means something if the replica still holds
+                # the members the primary is hiding.
+                assert_equal 260 [$replica SCARD src{t}]
+
+                $primary $cmd dst{t} src{t} other{t}
+                assert_inside_rax_window
+                # A STORE reads its sources, so both sides must still hold them.
+                assert_equal 260 [$primary SCARD src{t}]
+                wait_for_ofs_sync $primary $replica
+                assert_equal 260 [$replica SCARD src{t}]
+                assert_equal [$primary SCARD dst{t}] [$replica SCARD dst{t}]
+                assert_equal [lsort [$primary SMEMBERS dst{t}]] [lsort [$replica SMEMBERS dst{t}]]
+
+                $primary DEBUG SET-ACTIVE-EXPIRE 1
+                $replica DEBUG SET-ACTIVE-EXPIRE 1
+            } {OK} {needs:debug}
+        }
+
+    }
+}
+
+start_server {tags {"setexpire external:skip"} overrides {set-max-listpack-entries 0}} {
+    test "SRANDMEMBER with a count below the physical size returns unique live members" {
+        r FLUSHALL
+        r DEBUG SET-ACTIVE-EXPIRE 0
+        set live_members [make_rax_window_set r myset 200 150]
+
+        # Three times the count exceeds the physical size, which selects the
+        # path that copies the set and subtracts down to the count.
+        set got [r SRANDMEMBER myset 120]
+        assert_inside_rax_window
+        assert_equal 120 [llength [lsort -unique $got]]
+        assert_all_live $got $live_members
+        assert_equal 350 [r SCARD myset]
+        r DEBUG SET-ACTIVE-EXPIRE 1
+    } {OK} {needs:debug}
+}
+
+# A set operand of a sorted set operation is iterated, and its members are handed
+# to the other operands as lookup keys. Both are places where the set's own
+# member metadata and its hidden members can leak out.
+
+# One live and one hidden member, plus the sorted set operands that leave each
+# store command with exactly the live member to store. None of them names the
+# hidden member, so a command that sees it stores it.
+proc seed_hidden_member_store_sources {r} {
+    $r SADD s{t} live gone
+    make_members_expired $r s{t} {gone}
+    # Larger than the set, so the set is the operand the intersection iterates.
+    $r ZADD z{t} 1 live 1 gone 1 extra
+    $r ZADD other{t} 1 extra
+    $r ZADD dst{t} 1 stale
+}
+
+# {store command, the score its single stored member gets, its operands}
+set ::hidden_member_stores {
+    ZUNIONSTORE 1 {1 s{t}}
+    ZINTERSTORE 2 {2 s{t} z{t}}
+    ZDIFFSTORE 1 {2 s{t} other{t}}
+}
+
+start_server {tags {"setexpire external:skip"}} {
+    foreach encoding {listpack hashtable} {
+        test "A set source keeps its member TTLs across the sorted set operations - $encoding" {
+            r FLUSHALL
+            use_set_encoding $encoding
+            r SADDEX s{t} EX $::live_member_ttl MEMBERS 2 m1 m2
+            assert_encoding $encoding s{t}
+            r ZADD z{t} 1 m1 1 m2 1 other
+
+            r ZUNION 1 s{t}
+            r ZUNIONSTORE u{t} 1 s{t}
+            r ZINTERSTORE i{t} 2 s{t} z{t}
+            r ZINTERCARD 2 s{t} z{t}
+            r ZDIFF 2 s{t} z{t}
+
+            assert_range [set_member_ttl r s{t} m1] 90 $::live_member_ttl
+            assert_range [set_member_ttl r s{t} m2] 90 $::live_member_ttl
+            # Freeing a member whose expiry was lost reads the wrong allocation,
+            # once through the member's own removal and once through the key's.
+            assert_equal 1 [r SREM s{t} m1]
+            assert_equal 1 [r DEL s{t}]
+            assert_equal 0 [get_keys_with_volatile_items r]
+        }
+
+        test "A set source hides its expired members from the sorted set operations - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD s{t} live gone
+            make_members_expired r s{t} {gone}
+            assert_encoding $encoding s{t}
+            r ZADD z{t} 1 live 1 gone 1 extra
+            r ZADD one{t} 1 live
+
+            # The set is the operand being iterated: the only one, or the smallest.
+            assert_equal {live} [r ZUNION 1 s{t}]
+            assert_equal 1 [r ZUNIONSTORE u{t} 1 s{t}]
+            assert_equal {live} [r ZRANGE u{t} 0 -1]
+            assert_equal 1 [r ZINTERCARD 2 s{t} z{t}]
+            assert_equal 1 [r ZINTERSTORE i{t} 2 s{t} z{t}]
+            assert_equal {live} [r ZRANGE i{t} 0 -1]
+            assert_equal {} [r ZDIFF 2 s{t} one{t}]
+
+            # The set is the larger operand: the one searched, not the one iterated.
+            assert_equal {live} [r ZUNION 2 one{t} s{t}]
+            assert_equal 1 [r ZINTERCARD 2 one{t} s{t}]
+            assert_equal 1 [r ZINTERSTORE i{t} 2 one{t} s{t}]
+            assert_equal {live} [r ZRANGE i{t} 0 -1]
+            assert_equal {} [r ZDIFF 2 one{t} s{t}]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        foreach {cmd score operands} $::hidden_member_stores {
+            test "$cmd over a set source with hidden members propagates its result - $encoding" {
+                flush_and_disable_active_expiry
+                use_set_encoding $encoding
+                seed_hidden_member_store_sources r
+                assert_encoding $encoding s{t}
+
+                set repl [attach_to_replication_stream]
+                assert_equal 1 [r $cmd dst{t} {*}$operands]
+
+                # Replaying the command would read the hidden member, which is
+                # live on a replica, so only the result itself may be sent.
+                assert_replication_stream $repl [subst {
+                    {multi}
+                    {select *}
+                    {unlink dst{t}}
+                    {zadd dst{t} $score live}
+                    {exec}
+                }]
+                close_replication_stream $repl
+                assert_equal {live} [r ZRANGE dst{t} 0 -1]
+                r DEBUG SET-ACTIVE-EXPIRE 1
+            } {OK} {needs:debug}
+        }
+
+        test "ZUNIONSTORE over a set source with hidden members can store into it - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            seed_hidden_member_store_sources r
+
+            set repl [attach_to_replication_stream]
+            # The destination overwrites the source, so the result is the only
+            # description of it left.
+            assert_equal 1 [r ZUNIONSTORE s{t} 1 s{t}]
+
+            assert_replication_stream $repl [subst {
+                {multi}
+                {select *}
+                {unlink s{t}}
+                {zadd s{t} 1 live}
+                {exec}
+            }]
+            close_replication_stream $repl
+            assert_equal {live} [r ZRANGE s{t} 0 -1]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
+        test "ZINTERSTORE over a set source of only hidden members propagates one UNLINK - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD s{t} gone
+            make_members_expired r s{t} {gone}
+            r ZADD z{t} 1 gone 1 extra
+            r ZADD dst{t} 1 stale
+
+            set repl [attach_to_replication_stream]
+            assert_equal 0 [r ZINTERSTORE dst{t} 2 s{t} z{t}]
+
+            assert_replication_stream $repl {
+                {select *}
+                {unlink dst{t}}
+            }
+            close_replication_stream $repl
+            assert_equal 0 [r EXISTS dst{t}]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
+
+    # MXX caches the members it looked up, and only members whose expiry state
+    # already matches the one being applied stay in the cache. The past
+    # expiration then takes a path of its own, which the cache must not outlive,
+    # so a sanitizer build fails here if it does.
+    test {SADDEX MXX with a past expiration removes volatile members} {
+        r FLUSHALL
+        use_set_encoding hashtable
+        r SADDEX s{t} EX $::live_member_ttl MEMBERS 2 m1 m2
+        set repl [attach_to_replication_stream]
+
+        assert_equal 0 [r SADDEX s{t} MXX EX 0 MEMBERS 2 m1 m2]
+
+        assert_replication_stream $repl {
+            {select *}
+            {srem s{t} m1 m2}
+        }
+        close_replication_stream $repl
+        assert_equal 0 [r EXISTS s{t}]
+        assert_equal 0 [get_keys_with_volatile_items r]
+    }
+
+    test {SADDEX MXX with a past expiration removes duplicate volatile members once} {
+        r FLUSHALL
+        use_set_encoding hashtable
+        r SADDEX s{t} EX $::live_member_ttl MEMBERS 1 m1
+        set repl [attach_to_replication_stream]
+
+        # One cache slot per argument, both naming the same member.
+        assert_equal 0 [r SADDEX s{t} MXX EX 0 MEMBERS 2 m1 m1]
+
+        # The second argument names a member the first one already removed.
+        assert_replication_stream $repl {
+            {select *}
+            {srem s{t} m1}
+        }
+        close_replication_stream $repl
+        assert_equal 0 [r EXISTS s{t}]
+        assert_equal 0 [get_keys_with_volatile_items r]
+    }
+}
+
+# A replica holds the members the primary hides, so a store command it recomputes
+# reads members the primary did not.
+start_server {tags {"setexpire needs:repl external:skip"}} {
+    start_server {} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        foreach encoding {listpack hashtable} {
+            foreach {cmd score operands} $::hidden_member_stores {
+                test "$cmd over a set source with hidden members stores the same result on the replica - $encoding" {
+                    $primary FLUSHALL
+                    $primary DEBUG SET-ACTIVE-EXPIRE 0
+                    $replica DEBUG SET-ACTIVE-EXPIRE 0
+                    $primary config set set-max-listpack-entries [expr {$encoding eq "hashtable" ? 0 : 128}]
+                    $replica config set set-max-listpack-entries [expr {$encoding eq "hashtable" ? 0 : 128}]
+                    attach_replica $primary $replica $primary_host $primary_port
+                    seed_hidden_member_store_sources $primary
+                    wait_for_ofs_sync $primary $replica
+                    # The comparison only means something while the replica still
+                    # holds the member the primary is hiding.
+                    assert_equal 2 [$replica SCARD s{t}]
+
+                    assert_equal 1 [$primary $cmd dst{t} {*}$operands]
+                    assert_equal {live} [$primary ZRANGE dst{t} 0 -1]
+                    wait_for_ofs_sync $primary $replica
+                    assert_equal [$primary ZRANGE dst{t} 0 -1 WITHSCORES] \
+                        [$replica ZRANGE dst{t} 0 -1 WITHSCORES]
+
+                    $primary DEBUG SET-ACTIVE-EXPIRE 1
+                    $replica DEBUG SET-ACTIVE-EXPIRE 1
+                } {OK} {needs:debug}
+            }
+        }
+    }
+}
+
+# Build a set of live volatile members, numerous enough for the expiry index to be
+# a RAX. The index reports the start of the window holding its earliest deadline,
+# so while that window is the current one it claims an expired member that the set
+# does not have. Returns the member names.
+proc make_rax_live_set {r key members} {
+    # Enter a window with room for the whole test body before the members expire,
+    # which is what keeps the index's claim wrong rather than right.
+    while {[clock milliseconds] % 8192 >= 1024} { after 50 }
+
+    set names {}
+    for {set i 0} {$i < $members} {incr i} { lappend names live$i }
+    set ::rax_live_deadline [expr {[clock milliseconds] + 6000}]
+    $r SADDEX $key PXAT $::rax_live_deadline MEMBERS [llength $names] {*}$names
+
+    assert_equal $members [$r SCARD $key]
+    assert_equal $members [llength [$r SMEMBERS $key]]
+    assert_before_rax_deadline
+    return $names
+}
+
+# A member that expired mid-test makes the run prove nothing, so it must fail.
+proc assert_before_rax_deadline {} {
+    set remaining [expr {$::rax_live_deadline - [clock milliseconds]}]
+    assert_equal 1 [expr {$remaining > 0}] \
+        "the members expired [expr {-$remaining}] ms ago, so this run proves nothing"
+}
+
+# Separate blocks because a path that trusts the index leaves a key that later
+# reads of the same key then sample.
+start_server {tags {"setexpire needs:repl external:skip"} overrides {set-max-listpack-entries 0}} {
+    start_server {overrides {set-max-listpack-entries 0}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        foreach count {200 260} {
+            test "SPOP with a count of $count over 200 live volatile members leaves no key" {
+                $primary FLUSHALL
+                $primary DEBUG SET-ACTIVE-EXPIRE 0
+                $replica DEBUG SET-ACTIVE-EXPIRE 0
+                attach_replica $primary $replica $primary_host $primary_port
+                set members [make_rax_live_set $primary myset 200]
+                wait_for_ofs_sync $primary $replica
+
+                # A count at or above the size of a set the index calls partly
+                # expired, of members it is all wrong about.
+                set popped [$primary SPOP myset $count]
+                assert_before_rax_deadline
+                assert_equal [lsort $members] [lsort $popped]
+
+                # Every member left, so no key may remain on either side.
+                assert_equal 0 [$primary EXISTS myset]
+                assert_equal 0 [$primary SCARD myset]
+                assert_equal 0 [get_keys_with_volatile_items $primary]
+                # Reads that sample a key left behind sample nothing.
+                assert_equal {} [$primary SRANDMEMBER myset 3]
+                assert_equal {} [$primary SPOP myset 3]
+                wait_for_ofs_sync $primary $replica
+                assert_equal 0 [$replica EXISTS myset]
+
+                $primary DEBUG SET-ACTIVE-EXPIRE 1
+                $replica DEBUG SET-ACTIVE-EXPIRE 1
+            } {OK} {needs:debug}
+        }
+    }
+}
+
+start_server {tags {"setexpire needs:repl external:skip"} overrides {set-max-listpack-entries 0}} {
+    start_server {overrides {set-max-listpack-entries 0}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test "SPOP with a count over every live member keeps the hidden ones" {
+            $primary FLUSHALL
+            $primary DEBUG SET-ACTIVE-EXPIRE 0
+            $replica DEBUG SET-ACTIVE-EXPIRE 0
+            attach_replica $primary $replica $primary_host $primary_port
+            set live_members [make_rax_window_set $primary myset 200 60]
+            wait_for_ofs_sync $primary $replica
+            assert_equal 260 [$replica SCARD myset]
+
+            # The set the index is right about: popping its whole live remainder
+            # still leaves the hidden members, so the key stays.
+            set popped [$primary SPOP myset 60]
+            assert_inside_rax_window
+            assert_equal 60 [llength $popped]
+            assert_all_live $popped $live_members
+            assert_equal 1 [$primary EXISTS myset]
+            assert_equal 200 [$primary SCARD myset]
+            assert_equal {} [$primary SMEMBERS myset]
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary SCARD myset] [$replica SCARD myset]
+
+            $primary DEBUG SET-ACTIVE-EXPIRE 1
+            $replica DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
     }
 }

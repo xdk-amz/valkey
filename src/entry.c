@@ -98,7 +98,9 @@ enum {
     FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF = 2,
     FIELD_SDS_AUX_BIT_MAX
 };
-static_assert(FIELD_SDS_AUX_BIT_MAX < sizeof(char) - SDS_TYPE_BITS, "too many sds bits are used for entry metadata");
+static_assert(FIELD_SDS_AUX_BIT_MAX <= CHAR_BIT - SDS_TYPE_BITS, "too many sds bits are used for entry metadata");
+static_assert(FIELD_SDS_AUX_BIT_MAX <= ZSET_SDS_AUX_BIT_LOOKUP_KEY,
+              "entry metadata overlaps the bit that marks a borrowed field as a zset lookup key");
 
 /* The entry pointer is the field sds, but that's an implementation detail. */
 sds entryGetField(const entry *entry) {

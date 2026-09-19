@@ -2117,6 +2117,20 @@ void propagateCommandAndKeyExpiration(client *c, robj *key, mstime_t when) {
     preventCommandPropagation(c);
 }
 
+/* Appends one ZADD score/member pair to 'argv', flushing a full batch first.
+ * Returns the new argument count. */
+static int propagateZaddPair(client *c, robj **argv, int n, double score, const char *member, size_t len) {
+    if (n + 2 > (int)EXPIRE_BULK_LIMIT + 2) {
+        alsoPropagate(c->db->id, argv, n, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
+        while (n > 2) decrRefCount(argv[--n]);
+    }
+    char buf[MAX_D2STRING_CHARS];
+    int buflen = d2string(buf, sizeof(buf), score);
+    argv[n++] = createStringObject(buf, buflen);
+    argv[n++] = createStringObject(member, len);
+    return n;
+}
+
 /* Replace a STORE command by DEL dst plus the stored members, so a replica cannot recompute
  * over members that were expired here. */
 void propagateStoreAsEffects(client *c, robj *dstkey, robj *dst) {
@@ -2141,6 +2155,38 @@ void propagateStoreAsEffects(client *c, robj *dstkey, robj *dst) {
                 }
             }
             setTypeReleaseIterator(si);
+        } else if (dst->type == OBJ_ZSET) {
+            argv[0] = shared.zadd;
+            if (dst->encoding == OBJ_ENCODING_LISTPACK) {
+                unsigned char *zl = objectGetVal(dst);
+                unsigned char *eptr = lpSeek(zl, 0);
+                unsigned char *sptr = eptr ? lpNext(zl, eptr) : NULL;
+                while (eptr != NULL) {
+                    unsigned int vlen;
+                    long long vlong;
+                    unsigned char *vstr = lpGetValue(eptr, &vlen, &vlong);
+                    char numbuf[LONG_STR_SIZE];
+                    const char *ele = (const char *)vstr;
+                    size_t elelen = vlen;
+                    if (vstr == NULL) {
+                        elelen = ll2string(numbuf, sizeof(numbuf), vlong);
+                        ele = numbuf;
+                    }
+                    n = propagateZaddPair(c, argv, n, zzlGetScore(sptr), ele, elelen);
+                    zzlNext(zl, &eptr, &sptr);
+                }
+            } else {
+                zset *zs = objectGetVal(dst);
+                OrderedIndexIterator iter;
+                orderedIndexInitIterator(&iter, zs->oi);
+                OrderedIndexItem *node;
+                while ((node = orderedIndexNext(&iter)) != NULL) {
+                    const char *ele;
+                    size_t elelen;
+                    orderedIndexItemGetElement(node, &ele, &elelen);
+                    n = propagateZaddPair(c, argv, n, orderedIndexItemGetScore(node), ele, elelen);
+                }
+            }
         } else {
             argv[0] = shared.rpush;
             listTypeEntry entry;
