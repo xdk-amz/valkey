@@ -804,6 +804,95 @@ TEST_F(VsetTest, TestVsetMixedHashtableBucketSelection) {
     for (mock_entry *entry : entries) mockFreeEntry(entry);
 }
 
+TEST_F(VsetTest, TestVsetUnsortedRaxVectorSelection) {
+    auto makeRax = [](vset *set, mock_entry **base) {
+        vsetInit(set);
+        for (size_t i = 0; i < 128; i++) {
+            char key[32];
+            snprintf(key, sizeof(key), "rax_base_%zu", i);
+            base[i] = mockCreateEntry(key, 80);
+            ASSERT_TRUE(vsetAddEntry(set, mockGetExpiry, base[i]));
+        }
+    };
+    auto check = [](vset *set, mstime_t now, size_t expected_hidden,
+                    mock_entry **expected_live, size_t live_count) {
+        size_t hidden = 0;
+        ASSERT_EQ(vsetCountHidden(set, mockGetExpiry, now, &hidden), expected_hidden + live_count);
+        ASSERT_EQ(hidden, expected_hidden);
+
+        void *seen[8] = {};
+        ASSERT_LE(live_count, std::size(seen));
+        for (size_t rank = 0; rank < live_count; rank++) {
+            void *selected = nullptr;
+            ASSERT_TRUE(vsetSelectLive(set, mockGetExpiry, now, rank, &selected));
+            ASSERT_GE(mockGetExpiry(selected), now);
+            bool expected = false;
+            for (size_t i = 0; i < live_count; i++) expected |= selected == expected_live[i];
+            ASSERT_TRUE(expected);
+            for (size_t i = 0; i < rank; i++) ASSERT_NE(selected, seen[i]);
+            seen[rank] = selected;
+        }
+        void *selected = nullptr;
+        ASSERT_FALSE(vsetSelectLive(set, mockGetExpiry, now, live_count, &selected));
+    };
+
+    {
+        vset set;
+        mock_entry *base[128];
+        makeRax(&set, base);
+        mock_entry *entries[] = {
+            mockCreateEntry("append_a", 8193),
+            mockCreateEntry("append_b", 8202),
+            mockCreateEntry("append_c", 8195),
+        };
+        for (mock_entry *entry : entries) ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entry));
+        mock_entry *live[] = {entries[1]};
+        check(&set, 8197, 130, live, std::size(live));
+        vsetRelease(&set);
+        for (mock_entry *entry : base) mockFreeEntry(entry);
+        for (mock_entry *entry : entries) mockFreeEntry(entry);
+    }
+
+    {
+        vset set;
+        mock_entry *base[128];
+        makeRax(&set, base);
+        mock_entry *entries[] = {
+            mockCreateEntry("remove_a", 8193),
+            mockCreateEntry("remove_b", 8195),
+            mockCreateEntry("remove_c", 8200),
+            mockCreateEntry("remove_d", 8204),
+        };
+        for (mock_entry *entry : entries) ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entry));
+        ASSERT_TRUE(vsetRemoveEntry(&set, mockGetExpiry, entries[1]));
+        mock_entry *live[] = {entries[3]};
+        check(&set, 8202, 130, live, std::size(live));
+        vsetRelease(&set);
+        for (mock_entry *entry : base) mockFreeEntry(entry);
+        for (mock_entry *entry : entries) mockFreeEntry(entry);
+    }
+
+    {
+        vset set;
+        mock_entry *base[128];
+        makeRax(&set, base);
+        mock_entry *entries[] = {
+            mockCreateEntry("update_a", 8193),
+            mockCreateEntry("update_b", 8202),
+            mockCreateEntry("update_c", 8204),
+        };
+        for (mock_entry *entry : entries) ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entry));
+        mock_entry *old = entries[0];
+        entries[0] = mockEntryUpdate(entries[0], 8203);
+        ASSERT_TRUE(vsetUpdateEntry(&set, mockGetExpiry, old, entries[0], 8193, 8203));
+        mock_entry *live[] = {entries[0], entries[2]};
+        check(&set, 8203, 129, live, std::size(live));
+        vsetRelease(&set);
+        for (mock_entry *entry : base) mockFreeEntry(entry);
+        for (mock_entry *entry : entries) mockFreeEntry(entry);
+    }
+}
+
 TEST_F(VsetTest, TestVsetDefrag) {
     srand(time(nullptr));
 

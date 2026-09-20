@@ -2355,17 +2355,13 @@ static size_t vsetBucketSizeOf(vsetBucket *bucket) {
     return 0;
 }
 
-/* Vector buckets are expiry-sorted, so hidden entries form a prefix. */
+/* RAX vector buckets are append-ordered and removals may swap entries. */
 static uint32_t vsetVectorHiddenCount(vsetGetExpiryFunc getExpiry, pVector *pv, mstime_t now) {
-    uint32_t left = 0, right = pvLen(pv);
-    while (left < right) {
-        uint32_t mid = left + (right - left) / 2;
-        if (vsetEntryIsHidden(getExpiry(pvGet(pv, mid)), now))
-            left = mid + 1;
-        else
-            right = mid;
+    uint32_t hidden = 0;
+    for (uint32_t i = 0; i < pvLen(pv); i++) {
+        if (vsetEntryIsHidden(getExpiry(pvGet(pv, i)), now)) hidden++;
     }
-    return left;
+    return hidden;
 }
 
 static size_t vsetBucketCountHidden(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now) {
@@ -2411,13 +2407,15 @@ vsetBucketSelectLive(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t n
     }
     case VSET_BUCKET_VECTOR: {
         pVector *pv = vsetBucketVector(bucket);
-        uint32_t first = vsetVectorHiddenCount(getExpiry, pv, now);
-        size_t live = pvLen(pv) - first;
-        if (*rank < live) {
-            *entry = pvGet(pv, first + (uint32_t)*rank);
-            return true;
+        for (uint32_t i = 0; i < pvLen(pv); i++) {
+            void *e = pvGet(pv, i);
+            if (vsetEntryIsHidden(getExpiry(e), now)) continue;
+            if (*rank == 0) {
+                *entry = e;
+                return true;
+            }
+            (*rank)--;
         }
-        *rank -= live;
         return false;
     }
     case VSET_BUCKET_HT: {

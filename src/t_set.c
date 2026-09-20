@@ -551,6 +551,66 @@ typedef struct {
     unsigned long live_ttl; /* live members that carry a TTL; live - live_ttl carry none */
 } setLiveCensus;
 
+static bool setTypeProductExceeds(unsigned long a, unsigned long b, unsigned long limit) {
+    return a != 0 && b > limit / a;
+}
+
+/* A positional draw is cheaper until repeating it would cost more than one
+ * pass over the physical set. Persistent ranks use the live population as the
+ * denominator because only that fraction of uniform draws can choose them. */
+static bool setTypeBulkSamplePreferred(const setLiveCensus *census, unsigned long count) {
+    if (census->live >= census->physical / SET_LIVE_REJECTION_DIVISOR) return false;
+    unsigned long persistent = census->live - census->live_ttl;
+    return setTypeProductExceeds(count, census->live_ttl, census->physical) ||
+           setTypeProductExceeds(count, persistent, census->live);
+}
+
+typedef struct {
+    unsigned long rank;
+    unsigned long order;
+} setSampleRank;
+
+static int setTypeSampleRankCompare(const void *lhs, const void *rhs) {
+    const setSampleRank *a = lhs;
+    const setSampleRank *b = rhs;
+    if (a->rank != b->rank) return a->rank > b->rank ? 1 : -1;
+    return (a->order > b->order) - (a->order < b->order);
+}
+
+/* Resolve independent ranks in one live-member pass. The output array keeps
+ * draw order, so duplicate ranks remain independent with-replacement draws. */
+static listpackEntry *setTypeSampleLiveMembersByRank(robj *set, unsigned long count, unsigned long live_count) {
+    serverAssert(count > 0 && live_count > 0);
+    serverAssert(count <= SIZE_MAX / sizeof(setSampleRank));
+    serverAssert(count <= SIZE_MAX / sizeof(listpackEntry));
+
+    setSampleRank *ranks = zmalloc(sizeof(*ranks) * count);
+    listpackEntry *selected = zmalloc(sizeof(*selected) * count);
+    for (unsigned long i = 0; i < count; i++) {
+        ranks[i].rank = setTypeRandomBelow(live_count);
+        ranks[i].order = i;
+    }
+    qsort(ranks, count, sizeof(*ranks), setTypeSampleRankCompare);
+
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long live_index = 0, next = 0;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (next < count && setTypeNext(si, &str, &len, &llele) != -1) {
+        while (next < count && ranks[next].rank == live_index) {
+            selected[ranks[next].order] =
+                (listpackEntry){.sval = (unsigned char *)str, .slen = len, .lval = llele};
+            next++;
+        }
+        live_index++;
+    }
+    setTypeReleaseIterator(si);
+    zfree(ranks);
+    serverAssert(next == count);
+    return selected;
+}
+
 /* POLICY_IGNORE_EXPIRE sees every stored member; otherwise time is frozen for
  * the command so repeated draws share one partition. */
 static mstime_t setTypeLivenessTime(void) {
@@ -1361,11 +1421,29 @@ void spopWithCountCommand(client *c) {
         setLiveCensus census;
         setTypeLiveCensus(set, now, &census);
         unsigned long to_pop = count < census.live ? count : census.live;
+        robj **sampled = NULL;
+        if (set->encoding == OBJ_ENCODING_HASHTABLE && to_pop > 0 &&
+            setTypeBulkSamplePreferred(&census, to_pop)) {
+            listpackEntry *entries = NULL;
+            unsigned long held = setTypeSampleLiveMembersAlloc(set, &entries, to_pop);
+            serverAssert(held == to_pop && to_pop <= SIZE_MAX / sizeof(*sampled));
+            sampled = zmalloc(sizeof(*sampled) * to_pop);
+            for (unsigned long i = 0; i < to_pop; i++) {
+                sampled[i] = entries[i].sval ? createStringObject((char *)entries[i].sval, entries[i].slen)
+                                             : createStringObjectFromLongLongWithSds(entries[i].lval);
+            }
+            zfree(entries);
+        }
         while (popped < to_pop) {
-            int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
-            serverAssert(encoding != -1);
-            /* Copy and read the TTL before removal invalidates the borrowed member. */
-            robj *member = str ? createStringObject(str, len) : createStringObjectFromLongLongWithSds(llele);
+            robj *member;
+            if (sampled != NULL) {
+                member = sampled[popped];
+            } else {
+                int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
+                serverAssert(encoding != -1);
+                member = str ? createStringObject(str, len) : createStringObjectFromLongLongWithSds(llele);
+            }
+            /* Read the TTL before removal invalidates the borrowed member. */
             mstime_t expiry = EXPIRY_NONE;
             serverAssert(setTypeGetExpiry(set, objectGetVal(member), &expiry) == C_OK);
             serverAssert(setTypeRemove(set, objectGetVal(member)));
@@ -1382,6 +1460,7 @@ void spopWithCountCommand(client *c) {
                 propindex = 2;
             }
         }
+        zfree(sampled);
     } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count) {
         for (unsigned long i = 0; i < count; i++) {
             propargv[propindex] = setTypePopRandom(set);
@@ -1596,17 +1675,24 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
     }
 
     if (!uniq) {
-        /* Listpack storage is configuration-bounded; hashtables need no buffer. */
+        /* Listpack storage is configuration-bounded. Hashtable draws stay
+         * scalar unless one live-member pass is cheaper than repeated ranks. */
         listpackEntry *live = NULL;
         unsigned long live_count = 0;
+        bool ranked = set->encoding == OBJ_ENCODING_HASHTABLE &&
+                      setTypeBulkSamplePreferred(&census, count) &&
+                      count <= SIZE_MAX / sizeof(setSampleRank) &&
+                      count <= SIZE_MAX / sizeof(listpackEntry);
         if (set->encoding == OBJ_ENCODING_LISTPACK) {
             live_count = setTypeCollectLiveMembers(set, &live);
             serverAssert(live_count == census.live);
+        } else if (ranked) {
+            live = setTypeSampleLiveMembersByRank(set, count, census.live);
         }
         addReplyArrayLen(c, count);
-        while (count--) {
+        for (unsigned long i = 0; i < count; i++) {
             if (live != NULL) {
-                listpackEntry selected = live[setTypeRandomBelow(live_count)];
+                listpackEntry selected = ranked ? live[i] : live[setTypeRandomBelow(live_count)];
                 if (selected.sval)
                     addReplyBulkCBuffer(c, selected.sval, selected.slen);
                 else
@@ -1644,7 +1730,8 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
 
     /* In this range, deduplicating uniform draws takes fewer than 1.5 * count
      * draws in expectation. */
-    if (count <= census.live / SRANDMEMBER_SUB_STRATEGY_MUL) {
+    if (count <= census.live / SRANDMEMBER_SUB_STRATEGY_MUL &&
+        !setTypeBulkSamplePreferred(&census, count)) {
         unsigned long attempts = count > ULONG_MAX / (2 * SRANDMEMBER_SUB_STRATEGY_MUL)
                                      ? ULONG_MAX
                                      : count * 2 * SRANDMEMBER_SUB_STRATEGY_MUL;
