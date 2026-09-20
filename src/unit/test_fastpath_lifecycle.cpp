@@ -145,7 +145,7 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     int peer;
     client *c = newFastpathClient(&peer);
     EXPECT_EQ(fastpathProcessReturns(1), 1); /* the attach request: thread takes ownership */
-    EXPECT_EQ(c->fp_state, FP_ACTIVE);
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);
 
     std::string req = std::string(INCR_A) + INCR_A + INCR_A;
     send(peer, req.c_str());
@@ -157,7 +157,7 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_QUIESCING);
     fastpathProcessReturns(1);
     EXPECT_EQ(fastpathDrain(), 0); /* nothing was published after the quiesce */
-    EXPECT_EQ(c->fp_state, FP_LEAVING);
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(c->argc, 2);
     EXPECT_EQ(c->cmd_queue.len - c->cmd_queue.off, 2);
@@ -191,7 +191,7 @@ TEST_F(FastpathLifecycleTest, QuiesceWaitsForInflightBatchThenCancelsTheRest) {
 
     fastpathWorkerQuiesce(1);
     fastpathProcessReturns(1); /* observed; a batch is still out, so nothing is cancelled */
-    EXPECT_EQ(c->fp_state, FP_LEAVING);
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_QUIESCING);
     EXPECT_EQ(c->fp_inflight, 4u);
 
@@ -230,7 +230,7 @@ TEST_F(FastpathLifecycleTest, AttachDuringQuiesceIsHandedBack) {
     client *c = newFastpathClient(&peer);
     fastpathWorkerQuiesce(1); /* before the thread saw the attach */
     fastpathProcessReturns(1);
-    EXPECT_EQ(c->fp_state, FP_LEAVING);
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_DRAINED);
     fastpathHandoffDone(c, 0);
     EXPECT_TRUE(fastpathWorkerDrained(1));
@@ -249,7 +249,7 @@ TEST_F(FastpathLifecycleTest, DetachIsConsumedBeforeMainMayFree) {
     EXPECT_FALSE(fastpathDetachConsumed(c));
     EXPECT_FALSE(fastpathWorkerDrained(1));
     fastpathProcessReturns(1); /* owned: closes, hands back FP_CLOSE */
-    EXPECT_EQ(c->fp_state, FP_CLOSING);
+    EXPECT_EQ(c->control->lifecycle, FP_CLOSING);
     EXPECT_TRUE(fastpathDetachConsumed(c));
     EXPECT_EQ(c->flag.fp_detach_sent, 0u);
     fastpathHandoffDone(c, 1); /* frees it */

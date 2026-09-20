@@ -421,6 +421,7 @@ client *createClient(connection *conn) {
     c->woff = 0;
     c->peerid = NULL;
     c->origin = NULL;
+    c->control = NULL;
     memset(&c->fp_peer, 0, sizeof(c->fp_peer));
     memset(&c->fp_local, 0, sizeof(c->fp_local));
     c->sockname = NULL;
@@ -2539,6 +2540,7 @@ int freeClient(client *c) {
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
     sdsfree(c->peerid);
     sdsfree(c->sockname);
+    fastpathControlReclaim(c);
     zfree(c);
     return 1;
 }
