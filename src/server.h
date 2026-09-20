@@ -64,6 +64,11 @@
 #define static_assert _Static_assert
 #endif
 
+/* C++ has no _Thread_local keyword; map it to thread_local for unit-test inclusion. */
+#ifdef __cplusplus
+#define _Thread_local thread_local
+#endif
+
 #include "ae.h"         /* Event driven programming library */
 #include "sds.h"        /* Dynamic safe strings */
 #include "dict.h"       /* Hash tables (old implementation) */
@@ -1498,7 +1503,6 @@ typedef struct client {
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
-    uint8_t fp_state;                     /* Fast path: FP_ACTIVE/LEAVING/CLOSING/DETACHED (IO thread, then main) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
@@ -1506,6 +1510,7 @@ typedef struct client {
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
+    struct ClientControl *control;        /* Shared control for this connection: allocated once when it first becomes crossing-capable, reclaimed once at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each

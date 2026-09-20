@@ -9,6 +9,28 @@
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
+/* Layout invariants for the crossing-capable connection types. Base (worker-lifecycle @ 2b5d42831,
+ * CACHE_LINE_SIZE 64): cmdEntry 160, cmdBatch 10280, client 744, CommandOrigin 64. This deliverable
+ * replaces the entry's 8-byte io_client cookie with a 16-byte ClientHandle, so cmdEntry is now 168 and
+ * cmdBatch its header plus IO_BATCH_MAX * 168. */
+static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
+              "ClientHandle is a compact {control ref, generation}, not a fatter record");
+static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs only pointer alignment");
+static_assert(sizeof(cmdEntry) == 168, "cmdEntry layout changed; re-measure before/after for the report");
+static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
+              "cmdBatch is its header plus IO_BATCH_MAX inline entries");
+/* The two reply counters each sit on their own cache line so the main producer and the IO consumer
+ * never share a line, and neither shares the identity/control line at offset 0. */
+static_assert(_Alignof(ClientControl) == CACHE_LINE_SIZE, "ClientControl aligns to a cache line for its counter lines");
+static_assert(offsetof(ClientControl, reply_bytes_produced) == CACHE_LINE_SIZE,
+              "reply_bytes_produced starts the producer line, past the identity/control line");
+static_assert(offsetof(ClientControl, reply_bytes_released) == 2 * CACHE_LINE_SIZE,
+              "reply_bytes_released starts its own consumer line, distinct from the producer line");
+static_assert(offsetof(ClientControl, reply_bytes_released) - offsetof(ClientControl, reply_bytes_produced) >=
+                  CACHE_LINE_SIZE,
+              "the two reply counters never share a cache line");
+static_assert(sizeof(ClientControl) == 3 * CACHE_LINE_SIZE, "identity/control line plus the two counter lines");
+
 #define FP_RING_SIZE 1024        /* batches per ring; batches, not commands */
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
@@ -29,8 +51,9 @@ typedef struct fpThread {
     int quiescing;    /* IO thread only: quiesce observed, every owned client marked leaving */
     list owned;       /* IO thread only: clients this thread reads; registry with leaving */
     list leaving;     /* IO thread only: clients whose entries must return before hand-off or close */
-    rax *registry;    /* IO thread only: owned + leaving keyed by pointer value, so a detach request needs no dereference */
+    rax *registry;    /* IO thread only: owned + leaving, keyed by the control pointer with the owned client* as value, so an entry's ClientHandle resolves back to its connection without a pointer in the control */
     _Atomic int role; /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
+    _Atomic int req_pending; /* set by any request publisher, cleared before the owner scans; a hint that some owned client has a pending CC_REQ_* */
     size_t main_clients;   /* main only: clients routed here and not yet taken back */
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
@@ -188,6 +211,175 @@ static int fpCaptureAddrs(client *c) {
     return peerIdentityFromSockaddr(&c->fp_local, (struct sockaddr *)&sa, salen);
 }
 
+/* One connection, one ClientControl: allocated the first time the connection is admitted to the fast
+ * path, then kept for its life so its stable id and generation, and any pin the IO owner holds, survive
+ * a return to main and a later readmission. Idempotent, so a re-admission after a handoff reuses the
+ * existing control. Cache-line aligned (zmalloc_cache_aligned) so its two reply counters keep the
+ * padding the layout assertions require; freed only by fastpathControlReclaim. Main allocates it at the
+ * admission point before ownership passes to the IO thread, so no other domain observes a half-built
+ * control. */
+int fastpathControlEnsure(client *c) {
+    if (c->control) return C_OK;
+    ClientControl *cc = zmalloc_cache_aligned(sizeof(ClientControl));
+    if (!cc) return C_ERR;
+    cc->client_id = c->id;
+    cc->generation = 1;
+    cc->owner_domain = CC_OWNER_MAIN; /* still main's until the attach hands it to the IO thread */
+    cc->owner_tid = 0;
+    cc->lifecycle = FP_DETACHED;
+    cc->pin_refs = 0;
+    cc->pin_bits = 0;
+    atomic_init(&cc->requests, 0u);
+    atomic_init(&cc->reply_bytes_produced, (size_t)0);
+    atomic_init(&cc->reply_bytes_released, (size_t)0);
+    c->control = cc;
+    return C_OK;
+}
+
+/* Lifetime gate: pin_refs counts the still-live cross-thread references to the control that must drain
+ * before it can be reclaimed. Each is a coarse lifecycle-level pin, never a per-command refcount:
+ *   PIN_OWNER  - an IO thread owns the connection (held attach..handoff), so its worker registry and
+ *                any batch/return entry can still resolve the control.
+ *   PIN_DETACH - a terminal detach record is still in the owner's return ring (held request..consumed),
+ *                so the owner may still meet the pointer.
+ * Every pin is taken and dropped on main (the sole caller of attach/detach/handoff/reclaim), so pin_refs
+ * needs no atomic. Reply memory is a separate gate read from its own counters, not a pin. */
+#define CC_PIN_OWNER (1u << 0)
+#define CC_PIN_DETACH (1u << 1)
+
+/* Take a lifecycle pin on the control if it does not already hold that pin; idempotent per bit so a
+ * re-admission or a duplicate request never double-counts. Main-only. */
+static void fastpathControlPin(client *c, uint32_t pin) {
+    ClientControl *cc = c->control;
+    if (!cc || (cc->pin_bits & pin)) return;
+    cc->pin_bits |= pin;
+    cc->pin_refs++;
+}
+
+/* Drop a lifecycle pin held on the control; idempotent per bit so a late or duplicate release is a
+ * no-op. Main-only. */
+static void fastpathControlUnpin(client *c, uint32_t pin) {
+    ClientControl *cc = c->control;
+    if (!cc || !(cc->pin_bits & pin)) return;
+    cc->pin_bits &= ~pin;
+    serverAssert(cc->pin_refs > 0);
+    cc->pin_refs--;
+}
+
+/* True once every lifetime gate has cleared: no owner and no detach record pin the control, and every
+ * external reply charged to it has been released. Only then may the control be freed; a client whose
+ * control is still pinned or still owes released replies is not yet reclaimable. */
+static int fastpathControlReclaimable(const ClientControl *cc) {
+    return cc->pin_refs == 0 && fastpathReplyOutstanding(cc) == 0;
+}
+
+/* The one and only reclaimer for a ClientControl, called from freeClient once the connection is fully
+ * torn down. By this point freeClient has already waited out the fast-path and unconsumed-detach gates,
+ * so both pins are dropped; this asserts that lifetime invariant (no owner, no detach record, no
+ * outstanding replies) before freeing and clearing the connection's link. */
+void fastpathControlReclaim(client *c) {
+    if (!c->control) return;
+    serverAssert(fastpathControlReclaimable(c->control));
+    zfree(c->control);
+    c->control = NULL;
+}
+
+/* CC_REQ_* precedence, high to low: CLOSE dominates every other request; EVICT (a memory/QoS free)
+ * outranks a plain HANDOFF and a QUIESCE; HANDOFF (return to main) outranks QUIESCE (reassignable
+ * hand-back). One winner decides the terminal disposition; the rest are subsumed. */
+#define CC_REQ_TERMINAL (CC_REQ_CLOSE | CC_REQ_EVICT) /* the connection is freed, not reassigned */
+
+/* Any authorized caller (main or the owner itself) publishes a lifecycle request against the control.
+ * Nonblocking and idempotent: a bit already set is a no-op, and there is no synchronous or completion
+ * handshake back to the caller, only the bit. Compatible requests coalesce into the same word.
+ * Publishing CLOSE clears the requests it supersedes so the owner never has to re-resolve a dominated
+ * bit. Release ordering pairs with the owner's acquire load in fpExecuteRequests so the request is
+ * visible before the owner acts, and any state the caller wrote before requesting is visible with it. */
+void fastpathControlRequest(ClientControl *cc, uint32_t req) {
+    if (req == 0) return;
+    if (req & CC_REQ_CLOSE) req = CC_REQ_CLOSE; /* terminal: it subsumes QUIESCE/HANDOFF/EVICT */
+    uint32_t cur = atomic_load_explicit(&cc->requests, memory_order_relaxed);
+    uint32_t next;
+    do {
+        if (cur & CC_REQ_CLOSE) return;         /* already closing; nothing outranks it */
+        next = cur | req;
+        if (req & CC_REQ_CLOSE) next = CC_REQ_CLOSE; /* drop the bits CLOSE supersedes */
+        if (next == cur) return;                /* idempotent: bit already present */
+    } while (!atomic_compare_exchange_weak_explicit(&cc->requests, &cur, next, memory_order_release,
+                                                    memory_order_relaxed));
+    /* Signal the owning IO thread so an idle owner (no traffic, nothing in flight) still observes the
+     * request on its next pass without main walking into the owner's registry. owner_domain/owner_tid
+     * are published by the owner with release at attach/handoff; a benign stale read only sets an extra
+     * hint, which the scan clears harmlessly. */
+    if (cc->owner_domain == CC_OWNER_IO)
+        atomic_store_explicit(&fp_threads[cc->owner_tid].req_pending, 1, memory_order_release);
+}
+
+/* The single dominant request the owner should act on, given the pending bitmask and whether the
+ * client's external replies are all released (EVICT waits for that; the others do not). Returns 0 when
+ * nothing is actionable yet. Pure precedence, no side effects, so the owner's execution stays deterministic. */
+static uint32_t fpRequestWinner(uint32_t reqs, int replies_released) {
+    if (reqs & CC_REQ_CLOSE) return CC_REQ_CLOSE;
+    if (reqs & CC_REQ_EVICT) return replies_released ? CC_REQ_EVICT : 0;
+    if (reqs & CC_REQ_HANDOFF) return CC_REQ_HANDOFF;
+    if (reqs & CC_REQ_QUIESCE) return CC_REQ_QUIESCE;
+    return 0;
+}
+
+/* A handle captures the connection's control and the generation current at capture; a later mismatch
+ * means the slot was reused. A control-bearing client always has a control by the time it can be
+ * published into an entry (admission calls fastpathControlEnsure first). */
+ClientHandle fastpathHandleFor(client *c) {
+    serverAssert(c->control);
+    return (ClientHandle){.control = c->control, .generation = c->control->generation};
+}
+
+/* Stale iff the control's generation moved on from the snapshot; reads only the control, never a
+ * connection, so a reused slot is caught without touching freed connection storage. */
+int fastpathHandleStale(const ClientHandle *h) {
+    return h->control == NULL || h->control->generation != h->generation;
+}
+
+/* Logical reply bytes an entry retains for its client: the arena run or the spilled heap block, never
+ * both (main sets one or the other) and never allocator-rounded capacity, so produce and release count
+ * the same unit. Zero for a requeued or reply-less entry, so charging it is a no-op. */
+static inline size_t fpEntryReplyBytes(const cmdEntry *e) {
+    return e->reply_big ? e->reply_big_len : e->reply_len;
+}
+
+/* Main charges an entry's reply bytes the moment the storage becomes retained for the client, once per
+ * entry. Sole writer main, so the add is a plain load/store published with release; the IO owner's
+ * acquire load pairs with it. Charging against the entry's own control keeps producer and consumer on
+ * the same counter, so outstanding stays meaningful; a stale handle (reused slot) is never charged. */
+static void fpReplyCharge(cmdEntry *e) {
+    size_t bytes = fpEntryReplyBytes(e);
+    if (bytes == 0 || fastpathHandleStale(&e->handle)) return;
+    ClientControl *cc = e->handle.control;
+    size_t produced = atomic_load_explicit(&cc->reply_bytes_produced, memory_order_relaxed);
+    atomic_store_explicit(&cc->reply_bytes_produced, produced + bytes, memory_order_release);
+}
+
+/* The IO owner releases an entry's reply bytes once, when it reclaims/discards the charged storage
+ * (sent then freed, or dropped for a closing client). Sole writer the owner, so a plain load/store with
+ * release; released never exceeds produced because every released entry was charged with the same byte
+ * count against the same control. */
+static void fpReplyRelease(cmdEntry *e) {
+    size_t bytes = fpEntryReplyBytes(e);
+    if (bytes == 0 || fastpathHandleStale(&e->handle)) return;
+    ClientControl *cc = e->handle.control;
+    size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
+    atomic_store_explicit(&cc->reply_bytes_released, released + bytes, memory_order_release);
+}
+
+/* Reply bytes charged to a control but not yet released: produced minus released, read with acquire so a
+ * charge and a release are both visible. The unsigned difference stays correct across benign wraparound
+ * while outstanding < SIZE_MAX. Read-only: this does not enforce COB or maxmemory-clients. */
+size_t fastpathReplyOutstanding(const ClientControl *cc) {
+    size_t produced = atomic_load_explicit(&cc->reply_bytes_produced, memory_order_acquire);
+    size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_acquire);
+    return produced - released;
+}
+
 /* Ownership passes with the ring entry: after it main touches nothing of the client until it is handed back. */
 int fastpathAttach(client *c) {
     int n = ioThreadsReadyNum() - 1;
@@ -203,12 +395,18 @@ int fastpathAttach(client *c) {
     }
     if (!t) return C_ERR;
     if (c->fp_peer.family == 0 && fpCaptureAddrs(c) != C_OK) return C_ERR;
+    if (fastpathControlEnsure(c) != C_OK) return C_ERR;
     c->io_tid = tid;
     c->flag.fastpath = 1;
-    c->fp_state = FP_ACTIVE;
     c->fp_inflight = 0;
     c->fp_held = 0;
     c->fp_out = NULL;
+    /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
+     * next writer of these fields. control->lifecycle is the single source of truth for the state. */
+    c->control->owner_domain = CC_OWNER_IO;
+    c->control->owner_tid = (uint8_t)tid;
+    c->control->lifecycle = FP_ACTIVE;
+    fastpathControlPin(c, CC_PIN_OWNER); /* IO now owns the connection; hold until handoff returns it to main */
     listInitNode(&c->io_owner_node, c);
     fastpath_clients++;
     t->main_clients++;
@@ -243,39 +441,80 @@ void fastpathSubmitPending(int tid) {
     fpSubmit(t);
 }
 
-/* Registry membership changes only with ownership: taken here, dropped when the client is handed back. */
+/* Registry membership changes only with ownership: taken here, dropped when the client is handed back.
+ * Keyed by the connection's control pointer so an entry's ClientHandle resolves back to the owned
+ * client, with the owned client* as the value. */
 static void fpRegister(fpThread *t, client *c) {
     listLinkNodeTail(&t->owned, &c->io_owner_node);
-    raxInsert(t->registry, (unsigned char *)&c, sizeof(c), NULL, NULL);
+    ClientControl *cc = c->control;
+    raxInsert(t->registry, (unsigned char *)&cc, sizeof(cc), c, NULL);
 }
 
 static void fpUnregister(fpThread *t, client *c) {
     listUnlinkNode(&t->leaving, &c->io_owner_node);
-    raxRemove(t->registry, (unsigned char *)&c, sizeof(c), NULL);
+    ClientControl *cc = c->control;
+    raxRemove(t->registry, (unsigned char *)&cc, sizeof(cc), NULL);
+}
+
+/* Resolve an entry's handle back to the connection this thread owns, or NULL if the handle is stale
+ * (its control's slot was reused) or the client is no longer owned here. Owner-private: it consults
+ * this thread's registry and never dereferences a connection through the control. */
+static client *fpResolve(fpThread *t, const ClientHandle *h) {
+    void *found = NULL;
+    if (fastpathHandleStale(h)) return NULL;
+    ClientControl *cc = h->control;
+    if (!raxFind(t->registry, (unsigned char *)&cc, sizeof(cc), &found)) return NULL;
+    return (client *)found;
+}
+
+/* True while this thread still owns the connection (registry keyed by its control pointer). */
+static int fpOwns(fpThread *t, client *c) {
+    ClientControl *cc = c->control;
+    return cc && raxFind(t->registry, (unsigned char *)&cc, sizeof(cc), NULL);
 }
 
 static int fpCurHasClient(fpThread *t, client *c) {
     if (!t->cur) return 0;
     for (int i = 0; i < t->cur->count; i++)
-        if (t->cur->e[i].io_client == c) return 1;
+        if (fpResolve(t, &t->cur->e[i].handle) == c) return 1;
     return 0;
 }
 
 /* Handoff waits until every published command for the client returns. Entries of the client still
  * in the unpublished batch may only follow commands it holds, so hold_cur keeps them from publishing. */
 static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
-    if (c->fp_state != FP_ACTIVE) return;
-    c->fp_state = state;
+    if (c->control->lifecycle != FP_ACTIVE) return;
+    c->control->lifecycle = state;
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
     listUnlinkNode(&t->owned, &c->io_owner_node);
     listLinkNodeTail(&t->leaving, &c->io_owner_node);
     if (hold_cur && fpCurHasClient(t, c)) t->cur_hold = 1;
 }
 
+/* Owner-side execution of pending lifecycle requests for one client this thread owns. Only the owner
+ * runs this; a request is a published intent, the transition is the owner's alone, so no other domain
+ * mutates the client's lifecycle. Reads the bitmask with acquire to pair with the publisher's release.
+ * Maps the dominant request onto the existing leave transitions rather than a second lifecycle model:
+ * CLOSE/EVICT free the connection (FP_CLOSING), HANDOFF/QUIESCE return it to main (FP_LEAVING). EVICT
+ * defers until the client's external replies are all released so no charged reply memory is dropped
+ * mid-flight. Executed bits are cleared with release; the transition is idempotent (fpBeginLeave is a
+ * no-op once the client is no longer FP_ACTIVE), so a duplicate or late request does nothing. */
+static void fpExecuteRequests(fpThread *t, client *c) {
+    ClientControl *cc = c->control;
+    uint32_t reqs = atomic_load_explicit(&cc->requests, memory_order_acquire);
+    if (reqs == 0) return;
+    uint32_t win = fpRequestWinner(reqs, fastpathReplyOutstanding(cc) == 0);
+    if (win == 0) return; /* an EVICT still waiting on outstanding replies: revisit on a later pass */
+    if (cc->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
+    else if ((win & CC_REQ_TERMINAL) && cc->lifecycle == FP_LEAVING)
+        cc->lifecycle = FP_CLOSING; /* a close arriving after a handoff started still frees it */
+    atomic_fetch_and_explicit(&cc->requests, ~win, memory_order_release);
+}
+
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
                           unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
-    e->io_client = c;
+    e->handle = fastpathHandleFor(c);
     e->argv = argv;
     e->argc = argc;
     e->argv_len = argv_len;
@@ -364,7 +603,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
 
 void fastpathClientReadable(int tid, client *c) {
     fpThread *t = &fp_threads[tid];
-    if (c->fp_state != FP_ACTIVE) return;
+    if (c->control->lifecycle != FP_ACTIVE) return;
     /* Backpressure: the batch pipeline is deep enough; the socket stays
      * readable (level triggered) and is served on a later pass. */
     if (t->inflight >= server.io_batch_inflight || c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
@@ -419,7 +658,7 @@ static int fpFlushOut(fpThread *t, client *c) {
 
 /* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
-    if (c->fp_state == FP_CLOSING) return;
+    if (c->control->lifecycle == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
         return;
@@ -511,11 +750,12 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
     int i = 0;
     while (i < b->count) {
-        client *c = b->e[i].io_client;
+        client *c = fpResolve(t, &b->e[i].handle);
+        ClientControl *cc = b->e[i].handle.control;
         int n = 0;
         int j = i;
         int requeued = 0;
-        while (j < b->count && b->e[j].io_client == c) {
+        while (j < b->count && b->e[j].handle.control == cc) {
             cmdEntry *e = &b->e[j];
             if (e->requeued) {
                 requeued++;
@@ -526,14 +766,17 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             }
             j++;
         }
-        if (n) fpSend(t, c, iov, n);
-        c->fp_inflight -= (j - i);
-        c->commands_processed += (j - i) - requeued;
-        if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+        if (c) {
+            if (n) fpSend(t, c, iov, n);
+            c->fp_inflight -= (j - i);
+            c->commands_processed += (j - i) - requeued;
+            if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+        }
         i = j;
     }
     for (int k = 0; k < b->count; k++) {
         cmdEntry *e = &b->e[k];
+        fpReplyRelease(e); /* charged storage reclaimed on this pass: sent-then-freed or copied into fp_out then freed */
         if (e->reply_big) zfree(e->reply_big);
         /* Terminal frees of what main did not keep, on the thread that
          * allocated it; no free traffic through the shared inbox. */
@@ -559,9 +802,9 @@ static void fpFinishLeaving(fpThread *t) {
         client *c = listNodeValue(ln);
         ln = next;
         if (c->fp_inflight > 0) continue;
-        if (c->fp_state == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
+        if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
         fpUnregister(t, c);
-        sendToMainThread(c, c->fp_state == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
+        sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
     }
 }
 
@@ -575,25 +818,26 @@ static void fpCancelLeavingInCur(fpThread *t) {
     cmdEntry grp[IO_BATCH_MAX];
     int kept = 0;
     for (int i = 0; i < b->count; i++) {
-        client *c = b->e[i].io_client;
-        if (c == NULL) continue; /* already moved into its client's queue */
-        if (c->fp_state == FP_ACTIVE) {
+        ClientControl *cc = b->e[i].handle.control;
+        if (cc == NULL) continue; /* already moved into its client's queue */
+        client *c = fpResolve(t, &b->e[i].handle);
+        if (c && c->control->lifecycle == FP_ACTIVE) {
             b->e[kept++] = b->e[i];
             continue;
         }
         int n = 0;
         for (int j = i; j < b->count; j++) {
-            if (b->e[j].io_client != c) continue;
+            if (b->e[j].handle.control != cc) continue;
             grp[n++] = b->e[j];
-            b->e[j].io_client = NULL;
+            b->e[j].handle.control = NULL;
         }
-        c->fp_inflight -= n;
-        if (c->fp_state == FP_CLOSING) {
+        if (c) c->fp_inflight -= n;
+        if (c && c->control->lifecycle == FP_CLOSING) {
             for (int k = 0; k < n; k++) {
                 for (int a = 0; a < grp[k].argc; a++) decrRefCount(grp[k].argv[a]);
                 zfree(grp[k].argv);
             }
-        } else {
+        } else if (c) {
             fpRequeue(t, c, grp, n);
         }
     }
@@ -624,6 +868,21 @@ static void fpQuiesceStep(fpThread *t) {
     }
 }
 
+/* Owner-side sweep of pending lifecycle requests. Runs only when a publisher signalled this thread, so
+ * an idle owner costs nothing until a request arrives. The signal is cleared before the walk so a
+ * request published during it re-arms the flag and is caught next pass rather than lost. Only owned
+ * (still FP_ACTIVE) clients carry actionable requests; leaving/closing clients are already past the
+ * decision fpExecuteRequests would make. */
+static void fpDrainRequests(fpThread *t) {
+    if (!atomic_exchange_explicit(&t->req_pending, 0, memory_order_acquire)) return;
+    listNode *ln = t->owned.head;
+    while (ln) {
+        listNode *next = ln->next;
+        fpExecuteRequests(t, listNodeValue(ln));
+        ln = next;
+    }
+}
+
 /* Attach and detach requests name clients by pointer only until the registry confirms ownership. */
 static void fpTakeClient(fpThread *t, client *c) {
     fpRegister(t, c);
@@ -648,8 +907,9 @@ int fastpathProcessReturns(int tid) {
                 client *c = (client *)(v & ~FP_TAGS);
                 if (v & FP_TAG_ATTACH) {
                     fpTakeClient(t, c);
-                } else if (raxFind(t->registry, (unsigned char *)&c, sizeof(c), NULL)) {
-                    if (c->fp_state == FP_LEAVING) c->fp_state = FP_CLOSING; /* no reason left to flush its output */
+                } else if (fpOwns(t, c)) {
+                    if (c->control->lifecycle == FP_LEAVING)
+                        c->control->lifecycle = FP_CLOSING; /* no reason left to flush its output */
                     fpBeginLeave(t, c, FP_CLOSING, 0);
                 } /* else already handed back: main frees it once this request is consumed */
                 continue;
@@ -662,9 +922,11 @@ int fastpathProcessReturns(int tid) {
         total += (int)n;
     }
     if (atomic_load_explicit(&t->role, memory_order_acquire) == FP_ROLE_QUIESCING) {
+        fpDrainRequests(t); /* a CLOSE arriving mid-quiesce still upgrades a leaving client to closing */
         fpQuiesceStep(t);
         return total;
     }
+    fpDrainRequests(t);
     if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
     return total;
@@ -680,12 +942,13 @@ static client *fpExecutor(int tid) {
     return ec;
 }
 
-/* Cookies of clients main asked to close; their queued commands must not run, as with close_asap. */
+/* Controls of clients main asked to close; their queued commands must not run, as with close_asap.
+ * Keyed by the stable control pointer so main tests an entry by its handle without touching the connection. */
 static rax *fp_detaching = NULL;
 
-static int fpClientDetaching(client *io_client) {
-    return fp_detaching && raxSize(fp_detaching) > 0 &&
-           raxFind(fp_detaching, (unsigned char *)&io_client, sizeof(io_client), NULL);
+static int fpControlDetaching(ClientControl *cc) {
+    return cc && fp_detaching && raxSize(fp_detaching) > 0 &&
+           raxFind(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL);
 }
 
 /* The executor borrows argv and writes replies into the batch arena. */
@@ -694,7 +957,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
-    if (fpClientDetaching(e->io_client)) goto release_argv; /* no reply: the IO thread is closing it */
+    if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
         e->requeued = 1; /* the main path postpones it like any other client's command */
         return;
@@ -753,6 +1016,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->bufpos = 0;
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
+    fpReplyCharge(e); /* the entry's reply storage is now retained for the client; charge it once */
 release_argv:
     /* IO threads receive only sole-reference argv objects for terminal frees. */
     for (int j = 0; j < e->argc; j++) {
@@ -772,7 +1036,8 @@ static void fpRetFlushOverflow(fpThread *t) {
         client *c = listNodeValue(ln);
         listDelNode(t->ret_overflow, ln);
         spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
-        raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), (void *)t->ret.tail_local, NULL);
+        ClientControl *cc = c->control;
+        raxInsert(fp_detaching, (unsigned char *)&cc, sizeof(cc), (void *)t->ret.tail_local, NULL);
     }
 }
 
@@ -826,24 +1091,29 @@ void fastpathRequestDetach(client *c) {
     fpThread *t = &fp_threads[c->io_tid];
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
+    fastpathControlRequest(c->control, CC_REQ_CLOSE); /* record the terminal request on the control; the ring carries the pointer safely */
+    fastpathControlPin(c, CC_PIN_DETACH); /* a detach record now sits in the ring; hold until the owner consumes it */
     t->detach_pending++;
     if (!fp_detaching) fp_detaching = raxNew();
-    raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), NULL, NULL);
+    ClientControl *cc = c->control;
+    raxInsert(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL, NULL);
     fpRetPublish(t, c, FP_TAG_DETACH);
     if (listLength(t->ret_overflow) == 0)
-        raxInsert(fp_detaching, (unsigned char *)&c, sizeof(c), (void *)t->ret.tail_local, NULL);
+        raxInsert(fp_detaching, (unsigned char *)&cc, sizeof(cc), (void *)t->ret.tail_local, NULL);
 }
 
 /* True once the IO thread consumed the detach request; only then may main free the client. */
 int fastpathDetachConsumed(client *c) {
     void *pos = NULL;
     if (!c->flag.fp_detach_sent) return 1;
-    if (!raxFind(fp_detaching, (unsigned char *)&c, sizeof(c), &pos) || pos == NULL) return 0;
+    ClientControl *cc = c->control;
+    if (!raxFind(fp_detaching, (unsigned char *)&cc, sizeof(cc), &pos) || pos == NULL) return 0;
     fpThread *t = &fp_threads[c->io_tid];
     if (atomic_load_explicit(&t->ret.head, memory_order_acquire) < (size_t)pos) return 0;
-    raxRemove(fp_detaching, (unsigned char *)&c, sizeof(c), NULL);
+    raxRemove(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL);
     t->detach_pending--;
     c->flag.fp_detach_sent = 0;
+    fastpathControlUnpin(c, CC_PIN_DETACH); /* the owner passed the record; nothing in the ring names the control now */
     return 1;
 }
 
@@ -893,7 +1163,12 @@ void fastpathHandoffDone(client *c, int closing) {
     serverAssert(t->main_clients > 0);
     t->main_clients--;
     c->flag.fastpath = 0;
-    c->fp_state = FP_DETACHED;
+    /* Main is the owner again; publish the terminal state on the single source of truth. control is
+     * still live here (reclaimed only at freeClient), so the read/write is safe. */
+    c->control->owner_domain = CC_OWNER_MAIN;
+    c->control->owner_tid = 0;
+    c->control->lifecycle = FP_DETACHED;
+    fastpathControlUnpin(c, CC_PIN_OWNER); /* IO no longer owns it; drop the ownership pin as main takes over */
     fastpath_clients--;
     ACLFastpathClientReturned(c);
     sds out = c->fp_out;

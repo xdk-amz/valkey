@@ -5,13 +5,15 @@
  */
 
 /* Runs a fast-path batch through the main-thread executor while the
- * originating client's memory is unmapped: any dereference of the
- * io_client cookie on main faults, and origin data must still be intact. */
+ * originating client's memory is unmapped: main resolves every entry through
+ * its ClientHandle + CommandOrigin and never dereferences the connection, so
+ * the unmapped client cannot fault, and origin data must still be intact. */
 
 #include "generated_wrappers.hpp"
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -19,6 +21,7 @@
 extern "C" {
 #include "connection.h"
 #include "fastpath.h"
+#include "io_threads.h"
 #include "module.h"
 #include "server.h"
 extern hashtableType commandSetType;
@@ -79,11 +82,18 @@ class FastpathExecutorTest : public ::testing::Test {
         server.io_batch_inflight = 16;
         connTypeInitialize();
         initSharedQueryBuf();
+        testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
+        testOnlySetIOThreadReady(1, epoll_create1(EPOLL_CLOEXEC));
     }
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyFreeIOThreadQueues();
+    }
+
+    void SetUp() override {
+        testOnlyInitIOThreadQueues(); /* forget hand-off messages of the previous test */
     }
 
     /* Read whatever the executor produced for the client from the other end of the pair. */
@@ -111,10 +121,6 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     c->conn = conn;
     connSetPrivateData(conn, c);
     c->id = 424242;
-    c->flag.fastpath = 1;
-    c->fp_state = FP_ACTIVE;
-    c->io_tid = 1;
-    c->fp_inflight = 0;
     c->fp_out = NULL;
     struct sockaddr_in6 sa;
     memset(&sa, 0, sizeof(sa));
@@ -122,6 +128,13 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     sa.sin6_port = htons(31337);
     ASSERT_EQ(inet_pton(AF_INET6, "2001:db8::7", &sa.sin6_addr), 1);
     ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+
+    /* Admit through the real flow so the connection gets a ClientControl and the IO thread owns it;
+     * its control is a separate allocation, reachable while the client's own pages are unmapped. */
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1); /* the attach request: thread takes ownership */
 
     /* Two pipelined commands: GET on a missing key and SET, both plain data commands. */
     const char *req = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
@@ -130,18 +143,26 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     ASSERT_EQ(c->fp_inflight, 2u);
     fastpathSubmitPending(1);
 
-    /* Main runs the batch while the client is unreachable. */
+    /* Main runs the batch while the client is unreachable: it must resolve via handle + origin only. */
     ASSERT_EQ(mprotect(c, maplen, PROT_NONE), 0);
     EXPECT_EQ(fastpathDrain(), 2);
     ASSERT_EQ(mprotect(c, maplen, PROT_READ | PROT_WRITE), 0);
 
-    /* Back on the IO thread the cookie is a client again: replies go out and the entries are released. */
+    /* Back on the IO thread the handle resolves to the client again: replies go out, entries released. */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(readReply(sv[1]), "$-1\r\n+OK\r\n");
     robj *key = createStringObject("foo", 3);
     EXPECT_NE(lookupKeyRead(server.db[0], key), nullptr);
     decrRefCount(key);
+
+    /* Quiesce so the thread hands the client back and unregisters it (no freeClient on mmap'd pages);
+     * main completes the hand-off, then reclaim its separately allocated control so nothing is owned. */
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0); /* main takes the client back: drops the owner pin and the routed count */
+    EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
+    fastpathControlReclaim(c);
 
     close(sv[1]);
     close(sv[0]);
