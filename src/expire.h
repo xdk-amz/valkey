@@ -75,7 +75,7 @@ int parseExtendedExpireArgumentsOrReply(client *c, int *flags, int max_args);
 int convertExpireArgumentToUnixTime(client *c, robj *arg, mstime_t basetime, int unit, mstime_t *unixtime);
 
 /* Per-item TTL primitives of a listpack-encoded object. */
-void listpackObjectIgnoreTTL(bool ignore);
+bool listpackObjectIgnoreTTL(bool ignore);
 void listpackObjectUpdateVolatileCount(robj *o, long delta);
 bool listpackObjectItemIsValid(long long expiry);
 

@@ -211,6 +211,53 @@ TEST_F(SetVolatileTest, reclaimingTheLastVolatileMemberSwapsTypeBack) {
     decrRefCount(o);
 }
 
+/* Above VOLATILESET_VECTOR_BUCKET_MAX_SIZE the expiry index becomes a RAX keyed
+ * by the deadline rounded up to an 8192 ms window, so its earliest expiry reads
+ * as the window end. Fill one window and expire inside it. */
+static const mstime_t BUCKET_WINDOW = 8192;
+static const mstime_t WINDOW_START = (NOW / BUCKET_WINDOW) * BUCKET_WINDOW;
+static const size_t RAX_WINDOW_MEMBERS = 200;
+
+static robj *makeRaxWindowSet(char names[][16], const char **members, mstime_t deadline) {
+    for (size_t i = 0; i < RAX_WINDOW_MEMBERS; i++) {
+        snprintf(names[i], 16, "member:%zu", i);
+        members[i] = names[i];
+    }
+    robj *o = makeHashtableSet(members, RAX_WINDOW_MEMBERS);
+    for (size_t i = 0; i < RAX_WINDOW_MEMBERS; i++) {
+        EXPECT_EQ(setExpiry(o, members[i], deadline), EXPIRATION_MODIFICATION_SUCCESSFUL);
+    }
+    EXPECT_EQ(setTypeVolatileCount(o), (long long)RAX_WINDOW_MEMBERS);
+    return o;
+}
+
+/* The predicate gates every path that may not miss a hidden member, so it must
+ * never answer false while one exists — including the window in which the
+ * rounded-up bucket key is still in the future and reclamation refuses to run. */
+TEST_F(SetVolatileTest, hasExpiredMembersStaysTrueInsideTheBucketWindow) {
+    char names[RAX_WINDOW_MEMBERS][16];
+    const char *members[RAX_WINDOW_MEMBERS];
+    const mstime_t deadline = WINDOW_START + 100;
+
+    server.cmd_time_snapshot = WINDOW_START;
+    robj *o = makeRaxWindowSet(names, members, deadline);
+
+    server.cmd_time_snapshot = deadline + 1;
+    ASSERT_LT(server.cmd_time_snapshot, WINDOW_START + BUCKET_WINDOW);
+
+    /* Every member is hidden and none of them is reclaimable yet. */
+    mstime_t expiry;
+    for (size_t i = 0; i < RAX_WINDOW_MEMBERS; i++) {
+        ASSERT_EQ(getExpiry(o, members[i], &expiry), C_ERR) << members[i];
+    }
+    ASSERT_EQ(setTypeDeleteExpiredMembers(o, server.cmd_time_snapshot, RAX_WINDOW_MEMBERS, NULL), 0u);
+    ASSERT_EQ(setTypeSize(o), RAX_WINDOW_MEMBERS);
+
+    ASSERT_TRUE(setTypeHasExpiredMembers(o));
+
+    decrRefCount(o);
+}
+
 /* Defrag must repoint both hashtable buckets and the vset. */
 TEST_F(SetVolatileTest, scanDefragVolatileMovesMembersAndVset) {
     const size_t count = 200;

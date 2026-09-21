@@ -757,7 +757,7 @@ int rdbGetObjectType(robj *o, int rdbver) {
             serverPanic("Unknown list encoding");
     case OBJ_SET:
         if (setTypeHasVolatileMembers(o)) {
-            if (rdbver >= 81) return RDB_TYPE_SET_2;
+            if (rdbver >= 82) return RDB_TYPE_SET_2;
             return -1;
         }
         if (objectGetEncoding(o) == OBJ_ENCODING_INTSET)

@@ -49,9 +49,10 @@
  *     is provided and matches the old entry expiration time.
  *
  * Expiry Retrieval/Removal:
- *     long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) - will return an estimation to the lowest expiry time of
+ *     long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) - will return a lower bound on the lowest expiry time of
  *     the entries which currently exists in the set. Because of the semi-sorted ordering this implementation is using, the returned value MIGHT not be the 'real' minimum
- *     but rather some value which is the maximum among a group of entries which are all close or equal to the 'real' minimum.
+ *     but rather the start of the time window holding a group of entries which are all close or equal to the 'real' minimum, so a caller that must not miss an
+ *     already expired entry can rely on it.
  *
  *     size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx) - can be used
  *     in order to remove up to max_count entries from the vset. The removed entries will all satisfy the condition that their expiration time is smaller than the provided now.
@@ -93,7 +94,7 @@ long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry);
 size_t vsetCountHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t *hidden);
 bool vsetSelectLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t rank, void **entry);
 size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx);
-size_t vsetMemUsage(vset *set);
+size_t vsetMemUsage(vset *set, size_t sample_size);
 size_t vsetScanDefrag(vset *set, size_t cursor, void *(*defragfn)(void *));
 
 #endif

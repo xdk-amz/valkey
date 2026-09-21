@@ -3,7 +3,7 @@
         "summary": "Returns Unix timestamps in seconds since the epoch at which the given key's member(s) will expire.",
         "complexity": "O(N) where N is the number of specified members.",
         "group": "set",
-        "since": "9.2.0",
+        "since": "9.3.0",
         "arity": -5,
         "function": "sexpiretimeCommand",
         "command_flags": [

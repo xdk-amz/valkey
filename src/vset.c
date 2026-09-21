@@ -1702,31 +1702,37 @@ static inline size_t vsetBucketMemUsage_HASHTABLE(vsetBucket *bucket) {
     return hashtableMemUsage(ht);
 }
 
-static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
+/* Sums the memory of at most 'sample_size' time buckets and scales the result by
+ * the number of buckets, so a caller that samples k entries of the object does
+ * not pay a walk over every bucket. */
+static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket, size_t sample_size) {
     rax *r = vsetBucketRax(bucket);
     size_t total_mem = raxAllocSize(r);
+    size_t sampled_mem = 0, samples = 0;
     raxIterator it;
     raxStart(&it, r);
     assert(raxSeek(&it, "^", NULL, 0));
-    while (raxNext(&it)) {
+    while (samples < sample_size && raxNext(&it)) {
         switch (vsetBucketType(it.data)) {
         case VSET_BUCKET_NONE:
-            total_mem += vsetBucketMemUsage_NONE(it.data);
+            sampled_mem += vsetBucketMemUsage_NONE(it.data);
             break;
         case VSET_BUCKET_SINGLE:
-            total_mem += vsetBucketMemUsage_SINGLE(it.data);
+            sampled_mem += vsetBucketMemUsage_SINGLE(it.data);
             break;
         case VSET_BUCKET_VECTOR:
-            total_mem += vsetBucketMemUsage_VECTOR(it.data);
+            sampled_mem += vsetBucketMemUsage_VECTOR(it.data);
             break;
         case VSET_BUCKET_HT:
-            total_mem += vsetBucketMemUsage_HASHTABLE(it.data);
+            sampled_mem += vsetBucketMemUsage_HASHTABLE(it.data);
             break;
         default:
             panic("Unknown bucket type encountered in vsetBucketMemUsage_HASHTABLE");
         }
+        samples++;
     }
     raxStop(&it);
+    if (samples) total_mem += (size_t)((double)sampled_mem / samples * raxSize(r));
     return total_mem;
 }
 
@@ -2143,11 +2149,12 @@ size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc 
  *     set: Pointer to the volatile set (vset *) to inspect.
  *     getExpiry: Callback function used to extract the expiration time from a set entry.
  *
- * Returns the earliest expiration time based on the structure of the volatile set.
- * This is an *approximate* value:
- *   - For bucketed types (e.g., radix tree, vector), it returns the expiry of the first bucket or entry,
- *     which may not be the actual earliest expiring item.
- *   - For single-entry sets, it returns the expiry of the sole item.
+ * Returns a lower bound on the earliest expiration time in the set, so a caller
+ * that must not miss an already expired entry can rely on it:
+ *   - For a radix tree it returns the start of the earliest time window. The
+ *     bucket key is the deadline rounded UP to the end of its window, so an
+ *     entry filed under it expires anywhere inside that window.
+ *   - For vector and single-entry buckets it returns the exact expiry.
  *   - For VSET_BUCKET_NONE, it returns -1 to indicate there is no data.
  *
  * Supported bucket types:
@@ -2179,7 +2186,7 @@ long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) {
          * RAX-encoded set is never empty, so the first advance always succeeds. */
         raxSeek(&it, "^", NULL, 0);
         assert(raxNext(&it));
-        expiry = decodeExpiryKey(it.key);
+        expiry = decodeExpiryKey(it.key) - VOLATILESET_BUCKET_INTERVAL_MAX;
         raxStop(&it);
         break;
     }
@@ -2247,7 +2254,7 @@ bool vsetNext(vsetIterator *iter, void **entryptr) {
     return ret == 1;
 }
 
-size_t vsetMemUsage(vset *set) {
+size_t vsetMemUsage(vset *set, size_t sample_size) {
     int bucket_type = vsetBucketType(*set);
     switch (bucket_type) {
     case VSET_BUCKET_NONE:
@@ -2259,7 +2266,7 @@ size_t vsetMemUsage(vset *set) {
     case VSET_BUCKET_HT:
         panic("Unsupported hashtable bucket type for vset");
     case VSET_BUCKET_RAX:
-        return vsetBucketMemUsage_RAX(*set);
+        return vsetBucketMemUsage_RAX(*set, sample_size);
     default:
         panic("Unknown set type encountered in vsetMemUsage");
     }

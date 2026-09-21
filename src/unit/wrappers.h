@@ -83,6 +83,7 @@ int __wrap_ACLCheckAllUserCommandPerm(user *u, struct serverCommand *cmd, robj *
 
 size_t __wrap_hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);
 bool __wrap_hashtableScanHasPassedKey(hashtable *ht, const void *key, size_t cursor);
+int __wrap_setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele);
 
 /* Throttler mocks */
 throttler *__wrap_throttle_register(throttleCriteriaProc *criteria_proc, void *priv_data, const char *metrics_name);
