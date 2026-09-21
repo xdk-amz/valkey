@@ -161,10 +161,10 @@ TEST_F(FastpathClientControlTest, HandleAndControlLayoutIsCompact) {
     EXPECT_EQ(sizeof(ClientHandle), 2 * sizeof(void *));
     EXPECT_EQ(alignof(ClientHandle), alignof(void *));
 
-    /* The detached entry leads with the handle, not a connection pointer, and is 168 bytes now that
-     * the 8-byte io_client cookie became a 16-byte handle (base cmdEntry was 160). */
+    /* The detached entry leads with the handle, not a connection pointer, and field packing keeps the
+     * 16-byte handle inside the base branch's 160-byte command-entry budget. */
     EXPECT_EQ(offsetof(cmdEntry, handle), 0u);
-    EXPECT_EQ(sizeof(cmdEntry), 168u);
+    EXPECT_EQ(sizeof(cmdEntry), 160u);
     EXPECT_EQ(sizeof(cmdBatch), offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry));
 
     /* The control aligns to a cache line, and its two reply counters sit on their own lines so the
@@ -198,6 +198,7 @@ TEST_F(FastpathClientControlTest, ControlEnsuredOncePerConnectionAndEntriesCarry
     ClientHandle h = fastpathHandleFor(c);
     EXPECT_EQ(h.control, cc);
     EXPECT_EQ(h.generation, cc->generation);
+    EXPECT_EQ(h.owner_slot, c->fp_owner_slot);
     EXPECT_FALSE(fastpathHandleStale(&h));
 
     quiesceAndFree(c, peer);
@@ -225,7 +226,7 @@ TEST_F(FastpathClientControlTest, StaleHandleDetectedByGenerationWithoutTouching
     EXPECT_FALSE(fastpathHandleStale(&h2));
 
     /* A NULL-control handle is stale, never dereferenced. */
-    ClientHandle empty = {NULL, 0};
+    ClientHandle empty = {NULL, 0, 0};
     EXPECT_TRUE(fastpathHandleStale(&empty));
 
     cc->generation--; /* restore so the still-owned client reconciles cleanly on teardown */
