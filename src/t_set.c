@@ -36,6 +36,7 @@
 #include "bgiteration.h"
 #include "hashtable.h"
 #include "intset.h" /* Compact integer set structure */
+#include "mt19937-64.h"
 
 /*-----------------------------------------------------------------------------
  * Set Commands
@@ -227,6 +228,20 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         serverPanic("Unknown set encoding");
     }
     return 0;
+}
+
+/* Add a member taken from another set, as setTypeAddAux() takes it. A member
+ * without an expiry is inserted raw, which needs no sds of its own, as long as
+ * no earlier member brought a TTL into 'set': setTypeAddAux() does not maintain
+ * the volatile member index. */
+static void setTypeAddMovedMember(robj *set, char *str, size_t len, int64_t llval, int str_is_sds, mstime_t expiry) {
+    if (expiry == EXPIRY_NONE && !setTypeHasVolatileMembers(set)) {
+        setTypeAddAux(set, str, len, llval, str_is_sds);
+        return;
+    }
+    sds member = str_is_sds ? (sds)str : (str ? sdsnewlen(str, len) : sdsfromlonglong(llval));
+    setTypeAddWithExpiry(set, member, expiry, 0, NULL, NULL);
+    if (member != str) sdsfree(member);
 }
 
 /* Deletes a value provided as an sds string from the set. Returns 1 if the
@@ -433,29 +448,305 @@ mstime_t setTypeCurrentExpiry(setTypeIterator *si, const char *str) {
     }
 }
 
-static robj *setTypeReclaimExpiredMembers(client *c, robj *set) {
-    if (getExpirationPolicyWithFlags(0) != POLICY_DELETE_EXPIRED ||
-        bgIteration_isEntryInuse(set) ||
-        !setTypeHasExpiredMembers(set))
-        return set;
-    dbReclaimExpiredItems(set, c->db, commandTimeSnapshot(), setTypeSize(set), c->slot);
-    return lookupKeyWrite(c->db, c->argv[1]);
+/* hashtableFairRandomEntry() reads a whole batch of candidate entries per call
+ * (FAIR_RANDOM_SAMPLE_SIZE of them), so a budget is counted in batches and stays
+ * small: a few batches already exhaust the acceptance probability that makes
+ * rejection sampling worthwhile, and beyond that the exact census below is
+ * cheaper than more batches. */
+#define SET_LIVE_PROBE_BATCHES 4
+
+/* Rejection sampling only pays off while live members are at least this fraction
+ * of the physical ones. */
+#define SET_LIVE_REJECTION_DIVISOR 2
+
+/* Rejection-sample a live member, spending at most '*batches' sample batches and
+ * deducting the ones it spent. Returns NULL when no draw landed on a live
+ * member, which is also the answer for an emptied set, a set with no live
+ * member and for the encodings without O(1) random access, whose callers pass
+ * over the set instead. */
+static void *setTypeProbeLiveMember(robj *setobj, unsigned long *batches) {
+    if (setobj->encoding != OBJ_ENCODING_HASHTABLE) return NULL;
+
+    /* Bracketed: under the validating type hashtableFairRandomEntry loops until it has sampled
+     * enough live members, forever when fewer remain than its sample size. */
+    void *entry = NULL;
+    setTypeIgnoreTTL(setobj, true);
+    while (*batches > 0) {
+        (*batches)--;
+        WC_INC(set_probe_batches);
+        if (!hashtableFairRandomEntry(objectGetVal(setobj), &entry)) break;
+        if (!smemberIsExpired(entry)) break;
+        WC_INC(set_random_expired_seen);
+        entry = NULL;
+    }
+    setTypeIgnoreTTL(setobj, false);
+    return entry;
 }
 
-/* Return a uniformly selected live member, or -1 if none exists. */
-static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
-    if (setobj->encoding == OBJ_ENCODING_HASHTABLE) {
-        /* Bracketed: under the validating type hashtableFairRandomEntry loops until it has sampled
-         * enough live members, forever when fewer remain than its sample size. */
-        void *entry = NULL;
-        setTypeIgnoreTTL(setobj, true);
-        for (int tries = 0; tries < 100; tries++) {
-            hashtableFairRandomEntry(objectGetVal(setobj), &entry);
-            if (!smemberIsExpired(entry)) break;
-            WC_INC(set_random_expired_seen);
-            entry = NULL;
+/* Rejection-sample a member that carries no TTL, so is live whatever the clock
+ * says. Returns NULL when the budget ran out. */
+static void *setTypeProbePersistentMember(robj *setobj, unsigned long batches) {
+    if (setobj->encoding != OBJ_ENCODING_HASHTABLE) return NULL;
+
+    void *entry = NULL;
+    setTypeIgnoreTTL(setobj, true);
+    while (batches > 0) {
+        batches--;
+        WC_INC(set_probe_batches);
+        if (!hashtableFairRandomEntry(objectGetVal(setobj), &entry)) break;
+        if (!smemberHasExpiry(entry)) break;
+        entry = NULL;
+    }
+    setTypeIgnoreTTL(setobj, false);
+    return entry;
+}
+
+/* Allocate a uniform sample without reserving space for hidden members. */
+static unsigned long setTypeSampleLiveMembersAlloc(robj *set, listpackEntry **entries, unsigned long cap) {
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long seen = 0, held = 0, allocated = 0;
+    listpackEntry *buf = NULL;
+    WC_INC(set_reservoir_passes);
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};
+        if (held < cap) {
+            if (held == allocated) {
+                unsigned long next = allocated ? (allocated > cap / 2 ? cap : allocated * 2) : (cap < 16 ? cap : 16);
+                buf = zrealloc(buf, sizeof(listpackEntry) * next);
+                allocated = next;
+            }
+            buf[held++] = e;
+        } else {
+            unsigned long r = (unsigned long)rand() % (seen + 1);
+            if (r < cap) buf[r] = e;
         }
-        setTypeIgnoreTTL(setobj, false);
+        seen++;
+    }
+    setTypeReleaseIterator(si);
+    *entries = buf;
+    return held;
+}
+
+/* Copy every live member into a buffer grown to hold them, which the caller
+ * frees. Returns how many it copied. Only a listpack reaches this, whose member
+ * count server.set_max_listpack_entries bounds. Members are borrowed from the
+ * set, so the caller must not mutate it before it is done with them. */
+static unsigned long setTypeCollectLiveMembers(robj *set, listpackEntry **entries) {
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long held = 0, cap = 0;
+    serverAssert(set->encoding == OBJ_ENCODING_LISTPACK);
+    listpackEntry *buf = NULL;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (setTypeNext(si, &str, &len, &llele) != -1) {
+        if (held == cap) {
+            cap = cap ? cap * 2 : 16;
+            buf = zrealloc(buf, sizeof(listpackEntry) * cap);
+        }
+        buf[held++] = (listpackEntry){.sval = (unsigned char *)str, .slen = len, .lval = llele};
+    }
+    setTypeReleaseIterator(si);
+    *entries = buf;
+    return held;
+}
+
+/* rand() cannot cover the rank space of a large live population, and its modulo
+ * would favour the low ranks; the rejection loop removes both. */
+static unsigned long setTypeRandomBelow(unsigned long n) {
+    serverAssert(n > 0);
+    unsigned long limit = ULONG_MAX - (ULONG_MAX % n);
+    unsigned long r;
+    do {
+        r = (unsigned long)genrand64_int64();
+    } while (r >= limit);
+    return r % n;
+}
+
+/* An exact partition of the physical members, drawn from the volatile index
+ * rather than from a pass over the members. */
+typedef struct {
+    unsigned long physical; /* setTypeSize(): hidden members included */
+    unsigned long hidden;   /* stored but not visible to this execution context */
+    unsigned long live;     /* physical - hidden */
+    unsigned long live_ttl; /* live members that carry a TTL; live - live_ttl carry none */
+} setLiveCensus;
+
+static bool setTypeProductExceeds(unsigned long a, unsigned long b, unsigned long limit) {
+    return a != 0 && b > limit / a;
+}
+
+/* A positional draw is cheaper until repeating it would cost more than one
+ * pass over the physical set. Persistent ranks use the live population as the
+ * denominator because only that fraction of uniform draws can choose them. */
+static bool setTypeBulkSamplePreferred(const setLiveCensus *census, unsigned long count) {
+    if (census->live >= census->physical / SET_LIVE_REJECTION_DIVISOR) return false;
+    unsigned long persistent = census->live - census->live_ttl;
+    return setTypeProductExceeds(count, census->live_ttl, census->physical) ||
+           setTypeProductExceeds(count, persistent, census->live);
+}
+
+typedef struct {
+    unsigned long rank;
+    unsigned long order;
+} setSampleRank;
+
+static int setTypeSampleRankCompare(const void *lhs, const void *rhs) {
+    const setSampleRank *a = lhs;
+    const setSampleRank *b = rhs;
+    if (a->rank != b->rank) return a->rank > b->rank ? 1 : -1;
+    return (a->order > b->order) - (a->order < b->order);
+}
+
+/* Resolve independent ranks in one live-member pass. The output array keeps
+ * draw order, so duplicate ranks remain independent with-replacement draws. */
+static listpackEntry *setTypeSampleLiveMembersByRank(robj *set, unsigned long count, unsigned long live_count) {
+    serverAssert(count > 0 && live_count > 0);
+    serverAssert(count <= SIZE_MAX / sizeof(setSampleRank));
+    serverAssert(count <= SIZE_MAX / sizeof(listpackEntry));
+
+    setSampleRank *ranks = zmalloc(sizeof(*ranks) * count);
+    listpackEntry *selected = zmalloc(sizeof(*selected) * count);
+    for (unsigned long i = 0; i < count; i++) {
+        ranks[i].rank = setTypeRandomBelow(live_count);
+        ranks[i].order = i;
+    }
+    qsort(ranks, count, sizeof(*ranks), setTypeSampleRankCompare);
+
+    char *str;
+    size_t len;
+    int64_t llele;
+    unsigned long live_index = 0, next = 0;
+    setTypeIterator *si = setTypeInitIterator(set);
+    while (next < count && setTypeNext(si, &str, &len, &llele) != -1) {
+        while (next < count && ranks[next].rank == live_index) {
+            selected[ranks[next].order] =
+                (listpackEntry){.sval = (unsigned char *)str, .slen = len, .lval = llele};
+            next++;
+        }
+        live_index++;
+    }
+    setTypeReleaseIterator(si);
+    zfree(ranks);
+    serverAssert(next == count);
+    return selected;
+}
+
+/* Zero hides nothing, which is how a POLICY_IGNORE_EXPIRE context reads a set;
+ * otherwise the frozen command time, so every draw of one command sees one
+ * partition. */
+static mstime_t setTypeLivenessTime(void) {
+    return getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE ? 0 : commandTimeSnapshot();
+}
+
+static void setTypeLiveCensus(robj *set, mstime_t now, setLiveCensus *c) {
+    unsigned long volatile_members = 0;
+    WC_INC(set_census_calls);
+    c->physical = setTypeSize(set);
+    c->hidden = 0;
+
+    if (setTypeHasVolatileMembers(set)) {
+        if (set->encoding == OBJ_ENCODING_LISTPACK) {
+            unsigned char *lp = objectGetVal(set);
+            for (unsigned char *p = lpFirst(lp); p != NULL; p = lpNext(lp, p)) {
+                mstime_t expiry = setTypeListpackGetExpiry(lp, p);
+                WC_INC(set_census_entries);
+                if (expiry == EXPIRY_NONE) continue;
+                volatile_members++;
+                if (!listpackObjectItemIsValid(expiry)) c->hidden++;
+            }
+        } else {
+            size_t hidden = 0;
+            WC_INDEX_BEGIN();
+            volatile_members = setTypeVolatileCensus(set, now, &hidden);
+            WC_INDEX_END();
+            c->hidden = hidden;
+        }
+    }
+
+    serverAssert(c->hidden <= volatile_members && volatile_members <= c->physical);
+    c->live = c->physical - c->hidden;
+    c->live_ttl = volatile_members - c->hidden;
+}
+
+/* Reports the 'rank'-th live member, which is a bijection onto the live members
+ * and so carries a uniform rank to a uniform member. */
+static int
+setTypeSelectLiveElement(robj *set, mstime_t now, unsigned long rank, char **str, size_t *len, int64_t *llele) {
+    WC_INC(set_rank_selects);
+    if (set->encoding == OBJ_ENCODING_LISTPACK) {
+        unsigned char *lp = objectGetVal(set);
+        for (unsigned char *p = lpFirst(lp); p != NULL; p = lpNext(lp, p)) {
+            if (!setTypeListpackIsValidAt(lp, p)) continue;
+            if (rank-- > 0) continue;
+            unsigned int l;
+            *str = (char *)lpGetValue(p, &l, (long long *)llele);
+            *len = (size_t)l;
+            return OBJ_ENCODING_LISTPACK;
+        }
+        return -1;
+    }
+
+    serverAssert(set->encoding == OBJ_ENCODING_HASHTABLE);
+    smember *m = NULL;
+    WC_INDEX_BEGIN();
+    setTypeSelectLiveVolatileMember(set, now, rank, &m);
+    WC_INDEX_END();
+    if (m != NULL) {
+        *str = (char *)m;
+        *len = sdslen((sds)m);
+        *llele = -123456789; /* Not needed. Defensive. */
+        return OBJ_ENCODING_HASHTABLE;
+    }
+    return -1;
+}
+
+/* Reports the 'index'-th member without a TTL. Such a member is never hidden, so
+ * the plain iterator reaches every candidate and no ignore-TTL bracket is needed.
+ * Walks the members, so it is only the fallback for a rejection budget that a
+ * vanishingly small population of them exhausted. */
+static int
+setTypeSelectPermanentElement(robj *set, unsigned long index, char **str, size_t *len, int64_t *llele) {
+    int encoding = -1;
+    char *s;
+    size_t l;
+    int64_t ll;
+    int enc;
+    WC_INC(set_persistent_scans);
+    setTypeIterator *si = setTypeInitIterator(set);
+    while ((enc = setTypeNext(si, &s, &l, &ll)) != -1) {
+        if (enc == OBJ_ENCODING_HASHTABLE && smemberHasExpiry((smember *)s)) continue;
+        if (index-- > 0) continue;
+        *str = s;
+        *len = l;
+        *llele = ll;
+        encoding = enc;
+        break;
+    }
+    setTypeReleaseIterator(si);
+    return encoding;
+}
+
+/* Return a uniformly selected live member against a census already taken, or -1
+ * if the set has none. The census splits the draw so neither part can land on a
+ * hidden member: a rank below 'live_ttl' is answered by the volatile index's
+ * rank/select, and the rest is a member without a TTL. */
+static int setTypeDrawLiveElement(robj *set,
+                                  mstime_t now,
+                                  const setLiveCensus *census,
+                                  char **str,
+                                  size_t *len,
+                                  int64_t *llele) {
+    if (census->live == 0) return -1;
+
+    /* Sparse hidden members make rejection sampling the cheapest answer, and the
+     * census says when that holds without reading a single member. */
+    if (census->live >= census->physical / SET_LIVE_REJECTION_DIVISOR) {
+        unsigned long batches = SET_LIVE_PROBE_BATCHES;
+        void *entry = setTypeProbeLiveMember(set, &batches);
         if (entry != NULL) {
             *str = entry;
             *len = sdslen((sds)entry);
@@ -464,25 +755,48 @@ static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64
         }
     }
 
-    /* Reservoir sampling preserves uniformity when expired members are dense. */
-    int encoding = -1;
-    unsigned long seen = 0;
-    char *s;
-    size_t l;
-    int64_t ll;
-    int enc;
-    WC_INC(set_reservoir_passes);
-    setTypeIterator *si = setTypeInitIterator(setobj);
-    while ((enc = setTypeNext(si, &s, &l, &ll)) != -1) {
-        if (rand() % ++seen == 0) {
-            *str = s;
-            *len = l;
-            *llele = ll;
-            encoding = enc;
+    unsigned long rank = setTypeRandomBelow(census->live);
+    if (set->encoding == OBJ_ENCODING_LISTPACK || rank < census->live_ttl)
+        return setTypeSelectLiveElement(set, now, rank, str, len, llele);
+
+    void *entry = setTypeProbePersistentMember(set, SET_LIVE_PROBE_BATCHES);
+    if (entry != NULL) {
+        *str = entry;
+        *len = sdslen((sds)entry);
+        *llele = -123456789; /* Not needed. Defensive. */
+        return OBJ_ENCODING_HASHTABLE;
+    }
+    return setTypeSelectPermanentElement(set, rank - census->live_ttl, str, len, llele);
+}
+
+/* Return a uniformly selected live member, or -1 if none exists. */
+static int setTypeRandomLiveElement(robj *setobj, char **str, size_t *len, int64_t *llele) {
+    /* A bounded rejection attempt answers a set whose hidden members are sparse
+     * without paying for the census at all. */
+    unsigned long batches = SET_LIVE_PROBE_BATCHES;
+    void *entry = setTypeProbeLiveMember(setobj, &batches);
+    if (entry != NULL) {
+        *str = entry;
+        *len = sdslen((sds)entry);
+        *llele = -123456789; /* Not needed. Defensive. */
+        return OBJ_ENCODING_HASHTABLE;
+    }
+
+    if (setobj->encoding == OBJ_ENCODING_LISTPACK) {
+        unsigned char *lp = objectGetVal(setobj);
+        unsigned char *p = lpSeek(lp, rand() % lpLength(lp));
+        if (setTypeListpackIsValidAt(lp, p)) {
+            unsigned int l;
+            *str = (char *)lpGetValue(p, &l, (long long *)llele);
+            *len = (size_t)l;
+            return OBJ_ENCODING_LISTPACK;
         }
     }
-    setTypeReleaseIterator(si);
-    return encoding;
+
+    mstime_t now = setTypeLivenessTime();
+    setLiveCensus census;
+    setTypeLiveCensus(setobj, now, &census);
+    return setTypeDrawLiveElement(setobj, now, &census, str, len, llele);
 }
 
 /* Return random element from a non empty set.
@@ -981,6 +1295,38 @@ void scardCommand(client *c) {
  * implementation for more info. */
 #define SPOP_MOVE_STRATEGY_MUL 5
 
+/* Collect at most 'budget' hidden members from the volatile index. Returns
+ * false if more exist. The returned member pointers are borrowed; the caller
+ * frees only the pointer array. */
+static bool setTypeCollectHiddenMembers(robj *set, unsigned long budget, smember ***members, unsigned long *count) {
+    smember **buf = NULL;
+    unsigned long held = 0, allocated = 0;
+    bool counted = true;
+    smember *m;
+    vsetIterator iter;
+    setTypeInitVolatileIterator(set, &iter);
+    while (setTypeNextVolatile(&iter, &m)) {
+        if (!smemberIsExpired(m)) continue;
+        if (held == budget) {
+            counted = false;
+            break;
+        }
+        if (held == allocated) {
+            allocated = allocated ? (allocated > budget / 2 ? budget : allocated * 2) : (budget < 16 ? budget : 16);
+            buf = zrealloc(buf, sizeof(smember *) * allocated);
+        }
+        buf[held++] = m;
+    }
+    setTypeResetVolatileIterator(&iter);
+    if (!counted) {
+        zfree(buf);
+        return false;
+    }
+    *members = buf;
+    *count = held;
+    return true;
+}
+
 /* setTypeSize() counts expired members, so a volatile set may pop fewer than 'count'. */
 void spopWithCountCommand(client *c) {
     long l;
@@ -999,12 +1345,6 @@ void spopWithCountCommand(client *c) {
     /* If count is zero, serve an empty set ASAP to avoid special
      * cases later. */
     if (count == 0) {
-        addReply(c, shared.emptyset[c->resp]);
-        return;
-    }
-
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
         addReply(c, shared.emptyset[c->resp]);
         return;
     }
@@ -1059,6 +1399,17 @@ void spopWithCountCommand(client *c) {
     int64_t llele;
     unsigned long remaining = count < size ? size - count : 0; /* Elements left after SPOP. */
 
+    /* CASE 3 is safe for a volatile hashtable only when every hidden member
+     * fits in the physical remainder. The same bounded index walk also gathers
+     * the members whose expiry metadata the replacement must preserve. */
+    smember **hidden = NULL;
+    unsigned long hidden_count = 0;
+    bool hidden_remainder = false;
+    if (has_expired && remaining > 0 && remaining * SPOP_MOVE_STRATEGY_MUL <= count &&
+        set->encoding == OBJ_ENCODING_HASHTABLE) {
+        hidden_remainder = setTypeCollectHiddenMembers(set, remaining, &hidden, &hidden_count);
+    }
+
     /* If we are here, the number of requested elements is less than the
      * number of elements inside the set. Also we are sure that count < size.
      * Use two different strategies.
@@ -1105,38 +1456,61 @@ void spopWithCountCommand(client *c) {
         objectSetVal(set, lp);
         if (volatile_deleted) listpackObjectUpdateVolatileCount(set, -(long)volatile_deleted);
         popped = count;
-    } else if (has_expired) {
-        /* Expiration-restricted contexts cannot reclaim hidden members. */
-        unsigned long cap = count < size ? count : size;
-        serverAssert(cap <= SIZE_MAX / sizeof(robj *));
-        robj **selected = zmalloc(sizeof(robj *) * cap);
-        unsigned long seen = 0, held = 0;
-        WC_INC(set_reservoir_passes);
-        setTypeIterator *si = setTypeInitIterator(set);
-        while (setTypeNext(si, &str, &len, &llele) != -1) {
-            unsigned long slot = held < cap ? held : (unsigned long)rand() % (seen + 1);
-            seen++;
-            if (slot >= cap) continue;
-            if (held < cap)
-                held++;
-            else
-                decrRefCount(selected[slot]);
-            selected[slot] = str ? createStringObject(str, len) : createStringObjectFromLongLong(llele);
-        }
-        setTypeReleaseIterator(si);
+    } else if (has_expired && !hidden_remainder) {
+        /* Hidden members must survive the command, so every pop has to land on a
+         * live member. One census names how many there are and splits each draw
+         * so that it cannot select a hidden one, which also bounds the command to
+         * the live population: a set with none pops nothing and keeps its key.
+         *
+         * A request for nearly the whole set comes here when its remainder would
+         * have to carry more hidden members than it has room for, and a listpack
+         * comes here always: it has no index to name them with. */
+        mstime_t now = setTypeLivenessTime();
+        setLiveCensus census;
+        setTypeLiveCensus(set, now, &census);
+        unsigned long to_pop = count < census.live ? count : census.live;
+        robj **sampled = NULL;
+        unsigned long sampled_index = 0;
+        while (popped < to_pop) {
+            unsigned long left = to_pop - popped;
+            if (sampled == NULL && set->encoding == OBJ_ENCODING_HASHTABLE &&
+                setTypeBulkSamplePreferred(&census, left)) {
+                listpackEntry *entries = NULL;
+                unsigned long held = setTypeSampleLiveMembersAlloc(set, &entries, left);
+                serverAssert(held == left && left <= SIZE_MAX / sizeof(*sampled));
+                sampled = zmalloc(sizeof(*sampled) * left);
+                for (unsigned long i = 0; i < left; i++) {
+                    sampled[i] = entries[i].sval ? createStringObject((char *)entries[i].sval, entries[i].slen)
+                                                 : createStringObjectFromLongLongWithSds(entries[i].lval);
+                }
+                zfree(entries);
+            }
 
-        for (unsigned long i = 0; i < held; i++) {
-            serverAssert(setTypeRemove(set, objectGetVal(selected[i])));
-            addReplyBulk(c, selected[i]);
-            propargv[propindex++] = selected[i];
+            robj *member;
+            if (sampled != NULL) {
+                member = sampled[sampled_index++];
+            } else {
+                int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
+                serverAssert(encoding != -1);
+                member = str ? createStringObject(str, len) : createStringObjectFromLongLongWithSds(llele);
+            }
+            mstime_t expiry = EXPIRY_NONE;
+            serverAssert(setTypeGetExpiry(set, objectGetVal(member), &expiry) == C_OK);
+            serverAssert(setTypeRemove(set, objectGetVal(member)));
+            /* A live member left, so only its own counts move; 'hidden' stands. */
+            census.physical--;
+            census.live--;
+            if (expiry != EXPIRY_NONE) census.live_ttl--;
+            addReplyBulk(c, member);
+            propargv[propindex++] = member;
+            popped++;
             if (propindex == 2 + batchsize) {
                 alsoPropagate(c->db->id, propargv, propindex, PROPAGATE_AOF | PROPAGATE_REPL, c->slot);
                 for (unsigned long j = 2; j < propindex; j++) decrRefCount(propargv[j]);
                 propindex = 2;
             }
         }
-        popped = held;
-        zfree(selected);
+        zfree(sampled);
     } else if (remaining * SPOP_MOVE_STRATEGY_MUL > count) {
         for (unsigned long i = 0; i < count; i++) {
             propargv[propindex] = setTypePopRandom(set);
@@ -1164,8 +1538,23 @@ void spopWithCountCommand(client *c) {
          * release it. */
         robj *newset = NULL;
 
+        /* Move hidden members first so subsequent random picks select only the
+         * live remainder. */
+        if (hidden_count > 0) {
+            newset = createSetListpackObject();
+            setTypeIgnoreTTL(set, true);
+            for (unsigned long i = 0; i < hidden_count; i++) {
+                len = sdslen((sds)hidden[i]);
+                setTypeAddMovedMember(newset, (char *)hidden[i], len, 0, 1, smemberGetExpiry(hidden[i]));
+                serverAssert(setTypeRemoveAux(set, (char *)hidden[i], len, 0, 1));
+            }
+            setTypeIgnoreTTL(set, false);
+        }
+        zfree(hidden);
+        if (hidden_remainder) remaining = size - hidden_count - count;
+
         /* Create a new set with just the remaining elements. */
-        if (set->encoding == OBJ_ENCODING_LISTPACK && !has_expired) {
+        if (set->encoding == OBJ_ENCODING_LISTPACK) {
             /* Specialized case for listpack. Traverse it only once. */
             newset = createSetListpackObject();
             unsigned char *lp = objectGetVal(set);
@@ -1179,10 +1568,7 @@ void spopWithCountCommand(client *c) {
                 str = (char *)lpGetValue(p, &len, (long long *)&llele);
                 mstime_t expiry = setTypeListpackGetExpiry(lp, p);
                 if (expiry != EXPIRY_NONE) volatile_moved++;
-                sds member = str ? sdsnewlen(str, len) : sdsfromlonglong(llele);
-                bool replaced = false;
-                setTypeAddWithExpiry(newset, member, expiry, 0, &replaced, NULL);
-                sdsfree(member);
+                setTypeAddMovedMember(newset, str, len, llele, 0, expiry);
                 ps[i] = p;
                 p = lpNext(lp, p);
                 index++;
@@ -1197,10 +1583,7 @@ void spopWithCountCommand(client *c) {
                 if (encoding == -1) break;
                 if (!newset) newset = str ? createSetListpackObject() : createIntsetObject();
                 mstime_t expiry = encoding == OBJ_ENCODING_HASHTABLE ? smemberGetExpiry((smember *)str) : EXPIRY_NONE;
-                sds member = str ? (sds)str : sdsfromlonglong(llele);
-                bool replaced = false;
-                setTypeAddWithExpiry(newset, member, expiry, 0, &replaced, NULL);
-                if (!str) sdsfree(member);
+                setTypeAddMovedMember(newset, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE, expiry);
                 setTypeRemoveAux(set, str, len, llele, encoding == OBJ_ENCODING_HASHTABLE);
             }
         }
@@ -1232,8 +1615,17 @@ void spopWithCountCommand(client *c) {
         dbReplaceValue(c->db, c->argv[1], &newset);
         set_replaced = true;
     }
-    if (!set_replaced && volatile_set && !setTypeHasVolatileMembers(set))
+    /* Popping every live member of a set whose index only reported its hidden
+     * members as possible empties it, which no key may be left as. */
+    bool set_emptied = !set_replaced && setTypeSize(set) == 0;
+    if (set_emptied) {
+        /* The last volatile member left with the pops, so dbDelete() no longer
+         * recognizes the key as one it has to stop tracking. */
+        if (volatile_set) dbUntrackKeyWithVolatileItems(c->db, set);
+        dbDelete(c->db, c->argv[1]);
+    } else if (!set_replaced && volatile_set && !setTypeHasVolatileMembers(set)) {
         dbUpdateObjectWithVolatileItemsTracking(c->db, set);
+    }
     if (volatile_set) setDeferredSetLen(c, replylen, popped);
     server.dirty += popped;
 
@@ -1254,6 +1646,7 @@ void spopWithCountCommand(client *c) {
     preventCommandPropagation(c);
     if (popped) {
         notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        if (set_emptied) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         signalModifiedKey(c, c->db, c->argv[1]);
     }
 }
@@ -1273,12 +1666,6 @@ void spopCommand(client *c) {
      * indeed a set */
     if ((set = lookupKeyWriteOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET))
         return;
-
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.null[c->resp]);
-        return;
-    }
 
     bool was_volatile = setTypeHasVolatileMembers(set);
     ele = setTypePopRandom(set);
@@ -1313,61 +1700,143 @@ void spopCommand(client *c) {
  * the number of randoms per time. */
 #define SRANDFIELD_RANDOM_SAMPLE_LIMIT 1000
 
-/* setTypeSize() counts expired members and a random position may hold one, so the plain samplers do not apply. */
-static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
-    char *str;
-    size_t len;
-    int64_t llele;
-    unsigned long size = setTypeSize(set);
-    unsigned long cap = uniq ? (count < size ? count : size) : size;
-    if (cap == 0) {
-        addReply(c, shared.emptyarray);
-        return;
-    }
-
-    listpackEntry *res = zmalloc(sizeof(listpackEntry) * cap);
-    unsigned long seen = 0, held = 0;
-    WC_INC(set_reservoir_passes);
-    setTypeIterator *si = setTypeInitIterator(set);
-    while (setTypeNext(si, &str, &len, &llele) != -1) {
-        listpackEntry e = {.sval = (unsigned char *)str, .slen = len, .lval = llele};
-        if (held < cap) {
-            res[held++] = e;
-        } else {
-            unsigned long r = (unsigned long)rand() % (seen + 1);
-            if (r < cap) res[r] = e;
-        }
-        seen++;
-    }
-    setTypeReleaseIterator(si);
-
-    if (held == 0) {
-        zfree(res);
-        addReply(c, shared.emptyarray);
-        return;
-    }
-
-    unsigned long reply_count = uniq ? held : count;
-    addReplyArrayLen(c, reply_count);
-    for (unsigned long i = 0; i < reply_count; i++) {
-        unsigned long idx = uniq ? i : (unsigned long)rand() % held;
-        if (res[idx].sval)
-            addReplyBulkCBuffer(c, res[idx].sval, res[idx].slen);
-        else
-            addReplyBulkLongLong(c, res[idx].lval);
-        if (!uniq && c->flag.close_asap) break;
-    }
-    zfree(res);
-}
-
-/* handle the "SRANDMEMBER key <count>" variant. The normal version of the
- * command is handled by the srandmemberCommand() function itself. */
-
 /* How many times bigger should be the set compared to the requested size
  * for us to don't use the "remove elements" strategy? Read later in the
  * implementation for more info. */
 #define SRANDMEMBER_SUB_STRATEGY_MUL 3
 
+/* SRANDMEMBER over a set that may hold hidden members: setTypeSize() counts them
+ * and a random position may hold one, so neither the size comparisons nor the
+ * samplers of the paths below apply.
+ *
+ * One census taken up front replaces them. It is exact, so the reply length is
+ * known before any member is read, and it splits every draw into a part the
+ * volatile index can answer by rank and a part that cannot land on a hidden
+ * member at all. commandTimeSnapshot() is frozen for the command and a read
+ * does not mutate the set, so the same census governs every draw and the draws
+ * stay identically distributed. */
+static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned long count, int uniq) {
+    mstime_t now = setTypeLivenessTime();
+    setLiveCensus census;
+    setTypeLiveCensus(set, now, &census);
+    char *str;
+    size_t len;
+    int64_t llele;
+
+    if (census.live == 0) {
+        addReply(c, shared.emptyarray);
+        return;
+    }
+
+    if (!uniq) {
+        /* Listpack storage is configuration-bounded. Hashtable ranks are
+         * resolved in bounded batches so output limits can stop between passes. */
+        listpackEntry *live = NULL;
+        unsigned long live_count = 0;
+        bool ranked = set->encoding == OBJ_ENCODING_HASHTABLE && setTypeBulkSamplePreferred(&census, count);
+        if (set->encoding == OBJ_ENCODING_LISTPACK) {
+            live_count = setTypeCollectLiveMembers(set, &live);
+            serverAssert(live_count == census.live);
+        }
+        addReplyArrayLen(c, count);
+        unsigned long emitted = 0;
+        while (emitted < count && !c->flag.close_asap) {
+            unsigned long batch_count = count - emitted;
+            listpackEntry *batch = NULL;
+            if (ranked) {
+                if (batch_count > SRANDFIELD_RANDOM_SAMPLE_LIMIT) batch_count = SRANDFIELD_RANDOM_SAMPLE_LIMIT;
+                batch = setTypeSampleLiveMembersByRank(set, batch_count, census.live);
+            }
+            for (unsigned long i = 0; i < batch_count; i++) {
+                if (ranked || live != NULL) {
+                    listpackEntry selected = ranked ? batch[i] : live[setTypeRandomBelow(live_count)];
+                    if (selected.sval)
+                        addReplyBulkCBuffer(c, selected.sval, selected.slen);
+                    else
+                        addReplyBulkLongLong(c, selected.lval);
+                } else {
+                    int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
+                    serverAssert(encoding != -1);
+                    if (str == NULL)
+                        addReplyBulkLongLong(c, llele);
+                    else
+                        addReplyBulkCBuffer(c, str, len);
+                }
+                emitted++;
+                if (c->flag.close_asap) break;
+            }
+            zfree(batch);
+        }
+        zfree(live);
+        return;
+    }
+
+    /* CASE 2 of the plain path, against the live members rather than the
+     * physical ones: the whole live population is the reply. */
+    if (count >= census.live) {
+        addReplyArrayLen(c, census.live);
+        unsigned long emitted = 0;
+        setTypeIterator *si = setTypeInitIterator(set);
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            if (str == NULL)
+                addReplyBulkLongLong(c, llele);
+            else
+                addReplyBulkCBuffer(c, str, len);
+            emitted++;
+        }
+        setTypeReleaseIterator(si);
+        serverAssert(emitted == census.live);
+        return;
+    }
+
+    /* Distinct members. Drawing until 'count' of them differ cannot tell when it
+     * has collected every live member, so it is only tried for a request small
+     * against the live population - the same ratio at which the plain path stops
+     * passing over the set. Each draw is uniform, so the expected number of them
+     * is bounded by count * live / (live - count) < 1.5 * count here. */
+    if (count <= census.live / SRANDMEMBER_SUB_STRATEGY_MUL &&
+        !setTypeBulkSamplePreferred(&census, count)) {
+        unsigned long attempts = count > ULONG_MAX / (2 * SRANDMEMBER_SUB_STRATEGY_MUL)
+                                     ? ULONG_MAX
+                                     : count * 2 * SRANDMEMBER_SUB_STRATEGY_MUL;
+        hashtable *ht = hashtableCreate(&sdsReplyHashtableType);
+        hashtableExpand(ht, count);
+        while (hashtableSize(ht) < count && attempts-- > 0) {
+            if (setTypeDrawLiveElement(set, now, &census, &str, &len, &llele) == -1) break;
+            sds member = str ? sdsnewlen(str, len) : sdsfromlonglong(llele);
+            if (!hashtableAdd(ht, member)) sdsfree(member);
+        }
+
+        hashtableIterator iter;
+        hashtableInitIterator(&iter, ht, 0);
+        bool served = hashtableSize(ht) == count;
+        if (served) addReplyArrayLen(c, count);
+        void *element;
+        while (hashtableNext(&iter, &element)) {
+            if (served)
+                addReplyBulkSds(c, (sds)element);
+            else
+                sdsfree((sds)element);
+        }
+        hashtableCleanupIterator(&iter);
+        hashtableRelease(ht);
+        if (served) return;
+    }
+
+    listpackEntry *sampled = NULL;
+    unsigned long held = setTypeSampleLiveMembersAlloc(set, &sampled, count);
+    addReplyArrayLen(c, held);
+    for (unsigned long i = 0; i < held; i++) {
+        if (sampled[i].sval)
+            addReplyBulkCBuffer(c, sampled[i].sval, sampled[i].slen);
+        else
+            addReplyBulkLongLong(c, sampled[i].lval);
+    }
+    zfree(sampled);
+}
+
+/* handle the "SRANDMEMBER key <count>" variant. The normal version of the
+ * command is handled by the srandmemberCommand() function itself. */
 void srandmemberWithCountCommand(client *c) {
     long l;
     unsigned long count, size;
@@ -1395,12 +1864,21 @@ void srandmemberWithCountCommand(client *c) {
         return;
     }
 
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.emptyarray);
+    size = setTypeSize(set);
+
+    if (count == 1 && setTypeHasVolatileMembers(set)) {
+        int encoding = setTypeRandomLiveElement(set, &str, &len, &llele);
+        if (encoding == -1) {
+            addReply(c, shared.emptyarray);
+        } else {
+            addReplyArrayLen(c, 1);
+            if (str)
+                addReplyBulkCBuffer(c, str, len);
+            else
+                addReplyBulkLongLong(c, llele);
+        }
         return;
     }
-    size = setTypeSize(set);
 
     if (setTypeHasExpiredMembers(set)) {
         srandmemberWithCountFromVolatileSet(c, set, count, uniq);
@@ -1591,12 +2069,6 @@ void srandmemberCommand(client *c) {
 
     /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL || checkType(c, set, OBJ_SET)) return;
-
-    set = setTypeReclaimExpiredMembers(c, set);
-    if (set == NULL) {
-        addReply(c, shared.null[c->resp]);
-        return;
-    }
 
     if (setTypeRandomElement(set, &str, &len, &llele) == -1) {
         addReply(c, shared.null[c->resp]);

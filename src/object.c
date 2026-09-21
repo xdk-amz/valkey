@@ -1381,7 +1381,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
             if (vsetIsValid(volatile_members)) {
                 WC_INDEX_BEGIN();
-                asize += vsetMemUsage(volatile_members);
+                asize += vsetMemUsage(volatile_members, sample_size);
                 WC_INDEX_END();
             }
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
@@ -1429,7 +1429,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
-            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields);
+            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields, sample_size);
         } else {
             serverPanic("Unknown hash encoding");
         }

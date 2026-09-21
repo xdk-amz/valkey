@@ -160,6 +160,52 @@ proc wc_fixture {key n ttl {payload short} {live_keep 3} {client ""}} {
     return $members
 }
 
+# n live members whose deadlines fall into `buckets` distinct expiry buckets.
+# The index files an entry under its deadline rounded up to an 8192 ms window
+# (vset.c get_max_bucket_ts), so the deadlines are spaced a minute apart to make
+# one bucket each; all of them are far in the future, so nothing is hidden and
+# the only variable is how many deadline groups the index holds.
+proc wc_fixture_buckets {key n buckets {client ""}} {
+    if {$client eq ""} { set client [srv 0 client] }
+    $client del $key
+    set members [wc_members $n short]
+    wc_batched $client sadd $key $members
+    set base [expr {[clock milliseconds] + 3600 * 1000}]
+    for {set b 0} {$b < $buckets} {incr b} {
+        set chunk {}
+        for {set i $b} {$i < $n} {incr i $buckets} { lappend chunk [lindex $members $i] }
+        if {[llength $chunk] == 0} continue
+        set at [expr {$base + $b * 60000}]
+        for {set j 0} {$j < [llength $chunk]} {incr j 4000} {
+            set part [lrange $chunk $j [expr {$j + 3999}]]
+            $client spexpireat $key $at members [llength $part] {*}$part
+        }
+    }
+    return $members
+}
+
+# `live_keep` live members that all carry a FAR-FUTURE TTL, with the rest of the
+# n members expired and unreclaimed. Distinct from `mostly_expired`, whose live
+# members carry no TTL at all: here every live member is indexed by the vset, so
+# a rank/select over the index can name one without reading a member, while in
+# `mostly_expired` the live members are invisible to the index and finding one
+# is the documented needle walk. Returns the live members.
+proc wc_fixture_hidden_ttl {key n live_keep {client ""}} {
+    if {$client eq ""} { set client [srv 0 client] }
+    $client del $key
+    set members [wc_members $n short]
+    wc_batched $client sadd $key $members
+    set live [lrange $members 0 [expr {$live_keep - 1}]]
+    set far [expr {[clock milliseconds] + 3600 * 1000 * 24}]
+    for {set i 0} {$i < [llength $live]} {incr i 4000} {
+        set part [lrange $live $i [expr {$i + 3999}]]
+        $client spexpireat $key $far members [llength $part] {*}$part
+    }
+    wc_spexpire_batched $client $key 1 [lrange $members $live_keep end]
+    after 5
+    return $live
+}
+
 # Force a hashtable encoding for small cardinalities by adding+removing a
 # member longer than set-max-listpack-value (a hashtable never converts back).
 proc wc_force_hashtable {key {client ""}} {
@@ -219,6 +265,32 @@ proc wc_assert_le {what actual bound contract cmd key {extra ""}} {
     if {$actual > $bound} {
         fail "CONTRACT VIOLATED: $contract\n  $what = $actual, bound = $bound\n  [wc_ctx $cmd $key $extra]\n  [wc_repro $cmd]"
     }
+}
+
+# actual == expected, for the survival and reply-shape contracts.
+proc wc_assert_eq {what actual expected contract cmd key {extra ""}} {
+    if {$actual != $expected} {
+        fail "CONTRACT VIOLATED: $contract\n  $what = $actual, required = $expected\n  [wc_ctx $cmd $key $extra]\n  [wc_repro $cmd]"
+    }
+}
+
+# actual >= floor, for accounting contracts.
+proc wc_assert_ge {what actual floor contract cmd key {extra ""}} {
+    if {$actual < $floor} {
+        fail "CONTRACT VIOLATED: $contract\n  $what = $actual, required floor = $floor\n  [wc_ctx $cmd $key $extra]\n  [wc_repro $cmd]"
+    }
+}
+
+# Keyspace changes the server booked, to gate a read command against writing.
+proc wc_dirty {{client ""}} {
+    if {$client eq ""} { set client [srv 0 client] }
+    return [getInfoProperty [$client info persistence] rdb_changes_since_last_save]
+}
+
+# Commands a measured window handed to replication/AOF, whether or not a
+# consumer was attached (with none they are counted as dropped).
+proc wc_propagated {d} {
+    wc_sum $d prop_cmds prop_cmds_dropped
 }
 
 # target <= baseline * factor + slack, for plain-vs-volatile comparisons.

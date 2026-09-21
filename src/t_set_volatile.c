@@ -117,6 +117,10 @@ bool setTypeHasExpiredMembers(robj *o) {
     if (!setTypeHasVolatileMembers(o) || getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE) return false;
 
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        /* A lower bound: a bucketed index only knows the start of the time
+         * window holding its earliest deadline, so this answers true for the
+         * rest of that window. Every caller that may not miss a hidden member
+         * gates on it, which forbids the opposite error. */
         mstime_t earliest = vsetEstimatedEarliestExpiry(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc);
         return timestampIsExpired(earliest);
     }
@@ -140,6 +144,26 @@ bool setTypeNextVolatile(vsetIterator *iter, smember **member) {
 
 void setTypeResetVolatileIterator(vsetIterator *iter) {
     vsetResetIterator(iter);
+}
+
+/* Reports the exact number of hidden (expired but still stored) members through
+ * 'hidden' and returns how many members carry a TTL at all. */
+size_t setTypeVolatileCensus(robj *o, mstime_t now, size_t *hidden) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+    vset *set = setTypeGetVolatileSet(o);
+    if (set == NULL) {
+        *hidden = 0;
+        return 0;
+    }
+    return vsetCountHidden(set, smemberGetExpiryVsetFunc, now, hidden);
+}
+
+/* Reports the 'rank'-th live member among those carrying a TTL. */
+bool setTypeSelectLiveVolatileMember(robj *o, mstime_t now, size_t rank, smember **member) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE);
+    vset *set = setTypeGetVolatileSet(o);
+    if (set == NULL) return false;
+    return vsetSelectLive(set, smemberGetExpiryVsetFunc, now, rank, (void **)member);
 }
 
 long long setTypeVolatileCount(robj *o) {

@@ -10,19 +10,12 @@
 #
 # Contract E: an estimator must stay sample-sized. MEMORY USAGE samples
 # SAMPLES members; a member TTL must not turn that into a walk of the
-# population, and memory that is physically allocated must stay accounted for
-# whatever the deadlines say.
+# population or of the expiry index, and memory that is physically allocated
+# must stay accounted for whatever the deadlines say.
 # Contract F: a whole-object rebuild (intset conversion, COPY, RDB save/load,
 # AOF rewrite, reclaim) is ONE pass over the members plus work proportional to
 # the volatile count through the expiry index -- not one full pass per volatile
 # member, and not one pass per member.
-
-# actual >= floor, for accounting contracts.
-proc lif_assert_ge {what actual floor contract cmd key {extra ""}} {
-    if {$actual < $floor} {
-        fail "CONTRACT VIOLATED: $contract\n  $what = $actual, required floor = $floor\n  [wc_ctx $cmd $key $extra]\n  [wc_repro $cmd]"
-    }
-}
 
 proc lif_note {msg} {
     if {$::verbose} { puts "  \[lifecycle\] $msg" }
@@ -137,7 +130,7 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
         # Identical live members: the TTL machinery may add bytes, never remove them.
         foreach samples {1 5 0} {
             # SAMPLES 0 is an exact walk: no sampling noise, so the floor is exact.
-            lif_assert_ge "MEMORY USAGE (SAMPLES $samples) of the all-TTL set" $lif_usage(all,$samples) \
+            wc_assert_ge "MEMORY USAGE (SAMPLES $samples) of the all-TTL set" $lif_usage(all,$samples) \
                 [expr {$samples == 0 ? $lif_usage(none,$samples) : $lif_usage(none,$samples) * 8 / 10}] \
                 "a volatile set holding the same members must not report less memory than a plain one" \
                 "memory usage key samples $samples" lif:mu:all "plain=$lif_usage(none,$samples)"
@@ -175,32 +168,90 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
     test "setperf-lifecycle: MEMORY USAGE must account for physically allocated expired members" {
         set n 20000
         lif_mu_fixtures $n
-        # lif:mu:all and lif:mu:all_expired hold the same n physical members,
-        # the same smember allocations and the same expiry index; only the
-        # deadlines differ. Nothing has been freed, so nothing may vanish from
-        # the report -- an estimator that samples zero members adds zero member
-        # memory and under-reports the object.
+        set key lif:mu:all_expired
+        assert_equal $n [dict get [wc_setinfo $key] physical]
+
         set lif_e3 {}
         foreach spec {{1 {samples 1}} {5 {}} {0 {samples 0}}} {
             lassign $spec samples tail
             set base [wc_measure "r memory usage lif:mu:all $tail"]
             set base_usage $::wc_last_reply
-            set d [wc_measure "r memory usage lif:mu:all_expired $tail"]
+            set cmd "memory usage $key $tail"
+            set d [wc_measure "r $cmd"]
             set exp_usage $::wc_last_reply
-            wc_record $::cur_test "memory usage key $tail" \
+            set visits [wc_get $d ht_iter_visits]
+            wc_record $::cur_test $cmd \
                 [dict create n $n ttl all_expired enc hashtable samples $samples] $d
-            lif_note "MEMORY USAGE samples=$samples: all=$base_usage all_expired=$exp_usage (physical members identical)"
-            lappend lif_e3 [list $samples $tail $base_usage $exp_usage]
+            lif_note "MEMORY USAGE samples=$samples: all=$base_usage all_expired=$exp_usage ht_iter_visits=$visits"
+            lappend lif_e3 [list $samples $tail $base_usage $exp_usage $visits]
         }
         foreach row $lif_e3 {
-            lassign $row samples tail base_usage exp_usage
-            lif_assert_ge "MEMORY USAGE (SAMPLES $samples) of the all-expired set" $exp_usage \
-                [expr {$samples == 0 ? $base_usage : $base_usage * 8 / 10}] \
-                "expired-but-unreclaimed members are physically allocated and must stay accounted for" \
-                "memory usage key $tail" lif:mu:all_expired \
+            lassign $row samples tail base_usage exp_usage visits
+            if {$samples == 0} {
+                wc_assert_ge "hashtable positions examined" $visits $n \
+                    "SAMPLES 0 must account for every physically allocated member" \
+                    "memory usage key $tail" $key
+                wc_assert_le "hashtable positions examined" $visits [expr {$n + 8}] \
+                    "SAMPLES 0 must use one bounded pass" \
+                    "memory usage key $tail" $key
+            } else {
+                wc_assert_ge "hashtable positions examined" $visits $samples \
+                    "the estimator must sample physically allocated expired members" \
+                    "memory usage key $tail" $key
+                wc_assert_le "hashtable positions examined" $visits [expr {$samples + 8}] \
+                    "the estimator must remain sample-sized" \
+                    "memory usage key $tail" $key
+            }
+            wc_assert_ge "MEMORY USAGE (SAMPLES $samples) of the all-expired set" $exp_usage \
+                [expr {$base_usage * 8 / 10}] \
+                "the estimate must include the physically allocated member population despite representation-size variation" \
+                "memory usage key $tail" $key \
                 "same-members baseline=$base_usage; all fixtures: [list $lif_e3]"
         }
     }
+
+    test "setperf-lifecycle: MEMORY USAGE SAMPLES k must not scale with the number of expiry buckets" {
+        set n 20000
+        # Live members only: the variable is how many distinct deadlines the
+        # index holds, not how many members are hidden.
+        set bucket_counts {8 64 512 4096}
+        foreach spec {{1 {memory usage $key samples 1}} {5 {memory usage $key}}} {
+            lassign $spec samples cmdtpl
+            set visits {}
+            foreach buckets $bucket_counts {
+                set key lif:mu:buckets
+                wc_fixture_buckets $key $n $buckets
+                assert_equal hashtable [dict get [wc_setinfo $key] encoding]
+                assert_equal $n [dict get [wc_setinfo $key] volatile]
+                set cmd [subst -nocommands $cmdtpl]
+                set d [wc_measure "r $cmd"]
+                lappend visits [wc_get $d vset_bucket_visits]
+                wc_record $::cur_test $cmd [dict create n $n ttl buckets enc hashtable samples $samples buckets $buckets] $d
+                lif_note "MEMORY USAGE samples=$samples buckets=$buckets -> $::wc_last_reply bytes, ht_iter_visits=[wc_get $d ht_iter_visits] vset_buckets=[wc_get $d vset_bucket_visits]"
+                # Member sampling stays bounded, and the reported size is real
+                # work: a sampled estimate of nothing would satisfy any bound.
+                wc_assert_le "hashtable positions examined" [wc_get $d ht_iter_visits] [expr {$samples + 8}] \
+                    "the estimator examines SAMPLES members, not the population (buckets=$buckets)" $cmd $key
+                wc_assert_ge "MEMORY USAGE reply (bytes)" $::wc_last_reply 1 \
+                    "sizing an object with members must account for them" $cmd $key
+                # MEMORY USAGE ... SAMPLES k documents O(N) in the samples.
+                # Sizing the expiry index by walking one bucket per deadline
+                # makes it O(k+V), which is what this bound rejects.
+                wc_assert_le "expiry buckets visited" [wc_get $d vset_bucket_visits] [expr {$samples + 8}] \
+                    "a sampled size must not walk the expiry index bucket by bucket (buckets=$buckets)" $cmd $key
+            }
+            wc_assert_flat "expiry buckets visited" $bucket_counts $visits 2 8 \
+                "sampled accounting must not grow with the number of deadline groups (samples=$samples)" \
+                "memory usage key samples $samples" lif:mu:buckets
+        }
+        # SAMPLES 0 asks for an exact size, so walking every bucket is its price;
+        # recorded so the k>0 numbers above are read against it.
+        wc_fixture_buckets lif:mu:buckets $n 512
+        set d [wc_measure {r memory usage lif:mu:buckets samples 0}]
+        wc_record $::cur_test "memory usage key samples 0" \
+            [dict create n $n ttl buckets enc hashtable samples 0 buckets 512] $d
+        lif_note "SAMPLES 0 with 512 buckets: vset_buckets=[wc_get $d vset_bucket_visits] ht_iter_visits=[wc_get $d ht_iter_visits] -> $::wc_last_reply bytes"
+    } {} {slow}
 
     test "setperf-lifecycle: MEMORY USAGE on a volatile hash, same estimator (classification probe)" {
         set n 20000

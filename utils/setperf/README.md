@@ -104,7 +104,10 @@ Fixtures hold identical live members across `none` / `one` (one far-future TTL
 on `m0`) / `all` (every member far-future); `mostly_expired` and `all_expired`
 expire members outside any measured command with active expiration disabled
 (`wc_quiesce`); `one_expired` expires only `m0`, leaving a large live population
-with a single hidden member that no selection path may reclaim. Hashtable sizes 2,000 / 20,000 / 200,000 (+1,000,000 extended),
+with a single hidden member that no selection path may reclaim. `wc_fixture_buckets`
+holds `n` live members spread over a requested number of distinct expiry buckets
+(deadlines a minute apart, so the index's 8192 ms bucket key separates every one),
+isolating the number of deadline groups from the number of members. Hashtable sizes 2,000 / 20,000 / 200,000 (+1,000,000 extended),
 listpack 16 / 64 / 128, short (`m<i>`) and long (64-byte) payloads, intset
 conversions. Every measurement is one command through `wc_measure`, seeded.
 
@@ -121,12 +124,13 @@ both counters, the violated contract and an exact reproduction line.
 | Family | Baseline (parent path) | Counters gated | Contract | Tests |
 |---|---|---|---|---|
 | SPOP key, SPOP key k (small), SRANDMEMBER key / k / -k, hashtable | `hashtableFairRandomEntry` per pick (bounded scan), CASE 2 pops | `ht_iter_visits+ht_scan_visits+ht_bucket_probes`, `set_reservoir_passes`, `mem_max_alloc`, `str_objs_created` | plain <= 4096 examined; one/all <= 4x plain + 500; no reservoir pass; flat across sizes | setperf-random: "* hashtable, one future TTL adds no population scan" (x6), long payload |
-| Same, with one expired (hidden, unreclaimed) member among n live | per-pick validation rejects the one expired pick (probability 1/n) and re-samples | same counters; total over 10 repeated commands | same budget as one future TTL; no reservoir pass; 10 commands <= 10 x (4x plain + 500), i.e. no per-command population pass; `m0` never returned | setperf-random: "* hashtable, one expired member adds no population scan" (x6), "repeated * with one expired member" (x2), listpack (x3) |
+| Same, with one expired (hidden, unreclaimed) member among n live | per-pick validation rejects the one expired pick (probability 1/n) and re-samples; nothing reclaims it | same counters plus `set_members_reclaimed`, physical/volatile after, `prop_args`, `prop_cmds`, `rdb_changes_since_last_save` | same budget as one future TTL; no reservoir pass; 10 commands <= 10 x (4x plain + 500), i.e. no per-command population pass; `m0` never returned; `set_members_reclaimed` = 0 and physical = n - popped on every command, so the hidden member outlives them all; SRANDMEMBER books no keyspace change and propagates nothing; SPOP propagates no more arguments than the no-TTL pop | setperf-random: "* hashtable, one expired member adds no population scan" (x6), "repeated * with one expired member" (x2), listpack (x3) |
 | SRANDMEMBER k >= card., large -k | CASE 2 stream / per-result sampling | examined, `mem_max_alloc`, `mem_peak_live_delta` | one traversal, no population array | setperf-random: "count >= cardinality", "large negative count" |
 | SPOP / SRANDMEMBER listpack, incl. -100 | `lpNextRandom` + `lpBatchDelete`, `lpRandomEntries` per <=1000 results | `lp_find_steps+lp_next_steps+lp_random_steps`, `str_objs_created`, `lp_deletes`, `lp_batch_deletes`, `lp_tail_bytes_moved`, `lp_find_calls` | <= 3x plain + 2n; one batch delete; tail bytes <= 2 x listpack bytes | setperf-random listpack (x5), setperf-memory "listpack SPOP removes ... one batch", "listpack SREM" |
-| Expired members during selection (primary) | reclaim on encounter | examined over N commands, `set_members_reclaimed`, physical/live after | <= 3n + N x request budget (one cleanup pass, not one per command) | setperf-random "mostly-expired ... reclaimed, not rescanned" (x4), "all-expired ... terminates", listpack expired |
-| Replica reads | IGNORE_EXPIRE/hidden | examined, correctness of hidden members | request-sized on one-TTL; measured only on expired (no reclaim allowed) | setperf-random replica block |
+| Dense hidden population (primary) | per-pick rejection, then at most one fallback pass for the members still owed | `set_reservoir_passes` and examined *per command*, `set_members_reclaimed`, physical after, reply membership | <= 1 full pass and <= 2n + request budget per command; only live members returned; `set_members_reclaimed` = 0 and physical = n - popped after N commands; an all-hidden set keeps its members, its `SCARD` and its key, and re-enabling active expiration is what removes them | setperf-random "* on a mostly-hidden hashtable is bounded probes plus at most one fallback pass" (x4), "an all-hidden hashtable terminates, survives, and is left to active expiration", "listpack SPOP leaves the hidden members in place" |
+| Replica reads (`SRANDMEMBER` / `-k` / no count) | hidden, and no policy there reclaims | examined, `set_reservoir_passes`, `set_members_reclaimed`, physical after, `prop_cmds` | one-TTL and one-hidden-member reads <= 4x plain + 500 and flat across sizes, no reservoir pass, nothing reclaimed, nothing propagated; dense hidden population <= 1 fallback pass per read | setperf-random replica block: "replica SRANDMEMBER key 2 on a one-TTL set", "... on a mostly-expired set", "replica * with one hidden member stays request-sized" (x3) |
 | Near-total SPOP, total pop | CASE 3 remembers `remaining`; CASE 1 | `mem_max_alloc` (flat across sizes), `str_objs_created`, `prop_peak_retained_bytes` (measured) | aux memory ~ remaining | setperf-memory T1/T2/T3, T9 (propagation equivalence, inherited O(count) retention) |
+| Near-total SPOP `count` = n-5 and n-1 with one hidden member | the remainder is defined by the live members returned | `set_members_reclaimed`, physical/volatile after, key existence, `mem_max_alloc`, `str_objs_created`, `prop_args` | reply is `min(count, live)` live members and never `m0`; nothing reclaimed; the hidden member and the key survive even when `count` = live; allocation and copies <= 2x the no-TTL pop; propagated arguments <= the no-TTL pop + 8 | setperf-memory "near-total SPOP with one hidden member sizes memory by the remainder and reclaims nothing" |
 | SRANDMEMBER k = n/2, k = 5 | CASE 3 aux table / CASE 4 | examined, memory, copies | ratio <= 2x / request-sized | setperf-memory T4/T5 |
 | Repeated small SPOP, all-TTL (nothing expired) | CASE 2 | total examined over 20 commands | <= 20 x request budget | setperf-memory T8 |
 | SADD / SADDEX (EX, PX, KEEPTTL, NX/XX/MNX/MXX) absent, existing, expired; SMOVE | `hashtableFindPositionForInsert` = 1 lookup + insert | `ht_lookups`, `ht_pops`, `vset_*`, `set_members_reclaimed`, listpack `lp_find_calls`/`lp_inserts`/`lp_reallocs` | <= 2 lookups per member (1 for existing); replacement = 1 probe + 1 pop + 1 index removal | setperf-insert (x13), gtest `SetWorkCounterTest.add*`, `replacingExpired*`, `listpackAddAbsent*` |
@@ -134,6 +138,7 @@ both counters, the violated contract and an exact reproduction line.
 | SUNIONSTORE / SINTERSTORE / SDIFFSTORE / SORT ... STORE (no consumer, replica, AOF) | verbatim command propagation | `prop_cmds_dropped`, `prop_dropped_arg*`, `str_objs_created`, `set_iter_next`/`ht_iter_visits`/`list_iter_next`, `repl_bytes`, `aof_bytes`, `prop_now_cmds`, `prop_peak_retained_bytes` | one-TTL == none (+ small const); flat across result sizes; expired sources: one copy of the result, replica/AOF contents equal | setperf-store (3 blocks, 29 tests) |
 | SUNION / SINTER / SDIFF / SINTERCARD / SORT (no STORE) | same algorithms | examined, copies, `prop_cmds` | <= 2x + 16, no propagation | setperf-store "no dst" (x5) |
 | MEMORY USAGE SAMPLES 1 / 5 / 0 | bounded sampling | `ht_iter_visits`, `vset_bucket_visits`, reply value | visits <= samples + 8; all_expired >= 0.8 x none | setperf-lifecycle E (x3 + hash probe) |
+| MEMORY USAGE SAMPLES 1 / 5 over 8 / 64 / 512 / 4,096 distinct expiry buckets, every member live | documented `O(N) where N is the number of samples.` | `vset_bucket_visits`, `ht_iter_visits`, reply value | buckets visited <= samples + 8 and flat across bucket counts; member sampling still <= samples + 8; reply > 0. `SAMPLES 0` asks for an exact size, so its bucket walk is recorded, not gated | setperf-lifecycle "MEMORY USAGE SAMPLES k must not scale with the number of expiry buckets" |
 | First TTL on intset; SPERSIST last TTL | conversion | `set_iter_next`, `mem_max_alloc`, `smember_created`, `lp_inserts`, MEMORY USAGE before/after | one pass; no retained storage | setperf-lifecycle F1/F2 |
 | COPY, DEBUG RELOAD, BGSAVE child, volatile listpack load | one pass, RDB_TYPE_SET_2 | `smember_created`, `vset_adds`, `rdb_members_*`, `lp_find_calls` on load | linear, members+TTLs equal | setperf-lifecycle F3/F4 |
 | AOF rewrite (`aof-use-rdb-preamble no`) | `rewriteHashObject` uses the volatile iterator | child `ht_iter_visits`, `vset_entry_visits`, `aof_rewrite_cmds/bytes` | <= 2 passes; volatile members via index; linear bytes | setperf-lifecycle G (x4) |
@@ -238,6 +243,60 @@ Removing the two gates in a probe build made all eight hashtable tests pass
 with `m0` never returned, so the budget is met by the existing per-pick
 validation; the gate itself is the regression. The `one` (future-TTL) fixture
 cannot see this, which is why the suite previously passed on f4475160e.
+
+## Findings on af090ba (measured with this suite on this head, seed 12345)
+
+Every selection path reclaims. `setTypeReclaimExpiredMembers()` runs at the top
+of `spopCommand`, `spopWithCountCommand`, `srandmemberCommand` and
+`srandmemberWithCountCommand`, so a hidden member is deleted, unindexed and
+propagated by the command that merely sampled near it:
+
+* One hidden member of n live: `set_members_reclaimed` = 1 on every one of the
+  six forms (`SPOP key`, `SPOP key 1`, `SPOP key 2`, `SRANDMEMBER key`,
+  `SRANDMEMBER key 2`, `SRANDMEMBER key -5`), at n = 2,000 / 20,000 / 200,000
+  and on both encodings; the physical count drops by one more than the command
+  returned. Over 10 repeated `SPOP key 1` at n = 200,000 the member is reclaimed
+  once and then gone, so the *examined* budget is met -- the cost contracts alone
+  cannot see this, which is why the suite needed the survival gates.
+* Dense hidden population (20,000 physical, 40 live): 19,960 members reclaimed
+  over 10 commands, for `SRANDMEMBER key` and `SRANDMEMBER key 2` as well as for
+  the two `SPOP` forms. A read deletes 19,960 members.
+* All hidden (20,000): the first `SPOP key` reclaims all 20,000 and removes the
+  key (`EXISTS` = 0 with `reclaimed so far: 20000`). Before the survival gate was
+  added this showed up as a harness error (`DEBUG WORKCTR SETINFO` -> `ERR no
+  such key`), not as a contract violation.
+* Listpack (128 physical, 8 live): one `SPOP key 2` reclaims 120, and
+  `lp_deletes` counts each of them.
+
+A single hidden member still costs a full pass where nothing can reclaim it. On
+a replica (`spr:one_expired`, physical 2,000 / volatile 1 / live 1,999)
+`SRANDMEMBER key 2` and `SRANDMEMBER key -5` report
+`set_reservoir_passes` = 1 at the smallest fixture size, and the reply is drawn
+from a reservoir over all 2,000 entries; the no-count form is request-sized
+(per-pick rejection). This is the steady state for staggered TTLs: no policy on
+a replica ever removes the member.
+
+`MEMORY USAGE key SAMPLES k` is O(k+V) in the number of deadline groups. With
+20,000 live members and `SAMPLES 1`, member sampling is bounded
+(`ht_iter_visits` = 1) but `vset_bucket_visits` = buckets + 1: 9 over 8 buckets,
+65 over 64. `vsetBucketMemUsage_RAX` walks every bucket in the index, while the
+command documents `O(N) where N is the number of samples.` `SAMPLES 0` asks for
+an exact size, so its walk is the price of the request and is recorded only.
+
+A near-total pop reclaims outside its request: `SPOP spm:one_expired 19995` on a
+20,000-member set with one hidden member returns 19,995 live members and leaves
+4 behind instead of 5, having reclaimed the hidden member as well.
+
+Per-suite result on this head (all failures are contract violations, no harness
+errors): setperf-random 17 ok / 19 failed, setperf-memory 9 / 1,
+setperf-lifecycle 19 / 1, setperf-insert 16 / 1, setperf-store 29 / 0, gtest
+`SetWorkCounterTest` 9 / 0. The one insert failure is the MXX replacement path:
+`SADDEX key MXX EX 1000 MEMBERS 100 <existing>` costs 302 hashtable lookups
+where 204 is the bound (one validating probe plus one update per member), the
+fresh-lookup-per-mutation this head adopted to close the cached-pointer
+use-after-free. The store suite (propagation volume, replica and AOF content
+equality) is clean, and the `MEMORY USAGE` accounting floor for
+expired-but-unreclaimed members -- a failure on da37a1d -- now passes.
 
 ## Recorded run against da37a1d (instrumented build, seed 12345)
 
