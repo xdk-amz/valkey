@@ -1494,6 +1494,7 @@ typedef struct client {
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
+    uint32_t fp_owner_slot;               /* Fast path: index in the owning IO thread's private connection table */
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
     listNode io_owner_node;               /* Registry link of the IO thread that owns the socket: linked by that thread for fast-path clients, by main for partitioned ones */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */

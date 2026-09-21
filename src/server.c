@@ -1981,6 +1981,11 @@ static void updateCopyAvoidPressure(monotime current_time) {
     }
 }
 
+/* Keep the main execution loop together in the compiler hot section as adjacent subsystems grow. */
+void beforeSleep(struct aeEventLoop *eventLoop) __attribute__((hot, aligned(64)));
+void call(client *c, int flags) __attribute__((hot, aligned(64)));
+int processCommand(client *c) __attribute__((hot, aligned(64)));
+
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 

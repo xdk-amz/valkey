@@ -45,7 +45,7 @@
 typedef struct ClientControl {
     /* Identity + control cache line: mostly-immutable identity and owner-published fields. */
     uint64_t client_id;         /* Immutable: the connection's stable client id, set once at init. */
-    uint32_t generation;        /* Immutable for a control's life; bumped on slot reuse to invalidate stale handles. */
+    uint32_t generation;        /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
     uint8_t owner_domain;       /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
     uint8_t owner_tid;          /* Owning IO thread id when owner_domain == CC_OWNER_IO; meaningless for main. */
     uint8_t lifecycle;          /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
@@ -60,36 +60,33 @@ typedef struct ClientControl {
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
 } ClientControl;
 
-/* Compact, generation-checked reference to a ClientControl held in place of a raw connection
- * pointer. A detached command/batch entry carries a handle, never an io_client/client*, so main
- * resolves control state without dereferencing a connection it does not own: the referenced
- * control is used only when its generation still matches, which detects slot reuse without
- * touching freed memory. The IO owner resolves it back to its own client through its private
- * registry, never by dereferencing the control. Deliberately no connection pointer, no refcount,
- * no per-command allocation. */
+/* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
+ * control and generation; the IO owner validates all three fields before resolving its connection.
+ * Deliberately no connection pointer, refcount, per-command allocation, or owner-side tree lookup. */
 typedef struct ClientHandle {
     ClientControl *control; /* The referenced control; valid only while generation matches. */
     uint32_t generation;    /* Snapshot of control->generation at capture; a mismatch means the slot was reused. */
+    uint32_t owner_slot;    /* Index in the owning IO thread's private connection table. */
 } ClientHandle;
 
 /* Ring publication transfers each entry from its IO thread to main and back. */
 typedef struct cmdEntry {
     ClientHandle handle; /* Owning connection's control by generation-checked reference; main never reaches the connection through it, and the IO owner resolves it back to its own client. */
     robj **argv;
-    int argc;
-    int argv_len;
     size_t argv_len_sum;
     unsigned long long input_bytes;
     struct serverCommand *cmd;
+    serverDb *db;
+    char *reply_big;
+    int argc;
+    int argv_len;
     int slot;
     int read_flags;
-    serverDb *db;
-    uint8_t resp;
-    uint8_t requeued; /* Main did not execute it; the IO thread hands it back for the main path. */
     uint32_t reply_off;
     uint32_t reply_len;
-    char *reply_big;
     uint32_t reply_big_len;
+    uint8_t resp;
+    uint8_t requeued;     /* Main did not execute it; the IO thread hands it back for the main path. */
     CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
 } cmdEntry;
 
