@@ -1422,22 +1422,25 @@ void spopWithCountCommand(client *c) {
         setTypeLiveCensus(set, now, &census);
         unsigned long to_pop = count < census.live ? count : census.live;
         robj **sampled = NULL;
-        if (set->encoding == OBJ_ENCODING_HASHTABLE && to_pop > 0 &&
-            setTypeBulkSamplePreferred(&census, to_pop)) {
-            listpackEntry *entries = NULL;
-            unsigned long held = setTypeSampleLiveMembersAlloc(set, &entries, to_pop);
-            serverAssert(held == to_pop && to_pop <= SIZE_MAX / sizeof(*sampled));
-            sampled = zmalloc(sizeof(*sampled) * to_pop);
-            for (unsigned long i = 0; i < to_pop; i++) {
-                sampled[i] = entries[i].sval ? createStringObject((char *)entries[i].sval, entries[i].slen)
-                                             : createStringObjectFromLongLongWithSds(entries[i].lval);
-            }
-            zfree(entries);
-        }
+        unsigned long sampled_index = 0;
         while (popped < to_pop) {
+            unsigned long left = to_pop - popped;
+            if (sampled == NULL && set->encoding == OBJ_ENCODING_HASHTABLE &&
+                setTypeBulkSamplePreferred(&census, left)) {
+                listpackEntry *entries = NULL;
+                unsigned long held = setTypeSampleLiveMembersAlloc(set, &entries, left);
+                serverAssert(held == left && left <= SIZE_MAX / sizeof(*sampled));
+                sampled = zmalloc(sizeof(*sampled) * left);
+                for (unsigned long i = 0; i < left; i++) {
+                    sampled[i] = entries[i].sval ? createStringObject((char *)entries[i].sval, entries[i].slen)
+                                                 : createStringObjectFromLongLongWithSds(entries[i].lval);
+                }
+                zfree(entries);
+            }
+
             robj *member;
             if (sampled != NULL) {
-                member = sampled[popped];
+                member = sampled[sampled_index++];
             } else {
                 int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
                 serverAssert(encoding != -1);
@@ -1675,37 +1678,43 @@ static void srandmemberWithCountFromVolatileSet(client *c, robj *set, unsigned l
     }
 
     if (!uniq) {
-        /* Listpack storage is configuration-bounded. Hashtable draws stay
-         * scalar unless one live-member pass is cheaper than repeated ranks. */
+        /* Listpack storage is configuration-bounded. Hashtable ranks are
+         * resolved in bounded batches so output limits can stop between passes. */
         listpackEntry *live = NULL;
         unsigned long live_count = 0;
-        bool ranked = set->encoding == OBJ_ENCODING_HASHTABLE &&
-                      setTypeBulkSamplePreferred(&census, count) &&
-                      count <= SIZE_MAX / sizeof(setSampleRank) &&
-                      count <= SIZE_MAX / sizeof(listpackEntry);
+        bool ranked = set->encoding == OBJ_ENCODING_HASHTABLE && setTypeBulkSamplePreferred(&census, count);
         if (set->encoding == OBJ_ENCODING_LISTPACK) {
             live_count = setTypeCollectLiveMembers(set, &live);
             serverAssert(live_count == census.live);
-        } else if (ranked) {
-            live = setTypeSampleLiveMembersByRank(set, count, census.live);
         }
         addReplyArrayLen(c, count);
-        for (unsigned long i = 0; i < count; i++) {
-            if (live != NULL) {
-                listpackEntry selected = ranked ? live[i] : live[setTypeRandomBelow(live_count)];
-                if (selected.sval)
-                    addReplyBulkCBuffer(c, selected.sval, selected.slen);
-                else
-                    addReplyBulkLongLong(c, selected.lval);
-            } else {
-                int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
-                serverAssert(encoding != -1);
-                if (str == NULL)
-                    addReplyBulkLongLong(c, llele);
-                else
-                    addReplyBulkCBuffer(c, str, len);
+        unsigned long emitted = 0;
+        while (emitted < count && !c->flag.close_asap) {
+            unsigned long batch_count = count - emitted;
+            listpackEntry *batch = NULL;
+            if (ranked) {
+                if (batch_count > SRANDFIELD_RANDOM_SAMPLE_LIMIT) batch_count = SRANDFIELD_RANDOM_SAMPLE_LIMIT;
+                batch = setTypeSampleLiveMembersByRank(set, batch_count, census.live);
             }
-            if (c->flag.close_asap) break;
+            for (unsigned long i = 0; i < batch_count; i++) {
+                if (ranked || live != NULL) {
+                    listpackEntry selected = ranked ? batch[i] : live[setTypeRandomBelow(live_count)];
+                    if (selected.sval)
+                        addReplyBulkCBuffer(c, selected.sval, selected.slen);
+                    else
+                        addReplyBulkLongLong(c, selected.lval);
+                } else {
+                    int encoding = setTypeDrawLiveElement(set, now, &census, &str, &len, &llele);
+                    serverAssert(encoding != -1);
+                    if (str == NULL)
+                        addReplyBulkLongLong(c, llele);
+                    else
+                        addReplyBulkCBuffer(c, str, len);
+                }
+                emitted++;
+                if (c->flag.close_asap) break;
+            }
+            zfree(batch);
         }
         zfree(live);
         return;
