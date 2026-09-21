@@ -131,6 +131,63 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
         }
     } {} {slow}
 
+    # ---- near-total SPOP with a hidden member ------------------------------
+    #
+    # The remainder a near-total pop has to remember is defined by the LIVE
+    # members it returns; a hidden member is part of neither the reply nor the
+    # reclamation work, so it must not change the strategy, the working memory
+    # or the propagated volume, and it must still be in the set afterwards.
+    test "setperf-memory: near-total SPOP with one hidden member sizes memory by the remainder and reclaims nothing" {
+        set n 20000
+        set live_n [expr {$n - 1}]
+        foreach count [list [expr {$n - 5}] $live_n] {
+            foreach ttl {none one_expired} {
+                set key "spm:$ttl"
+                set fx [wc_fixture $key $n $ttl]
+                assert_equal [dict get [wc_setinfo $key] encoding] hashtable
+                set spm_h($ttl) [wc_measure "r spop $key $count"]
+                set spm_reply($ttl) $::wc_last_reply
+                wc_record $::cur_test "spop key $count" \
+                    [dict create n $n ttl $ttl enc hashtable count $count] $spm_h($ttl)
+            }
+            # The reply is drawn from the live members only: never the hidden
+            # one, never a duplicate, and as many as the live population allows.
+            set expected [expr {$count < $live_n ? $count : $live_n}]
+            assert_equal [llength $spm_reply(one_expired)] $expected
+            assert_equal [lsearch -exact $spm_reply(one_expired) m0] -1
+            spm_assert_members $spm_reply(one_expired) $fx "spop spm:one_expired $count"
+            set extra "measured: n=$n count=$count live=$live_n returned=$expected"
+            # Checked before reading the fixture: a pop that also removed the
+            # hidden member can leave the set empty and the key gone, and DEBUG
+            # WORKCTR SETINFO would error instead of reporting the violation.
+            wc_assert_eq "key still exists" [r exists spm:one_expired] 1 \
+                "the hidden member is not the pop's to remove, so the key survives a near-total pop" \
+                "spop key $count" spm:one_expired $extra
+            set info [wc_setinfo spm:one_expired]
+            wc_assert_le "members reclaimed" [wc_get $spm_h(one_expired) set_members_reclaimed] 0 \
+                "a pop reclaims nothing it was not asked to pop" "spop key $count" spm:one_expired $extra
+            wc_assert_eq "physical members after the pop" [dict get $info physical] [expr {$n - $expected}] \
+                "the hidden member is still allocated after a near-total pop" \
+                "spop key $count" spm:one_expired $extra
+            wc_assert_eq "volatile members after the pop" [dict get $info volatile] 1 \
+                "the hidden member keeps its index entry" "spop key $count" spm:one_expired $extra
+            # Same strategy as the no-TTL pop: the remainder, not the count.
+            wc_assert_ratio "largest single allocation (bytes)" \
+                [wc_get $spm_h(one_expired) mem_max_alloc] [wc_get $spm_h(none) mem_max_alloc] 2 8192 \
+                "one hidden member must not make the pop allocate a count-sized array" \
+                "spop key $count" spm:one_expired $extra
+            wc_assert_ratio "string objects created" \
+                [wc_get $spm_h(one_expired) str_objs_created] [wc_get $spm_h(none) str_objs_created] 2 16 \
+                "the pop copies the members it returns, not the hidden one" \
+                "spop key $count" spm:one_expired $extra
+            wc_assert_ratio "propagated arguments" \
+                [wc_sum $spm_h(one_expired) prop_args prop_dropped_args] \
+                [wc_sum $spm_h(none) prop_args prop_dropped_args] 1 8 \
+                "the pop propagates the members it returned and nothing else" \
+                "spop key $count" spm:one_expired $extra
+        }
+    } {} {slow}
+
     # ---- SPOP count >= cardinality: TTL-independent whole-set return -------
     test "setperf-memory: SPOP count >= cardinality is TTL-independent" {
         set sizes [wc_ht_sizes]
