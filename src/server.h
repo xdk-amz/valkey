@@ -1293,6 +1293,7 @@ typedef struct ClientFlags {
     uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
     uint64_t fp_detach_sent : 1; /* Main asked the owning IO thread to detach this fast-path client. */
     uint64_t fp_readmit : 1;     /* Authenticated on main; joins the fast path once main has nothing further to do for it. */
+    uint64_t fp_deferred : 1;    /* Readable but turned away by the owning IO thread's in-flight cap; waiting in its deferred FIFO. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1508,6 +1509,7 @@ typedef struct client {
     uint32_t fp_owner_slot;               /* Fast path: index in the owning IO thread's private connection table */
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
     listNode io_owner_node;               /* Registry link of the IO thread that owns the socket: linked by that thread for fast-path clients, by main for partitioned ones */
+    listNode fp_defer_node;               /* Fast path: link in the owning IO thread's deferred FIFO while fp_deferred is set (IO thread only) */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */

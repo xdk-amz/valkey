@@ -57,6 +57,7 @@ typedef struct fpThread {
     int quiescing;    /* IO thread only: quiesce observed, every owned client marked leaving */
     list owned;       /* IO thread only: clients this thread reads; registry with leaving */
     list leaving;     /* IO thread only: clients whose entries must return before hand-off or close */
+    list deferred;    /* IO thread only: readable clients the in-flight cap turned away, oldest first */
     rax *registry;    /* IO thread only: lifecycle membership for owned + leaving clients */
     fpOwnerSlot *owner_slots; /* IO thread only: O(1) handle-to-connection resolution */
     uint32_t owner_slots_len;
@@ -68,7 +69,7 @@ typedef struct fpThread {
     size_t main_clients;   /* main only: clients routed here and not yet taken back */
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
-    long long reads, net_input_bytes, net_output_bytes, writes, batches;
+    long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -76,7 +77,7 @@ static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per I
 static size_t fastpath_clients = 0;                 /* main thread only */
 static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
-static long long fp_retired[5]; /* main thread only: counters of threads since retired */
+static long long fp_retired[6]; /* main thread only: counters of threads since retired */
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -124,6 +125,7 @@ void fastpathFreeThread(int tid) {
     fpThread *t = &fp_threads[tid];
     if (t->submit.buffer == NULL) return;
     serverAssert(listLength(&t->owned) == 0 && listLength(&t->leaving) == 0 && raxSize(t->registry) == 0);
+    serverAssert(listLength(&t->deferred) == 0);
     serverAssert(t->owner_slots_used == 0);
     serverAssert(t->inflight == 0 && t->cur == NULL);
     serverAssert(spscBacklog(&t->submit) == 0 && spscIsEmpty(&t->ret));
@@ -148,6 +150,7 @@ void fastpathFreeThread(int tid) {
     fp_retired[2] += t->net_output_bytes;
     fp_retired[3] += t->writes;
     fp_retired[4] += t->batches;
+    fp_retired[5] += t->deferrals;
     while (fp_slots > 0 && fp_threads[fp_slots - 1].submit.buffer == NULL) fp_slots--;
 }
 
@@ -438,6 +441,8 @@ int fastpathAttach(client *c) {
     c->fp_held = 0;
     c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
+    c->flag.fp_deferred = 0;
+    listInitNode(&c->fp_defer_node, c);
     /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
      * next writer of these fields. control->lifecycle is the single source of truth for the state. */
     c->control->owner_domain = CC_OWNER_IO;
@@ -556,6 +561,10 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
+    if (c->flag.fp_deferred) {
+        listUnlinkNode(&t->deferred, &c->fp_defer_node);
+        c->flag.fp_deferred = 0;
+    }
     listUnlinkNode(&t->owned, &c->io_owner_node);
     listLinkNodeTail(&t->leaving, &c->io_owner_node);
     if (hold_cur && fpCurHasClient(t, c)) t->cur_hold = 1;
@@ -671,13 +680,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     q->off = q->len = 0;
 }
 
-void fastpathClientReadable(int tid, client *c) {
-    fpThread *t = &fp_threads[tid];
-    if (c->control->lifecycle != FP_ACTIVE) return;
-    /* Backpressure: the batch pipeline is deep enough; the socket stays
-     * readable (level triggered) and is served on a later pass. */
-    if (t->inflight >= server.io_batch_inflight || c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
-
+static void fpRead(fpThread *t, int tid, client *c) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     readToQueryBuf(c);
     t->reads++;
@@ -703,6 +706,39 @@ void fastpathClientReadable(int tid, client *c) {
     prepareCommandQueue(c);
     fpHarvest(t, tid, c);
     trimClientQueryBuffer(c);
+}
+
+/* Clients turned away by the thread's in-flight cap wait in arrival order. The socket stays
+ * level-triggered readable, but the poll only enqueues it; reads come from the FIFO head as
+ * returned batches free capacity, so service order does not follow the kernel's ready list. */
+static void fpDefer(fpThread *t, client *c) {
+    if (c->flag.fp_deferred) return;
+    c->flag.fp_deferred = 1;
+    t->deferrals++;
+    listLinkNodeTail(&t->deferred, &c->fp_defer_node);
+}
+
+static void fpServeDeferred(fpThread *t, int tid) {
+    while (listLength(&t->deferred) > 0 && t->inflight < server.io_batch_inflight) {
+        client *c = listNodeValue(listFirst(&t->deferred));
+        listUnlinkNode(&t->deferred, &c->fp_defer_node);
+        c->flag.fp_deferred = 0;
+        if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
+        fpRead(t, tid, c);
+    }
+}
+
+void fastpathClientReadable(int tid, client *c) {
+    fpThread *t = &fp_threads[tid];
+    if (c->control->lifecycle != FP_ACTIVE) return;
+    if (c->flag.fp_deferred) return; /* already waiting its turn */
+    if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
+    if (t->inflight >= server.io_batch_inflight || listLength(&t->deferred) > 0) {
+        fpDefer(t, c);
+        fpServeDeferred(t, tid);
+        return;
+    }
+    fpRead(t, tid, c);
 }
 
 static void fpEnableWriteInterest(client *c, int on) {
@@ -999,6 +1035,7 @@ int fastpathProcessReturns(int tid) {
     fpDrainRequests(t);
     if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
+    fpServeDeferred(t, tid);
     return total;
 }
 
@@ -1283,7 +1320,7 @@ void fastpathHandoffDone(client *c, int closing) {
 
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
-              batches = fp_retired[4];
+              batches = fp_retired[4], deferrals = fp_retired[5];
     int open = 0, quiescing = 0;
     for (int i = 1; i < fp_slots; i++) {
         if (fp_threads[i].submit.buffer == NULL) continue;
@@ -1295,6 +1332,7 @@ void fastpathInfo(sds *info) {
         out += fp_threads[i].net_output_bytes;
         writes += fp_threads[i].writes;
         batches += fp_threads[i].batches;
+        deferrals += fp_threads[i].deferrals;
     }
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
@@ -1303,7 +1341,8 @@ void fastpathInfo(sds *info) {
                          "fastpath_reads:%lld\r\n"
                          "fastpath_writes:%lld\r\n"
                          "fastpath_batches:%lld\r\n"
+                         "fastpath_deferrals:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, open, quiescing, reads, writes, batches, in, out);
+                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out);
 }
