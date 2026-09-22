@@ -139,14 +139,15 @@ static_assert(CLUSTER_NODE_MAX <= UINT16_MAX, "cluster node flags must fit in 16
 #define nodePrimaryIsFail(n) ((n)->flags & CLUSTER_NODE_MY_PRIMARY_FAIL)
 #define nodeSupportsFailoverAuthNack(n) ((n)->flags & CLUSTER_NODE_FAILOVER_AUTH_NACK_SUPPORTED)
 
-/* While our FAILOVER_AUTH_REQUEST is outstanding, every voting primary is in
- * exactly one of these states. A voter that responded keeps its state if it is
- * later marked FAIL, so no voter is counted twice. */
+/* While our FAILOVER_AUTH_REQUEST is outstanding, every node is in exactly one
+ * of these states; only voting primaries are counted. A voter that responded
+ * keeps its state if it is later marked FAIL, so no voter is counted twice. A
+ * FAIL voter that still manages to ACK moves to ACKED. */
 typedef enum {
     VOTER_CAN_RESPOND,            /* Has not responded and may still ACK or NACK. */
     VOTER_ACKED,                  /* Counted in failover_auth_count. */
     VOTER_NACKED,                 /* Counted in failover_auth_nack_count. */
-    VOTER_FAILED_WITHOUT_RESPONSE /* Counted in failed_voters_without_response, will never respond. */
+    VOTER_FAILED_WITHOUT_RESPONSE /* Will never respond; counted by clusterUpdateState. */
 } voterElectionState;
 
 /* Cluster messages header */
@@ -510,7 +511,7 @@ struct _clusterNode {
     int is_node_healthy;                     /* Boolean indicating the cached node health.
                                                 Update with updateAndCountChangedNodeHealth(). */
     unsigned int replica_priority;           /* Replica priority used for auto failover ranking. */
-    voterElectionState voter_election_state; /* The state of the node in the current failover election*/
+    voterElectionState voter_election_state; /* The state of the node in the current failover election. */
 };
 
 /* Struct used for storing slot statistics. */
