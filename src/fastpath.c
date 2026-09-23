@@ -702,9 +702,23 @@ static void fpRead(fpThread *t, int tid, client *c) {
         fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
-    parseInputBuffer(c);
-    prepareCommandQueue(c);
-    fpHarvest(t, tid, c);
+    /* The multibulk parser queues the pipelined RESP commands behind the first one, but the
+     * inline parser stops after one command and a queue run stops at the first non-RESP byte.
+     * The main path drains the leftover bytes by looping in processInputBuffer; do the same
+     * here, or the rest of the packet waits for the connection's next read event. */
+    for (;;) {
+        size_t pos = c->qb_pos;
+        parseInputBuffer(c);
+        int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
+        prepareCommandQueue(c);
+        fpHarvest(t, tid, c);
+        /* Stop once the client has left the fast path, a partial command needs more
+         * bytes, a parse error is pending for main, or the buffer is drained. */
+        if (c->control->lifecycle != FP_ACTIVE) break;
+        if (!completed || c->argc > 0 || (c->read_flags & READ_FLAGS_ERROR_MASK)) break;
+        if (c->querybuf == NULL || c->qb_pos >= sdslen(c->querybuf) || c->qb_pos == pos) break;
+        c->read_flags = 0;
+    }
     trimClientQueryBuffer(c);
 }
 

@@ -249,4 +249,64 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         $rd close
         r config set commandlog-request-larger-than 1048576
     }
+
+    # A raw socket that writes several commands in one packet, with nothing
+    # (no SELECT, no HELLO) sent first, so the connection stays on the fast path.
+    proc fastpath_raw_socket {} {
+        wait_for_condition 100 20 { [fastpath_clients] == 0 } else { fail "fast-path clients linger" }
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1
+        return $fd
+    }
+    proc fastpath_raw_read {fd n} {
+        set out {}
+        fconfigure $fd -blocking 0
+        set deadline [expr {[clock milliseconds] + 2000}]
+        while {[llength $out] < $n && [clock milliseconds] < $deadline} {
+            set line [gets $fd]
+            if {$line eq ""} { after 5; continue }
+            lappend out $line
+        }
+        fconfigure $fd -blocking 1
+        return $out
+    }
+
+    # Only the multibulk parser queues pipelined commands; an inline command
+    # after the first one used to sit in the query buffer until the next read.
+    test {Fast path drains inline commands pipelined in one write} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "SET fpinline old\r\n"
+        flush $fd
+        assert_equal {+OK} [fastpath_raw_read $fd 1]
+        puts -nonewline $fd "SET fpinline new\r\nGET fpinline\r\nGET fpinline\r\n"
+        flush $fd
+        assert_equal {+OK {$3} new {$3} new} [fastpath_raw_read $fd 5]
+        puts -nonewline $fd "PING\r\n"
+        flush $fd
+        assert_equal {+PONG} [fastpath_raw_read $fd 1]
+        assert_equal 1 [fastpath_clients]
+        close $fd
+    }
+
+    test {Fast path drains an inline command written after a RESP command} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "*3\r\n\$3\r\nSET\r\n\$8\r\nfpinline\r\n\$3\r\nrsp\r\nGET fpinline\r\n*1\r\n\$4\r\nPING\r\n"
+        flush $fd
+        assert_equal {+OK {$3} rsp +PONG} [fastpath_raw_read $fd 4]
+        assert_equal 1 [fastpath_clients]
+        close $fd
+    }
+
+    # A packet ending mid-command must wait for more bytes, not spin or leave.
+    test {Fast path holds a trailing partial inline command for the next read} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "GET fpinline\r\nGET fpin"
+        flush $fd
+        assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+        puts -nonewline $fd "line\r\n"
+        flush $fd
+        assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+        assert_equal 1 [fastpath_clients]
+        close $fd
+    }
 }
