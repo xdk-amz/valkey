@@ -99,6 +99,7 @@ void ioThreadsDebugFailCreate(int tid);
 long long getIOThreadActiveTimeMicroseconds(int id);
 int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
+void commitIOJobs(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);
 

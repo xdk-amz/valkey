@@ -69,6 +69,7 @@
 #include "module.h"
 #include "call_reply.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
@@ -10542,7 +10543,11 @@ int VM_FreeModuleUser(ValkeyModuleUser *user) {
  * Returns VALKEYMODULE_OK on success and VALKEYMODULE_ERR on failure
  * and will set an errno describing why the operation failed. */
 int VM_SetModuleUserACL(ValkeyModuleUser *user, const char *acl) {
-    return ACLSetUser(user->user, acl, -1);
+    int ret = ACLSetUser(user->user, acl, -1);
+    /* Module users can be attached to clients (VM_AuthenticateClient*) —
+     * re-gate D+ speculation for any client pointing at the mutated user. */
+    if (ret == C_OK) dplusOnAclRulesChanged();
+    return ret;
 }
 
 /* Sets the permission of a user with a complete ACL string, such as one
@@ -10576,6 +10581,8 @@ int VM_SetModuleUserACLString(ValkeyModuleCtx *ctx,
         return VALKEYMODULE_ERR;
     }
 
+    /* Re-gate D+ speculation for clients attached to the mutated user. */
+    dplusOnAclRulesChanged();
     return VALKEYMODULE_OK;
 }
 
@@ -13081,9 +13088,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
         if (callback == NULL) {
             listDelNode(ValkeyModule_EventListeners, ln);
             zfree(el);
-            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;
@@ -13103,9 +13111,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
     el->event = event;
     el->callback = callback;
     listAddNodeTail(ValkeyModule_EventListeners, el);
-    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
         commandResultSuccessListeners++;
-    else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+        dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+    } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
         commandResultFailureListeners++;
     else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
         commandResultRejectedListeners++;
@@ -13261,9 +13270,10 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
     while ((ln = listNext(&li))) {
         el = ln->value;
         if (el->module == module) {
-            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;

@@ -1,0 +1,129 @@
+# ThreadSanitizer suppressions for the D+/door-2 concurrent-read design.
+#
+# Usage:  TSAN_OPTIONS="suppressions=src/tsan.sup" ./src/valkey-server ...
+# Build:  make SANITIZER=thread
+#
+# PURPOSE: scope out the report classes that are BY DESIGN or that TSan
+# cannot model, so that any NEW report is actionable signal. Each entry
+# must carry its justification; do not add entries to silence a report
+# you have not root-caused.
+
+# ---------------------------------------------------------------------------
+# Class 1: seqlock speculative reads (BY DESIGN).
+# dplusSpeculateBatch executes GETs on IO threads by reading hashtable
+# buckets, entry keys, and robj values WITHOUT locks, racing main's writers
+# (insert/moveEntry/rehashEntry/dbSetValue/memset) by construction. Torn or
+# stale reads are expected and discarded: the sharded seqlock version check
+# (dplusValidateAndReply) rejects any read that overlapped a mutation, and
+# entry/table memory lifetime is guaranteed by quiescence-deferred
+# reclamation (limbo lists), verified by ASan and the expiry-race gauntlet.
+# Every by-design racy read has dplusSpeculateBatch in its stack, so this
+# single entry scopes the whole class. True bugs in this path are covered
+# by: seqlock validation itself, ASan legs, the V4 differential fuzzer,
+# and ownership.tcl.
+race:dplusSpeculateBatch
+
+# ---------------------------------------------------------------------------
+# Class 2: owned-client handshake (FENCE-ORDERED; TSan limitation).
+# The door-2 owned-client handshake (io_read_state / io_write_state /
+# flag.pending_write) uses volatile fields ordered by explicit
+# atomic_thread_fence acquire/release pairs (DOOR2_RELEASE_OWNED_READ /
+# DOOR2_RELEASE_OWNED_WRITE + the acquire in the worker dispatch guard).
+# TSan does NOT model standalone fences, so it reports these as races even
+# though the publications are ordered. The two functions below are the
+# main-side consumers/publishers of the handshake. NOTE: this is the
+# weakest suppression in the file — a genuine new race in these functions
+# would be hidden from TSan; the V4 differential fuzzer and ownership.tcl
+# are the compensating detectors for this surface.
+race:processClientIOWriteDone
+race:ioThreadWriteToClient
+
+# ---------------------------------------------------------------------------
+# Class 4: per-thread memory accounting aggregate (UPSTREAM DESIGN).
+# zmalloc maintains a plain size_t counter per thread (used_memory_thread[i],
+# each written only by its owning thread) and zmalloc_used_memory() sums all
+# slots with plain reads from whichever thread asks (main via INFO/maxmemory,
+# BIO via lazyfree accounting). The aggregate is intentionally imprecise --
+# a torn/stale read changes a statistic, never control flow correctness, and
+# aligned 8-byte loads don't tear on supported targets. This is inherited
+# upstream valkey design (predates door-2), reproduced on the unmodified
+# base commit 89e774674 under unit/lazyfree; converting the array to relaxed
+# atomics is an upstream conversation, not a D+ fix. Root-caused Sep 4 2026
+# (Phase 1 S1.6 sanitizer leg).
+race:zmalloc_used_memory
+
+# ---------------------------------------------------------------------------
+# Class 5: owned-client read-handshake surface (PRE-EXISTING REPORT STORM --
+# REAL CLASS, DEDICATED AUDIT PENDING, NOT ALL BENIGN). Under the
+# instrumented ownership suite, TSan reports 22 distinct race locations on
+# the UNMODIFIED base commit 89e774674 (evidence: /tmp/base-races.txt sweep
+# Sep 4 2026): cross-thread fd registration vs the F13 unlocked sweep
+# (aeCreateFileEvent/connSocketSetReadHandler/connIncrRefs), SPSC
+# inbox/outbox accessors (spscEnqueue/IsEmpty/IsFull), query-buffer handoff
+# (readToQueryBuf/parseMultibulk/readQueryFromClient), and D+ stats
+# aggregation. This is the same fence-ordered surface Class 2 documents as
+# TSan-unmodellable, PLUS genuinely unlocked windows that need their own
+# audit -- tracked as the Phase 1 follow-up 'owned-client handshake TSan
+# audit' in the lane tasks. Suppressed as a class so NEW keyspace-protocol
+# races (the Phase 1 surface, verified TSan-clean on expire/string/keyspace/
+# lazyfree suites) stay actionable. aePoll/clientsCron/sdsIncrLen appear
+# only under the battery's parked-reader scenarios (hooks absent on base --
+# provenance unverifiable) and are provisionally classed here.
+race:aeCreateFileEvent
+race:aeDeleteFileEvent
+race:aePoll
+race:aeSetDontWait
+race:beforeNextClient
+race:clientsCron
+race:connIncrRefs
+race:connSocketEventHandler
+race:connSocketRead
+race:connSocketSetReadHandler
+race:connSocketSetWriteHandler
+race:dplusAggregateStats
+race:dplusConsumeSpeculated
+race:dplusDoorbellRings
+race:dplusInfoString
+race:invoke_callback
+race:ioThreadReadQueryFromClient
+race:parseMultibulk
+race:readQueryFromClient
+race:readToQueryBuf
+race:sdsIncrLen
+race:spscEnqueue
+race:spscIsEmpty
+race:spscIsFull
+race:trySendReadToIOThreads
+
+# ---------------------------------------------------------------------------
+# Class 6: module-GIL vs io_threads_mutex order inversion (UPSTREAM DESIGN).
+# Init acquires GIL -> per-thread mutex (createIOThread); the event loop
+# acquires per-thread mutex (held across sleep for inactive threads) -> GIL
+# (afterSleep). Formal cycle, but both edges are main-thread-only: IO
+# threads never take the GIL, so the cycle cannot close across threads.
+# Reproduced 6x on unmodified base (Sep 4 2026). Upstream lineage
+# (io-threads pause/resume + module GIL both predate door-2).
+deadlock:createIOThread
+deadlock:moduleAcquireGIL
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Class 3: crash-report path (best-effort by intent).
+# The sigsegv handler's crash dump calls signal-unsafe logging on purpose
+# (last-gasp diagnostics). These reports only appear once the process is
+# already crashing — the crash itself is the actionable signal.
+signal:sigsegvHandler
+# DEBUG STACKTRACES / watchdog stack collection: threads_mngr delivers a
+# signal to every thread and the handler walks/symbolizes stacks (malloc in
+# dl machinery) -- deliberately best-effort diagnostics, upstream lineage.
+signal:collect_stacktrace_data
+signal:invoke_callback
+signal:writeStacktraces
+signal:printCrashReport
+signal:serverLogRaw
+signal:logServerInfo
+signal:logModulesInfo
+signal:logConfigDebugInfo
+signal:logRegisters
+signal:logStackContent
+signal:doFastMemoryTest

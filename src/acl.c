@@ -29,6 +29,7 @@
 
 #include "server.h"
 #include "sha256.h"
+#include "dplus.h"
 #include "module.h"
 #include "intset.h"
 #include <fcntl.h>
@@ -3879,6 +3880,9 @@ void aclCommand(client *c) {
         sds error = ACLStringSetUser(u, username, temp_argv, c->argc - 3);
         zfree(temp_argv);
         if (error == NULL) {
+            /* Existing clients may point at the mutated user — drain
+             * in-flight speculation and recompute their D+ ACL gates. */
+            dplusOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyErrorSdsSafe(c, error);
@@ -3906,6 +3910,9 @@ void aclCommand(client *c) {
                 deleted++;
             }
         }
+        /* Surviving clients kicked to DefaultUser were re-gated via
+         * clientSetUser; drain covers the in-flight temporal window. */
+        if (deleted) dplusOnAclRulesChanged();
         addReplyLongLong(c, deleted);
     } else if (!strcasecmp(sub, "getuser") && c->argc == 3) {
         /* Redact the username to not leak any information about the user. */
@@ -4029,6 +4036,9 @@ void aclCommand(client *c) {
     } else if (!strcasecmp(sub, "load") && c->argc == 2) {
         sds errors = ACLLoadFromFile(server.acl_filename);
         if (errors == NULL) {
+            /* ACLLoadFromFile swaps c->user pointers directly (not via
+             * clientSetUser) — blanket re-gate + drain. */
+            dplusOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyError(c, errors);

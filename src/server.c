@@ -48,6 +48,7 @@
 #include "syscheck.h"
 #include "threads_mngr.h"
 #include "fmtargs.h"
+#include "dplus.h"
 #include "io_threads.h"
 #include "compression.h"
 #include "fastpath.h"
@@ -678,10 +679,6 @@ hashtableType zsetHashtableType = {
     .hashFunction = zsetHashFunction,
     .keyCompare = zsetKeyCompare,
 };
-
-uint64_t hashtableSdsHash(const void *key) {
-    return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
-}
 
 const void *hashtableObjectGetKey(const void *entry) {
     return objectGetKey(entry);
@@ -1629,12 +1626,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
                                  server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes, current_time,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
                                  factor);
@@ -2020,6 +2017,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
+    /* D+: fold per-IO-thread speculated command counters into stat_numcommands, then seal this
+     * loop's retirements, advance the epoch and reclaim what no reader can still reach. */
+    dplusAggregateStats();
+    dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -2991,6 +2992,7 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+    dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
@@ -3043,7 +3045,7 @@ void resetServerStats(void) {
     server.stat_net_output_bytes = 0;
     server.stat_reply_copy_avoided = 0;
     server.stat_net_repl_input_bytes = 0;
-    server.bio_stat_net_repl_input_bytes = 0;
+    atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
     server.stat_net_repl_output_bytes = 0;
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
@@ -4301,7 +4303,27 @@ void call(client *c, int flags) {
         }
     }
 
+    /* D+: exclusive mode for commands whose partial state a speculative read must not observe
+     * (multi-key atomic operations). Plain writes are covered by the sharded version bump. Only
+     * the top-level command enters; nested calls (EVAL/EXEC bodies) are already covered. */
+    int dplus_exclusive = 0;
+    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
+        serverCommandProc *proc = c->cmd->proc;
+        int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
+                                     (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
+                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
+        if (proc == evalCommand || proc == evalShaCommand || proc == fcallCommand || proc == execCommand ||
+            proc == keysCommand || proc == flushdbCommand || proc == flushallCommand ||
+            (proc == debugCommand && !dplus_epoch_debug_hook)) {
+            dplusExclusiveEnter();
+            dplus_exclusive = 1;
+        }
+    }
+
     c->cmd->proc(c);
+
+    if (dplus_exclusive) dplusExclusiveLeave();
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -6985,7 +7007,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
                 "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
                 "copy_avoid_mode:%s\r\n",
@@ -6994,7 +7016,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                                                                       : "static"),
                 "copy_avoid_current_floor:%d\r\n", server.copy_avoid_current_floor,
                 "main_thread_busy_pct:%d\r\n", (int)(server.copy_avoid_busy_ema + 0.5),
-                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes,
+                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),
                 "total_net_repl_output_bytes:%lld\r\n", server.stat_net_repl_output_bytes,
                 "total_net_cluster_slot_import_bytes:%lld\r\n", server.stat_net_cluster_slot_import_bytes,
                 "total_net_cluster_slot_export_bytes:%lld\r\n", server.stat_net_cluster_slot_export_bytes,
@@ -7248,6 +7270,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "commandstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
+        dplusAggregateStats(); /* speculated replies already sent must count before rendering */
         info = genValkeyInfoStringCommandStats(info, server.commands);
     }
 
@@ -7335,6 +7358,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
+    if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = dplusInfoString(info);
+    }
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -7411,6 +7439,7 @@ void monitorCommand(client *c) {
     c->flag.replica = 1;
     c->flag.monitor = 1;
     listAddNodeTail(server.monitors, c);
+    dplusOnMonitorsChanged(); /* gate speculation off while a monitor is attached */
     addReply(c, shared.ok);
 }
 

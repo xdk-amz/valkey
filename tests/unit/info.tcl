@@ -544,13 +544,11 @@ start_server {tags {"info" "external:skip"}} {
         assert_equal [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] {0}
         # overhead.db.hashtable.lut = memory overhead of hashtable including hashtable struct and tables
         set hashtable_overhead [dict get $mem_stats overhead.db.hashtable.lut]
-        if {$hashtable_overhead < 140} {
-            # 32-bit version (hashtable struct + 1 bucket of 64 bytes)
-            set bits 32
-        } else {
-            set bits 64
-        }
-        assert_range [dict get $mem_stats overhead.db.hashtable.lut] 1 256
+        # The D+ version array adds a fixed 2KB LUT per hashtable, so infer
+        # architecture directly and widen the absolute bound (ported from
+        # the Lane C fix for the same feature-1 test debt).
+        set bits [expr {$::tcl_platform(wordSize) * 8}]
+        assert_range $hashtable_overhead 1 4096
         assert_equal [dict get $mem_stats overhead.db.hashtable.rehashing] {0}
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {0}
         # set 7 more keys to trigger rehashing
@@ -578,7 +576,7 @@ start_server {tags {"info" "external:skip"}} {
         set info_mem [lindex $res end-1]
         set mem_stats [lindex $res end]
         assert_range [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] 1 64
-        assert_range [dict get $mem_stats overhead.db.hashtable.lut] 1 300
+        assert_range [dict get $mem_stats overhead.db.hashtable.lut] $hashtable_overhead [expr {$hashtable_overhead + 512}]
         assert_range [dict get $mem_stats overhead.db.hashtable.rehashing] 1 64
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {1}
     }
