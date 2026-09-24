@@ -198,6 +198,12 @@ void throttle_init(void) {
     }
 }
 
+/* True while any throttler is registered, so callers can conservatively route commands through the
+ * main path where the throttle check runs. */
+bool throttle_active(void) {
+    return throttler_list != NULL && listLength(throttler_list) > 0;
+}
+
 /* In most cases, each throttler should have its own independent metrics_name. When the same
  * throttler is instantiated multiple times (with different priv_data), they may share a single
  * metrics object by using the same name. This allows statistics to be aggregated across related

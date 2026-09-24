@@ -56,6 +56,9 @@ typedef struct {
  * throttler is registered. Idempotent: safe to call more than once. */
 void throttle_init(void);
 
+/* True while any throttler is registered. */
+bool throttle_active(void);
+
 /* Register a new throttler.
  *   criteria_proc - identifies clients whose commands meet the criteria for throttling
  *   priv_data     - private data for passing to the criteria_proc (may be NULL)

@@ -4,6 +4,8 @@
 #include "fastpath.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
+#include "throttle.h"
+#include "module.h"
 #include <sys/epoll.h>
 #include <sys/uio.h>
 
@@ -189,6 +191,7 @@ int fastpathWorkerReopen(int tid) {
 }
 
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
+static int fpDynamicGate(void); /* defined below; global-state capability gate consulted here too */
 static int fpSessionEligible(client *c) {
     if (!server.io_threads_fast_path) return 0;
     if (!strictOffloadActive() || server.io_threads_num < 2) return 0;
@@ -196,7 +199,7 @@ static int fpSessionEligible(client *c) {
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
     if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
     if (server.cluster_enabled) return 0;
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
+    if (!fpDynamicGate()) return 0; /* pause, failover, command filter or throttle active: stay on main */
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
@@ -439,13 +442,34 @@ int fastpathAttach(client *c) {
     return C_OK;
 }
 
+/* Centralized conservative capability decision for the fast path, split in two:
+ *
+ *   fpCommandAllowed() - STATIC, per command, from command flags alone. Stable for a given command,
+ *       so the IO thread checks it once at admission.
+ *   fpDynamicGate()    - DYNAMIC, global server state that a command's flags cannot express and that
+ *       main can change at any time (module command filters, active throttlers, an in-progress
+ *       failover, a client pause). Read lock-free from both the IO thread (admission) and main
+ *       (execution). The execute-time check is the authoritative one: if a gate closes after a
+ *       command was admitted, the executor requeues it to main rather than running it under stale
+ *       eligibility, so ACL/MONITOR/module/throttle/failover invariants are always upheld by the
+ *       main path. Reading a gate the moment it flips is a benign race: a missed close is caught at
+ *       execution, and a missed open only defers a command to main (conservative, never wrong).
+ * Both are pure reads of a few globals: no locks, allocations, lookups or handshakes on the hot path. */
+static int fpDynamicGate(void) {
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused: main postpones */
+    if (server.failover_state != NO_FAILOVER) return 0;  /* coordinated failover: writes belong on main */
+    if (moduleHasCommandFilters()) return 0;             /* a filter may rewrite/redirect any command */
+    if (throttle_active()) return 0;                     /* main runs the throttle check */
+    return 1;
+}
+
 static int fpCommandAllowed(struct serverCommand *cmd) {
     if (!cmd) return 0; /* unknown command: the main path replies (and runs the host:/post check) */
     if (cmd->proc == pingCommand) return 1; /* fast-path clients are never in pubsub mode */
     if (!(cmd->flags & (CMD_WRITE | CMD_READONLY))) return 0;
     if (cmd->flags & (CMD_BLOCKING | CMD_PUBSUB | CMD_ADMIN | CMD_NOSCRIPT | CMD_NO_MULTI | CMD_NO_ASYNC_LOADING |
-                      CMD_ALLOW_BUSY | CMD_TOUCHES_ARBITRARY_KEYS))
-        return 0;
+                      CMD_ALLOW_BUSY | CMD_TOUCHES_ARBITRARY_KEYS | CMD_MODULE))
+        return 0; /* CMD_MODULE runs module code with its own context: keep it on main */
     return 1;
 }
 
@@ -599,7 +623,9 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     int max = server.io_batch_commands;
     cmdQueue *q = &c->cmd_queue;
 
-    if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
+    if (!fpDynamicGate()) leave = 1; /* a global gate is closed: hand this client to main */
+
+    if (!leave && c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
         } else {
@@ -1112,8 +1138,8 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     user *principal = e->origin.principal;
 
     if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
-        e->requeued = 1; /* the main path postpones it like any other client's command */
+    if (!fpDynamicGate()) {
+        e->requeued = 1; /* a global gate closed since admission: main runs it under current eligibility */
         return;
     }
 
@@ -1199,8 +1225,9 @@ static void fpRetFlushOverflow(fpThread *t) {
 int fastpathDrain(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    /* While clients are paused every entry is handed back for the main path to postpone. */
-    int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
+    /* While a global gate is closed (pause, failover, command filter, throttle) every entry is
+     * handed back for the main path to run under current eligibility. */
+    int gated = !fpDynamicGate();
     /* io-batch-drain-us bounds how long a thin batch waits for amortization. */
     monotime deadline = server.io_batch_drain_us > 0 ? getMonotonicUs() + server.io_batch_drain_us : 0;
     int enough = server.io_batch_commands * 4;
@@ -1215,7 +1242,7 @@ again:
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
-            if (use_prefetch && !paused) {
+            if (use_prefetch && !gated) {
                 getKeysResult result;
                 initGetKeysResult(&result);
                 int room = 1;

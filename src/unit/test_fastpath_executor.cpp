@@ -393,3 +393,62 @@ TEST_F(FastpathExecutorTest, WoffAppliedToLeavingClientBeforeHandoff) {
     freeClient(c);
     close(sv[1]);
 }
+
+/* The dynamic capability gate is authoritative at execution: a write admitted while the fast path
+ * was capable must be requeued to main, not executed on the scratch executor, once a global gate
+ * closes (here an in-progress coordinated failover). This pins the "gates change while clients are
+ * active -> conservatively requeue/hand off, not run under stale eligibility" invariant. */
+TEST_F(FastpathExecutorTest, FailoverGateRequeuesAdmittedWrite) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = 727272;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40003);
+    ASSERT_EQ(inet_pton(AF_INET, "192.0.2.91", &sa.sin_addr), 1);
+    ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+    c->woff = 0;
+
+    server.replication_allowed = 1;
+    server.primary_host = NULL;
+    server.aof_state = AOF_ON;
+    server.aof_buf = sdsempty();
+    server.aof_selected_db = 0;
+    server.failover_state = NO_FAILOVER;
+
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1);
+
+    robj *key = createStringObject("gatekey", 7);
+    long long off_before = server.primary_repl_offset;
+
+    /* Admit a SET while the fast path is capable, then close the gate before draining: the executor
+     * must requeue it, so the global offset does not advance and the key is not written here. */
+    const char *setreq = "*3\r\n$3\r\nSET\r\n$7\r\ngatekey\r\n$3\r\nbar\r\n";
+    ASSERT_EQ(write(sv[1], setreq, strlen(setreq)), (ssize_t)strlen(setreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    server.failover_state = FAILOVER_IN_PROGRESS; /* gate closes after admission, before execution */
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(server.primary_repl_offset, off_before);       /* requeued: nothing executed on main here */
+    EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr);    /* the write did not run under the closed gate */
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);            /* and the client was handed off to main */
+
+    server.failover_state = NO_FAILOVER;
+    decrRefCount(key);
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(sv[1]);
+}
