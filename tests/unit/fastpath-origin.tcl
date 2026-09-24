@@ -605,3 +605,88 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {require
         r config set appendonly no
     }
 }
+
+# A real replica held behind: with 0 replicas WAIT returns 0 for any woff, so the numeric proof of
+# woff propagation needs a replica that is online and acking, then paused so it cannot ack the offset
+# the offloaded write reaches. A correct woff makes WAIT 1 wait on that new offset and time out at 0
+# while the replica is behind; a stale woff (0, the origin's pre-write value the replica already
+# acked) would return 1 at once. Release the replica and WAIT 1 returns 1.
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000 enable-debug-command yes}} {
+    start_server {overrides {io-threads 2}} {
+        set replica [srv 0 client]
+        set replica_pid [srv 0 pid]
+        set master [srv -1 client]
+        set master_host [srv -1 host]
+        set master_port [srv -1 port]
+        set replica_host [srv 0 host]
+        set replica_port [srv 0 port]
+        # Fast-path raw clients live on db 0; align the master/replica control clients so their
+        # reads and WAIT see the same keyspace and offset.
+        $master select 0
+        $replica select 0
+
+        # A raw db-0 fast-path client on the master (SELECT would move it to the main path).
+        proc fp_master_client {host port} {
+            return [valkey $host $port 1 $::tls]
+        }
+
+        # fp_wait_fastpath_clients polls the default client r, which is the replica in this nested
+        # block; the fast-path clients live on the master, so poll the master's info instead.
+        proc fp_wait_master_fastpath_clients {m n} {
+            wait_for_condition 100 20 {
+                [getInfoProperty [$m info fastpath] fastpath_clients] == $n
+            } else {
+                fail "expected $n fast-path clients on master: [$m info fastpath]"
+            }
+        }
+
+        test {Fast path: replica setup and online} {
+            $replica replicaof $master_host $master_port
+            wait_for_sync $replica
+            wait_replica_online $master
+            # Baseline: an offloaded write acked by the online replica, so a stale woff would equal
+            # the replica's acked offset for the next test.
+            set a [fp_master_client $master_host $master_port]
+            fp_wait_master_fastpath_clients $master 1
+            $a set fp:repl:base b0
+            assert_equal OK [$a read]
+            $a close
+            fp_wait_master_fastpath_clients $master 0
+            wait_for_ofs_sync $master $replica
+            assert_equal 1 [$master wait 1 5000]
+        }
+
+        test {Fast path: WAIT after offloaded write waits on the propagated offset, replica held} {
+            pause_process $replica_pid
+            set acked_before [status $master master_repl_offset]
+            set a [fp_master_client $master_host $master_port]
+            fp_wait_master_fastpath_clients $master 1
+            # True pipelining: SET then WAIT 1 out together, flushed before either reply is read, so
+            # the SET batch is in flight when WAIT triggers the ACTIVE->LEAVING handoff.
+            $a write [fp_resp set fp:repl:woff v1]
+            $a write [fp_resp wait 1 1500]
+            $a flush
+            assert_equal OK [$a read]
+            # Correct woff: the paused replica cannot ack the offset the SET reached, so WAIT times
+            # out at 0. A stale woff=0 would read the already-acked baseline offset and return 1.
+            assert_equal 0 [$a read]
+            # Primary evidence: the write advanced the master past what the replica last acked.
+            set off_after [status $master master_repl_offset]
+            assert {$off_after > $acked_before}
+            regexp {slave0:[^\r\n]*offset=(\d+)} [$master info replication] -> replica_acked
+            assert {$off_after > $replica_acked}
+            $a close
+            fp_wait_master_fastpath_clients $master 0
+
+            # Release: the replica acks the new offset and WAIT 1 returns 1.
+            resume_process $replica_pid
+            wait_for_ofs_sync $master $replica
+            assert_equal 1 [$master wait 1 5000]
+            wait_for_condition 50 100 {
+                [$replica get fp:repl:woff] eq {v1}
+            } else {
+                fail "replica did not receive the offloaded write after release"
+            }
+        }
+    }
+}
