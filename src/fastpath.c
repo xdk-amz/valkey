@@ -5,6 +5,7 @@
 #include "io_threads.h"
 #include "memory_prefetch.h"
 #include "dplus.h"
+#include "fpuring.h"
 #include <sys/epoll.h>
 #include <sys/uio.h>
 
@@ -71,6 +72,7 @@ typedef struct fpThread {
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals, speculated;
+    struct fpUringRing *uring; /* per-thread io_uring send ring when io-threads-uring is on, else NULL */
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -119,6 +121,34 @@ void fastpathInitThread(int tid) {
     t->ret_overflow = listCreate();
     atomic_init(&t->role, FP_ROLE_OPEN);
     if (tid + 1 > fp_slots) fp_slots = tid + 1;
+    if (fpUringWanted()) {
+        t->uring = fpUringInit(tid);
+        if (!t->uring) serverLog(LL_WARNING, "IO thread %d: io_uring init failed; fast-path sends stay on writev", tid);
+    }
+}
+
+/* Ring completions are reaped by the per-loop fastpathUringPump; the ring fd is deliberately NOT
+ * added to epoll. A level-triggered ring fd stays readable while CQEs are pending and turns the
+ * epoll loop into a busy-spin that starves the client sockets (observed: 500k epoll_pwait/3s, ~0
+ * commands served). The loop already polls epoll with a zero timeout, so per-iteration pump reaps
+ * completions promptly without a self-triggering fd. */
+void fastpathUringRegisterEpoll(int tid) {
+    UNUSED(tid);
+}
+
+/* True if p is this thread's own fpThread pointer, i.e. an epoll event for the ring fd. */
+int fastpathIsUringEvent(int tid, void *p) {
+    return fp_threads[tid].uring && p == (void *)&fp_threads[tid];
+}
+
+/* Reap ring completions; submit any queued sends. Called once per loop iteration and on the
+ * ring fd's epoll readiness. */
+int fastpathUringPump(int tid) {
+    fpThread *t = &fp_threads[tid];
+    if (!t->uring) return 0;
+    int n = fpUringReap(t->uring);
+    fpUringSubmit(t->uring);
+    return n;
 }
 
 /* Destruction preconditions: no client, batch, ring entry or request may still name this thread. */
@@ -146,6 +176,7 @@ void fastpathFreeThread(int tid) {
     t->owner_slots_free = FP_OWNER_SLOT_NONE;
     listRelease(t->ret_overflow);
     t->ret_overflow = NULL;
+    if (t->uring) { fpUringFree(t->uring); t->uring = NULL; }
     fp_retired[0] += t->reads;
     fp_retired[1] += t->net_input_bytes;
     fp_retired[2] += t->net_output_bytes;
@@ -805,6 +836,27 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
         return;
     }
+    /* io_uring send path: with no buffered residue, coalesce the iov and queue one SEND SQE
+     * (submitted once per loop). Ordering per client is preserved by submission order. On any
+     * failure to queue, fall through to the writev path below. */
+    if (t->uring) {
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+        if (total > 0) {
+            char stackbuf[16384];
+            char *flat = total <= sizeof(stackbuf) ? stackbuf : zmalloc(total);
+            size_t off = 0;
+            for (int i = 0; i < iovcnt; i++) { memcpy(flat + off, iov[i].iov_base, iov[i].iov_len); off += iov[i].iov_len; }
+            int ok = fpUringQueueSend(t->uring, c, c->conn->fd, flat, total) == C_OK;
+            if (flat != stackbuf) zfree(flat);
+            if (ok) {
+                t->net_output_bytes += total;
+                c->net_output_bytes += total;
+                t->writes++;
+                return;
+            }
+        }
+    }
     ssize_t n = writev(c->conn->fd, iov, iovcnt);
     if (n < 0) {
         if (errno != EAGAIN && errno != EINTR) {
@@ -937,6 +989,9 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
  * residue over with the client so a slow reader cannot hold it. */
 static void fpFinishLeaving(fpThread *t) {
     if (listLength(&t->leaving) == 0) return;
+    /* Drain the ring before any hand-back so no queued send still references a leaving client's
+     * socket fd; a client is handed back only once the ring holds no outstanding send. */
+    if (t->uring && fpUringClientInflight(t->uring, NULL) > 0) { fastpathUringPump(t - fp_threads); if (fpUringClientInflight(t->uring, NULL) > 0) return; }
     int open = atomic_load_explicit(&t->role, memory_order_relaxed) == FP_ROLE_OPEN;
     listNode *ln = t->leaving.head;
     while (ln) {
@@ -1383,4 +1438,5 @@ void fastpathInfo(sds *info) {
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
                          fastpath_clients, open, quiescing, reads, writes, batches, deferrals, speculated, in, out);
+    *info = fpUringInfo(*info);
 }

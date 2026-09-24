@@ -132,6 +132,9 @@ size_t fastpathReplyOutstanding(const ClientControl *cc);
 
 void fastpathInitThread(int tid);
 void fastpathFreeThread(int tid);
+void fastpathUringRegisterEpoll(int tid);
+int fastpathIsUringEvent(int tid, void *p);
+int fastpathUringPump(int tid);
 void fastpathClientReadable(int tid, client *c);
 void fastpathClientWritable(int tid, client *c);
 void fastpathSubmitPending(int tid);

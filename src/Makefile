@@ -259,6 +259,20 @@ endif
 # Include paths to dependencies
 FINAL_CFLAGS+= -I../deps/libvalkey/include -I../deps/linenoise -I../deps/hdr_histogram -I../deps/fpconv -I../deps/fast_float -I../deps/lz4
 
+# liburing: fast-path io_uring path is build-gated on the header being present.
+BUILD_URING ?= auto
+ifneq ($(CLEAN_ONLY),yes)
+ifeq ($(BUILD_URING),auto)
+	HAVE_LIBURING := $(shell echo '\#include <liburing.h>' | $(CC) -E - >/dev/null 2>&1 && echo yes || echo no)
+else
+	HAVE_LIBURING := $(BUILD_URING)
+endif
+ifeq ($(HAVE_LIBURING),yes)
+	FINAL_CFLAGS+= -DHAVE_LIBURING
+	FINAL_LIBS+= -luring
+endif
+endif
+
 # Zstandard support is disabled by default.
 BUILD_ZSTD ?= no
 
@@ -563,6 +577,7 @@ ENGINE_SERVER_OBJ = \
     intset.o \
     io_threads.o \
     fastpath.o \
+    fpuring.o \
     kvstore.o \
     latency.o \
     lazyfree.o \

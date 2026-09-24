@@ -2035,6 +2035,7 @@ struct valkeyServer {
     int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
+    int io_threads_uring;                     /* Fast-path client socket IO uses a per-IO-thread io_uring ring (build-gated on liburing) */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */

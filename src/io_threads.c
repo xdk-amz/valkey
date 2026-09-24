@@ -517,6 +517,10 @@ static int ioThreadPollPartition(int id) {
     int processed = 0;
     for (int i = 0; i < n; i++) {
         client *c = (client *)evs[i].data.ptr;
+        if (fastpathIsUringEvent(id, evs[i].data.ptr)) {
+            processed += fastpathUringPump(id); /* ring fd readable: reap send completions */
+            continue;
+        }
         if (c->flag.fastpath) {
             if (evs[i].events & EPOLLOUT) fastpathClientWritable(id, c);
             if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) fastpathClientReadable(id, c);
@@ -1133,6 +1137,7 @@ static void *IOThreadMain(void *myid) {
 
         processed += fastpathProcessReturns(id);
         fastpathSubmitPending(id);
+        processed += fastpathUringPump(id); /* submit queued fast-path sends, reap completions */
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
@@ -1195,6 +1200,7 @@ static int createIOThread(int id) {
 
     io_epfd[id] = epoll_create1(EPOLL_CLOEXEC);
     if (io_epfd[id] < 0) serverLog(LL_WARNING, "IO thread %d: epoll_create1 failed (%s); no clients will be partitioned to it", id, strerror(errno));
+    else fastpathUringRegisterEpoll(id);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
