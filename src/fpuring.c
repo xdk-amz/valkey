@@ -95,6 +95,7 @@ struct fpUringRing {
     fpuClient *clients;
     int clients_cap;
     long long n_recv, n_recv_bytes, n_send, n_send_bytes, n_reaped, n_enter, n_enter_err, n_epoll_wakes, n_enobufs, n_short;
+    long long pass_hist[16];   /* passes by CQEs reaped, log2 buckets: [0]=1, [1]=2-3, [2]=4-7, ... */
 };
 
 static struct fpUringRing *fpu_rings[64];
@@ -137,8 +138,13 @@ struct fpUringRing *fpUringInit(int tid) {
     /* Provided buffer ring for multishot recv. The kernel takes a buffer when data arrives and the
      * thread returns it when it reaps the CQE, so with every connection readable between two passes
      * the count must exceed the connections the thread carries or recvs fail with ENOBUFS and wait
-     * a full pass. */
+     * a full pass. Default: the thread's share of maxclients, capped at the kernel's ring limit. */
     unsigned want = (unsigned)server.io_threads_uring_bufs;
+    if (want == 0) {
+        int io_threads = server.io_threads_num > 1 ? server.io_threads_num - 1 : 1;
+        unsigned long long share = ((unsigned long long)server.maxclients + io_threads - 1) / io_threads;
+        want = share > 32768 ? 32768 : (unsigned)share;
+    }
     r->buf_count = 64;
     while (r->buf_count < want) r->buf_count <<= 1;
     r->buf_size = (unsigned)server.io_threads_uring_bufsize;
@@ -360,6 +366,11 @@ static int fpuReapAll(struct fpUringRing *r, fpUringEvents *ev) {
     }
     io_uring_cq_advance(&r->ring, n);
     r->n_reaped += n;
+    if (n > 0) {
+        int b = 0;
+        while ((n >> b) > 1 && b < 15) b++;
+        r->pass_hist[b]++;
+    }
     return n;
 }
 
@@ -439,14 +450,16 @@ void fpUringFoldEpoll(struct fpUringRing *r, int epfd) {
 sds fpUringInfo(sds info) {
     long long recv = 0, recvb = 0, send = 0, sendb = 0, reap = 0, enter = 0, enterr = 0, ep = 0, nob = 0, sh = 0;
     unsigned bufs = 0, bufsize = 0;
+    long long hist[16] = {0};
     for (int i = 0; i < 64; i++) {
         struct fpUringRing *r = fpu_rings[i];
         if (!r) continue;
         bufs = r->buf_count; bufsize = r->buf_size;
         recv += r->n_recv; recvb += r->n_recv_bytes; send += r->n_send; sendb += r->n_send_bytes;
         reap += r->n_reaped; enter += r->n_enter; enterr += r->n_enter_err; ep += r->n_epoll_wakes; nob += r->n_enobufs; sh += r->n_short;
+        for (int b = 0; b < 16; b++) hist[b] += r->pass_hist[b];
     }
-    return sdscatprintf(info,
+    info = sdscatprintf(info,
         "fastpath_uring_recv:%lld\r\n"
         "fastpath_uring_recv_bytes:%lld\r\n"
         "fastpath_uring_send:%lld\r\n"
@@ -460,6 +473,13 @@ sds fpUringInfo(sds info) {
         "fastpath_uring_bufs:%u\r\n"
         "fastpath_uring_bufsize:%u\r\n",
         recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh, bufs, bufsize);
+    /* Passes by CQEs reaped, as lower-bound:count pairs over log2 buckets. */
+    info = sdscatlen(info, "fastpath_uring_pass_hist:", 25);
+    for (int b = 0; b < 16; b++) {
+        if (!hist[b]) continue;
+        info = sdscatprintf(info, "%d=%lld,", 1 << b, hist[b]);
+    }
+    return sdscatlen(info, "\r\n", 2);
 }
 
 #endif /* HAVE_LIBURING */

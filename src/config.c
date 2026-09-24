@@ -3512,8 +3512,8 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
     createBoolConfig("io-threads-uring", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_uring, 0, NULL, NULL),
     createIntConfig("io-threads-uring-flags", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 3, server.io_threads_uring_flags, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-threads-uring-bufs", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 64, 32768, server.io_threads_uring_bufs, 2048, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-threads-uring-bufsize", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 512, 65536, server.io_threads_uring_bufsize, 16384, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-uring-bufs", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 32768, server.io_threads_uring_bufs, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-uring-bufsize", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 512, 65536, server.io_threads_uring_bufsize, 4096, INTEGER_CONFIG, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
