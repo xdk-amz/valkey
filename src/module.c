@@ -11718,6 +11718,12 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
     return VALKEYMODULE_OK;
 }
 
+/* True while any module command filter is registered. A filter may rewrite or redirect any
+ * command, so the fast path must route commands through the main path while one is installed. */
+int moduleHasCommandFilters(void) {
+    return moduleCommandFilters != NULL && listLength(moduleCommandFilters) > 0;
+}
+
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 
