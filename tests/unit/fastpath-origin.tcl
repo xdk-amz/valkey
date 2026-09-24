@@ -523,4 +523,83 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {require
         $a close
         fp_wait_fastpath_clients 0
     }
+
+    # A write executes on main via the offload batch, advancing the global replication offset. The
+    # IO owner must copy that offset onto the origin client so a WAIT/WAITAOF the same connection
+    # pipelines afterwards (which runs on the main path) waits on the offset the write reached.
+    # AOF on makes propagateNow advance master_repl_offset even with no replica attached (the WAITAOF
+    # path), which is exactly the durability scenario this feature must keep correct under offload.
+    test {Fast path: pipelined write then WAIT sees the write's offset} {
+        r config set appendonly yes
+        waitForBgrewriteaof r
+        set a [fp_client]
+        $a auth fppw
+        assert_equal OK [$a read]
+        fp_wait_fastpath_clients 1
+        set off0 [status r master_repl_offset]
+        # SET is offloaded; WAIT is not (blocking), so it is handed back to the main path.
+        $a set fp:woff v1
+        assert_equal OK [$a read]
+        set off1 [status r master_repl_offset]
+        assert {$off1 > $off0} ;# the offloaded write advanced the global offset
+        # WAIT with 0 replicas returns immediately with 0; it must not hang or error, and the
+        # main-path WAIT reads the woff the IO owner applied for the preceding offloaded write.
+        $a wait 0 100
+        assert_equal 0 [$a read]
+        $a close
+        fp_wait_fastpath_clients 0
+        r config set appendonly no
+    }
+
+    test {Fast path: pipelined write then WAITAOF reports local durability} {
+        r config set appendonly yes
+        waitForBgrewriteaof r
+        set a [fp_client]
+        $a auth fppw
+        assert_equal OK [$a read]
+        fp_wait_fastpath_clients 1
+        $a set fp:woffaof v2
+        assert_equal OK [$a read]
+        # numlocal=1 numreplicas=0: with AOF on, the local fsync must eventually satisfy it. It waits
+        # on the woff the IO owner applied for the offloaded write; a wrong/stale woff would hang or
+        # under-report. Poll until the array reply shows local durability reached.
+        wait_for_condition 50 100 {
+            [$a waitaof 1 0 200; $a read] eq {1 0}
+        } else {
+            fail "WAITAOF did not reach local durability for the offloaded write"
+        }
+        $a close
+        fp_wait_fastpath_clients 0
+        r config set appendonly no
+    }
+
+    # Two fast-path clients interleave writes in one batch; each must carry its own woff back, so a
+    # per-client WAIT reflects that client's write, not the other's.
+    test {Fast path: mixed-client batch keeps per-origin woff} {
+        r config set appendonly yes
+        waitForBgrewriteaof r
+        set a [fp_client]
+        set b [fp_client]
+        $a auth fppw
+        assert_equal OK [$a read]
+        $b auth fppw
+        assert_equal OK [$b read]
+        fp_wait_fastpath_clients 2
+        set off0 [status r master_repl_offset]
+        $a set fp:woff:a a
+        $b set fp:woff:b b
+        assert_equal OK [$a read]
+        assert_equal OK [$b read]
+        assert {[status r master_repl_offset] > $off0}
+        # Each client's own WAIT returns cleanly (0 replicas), proving its woff was applied and neither
+        # client hangs on the other's offset.
+        $a wait 0 100
+        assert_equal 0 [$a read]
+        $b wait 0 100
+        assert_equal 0 [$b read]
+        $a close
+        $b close
+        fp_wait_fastpath_clients 0
+        r config set appendonly no
+    }
 }

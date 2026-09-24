@@ -13,7 +13,7 @@ extern int ProcessingEventsWhileBlocked; /* networking.c */
 static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
               "ClientHandle is a compact {control ref, generation, owner slot}");
 static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs only pointer alignment");
-static_assert(sizeof(cmdEntry) == 160, "cmdEntry layout changed; re-measure before/after for the report");
+static_assert(sizeof(cmdEntry) == 168, "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
 /* The two reply counters each sit on their own cache line so the main producer and the IO consumer
@@ -865,6 +865,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         int n = 0;
         int j = i;
         int requeued = 0;
+        long long strand_woff = FP_WOFF_NONE;
         while (j < b->count && b->e[j].handle.control == cc) {
             cmdEntry *e = &b->e[j];
             if (e->requeued) {
@@ -874,9 +875,15 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             } else if (e->reply_len) {
                 iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
             }
+            if (e->woff != FP_WOFF_NONE && e->woff > strand_woff) strand_woff = e->woff; /* monotonic: entries are in arrival order */
             j++;
         }
         if (c) {
+            /* Apply the propagated offset before delivering, so a WAIT/WAITAOF the client pipelined
+             * after these writes (and requeued to the main path) reads the correct woff. Skip a
+             * client past FP_ACTIVE: one leaving/closing is handed to main and must not be mutated here. */
+            if (strand_woff != FP_WOFF_NONE && c->control->lifecycle == FP_ACTIVE && strand_woff > c->woff)
+                c->woff = strand_woff;
             size_t released = n ? fpSend(t, c, iov, n) : 0;
             fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
@@ -1104,6 +1111,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
+    e->woff = FP_WOFF_NONE; /* no propagation unless call() advances the global offset below */
     if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
         e->requeued = 1; /* the main path postpones it like any other client's command */
@@ -1132,7 +1140,12 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->flag.buf_encoded = 0;
     ec->flag.pending_command = 1;
 
+    long long pre_repl_offset = server.primary_repl_offset;
     processCommandAndResetClient(ec);
+    /* If this command propagated, carry the offset it reached back to the origin client (applied by
+     * the IO owner). Read the server global, never the IO-owned client. A requeued command did not
+     * execute here, so it leaves the sentinel and the origin's woff is decided on the main path. */
+    if (!e->requeued && server.primary_repl_offset != pre_repl_offset) e->woff = server.primary_repl_offset;
 
     e->reply_off = (uint32_t)b->arena_used;
     e->reply_len = (uint32_t)ec->bufpos;
