@@ -354,7 +354,7 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
         sds s = objectGetVal(o);
         vallen = sdslen(s);
-        if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
+        if (vallen > (size_t)server.io_threads_speculation_max_value) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             DPLUS_STAT_ADD(large_value_punts, 1);
 #endif

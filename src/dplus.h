@@ -327,13 +327,10 @@ void dplusAggregateStats(void);
 long long dplusDoorbellRings(void);
 long long dplusDoorbellCoalesced(void);
 
-/* Maximum embedded value size for speculative copy. Larger values punt.
- * W14 (Rain-blessed Aug 25 2026): 1024 is the Track-1 shipping default. The
- * value-size sweep showed a smooth gradient with NO cliff (96B parity, 512B
- * 3.3x above OFF, 1KB gradient) and wider copies did not inflate validation
- * misses, so no per-size knob is warranted (simplicity bar). D+-only constant,
- * not a standalone upstream PR. */
-#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
+/* Hard bound on a speculatively copied value: it must fit the 16 KiB client reply chunk with its
+ * bulk header. The runtime cap is server.io_threads_speculation_max_value (default 1024); values
+ * above it punt to main. */
+#define DPLUS_MAX_SPECULATIVE_VALUE_LEN 16320
 
 /* Component 6: INFO section. Epoch engagement/lifecycle gauges are always
  * available; detailed speculative counters remain build-flag dependent. */

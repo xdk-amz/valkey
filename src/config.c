@@ -40,6 +40,7 @@
 #include "eval.h"
 #include "lrulfu.h"
 #include "throttle_repl.h"
+#include "dplus.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -3510,6 +3511,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
+    createIntConfig("io-threads-speculation-max-value", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, DPLUS_MAX_SPECULATIVE_VALUE_LEN, server.io_threads_speculation_max_value, 1024, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("io-threads-uring", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_uring, 0, NULL, NULL),
     createIntConfig("io-threads-uring-flags", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 3, server.io_threads_uring_flags, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-uring-bufs", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 32768, server.io_threads_uring_bufs, 0, INTEGER_CONFIG, NULL, NULL),
