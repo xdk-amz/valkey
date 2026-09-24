@@ -5088,6 +5088,13 @@ uint64_t getClientOriginId(client *c) {
     return c->origin ? c->origin->client_id : c->id;
 }
 
+/* Transport of the client a command came from: the origin's captured type while an executor runs a
+ * fast-path entry (its own conn is NULL), otherwise the live connection. Lets MONITOR and tracing
+ * render the real transport without touching the IO-owned connection. */
+int getClientConnType(client *c) {
+    return c->origin ? c->origin->conn_type : connGetType(c->conn);
+}
+
 /* This function returns the client bound socket name, by creating and caching
  * it if client->sockname is NULL, otherwise returning the cached value.
  * The Socket Name never changes during the life of the client, however it
