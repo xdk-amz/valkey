@@ -330,12 +330,10 @@ void fastpathControlRequest(ClientControl *cc, uint32_t req) {
         atomic_store_explicit(&fp_threads[cc->owner_tid].req_pending, 1, memory_order_release);
 }
 
-/* The single dominant request the owner should act on, given the pending bitmask and whether the
- * client's external replies are all released (EVICT waits for that; the others do not). Returns 0 when
- * nothing is actionable yet. Pure precedence, no side effects, so the owner's execution stays deterministic. */
-static uint32_t fpRequestWinner(uint32_t reqs, int replies_released) {
+/* Dominant pending request by precedence CLOSE > EVICT > HANDOFF > QUIESCE, EVICT immediate; 0 when no known bit is set, so an unknown future bit is not actioned. */
+static uint32_t fpRequestWinner(uint32_t reqs) {
     if (reqs & CC_REQ_CLOSE) return CC_REQ_CLOSE;
-    if (reqs & CC_REQ_EVICT) return replies_released ? CC_REQ_EVICT : 0;
+    if (reqs & CC_REQ_EVICT) return CC_REQ_EVICT;
     if (reqs & CC_REQ_HANDOFF) return CC_REQ_HANDOFF;
     if (reqs & CC_REQ_QUIESCE) return CC_REQ_QUIESCE;
     return 0;
@@ -388,26 +386,11 @@ static void fpReplyChargeBatch(cmdBatch *b) {
     }
 }
 
-/* The IO owner publishes releases before reclaiming batch storage, coalescing adjacent entries for one
- * control and preserving released <= produced for each generation. */
-static void fpReplyReleaseBatch(cmdBatch *b) {
-    int i = 0;
-    while (i < b->count) {
-        ClientHandle *handle = &b->e[i].handle;
-        ClientControl *cc = handle->control;
-        uint32_t generation = handle->generation;
-        size_t bytes = 0;
-        int j = i;
-        while (j < b->count && b->e[j].handle.control == cc && b->e[j].handle.generation == generation) {
-            bytes += fpEntryReplyBytes(&b->e[j]);
-            j++;
-        }
-        if (bytes > 0 && !fastpathHandleStale(handle)) {
-            size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
-            atomic_store_explicit(&cc->reply_bytes_released, released + bytes, memory_order_release);
-        }
-        i = j;
-    }
+/* Sole writer is the IO owner; release-ordered so the reclaim gate's acquire load sees it before reclaiming. */
+static void fpControlReleaseBytes(ClientControl *cc, size_t bytes) {
+    if (bytes == 0) return;
+    size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
+    atomic_store_explicit(&cc->reply_bytes_released, released + bytes, memory_order_release);
 }
 
 /* Reply bytes charged to a control but not yet released: produced minus released, read with acquire so a
@@ -570,23 +553,16 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (hold_cur && fpCurHasClient(t, c)) t->cur_hold = 1;
 }
 
-/* Owner-side execution of pending lifecycle requests for one client this thread owns. Only the owner
- * runs this; a request is a published intent, the transition is the owner's alone, so no other domain
- * mutates the client's lifecycle. Reads the bitmask with acquire to pair with the publisher's release.
- * Maps the dominant request onto the existing leave transitions rather than a second lifecycle model:
- * CLOSE/EVICT free the connection (FP_CLOSING), HANDOFF/QUIESCE return it to main (FP_LEAVING). EVICT
- * defers until the client's external replies are all released so no charged reply memory is dropped
- * mid-flight. Executed bits are cleared with release; the transition is idempotent (fpBeginLeave is a
- * no-op once the client is no longer FP_ACTIVE), so a duplicate or late request does nothing. */
+/* Owner-only lifecycle transition for one client; the requests bitmask is read with acquire to pair with the publisher's release. */
 static void fpExecuteRequests(fpThread *t, client *c) {
     ClientControl *cc = c->control;
     uint32_t reqs = atomic_load_explicit(&cc->requests, memory_order_acquire);
     if (reqs == 0) return;
-    uint32_t win = fpRequestWinner(reqs, fastpathReplyOutstanding(cc) == 0);
-    if (win == 0) return; /* an EVICT still waiting on outstanding replies: revisit on a later pass */
+    uint32_t win = fpRequestWinner(reqs);
+    if (win == 0) return; /* only unknown future bits set: neither leave the client nor clear them */
     if (cc->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
     else if ((win & CC_REQ_TERMINAL) && cc->lifecycle == FP_LEAVING)
-        cc->lifecycle = FP_CLOSING; /* a close arriving after a handoff started still frees it */
+        cc->lifecycle = FP_CLOSING;
     atomic_fetch_and_explicit(&cc->requests, ~win, memory_order_release);
 }
 
@@ -765,45 +741,59 @@ static int fpFlushOut(fpThread *t, client *c) {
         ssize_t n = write(c->conn->fd, c->fp_out, sdslen(c->fp_out));
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
-            fpBeginLeave(t, c, FP_CLOSING, 0);
+            /* Fatal socket: force FP_CLOSING so fpFinishLeaving stops retrying; fpBeginLeave no-ops once past FP_ACTIVE. */
+            if (c->control->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, FP_CLOSING, 0);
+            else c->control->lifecycle = FP_CLOSING;
             return 0;
         }
         t->net_output_bytes += n;
         c->net_output_bytes += n;
         t->writes++;
+        fpControlReleaseBytes(c->control, (size_t)n); /* these bytes left the retained set */
         sdsrange(c->fp_out, n, -1);
     }
     return 1;
 }
 
-/* Buffered bytes always precede newly returned replies. */
-static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
-    if (c->control->lifecycle == FP_CLOSING) return;
+/* Total logical bytes across the reply iovecs; computed only on the rare discard paths, not per send. */
+static size_t fpIovLen(const struct iovec *iov, int iovcnt) {
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+    return total;
+}
+
+/* Returns the reply bytes that left the retained set: written to the socket or discarded whole on a fatal write; buffered bytes stay charged behind any existing residue. */
+static size_t fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
+    if (c->control->lifecycle == FP_CLOSING) return fpIovLen(iov, iovcnt); /* the closing client drops these */
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
-        return;
+        return 0;
     }
-    ssize_t n = writev(c->conn->fd, iov, iovcnt);
-    if (n < 0) {
+    ssize_t written = writev(c->conn->fd, iov, iovcnt);
+    if (written < 0) {
         if (errno != EAGAIN && errno != EINTR) {
-            fpBeginLeave(t, c, FP_CLOSING, 0);
-            return;
+            /* Fatal write must reach FP_CLOSING even past FP_ACTIVE, so a discarded reply cannot hand off a live connection; fpBeginLeave no-ops once leaving. */
+            if (c->control->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, FP_CLOSING, 0);
+            else c->control->lifecycle = FP_CLOSING;
+            return fpIovLen(iov, iovcnt); /* whole group discarded, released once by the caller */
         }
-        n = 0;
+        written = 0;
     }
-    t->net_output_bytes += n;
-    c->net_output_bytes += n;
+    t->net_output_bytes += written;
+    c->net_output_bytes += written;
     t->writes++;
+    size_t rem = (size_t)written;
     for (int i = 0; i < iovcnt; i++) {
-        if ((size_t)n >= iov[i].iov_len) {
-            n -= iov[i].iov_len;
+        if (rem >= iov[i].iov_len) {
+            rem -= iov[i].iov_len;
             continue;
         }
         if (!c->fp_out) c->fp_out = sdsempty();
-        c->fp_out = sdscatlen(c->fp_out, (char *)iov[i].iov_base + n, iov[i].iov_len - n);
-        n = 0;
+        c->fp_out = sdscatlen(c->fp_out, (char *)iov[i].iov_base + rem, iov[i].iov_len - rem);
+        rem = 0;
     }
     if (c->fp_out && sdslen(c->fp_out) > 0) fpEnableWriteInterest(c, 1);
+    return (size_t)written;
 }
 
 void fastpathClientWritable(int tid, client *c) {
@@ -887,14 +877,24 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             j++;
         }
         if (c) {
-            if (n) fpSend(t, c, iov, n);
+            size_t released = n ? fpSend(t, c, iov, n) : 0;
+            fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
             if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+        } else {
+            /* A current handle always resolves in flight, so c==NULL implies stale: never write a reused control, but still balance a current-but-unresolved strand in release builds. */
+            const ClientHandle *h = &b->e[i].handle;
+            int stale = fastpathHandleStale(h);
+            debugServerAssert(stale);
+            if (!stale) {
+                size_t bytes = 0;
+                for (int k = i; k < j; k++) bytes += fpEntryReplyBytes(&b->e[k]);
+                fpControlReleaseBytes(h->control, bytes);
+            }
         }
         i = j;
     }
-    fpReplyReleaseBatch(b);
     for (int k = 0; k < b->count; k++) {
         cmdEntry *e = &b->e[k];
         if (e->reply_big) zfree(e->reply_big);
@@ -922,7 +922,11 @@ static void fpFinishLeaving(fpThread *t) {
         client *c = listNodeValue(ln);
         ln = next;
         if (c->fp_inflight > 0) continue;
-        if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
+        /* Only a still-leaving client retries a partial drain; a fatal flush upgraded it to FP_CLOSING and must proceed. */
+        if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c) && c->control->lifecycle == FP_LEAVING)
+            continue;
+        /* Residue leaves the retained set exactly once here, posted before the hand-off so fastpathHandoffDone never re-releases it. */
+        if (c->fp_out && sdslen(c->fp_out) > 0) fpControlReleaseBytes(c->control, sdslen(c->fp_out));
         fpUnregister(t, c);
         sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
     }
@@ -988,18 +992,38 @@ static void fpQuiesceStep(fpThread *t) {
     }
 }
 
-/* Owner-side sweep of pending lifecycle requests. Runs only when a publisher signalled this thread, so
- * an idle owner costs nothing until a request arrives. The signal is cleared before the walk so a
- * request published during it re-arms the flag and is caught next pass rather than lost. Only owned
- * (still FP_ACTIVE) clients carry actionable requests; leaving/closing clients are already past the
- * decision fpExecuteRequests would make. */
-static void fpDrainRequests(fpThread *t) {
-    if (!atomic_exchange_explicit(&t->req_pending, 0, memory_order_acquire)) return;
-    listNode *ln = t->owned.head;
+/* Owner-side execution across leaving then owned, so a request that moves an owned client into leaving is not revisited this pass. */
+static void fpExecuteTrackedRequests(fpThread *t) {
+    listNode *ln = t->leaving.head;
     while (ln) {
         listNode *next = ln->next;
         fpExecuteRequests(t, listNodeValue(ln));
         ln = next;
+    }
+    ln = t->owned.head;
+    while (ln) {
+        listNode *next = ln->next;
+        fpExecuteRequests(t, listNodeValue(ln));
+        ln = next;
+    }
+}
+
+/* Gated by the publisher's signal, cleared with an exchange before the walk so a request published during it re-arms and is caught next pass. */
+static void fpDrainRequests(fpThread *t) {
+    if (!atomic_exchange_explicit(&t->req_pending, 0, memory_order_acquire)) return;
+    fpExecuteTrackedRequests(t);
+}
+
+/* Pre-delivery: execute requests only for the current controls this batch names, resolving each through the owner table so a stale handle is skipped and a reused control is never written. */
+static void fpExecuteBatchRequests(fpThread *t, cmdBatch *b) {
+    int i = 0;
+    while (i < b->count) {
+        ClientControl *cc = b->e[i].handle.control;
+        client *c = fpResolve(t, &b->e[i].handle);
+        int j = i + 1;
+        while (j < b->count && b->e[j].handle.control == cc) j++;
+        if (c) fpExecuteRequests(t, c);
+        i = j;
     }
 }
 
@@ -1035,6 +1059,8 @@ int fastpathProcessReturns(int tid) {
                 continue;
             }
             cmdBatch *b = (cmdBatch *)v;
+            /* Peeked, not cleared: a request against a control still behind an unconsumed attach in this ring must survive for the post-loop drain. */
+            if (atomic_load_explicit(&t->req_pending, memory_order_acquire)) fpExecuteBatchRequests(t, b);
             fpDeliverBatch(t, b);
             fpRecycleBatch(t, b);
             t->inflight--;
@@ -1299,6 +1325,7 @@ void fastpathHandoffDone(client *c, int closing) {
     fastpathControlUnpin(c, CC_PIN_OWNER); /* IO no longer owns it; drop the ownership pin as main takes over */
     fastpath_clients--;
     ACLFastpathClientReturned(c);
+    /* The IO owner already released this residue's fast-path charge at hand-off; here it only moves bytes. */
     sds out = c->fp_out;
     c->fp_out = NULL;
     /* A detach still in the ring keeps the client allocated: freeClientsInAsyncFreeQueue frees it once consumed. */

@@ -280,7 +280,20 @@ TEST_F(FastpathLifecycleTest, FreeThreadRequiresEmptyRegistry) {
     fastpathInitThread(2);
     testOnlySetIOThreadReady(2, epoll_create1(EPOLL_CLOEXEC));
     int peer_a, peer_b;
-    client *a = newFastpathClient(&peer_a);
+    int sv_a[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv_a), 0);
+    connection *conn_a = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv_a[0], NULL);
+    conn_a->state = CONN_STATE_CONNECTED;
+    client *a = createClient(conn_a);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40000);
+    sa.sin_addr.s_addr = htonl(0x7f000001);
+    ASSERT_EQ(peerIdentityFromSockaddr(&a->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    a->fp_local = a->fp_peer;
+    ASSERT_EQ(fastpathAttach(a), C_OK);
+    peer_a = sv_a[1];
     client *b = nullptr;
     if (a->io_tid != 2) {
         int sv[2];
