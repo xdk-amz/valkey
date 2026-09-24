@@ -39,6 +39,8 @@ sds fpUringInfo(sds info) { return info; }
 #include <liburing.h>
 #include <string.h>
 #include <poll.h>
+#include <errno.h>
+#include <unistd.h>
 
 #define FPU_RING_ENTRIES 4096    /* SQ/CQ depth per IO thread */
 #define FPU_SEND_MAX 65536       /* one queued send copies at most this many bytes */
@@ -79,6 +81,7 @@ struct fpUringRing {
     struct io_uring ring;
     int ring_fd;
     int inited;
+    int enabled;               /* rings enabled by the owning IO thread (SINGLE_ISSUER binds to it) */
     int epfd_folded;
     struct io_uring_buf_ring *buf_ring;
     void *buf_base;            /* FPU_BUF_COUNT * FPU_BUF_SIZE */
@@ -90,7 +93,7 @@ struct fpUringRing {
     /* fd -> client table; small linear map keyed by fd, sized to maxclients is overkill so grow. */
     fpuClient *clients;
     int clients_cap;
-    long long n_recv, n_recv_bytes, n_send, n_send_bytes, n_reaped, n_enter, n_epoll_wakes, n_enobufs, n_short;
+    long long n_recv, n_recv_bytes, n_send, n_send_bytes, n_reaped, n_enter, n_enter_err, n_epoll_wakes, n_enobufs, n_short;
 };
 
 static struct fpUringRing *fpu_rings[64];
@@ -114,13 +117,17 @@ struct fpUringRing *fpUringInit(int tid) {
     struct fpUringRing *r = zcalloc(sizeof(*r));
     struct io_uring_params p;
     memset(&p, 0, sizeof(p));
-    p.flags = fpuSetupFlags();
+    /* The ring is created by main and driven by the IO thread. R_DISABLED defers the issuer binding
+     * (SINGLE_ISSUER, SQPOLL thread start) to whichever thread enables it: the IO thread, on its
+     * first pass. Entering from another thread returns EEXIST and the loop would spin on it. */
+    p.flags = fpuSetupFlags() | IORING_SETUP_R_DISABLED;
     if (p.flags & IORING_SETUP_SQPOLL) {
         p.sq_thread_idle = 1000; /* ms; SQPOLL steals a core, noted in the report */
     }
     if (io_uring_queue_init_params(FPU_RING_ENTRIES, &r->ring, &p) < 0) {
         /* Retry once with baseline flags so an unsupported variant still yields a ring. */
         memset(&p, 0, sizeof(p));
+        p.flags = IORING_SETUP_R_DISABLED;
         if (io_uring_queue_init_params(FPU_RING_ENTRIES, &r->ring, &p) < 0) { zfree(r); return NULL; }
     }
     r->ring_fd = r->ring.ring_fd;
@@ -349,16 +356,39 @@ static int fpuReapAll(struct fpUringRing *r, fpUringEvents *ev) {
     return n;
 }
 
+/* First call on the owning IO thread: enable the ring, binding the issuer (and starting the SQPOLL
+ * thread) to this thread. Returns 0 if the ring is usable. */
+static int fpuEnable(struct fpUringRing *r) {
+    if (r->enabled) return 0;
+    int rc = io_uring_enable_rings(&r->ring);
+    if (rc < 0) {
+        serverLog(LL_WARNING, "IO thread %d: io_uring_enable_rings failed: %s", r->tid, strerror(-rc));
+        return -1;
+    }
+    r->enabled = 1;
+    return 0;
+}
+
+/* Persistent enter failures (EEXIST from a wrong issuer, EBADFD from a disabled ring) are logged
+ * once and counted; the caller then sleeps the tick rather than spinning at 100%. */
+static int fpuEnterFailed(struct fpUringRing *r, int rc) {
+    if (rc >= 0 || rc == -ETIME || rc == -EINTR || rc == -EAGAIN || rc == -EBUSY) return 0;
+    if (r->n_enter_err++ == 0) serverLog(LL_WARNING, "IO thread %d: io_uring_enter failed: %s", r->tid, strerror(-rc));
+    return 1;
+}
+
 int fpUringWaitAndReap(struct fpUringRing *r, int timeout_us, fpUringEvents *ev) {
     if (ev) memset(ev, 0, sizeof(*ev));
     if (!r || !r->inited) return 0;
+    if (fpuEnable(r) < 0) { usleep(timeout_us); return 0; }
     struct __kernel_timespec ts = {.tv_sec = timeout_us / 1000000, .tv_nsec = (long)(timeout_us % 1000000) * 1000};
     /* Single enter: submit queued SQEs and wait up to the tick for one completion. cqe_ptr must be
      * a real pointer; liburing writes the first CQE through it, so passing NULL segfaults. */
     struct io_uring_cqe *first = NULL;
-    io_uring_submit_and_wait_timeout(&r->ring, &first, 1, &ts, NULL);
+    int rc = io_uring_submit_and_wait_timeout(&r->ring, &first, 1, &ts, NULL);
     r->n_enter++;
     r->pending = 0;
+    if (fpuEnterFailed(r, rc)) usleep(timeout_us);
     int n = fpuReapAll(r, ev);
     /* Flush any SQEs the reap prepared (recv re-arms, short-send remainders, poll re-arm). */
     if (r->pending) { io_uring_submit(&r->ring); r->pending = 0; }
@@ -367,6 +397,7 @@ int fpUringWaitAndReap(struct fpUringRing *r, int timeout_us, fpUringEvents *ev)
 
 int fpUringReap(struct fpUringRing *r) {
     if (!r || !r->inited) return 0;
+    if (fpuEnable(r) < 0) return 0;
     fpUringEvents ev;
     int n = fpuReapAll(r, &ev);
     if (r->pending) { io_uring_submit(&r->ring); r->pending = 0; }
@@ -393,18 +424,18 @@ void fpUringFoldEpoll(struct fpUringRing *r, int epfd) {
     if (!sqe) return;
     io_uring_prep_poll_multishot(sqe, epfd, POLLIN);
     io_uring_sqe_set_data64(sqe, FPU_UD_POLL);
+    /* Left pending: main calls this before the IO thread exists and the ring is still disabled;
+     * the thread's first submit_and_wait flushes it. */
     r->pending++;
-    io_uring_submit(&r->ring);
-    r->pending = 0;
 }
 
 sds fpUringInfo(sds info) {
-    long long recv = 0, recvb = 0, send = 0, sendb = 0, reap = 0, enter = 0, ep = 0, nob = 0, sh = 0;
+    long long recv = 0, recvb = 0, send = 0, sendb = 0, reap = 0, enter = 0, enterr = 0, ep = 0, nob = 0, sh = 0;
     for (int i = 0; i < 64; i++) {
         struct fpUringRing *r = fpu_rings[i];
         if (!r) continue;
         recv += r->n_recv; recvb += r->n_recv_bytes; send += r->n_send; sendb += r->n_send_bytes;
-        reap += r->n_reaped; enter += r->n_enter; ep += r->n_epoll_wakes; nob += r->n_enobufs; sh += r->n_short;
+        reap += r->n_reaped; enter += r->n_enter; enterr += r->n_enter_err; ep += r->n_epoll_wakes; nob += r->n_enobufs; sh += r->n_short;
     }
     return sdscatprintf(info,
         "fastpath_uring_recv:%lld\r\n"
@@ -413,10 +444,11 @@ sds fpUringInfo(sds info) {
         "fastpath_uring_send_bytes:%lld\r\n"
         "fastpath_uring_reaped:%lld\r\n"
         "fastpath_uring_enter:%lld\r\n"
+        "fastpath_uring_enter_err:%lld\r\n"
         "fastpath_uring_epoll_wakes:%lld\r\n"
         "fastpath_uring_enobufs:%lld\r\n"
         "fastpath_uring_short_sends:%lld\r\n",
-        recv, recvb, send, sendb, reap, enter, ep, nob, sh);
+        recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh);
 }
 
 #endif /* HAVE_LIBURING */
