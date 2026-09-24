@@ -1438,5 +1438,11 @@ void fastpathInfo(sds *info) {
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
                          fastpath_clients, open, quiescing, reads, writes, batches, deferrals, speculated, in, out);
+    /* Fold-cadence-independent command count: sum the per-IO-thread speculated-command counters live.
+     * total_commands_processed folds these in main's beforeSleep, which is starved under uring, so it
+     * lags in bursts; this sum tracks served GETs exactly and matches the generator's completed rate. */
+    long long fp_cmds = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) fp_cmds += dplus_thread_stats[i].commands_processed;
+    *info = sdscatprintf(*info, "fastpath_commands_live:%lld\r\n", fp_cmds);
     *info = fpUringInfo(*info);
 }
