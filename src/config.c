@@ -3514,7 +3514,6 @@ standardConfig static_configs[] = {
     createIntConfig("io-threads-uring-flags", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 3, server.io_threads_uring_flags, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-uring-bufs", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 0, 32768, server.io_threads_uring_bufs, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-threads-uring-bufsize", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 512, 65536, server.io_threads_uring_bufsize, 4096, INTEGER_CONFIG, NULL, NULL),
-    createBoolConfig("io-threads-uring-zc", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_uring_zc, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

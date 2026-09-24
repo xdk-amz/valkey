@@ -2039,7 +2039,6 @@ struct valkeyServer {
     int io_threads_uring_flags;               /* io_uring SETUP variant: 0 baseline, 1 SINGLE_ISSUER|DEFER_TASKRUN, 2 COOP_TASKRUN, 3 SQPOLL */
     int io_threads_uring_bufs;                /* Provided recv buffers per IO thread ring, rounded up to a power of two; 0 = maxclients / IO threads */
     int io_threads_uring_bufsize;             /* Bytes per provided recv buffer */
-    int io_threads_uring_zc;                  /* Fast-path sends use IORING_OP_SEND_ZC (buffer pinned until the F_NOTIF CQE) */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */

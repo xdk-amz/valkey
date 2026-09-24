@@ -63,8 +63,6 @@ typedef struct fpuSend {
     uint32_t off;
     uint32_t cap;
     char *buf;
-    int done;          /* zc: result CQE seen (send finished, no more remainder to resubmit) */
-    int notif_pending; /* zc: a NOTIF CQE is still owed for this buffer (F_MORE was set) */
 } fpuSend;
 
 /* Per-client recv registration: how many recv/send SQEs of this client are still in flight, so a
@@ -97,7 +95,6 @@ struct fpUringRing {
     fpuClient *clients;
     int clients_cap;
     long long n_recv, n_recv_bytes, n_send, n_send_bytes, n_reaped, n_enter, n_enter_err, n_epoll_wakes, n_enobufs, n_short;
-    long long n_zc_sends, n_zc_notifs; /* zc: SEND_ZC SQEs issued, NOTIF CQEs reaped */
     long long pass_hist[16];   /* passes by CQEs reaped, log2 buckets: [0]=1, [1]=2-3, [2]=4-7, ... */
 };
 
@@ -242,8 +239,6 @@ static fpuSend *fpuAlloc(struct fpUringRing *r, size_t len) {
     if (s) r->freelist = s->free_next;
     else s = zcalloc(sizeof(*s));
     if (s->cap < len) { zfree(s->buf); s->buf = zmalloc(len); s->cap = len; }
-    s->done = 0;
-    s->notif_pending = 0;
     return s;
 }
 
@@ -256,14 +251,7 @@ static void fpuRecycle(struct fpUringRing *r, fpuSend *s) {
 static int fpuPrepSend(struct fpUringRing *r, fpuSend *s) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&r->ring);
     if (!sqe) return C_ERR;
-    if (server.io_threads_uring_zc) {
-        /* ZC yields a result CQE (F_MORE if a NOTIF follows) then a NOTIF CQE (F_NOTIF); the
-         * buffer must stay live until the NOTIF. MSG_NOSIGNAL matches the copying path. */
-        io_uring_prep_send_zc(sqe, s->fd, s->buf + s->off, s->len, MSG_NOSIGNAL, 0);
-        r->n_zc_sends++;
-    } else {
-        io_uring_prep_send(sqe, s->fd, s->buf + s->off, s->len, MSG_NOSIGNAL);
-    }
+    io_uring_prep_send(sqe, s->fd, s->buf + s->off, s->len, MSG_NOSIGNAL);
     io_uring_sqe_set_data(sqe, s); /* aligned pointer: low bits are FPU_UD_SEND (0) */
     r->pending++;
     r->n_send++;
@@ -313,19 +301,9 @@ static int fpuReapAll(struct fpUringRing *r, fpUringEvents *ev) {
         if (tag == FPU_UD_SEND) {
             fpuSend *s = (fpuSend *)(uintptr_t)ud;
             if (!s) continue;
-            if (cqe->flags & IORING_CQE_F_NOTIF) {
-                /* ZC notification: the kernel is done with the buffer. Recycle iff the send
-                 * itself already finished; the accounting was settled on the result CQE. */
-                r->n_zc_notifs++;
-                s->notif_pending = 0;
-                if (s->done) fpuRecycle(r, s);
-                continue;
-            }
-            /* Result CQE (may carry F_MORE meaning a NOTIF still owes this buffer). */
             r->inflight--;
             fpuClient *fc = fpuClientSlot(r, s->fd);
             if (fc && fc->fd == s->fd && fc->send_inflight > 0) fc->send_inflight--;
-            if (cqe->flags & IORING_CQE_F_MORE) s->notif_pending = 1;
             if (res > 0 && (uint32_t)res < s->len) {
                 s->off += (uint32_t)res;
                 s->len -= (uint32_t)res;
@@ -333,12 +311,10 @@ static int fpuReapAll(struct fpUringRing *r, fpUringEvents *ev) {
                 if (fpuPrepSend(r, s) == C_OK) {
                     r->inflight++;
                     if (fc && fc->fd == s->fd) fc->send_inflight++;
-                    continue; /* remainder in flight: buffer stays live, recycle deferred */
+                    continue;
                 }
             }
-            /* Send finished. Recycle now unless a NOTIF still owes this buffer (ZC, F_MORE). */
-            s->done = 1;
-            if (!s->notif_pending) fpuRecycle(r, s);
+            fpuRecycle(r, s);
             continue;
         }
         if (tag == FPU_UD_POLL) {
@@ -473,7 +449,6 @@ void fpUringFoldEpoll(struct fpUringRing *r, int epfd) {
 
 sds fpUringInfo(sds info) {
     long long recv = 0, recvb = 0, send = 0, sendb = 0, reap = 0, enter = 0, enterr = 0, ep = 0, nob = 0, sh = 0;
-    long long zcs = 0, zcn = 0;
     unsigned bufs = 0, bufsize = 0;
     long long hist[16] = {0};
     for (int i = 0; i < 64; i++) {
@@ -482,7 +457,6 @@ sds fpUringInfo(sds info) {
         bufs = r->buf_count; bufsize = r->buf_size;
         recv += r->n_recv; recvb += r->n_recv_bytes; send += r->n_send; sendb += r->n_send_bytes;
         reap += r->n_reaped; enter += r->n_enter; enterr += r->n_enter_err; ep += r->n_epoll_wakes; nob += r->n_enobufs; sh += r->n_short;
-        zcs += r->n_zc_sends; zcn += r->n_zc_notifs;
         for (int b = 0; b < 16; b++) hist[b] += r->pass_hist[b];
     }
     info = sdscatprintf(info,
@@ -496,11 +470,9 @@ sds fpUringInfo(sds info) {
         "fastpath_uring_epoll_wakes:%lld\r\n"
         "fastpath_uring_enobufs:%lld\r\n"
         "fastpath_uring_short_sends:%lld\r\n"
-        "fastpath_uring_zc_sends:%lld\r\n"
-        "fastpath_uring_zc_notifs:%lld\r\n"
         "fastpath_uring_bufs:%u\r\n"
         "fastpath_uring_bufsize:%u\r\n",
-        recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh, zcs, zcn, bufs, bufsize);
+        recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh, bufs, bufsize);
     /* Passes by CQEs reaped, as lower-bound:count pairs over log2 buckets. */
     info = sdscatlen(info, "fastpath_uring_pass_hist:", 25);
     for (int b = 0; b < 16; b++) {
