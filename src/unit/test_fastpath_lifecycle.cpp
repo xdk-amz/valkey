@@ -279,7 +279,7 @@ TEST_F(FastpathLifecycleTest, DetachIsConsumedBeforeMainMayFree) {
 TEST_F(FastpathLifecycleTest, FreeThreadRequiresEmptyRegistry) {
     fastpathInitThread(2);
     testOnlySetIOThreadReady(2, epoll_create1(EPOLL_CLOEXEC));
-    int peer_a, peer_b;
+    int peer_a = -1, peer_b = -1;
     int sv_a[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv_a), 0);
     connection *conn_a = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv_a[0], NULL);
