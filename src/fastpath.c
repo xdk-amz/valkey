@@ -589,6 +589,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->reply_big = NULL;
     e->reply_big_len = 0;
     e->requeued = 0;
+    e->woff = c->woff; /* prior causal state in; main executes against it and returns the resulting offset */
     c->fp_inflight++;
 }
 
@@ -865,7 +866,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         int n = 0;
         int j = i;
         int requeued = 0;
-        long long strand_woff = FP_WOFF_NONE;
+        long long strand_woff = 0;
         while (j < b->count && b->e[j].handle.control == cc) {
             cmdEntry *e = &b->e[j];
             if (e->requeued) {
@@ -875,15 +876,14 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             } else if (e->reply_len) {
                 iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
             }
-            if (e->woff != FP_WOFF_NONE && e->woff > strand_woff) strand_woff = e->woff; /* monotonic: entries are in arrival order */
+            if (!e->requeued && e->woff > strand_woff) strand_woff = e->woff; /* highest offset any executed entry reached */
             j++;
         }
         if (c) {
-            /* Apply the propagated offset before delivering, so a WAIT/WAITAOF the client pipelined
-             * after these writes (and requeued to the main path) reads the correct woff. Skip a
-             * client past FP_ACTIVE: one leaving/closing is handed to main and must not be mutated here. */
-            if (strand_woff != FP_WOFF_NONE && c->control->lifecycle == FP_ACTIVE && strand_woff > c->woff)
-                c->woff = strand_woff;
+            /* Apply the write offset to the origin before delivery, while the IO owner still holds it
+             * (ACTIVE, or LEAVING for the WAIT/WAITAOF requeue); not CLOSING/DETACHED. */
+            uint8_t lc = c->control->lifecycle;
+            if (strand_woff > c->woff && (lc == FP_ACTIVE || lc == FP_LEAVING)) c->woff = strand_woff;
             size_t released = n ? fpSend(t, c, iov, n) : 0;
             fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
@@ -1111,7 +1111,6 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
-    e->woff = FP_WOFF_NONE; /* no propagation unless call() advances the global offset below */
     if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
         e->requeued = 1; /* the main path postpones it like any other client's command */
@@ -1140,12 +1139,9 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->flag.buf_encoded = 0;
     ec->flag.pending_command = 1;
 
-    long long pre_repl_offset = server.primary_repl_offset;
+    ec->woff = e->woff; /* execute against the origin's prior causal state, not another client's */
     processCommandAndResetClient(ec);
-    /* If this command propagated, carry the offset it reached back to the origin client (applied by
-     * the IO owner). Read the server global, never the IO-owned client. A requeued command did not
-     * execute here, so it leaves the sentinel and the origin's woff is decided on the main path. */
-    if (!e->requeued && server.primary_repl_offset != pre_repl_offset) e->woff = server.primary_repl_offset;
+    e->woff = ec->woff; /* call() advanced it iff this command propagated; otherwise it stays the prior value */
 
     e->reply_off = (uint32_t)b->arena_used;
     e->reply_len = (uint32_t)ec->bufpos;

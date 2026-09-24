@@ -330,3 +330,66 @@ TEST_F(FastpathExecutorTest, OffloadedWritePropagatesWoffToOriginClient) {
     freeClient(c);
     close(sv[1]);
 }
+
+/* The blocker case: a write is in flight when the client transitions to FP_LEAVING (the WAIT/WAITAOF
+ * requeue moves it off the fast path via a handoff request). The write batch returns while the client
+ * is LEAVING, so the woff must be applied to a LEAVING (not only ACTIVE) client, or the requeued WAIT
+ * on the main path reads a stale woff. CC_REQ_HANDOFF drives the same ACTIVE->LEAVING transition the
+ * WAIT requeue does, deterministically: it is applied during the return pass, before delivery. */
+TEST_F(FastpathExecutorTest, WoffAppliedToLeavingClientBeforeHandoff) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = 727272;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40003);
+    ASSERT_EQ(inet_pton(AF_INET, "192.0.2.91", &sa.sin_addr), 1);
+    ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+    c->woff = 0;
+
+    server.replication_allowed = 1;
+    server.primary_host = NULL;
+    server.aof_state = AOF_ON;
+    server.aof_buf = sdsempty();
+    server.aof_selected_db = 0;
+
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1);
+
+    long long off_before = server.primary_repl_offset;
+    /* Publish a SET; it is in flight (not yet returned). */
+    const char *setreq = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    ASSERT_EQ(write(sv[1], setreq, strlen(setreq)), (ssize_t)strlen(setreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    ASSERT_EQ(c->fp_inflight, 1u);
+    ASSERT_EQ(c->control->lifecycle, FP_ACTIVE);
+
+    /* Execute the SET on main (advances the global offset) but do NOT process the return yet. */
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_GT(server.primary_repl_offset, off_before);
+
+    /* Request handoff: the same non-terminal transition a queued WAIT/WAITAOF causes. It moves the
+     * client ACTIVE->LEAVING during the return pass, before the SET's reply and woff are delivered. */
+    fastpathControlRequest(c->control, CC_REQ_HANDOFF);
+
+    fastpathProcessReturns(1);
+    /* woff applied to the LEAVING client, before handoff completes: this is the fix under test. */
+    EXPECT_EQ(c->woff, server.primary_repl_offset);
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);
+
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(sv[1]);
+}
