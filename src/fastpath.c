@@ -123,32 +123,52 @@ void fastpathInitThread(int tid) {
     if (tid + 1 > fp_slots) fp_slots = tid + 1;
     if (fpUringWanted()) {
         t->uring = fpUringInit(tid);
-        if (!t->uring) serverLog(LL_WARNING, "IO thread %d: io_uring init failed; fast-path sends stay on writev", tid);
+        if (!t->uring) serverLog(LL_WARNING, "IO thread %d: io_uring init failed; fast path stays on epoll", tid);
+        else fpUringSetRecvSink(t->uring, tid, fastpathUringRecv);
     }
 }
 
-/* Ring completions are reaped by the per-loop fastpathUringPump; the ring fd is deliberately NOT
- * added to epoll. A level-triggered ring fd stays readable while CQEs are pending and turns the
- * epoll loop into a busy-spin that starves the client sockets (observed: 500k epoll_pwait/3s, ~0
- * commands served). The loop already polls epoll with a zero timeout, so per-iteration pump reaps
- * completions promptly without a self-triggering fd. */
+/* Forward decl: the recv sink defined with the read path below. */
+void fastpathUringRecv(int tid, client *c, const char *buf, int len, int eof);
+
+/* When the ring is on it is the loop's blocking point, so the IO thread's epoll fd is folded into
+ * the ring via a multishot POLL_ADD: epoll readiness then arrives as a ring CQE and non-fastpath
+ * clients and control fds still wake the loop. The ring fd itself is never added to epoll. */
 void fastpathUringRegisterEpoll(int tid) {
-    UNUSED(tid);
+    fpThread *t = &fp_threads[tid];
+    if (t->uring) fpUringFoldEpoll(t->uring, ioThreadEpollFd(tid));
 }
 
-/* True if p is this thread's own fpThread pointer, i.e. an epoll event for the ring fd. */
+/* True if p is this thread's own fpThread pointer, i.e. an epoll event for the ring fd (legacy
+ * send-only path; unused once epoll is folded, kept so the poll dispatch compiles). */
 int fastpathIsUringEvent(int tid, void *p) {
     return fp_threads[tid].uring && p == (void *)&fp_threads[tid];
 }
 
-/* Reap ring completions; submit any queued sends. Called once per loop iteration and on the
- * ring fd's epoll readiness. */
+/* True when this IO thread has an active io_uring ring (uring on and init succeeded). */
+int fastpathUringActive(int tid) {
+    return fp_threads[tid].uring != NULL;
+}
+
+/* Reap ring completions without blocking; submit any queued SQEs. Used on the epoll-driven pass
+ * and while draining before a hand-back. */
 int fastpathUringPump(int tid) {
     fpThread *t = &fp_threads[tid];
     if (!t->uring) return 0;
     int n = fpUringReap(t->uring);
-    fpUringSubmit(t->uring);
     return n;
+}
+
+/* The ring is this thread's blocking point when on: one submit_and_wait per pass (bounded by the
+ * tick so batch-hold timers still fire), reaping recv/send/poll completions. Returns 1 if the
+ * folded epoll fd signalled (caller drains epoll with a zero timeout), else 0. Returns -1 when the
+ * ring is off so the caller keeps its existing epoll-blocking behavior. */
+int fastpathUringWait(int tid, int timeout_us) {
+    fpThread *t = &fp_threads[tid];
+    if (!t->uring) return -1;
+    fpUringEvents ev;
+    fpUringWaitAndReap(t->uring, timeout_us, &ev);
+    return ev.epoll_ready ? 1 : 0;
 }
 
 /* Destruction preconditions: no client, batch, ring entry or request may still name this thread. */
@@ -593,7 +613,8 @@ static int fpCurHasClient(fpThread *t, client *c) {
 static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
-    epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
+    if (t->uring) fpUringClientCancel(t->uring, c, c->conn->fd); /* ring-owned socket: cancel recv, not epoll */
+    else epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
     if (c->flag.fp_deferred) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
         c->flag.fp_deferred = 0;
@@ -732,23 +753,13 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     fpSend(t, c, &iov, 1);
 }
 
-static void fpRead(fpThread *t, int tid, client *c) {
-    c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
-    readToQueryBuf(c);
-    t->reads++;
-    if (c->nread <= 0) {
-        /* The client may still point at this thread's shared query buffer:
-         * give it back before anyone else can free it with the client. */
-        trimClientQueryBuffer(c);
-        if (c->nread < 0 && connGetState(c->conn) == CONN_STATE_CONNECTED) return; /* EAGAIN */
-        /* EOF or error: the client closes. Nothing more is read; entries in
-         * flight return first, then the main thread frees the client. */
-        fpBeginLeave(t, c, FP_CLOSING, 0);
-        return;
-    }
-    t->net_input_bytes += c->nread;
-    c->net_input_bytes += c->nread;
-    c->last_interaction = server.unixtime;
+/* Deferral helpers used by both the epoll dispatch and the uring recv sink; defined below. */
+static void fpDefer(fpThread *t, client *c);
+static void fpServeDeferred(fpThread *t, int tid);
+/* Parse loop shared by the epoll read path and the uring recv sink: drains the query buffer,
+ * speculating and harvesting commands, exactly as the post-read epilogue always has. The caller
+ * has already placed new bytes in c->querybuf and set c->nread. */
+static void fpParseHarvest(fpThread *t, int tid, client *c) {
     if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
         trimClientQueryBuffer(c);
         fpBeginLeave(t, c, FP_LEAVING, 0);
@@ -775,6 +786,72 @@ static void fpRead(fpThread *t, int tid, client *c) {
     trimClientQueryBuffer(c);
 }
 
+static void fpRead(fpThread *t, int tid, client *c) {
+    c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
+    readToQueryBuf(c);
+    t->reads++;
+    if (c->nread <= 0) {
+        /* The client may still point at this thread's shared query buffer:
+         * give it back before anyone else can free it with the client. */
+        trimClientQueryBuffer(c);
+        if (c->nread < 0 && connGetState(c->conn) == CONN_STATE_CONNECTED) return; /* EAGAIN */
+        /* EOF or error: the client closes. Nothing more is read; entries in
+         * flight return first, then the main thread frees the client. */
+        fpBeginLeave(t, c, FP_CLOSING, 0);
+        return;
+    }
+    t->net_input_bytes += c->nread;
+    c->net_input_bytes += c->nread;
+    c->last_interaction = server.unixtime;
+    fpParseHarvest(t, tid, c);
+}
+
+/* uring recv sink: bytes arrived on the ring for a fast-path client. Append them to the client's
+ * querybuf (as readToQueryBuf does for the epoll path), account, then run the shared parse loop.
+ * eof folds onto the same FP_CLOSING transition the epoll EOF path takes. Registered per thread. */
+void fastpathUringRecv(int tid, client *c, const char *buf, int len, int eof) {
+    fpThread *t = &fp_threads[tid];
+    if (c->control->lifecycle != FP_ACTIVE) return;
+    if (eof || len <= 0) {
+        trimClientQueryBuffer(c);
+        fpBeginLeave(t, c, FP_CLOSING, 0);
+        return;
+    }
+    c->read_flags = 0;
+    /* A deferred client holds its bytes in querybuf across recv CQEs, so it must own a PRIVATE
+     * buffer: the per-thread shared query buffer is reused by every other client's recv and would be
+     * clobbered, misdelivering replies. Promote off the shared buffer on first use. */
+    if (c->querybuf == NULL || c->querybuf == thread_shared_qb) {
+        sds priv = sdsempty();
+        if (c->querybuf == thread_shared_qb && sdslen(c->querybuf) > c->qb_pos)
+            priv = sdscatlen(priv, c->querybuf + c->qb_pos, sdslen(c->querybuf) - c->qb_pos);
+        if (c->querybuf == thread_shared_qb) resetSharedQueryBuf(c);
+        c->querybuf = priv;
+        c->qb_pos = 0;
+    }
+    c->querybuf = sdscatlen(c->querybuf, buf, (size_t)len);
+    c->nread = len;
+    if (c->querybuf_peak < sdslen(c->querybuf)) c->querybuf_peak = sdslen(c->querybuf);
+    size_t qb_memory = sdslen(c->querybuf) + (c->mstate ? c->mstate->argv_len_sums : 0);
+    if (qb_memory > server.client_max_querybuf_len) c->read_flags |= READ_FLAGS_QB_LIMIT_REACHED;
+    t->reads++;
+    t->net_input_bytes += len;
+    c->net_input_bytes += len;
+    c->last_interaction = server.unixtime;
+    /* Same backpressure as the epoll path: when the thread's in-flight cap is reached (or clients are
+     * already waiting), the received bytes stay buffered in querybuf and the client joins the arrival
+     * FIFO; fpServeDeferred re-parses it once capacity frees. Multishot recv keeps delivering, so the
+     * cap gates PARSING, not reading. */
+    if (c->flag.fp_deferred) return; /* already waiting; bytes appended, parse deferred */
+    if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) { fpDefer(t, c); return; }
+    if (t->inflight >= server.io_batch_inflight || listLength(&t->deferred) > 0) {
+        fpDefer(t, c);
+        fpServeDeferred(t, tid);
+        return;
+    }
+    fpParseHarvest(t, tid, c);
+}
+
 /* Clients turned away by the thread's in-flight cap wait in arrival order. The socket stays
  * level-triggered readable, but the poll only enqueues it; reads come from the FIFO head as
  * returned batches free capacity, so service order does not follow the kernel's ready list. */
@@ -791,7 +868,10 @@ static void fpServeDeferred(fpThread *t, int tid) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
         c->flag.fp_deferred = 0;
         if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
-        fpRead(t, tid, c);
+        /* uring clients have their bytes already in querybuf from the recv CQE: re-parse, do not
+         * connRead. epoll clients read from the socket as before. */
+        if (t->uring) { if (c->control->lifecycle == FP_ACTIVE) fpParseHarvest(t, tid, c); }
+        else fpRead(t, tid, c);
     }
 }
 
@@ -831,7 +911,7 @@ static int fpFlushOut(fpThread *t, client *c) {
 
 /* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
-    if (c->control->lifecycle == FP_CLOSING) return;
+    if (c->control->lifecycle == FP_CLOSING || !c->conn) return; /* closing or connection torn down: drop the reply */
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
         return;
@@ -989,9 +1069,9 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
  * residue over with the client so a slow reader cannot hold it. */
 static void fpFinishLeaving(fpThread *t) {
     if (listLength(&t->leaving) == 0) return;
-    /* Drain the ring before any hand-back so no queued send still references a leaving client's
-     * socket fd; a client is handed back only once the ring holds no outstanding send. */
-    if (t->uring && fpUringClientInflight(t->uring, NULL) > 0) { fastpathUringPump(t - fp_threads); if (fpUringClientInflight(t->uring, NULL) > 0) return; }
+    /* Pump once so cancels and sends make progress; each client is then gated on ITS OWN ring
+     * inflight, so one client's outstanding sends never stall another's hand-back. */
+    if (t->uring) fastpathUringPump(t - fp_threads);
     int open = atomic_load_explicit(&t->role, memory_order_relaxed) == FP_ROLE_OPEN;
     listNode *ln = t->leaving.head;
     while (ln) {
@@ -999,6 +1079,7 @@ static void fpFinishLeaving(fpThread *t) {
         client *c = listNodeValue(ln);
         ln = next;
         if (c->fp_inflight > 0) continue;
+        if (t->uring && fpUringClientInflight(t->uring, c) > 0) continue; /* this client's recv/send not yet drained */
         if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c)) continue; /* still draining output */
         fpUnregister(t, c);
         sendToMainThread(c, c->control->lifecycle == FP_CLOSING ? JOB_RES_FP_CLOSE : JOB_RES_FP_HANDOFF);
@@ -1085,6 +1166,10 @@ static void fpTakeClient(fpThread *t, client *c) {
     fpRegister(t, c);
     if (atomic_load_explicit(&t->role, memory_order_relaxed) != FP_ROLE_OPEN) {
         fpBeginLeave(t, c, FP_LEAVING, 0); /* admitted as the role closed: straight back to main */
+        return;
+    }
+    if (t->uring) {
+        if (fpUringClientAdd(t->uring, c, c->conn->fd) != C_OK) fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }
     struct epoll_event ev = {.events = EPOLLIN, .data.ptr = c};

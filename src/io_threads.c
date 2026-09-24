@@ -1133,11 +1133,26 @@ static void *IOThreadMain(void *myid) {
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
         }
 
-        if (io_epfd[id] > 0) processed += ioThreadPollPartition(id);
+        if (fastpathUringActive(id)) {
+            /* Ring is the blocking point: one submit_and_wait per pass (bounded by the tick),
+             * reaping recv/send/poll CQEs. Drain epoll only when the folded poll fd signalled.
+             * A pass that reaped or serviced nothing falls through to the mutex park below, which
+             * is how main quiesces or scales the thread; the ring wait already blocked in-kernel. */
+            processed += fastpathProcessReturns(id);
+            fastpathSubmitPending(id);
+            int epoll_ready = fastpathUringWait(id, 200); /* 200us tick keeps batch-hold timers live */
+            if (epoll_ready && io_epfd[id] > 0) processed += ioThreadPollPartition(id);
+            processed += fastpathProcessReturns(id);
+            /* Publish a pass so waitPartitionPass converges: the ring loop drains its own epoll only
+             * on demand, so it must still advance the sequence main waits on to retire references. */
+            atomic_fetch_add_explicit(&io_epoll_seq[id], 1, memory_order_release);
+        } else {
+            if (io_epfd[id] > 0) processed += ioThreadPollPartition(id);
 
-        processed += fastpathProcessReturns(id);
-        fastpathSubmitPending(id);
-        processed += fastpathUringPump(id); /* submit queued fast-path sends, reap completions */
+            processed += fastpathProcessReturns(id);
+            fastpathSubmitPending(id);
+            processed += fastpathUringPump(id); /* off: no-op; on-epoll path unused */
+        }
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
