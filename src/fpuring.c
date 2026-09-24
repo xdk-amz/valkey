@@ -44,8 +44,6 @@ sds fpUringInfo(sds info) { return info; }
 
 #define FPU_RING_ENTRIES 4096    /* SQ/CQ depth per IO thread */
 #define FPU_SEND_MAX 65536       /* one queued send copies at most this many bytes */
-#define FPU_BUF_COUNT 2048       /* provided buffers in the recv ring (power of two) */
-#define FPU_BUF_SIZE 16384       /* bytes per provided buffer = PROTO_IOBUF read size */
 #define FPU_BGID 0               /* buffer-group id for the recv ring */
 
 /* user_data tag lives in the low 2 bits; the high bits carry a pointer or fd. */
@@ -84,7 +82,10 @@ struct fpUringRing {
     int enabled;               /* rings enabled by the owning IO thread (SINGLE_ISSUER binds to it) */
     int epfd_folded;
     struct io_uring_buf_ring *buf_ring;
-    void *buf_base;            /* FPU_BUF_COUNT * FPU_BUF_SIZE */
+    void *buf_base;            /* buf_count * buf_size */
+    unsigned buf_count;        /* provided recv buffers (power of two); must cover the connections this thread carries */
+    unsigned buf_size;         /* bytes per provided buffer */
+    unsigned buf_mask;
     fpuSend *freelist;
     int inflight;              /* send SQEs submitted, not yet completed */
     int pending;               /* SQEs prepared, not yet submitted */
@@ -133,17 +134,24 @@ struct fpUringRing *fpUringInit(int tid) {
     r->ring_fd = r->ring.ring_fd;
     r->tid = tid;
 
-    /* Provided buffer ring for multishot recv. */
+    /* Provided buffer ring for multishot recv. The kernel takes a buffer when data arrives and the
+     * thread returns it when it reaps the CQE, so with every connection readable between two passes
+     * the count must exceed the connections the thread carries or recvs fail with ENOBUFS and wait
+     * a full pass. */
+    unsigned want = (unsigned)server.io_threads_uring_bufs;
+    r->buf_count = 64;
+    while (r->buf_count < want) r->buf_count <<= 1;
+    r->buf_size = (unsigned)server.io_threads_uring_bufsize;
+    r->buf_mask = io_uring_buf_ring_mask(r->buf_count);
     int ret = 0;
-    r->buf_ring = io_uring_setup_buf_ring(&r->ring, FPU_BUF_COUNT, FPU_BGID, 0, &ret);
+    r->buf_ring = io_uring_setup_buf_ring(&r->ring, r->buf_count, FPU_BGID, 0, &ret);
     if (!r->buf_ring) { io_uring_queue_exit(&r->ring); zfree(r); return NULL; }
-    r->buf_base = zmalloc((size_t)FPU_BUF_COUNT * FPU_BUF_SIZE);
-    unsigned mask = io_uring_buf_ring_mask(FPU_BUF_COUNT);
-    for (int i = 0; i < FPU_BUF_COUNT; i++) {
-        io_uring_buf_ring_add(r->buf_ring, (char *)r->buf_base + (size_t)i * FPU_BUF_SIZE, FPU_BUF_SIZE,
-                              i, mask, i);
+    r->buf_base = zmalloc((size_t)r->buf_count * r->buf_size);
+    for (unsigned i = 0; i < r->buf_count; i++) {
+        io_uring_buf_ring_add(r->buf_ring, (char *)r->buf_base + (size_t)i * r->buf_size, r->buf_size,
+                              (unsigned short)i, r->buf_mask, (int)i);
     }
-    io_uring_buf_ring_advance(r->buf_ring, FPU_BUF_COUNT);
+    io_uring_buf_ring_advance(r->buf_ring, (int)r->buf_count);
 
     r->clients_cap = 1024;
     r->clients = zcalloc((size_t)r->clients_cap * sizeof(fpuClient));
@@ -268,9 +276,8 @@ void fpUringSubmit(struct fpUringRing *r) {
 }
 
 static void fpuBufRingRecycle(struct fpUringRing *r, int bid) {
-    unsigned mask = io_uring_buf_ring_mask(FPU_BUF_COUNT);
-    io_uring_buf_ring_add(r->buf_ring, (char *)r->buf_base + (size_t)bid * FPU_BUF_SIZE, FPU_BUF_SIZE,
-                          bid, mask, 0);
+    io_uring_buf_ring_add(r->buf_ring, (char *)r->buf_base + (size_t)bid * r->buf_size, r->buf_size,
+                          (unsigned short)bid, r->buf_mask, 0);
     io_uring_buf_ring_advance(r->buf_ring, 1);
 }
 
@@ -333,7 +340,7 @@ static int fpuReapAll(struct fpUringRing *r, fpUringEvents *ev) {
             }
             int eof = (res <= 0);
             if (res > 0 && bid >= 0 && fc && fc->c && r->recv_fn) {
-                const char *b = (const char *)r->buf_base + (size_t)bid * FPU_BUF_SIZE;
+                const char *b = (const char *)r->buf_base + (size_t)bid * r->buf_size;
                 r->recv_fn(r->tid, fc->c, b, res, 0);
                 r->n_recv++;
                 r->n_recv_bytes += res;
@@ -431,9 +438,11 @@ void fpUringFoldEpoll(struct fpUringRing *r, int epfd) {
 
 sds fpUringInfo(sds info) {
     long long recv = 0, recvb = 0, send = 0, sendb = 0, reap = 0, enter = 0, enterr = 0, ep = 0, nob = 0, sh = 0;
+    unsigned bufs = 0, bufsize = 0;
     for (int i = 0; i < 64; i++) {
         struct fpUringRing *r = fpu_rings[i];
         if (!r) continue;
+        bufs = r->buf_count; bufsize = r->buf_size;
         recv += r->n_recv; recvb += r->n_recv_bytes; send += r->n_send; sendb += r->n_send_bytes;
         reap += r->n_reaped; enter += r->n_enter; enterr += r->n_enter_err; ep += r->n_epoll_wakes; nob += r->n_enobufs; sh += r->n_short;
     }
@@ -447,8 +456,10 @@ sds fpUringInfo(sds info) {
         "fastpath_uring_enter_err:%lld\r\n"
         "fastpath_uring_epoll_wakes:%lld\r\n"
         "fastpath_uring_enobufs:%lld\r\n"
-        "fastpath_uring_short_sends:%lld\r\n",
-        recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh);
+        "fastpath_uring_short_sends:%lld\r\n"
+        "fastpath_uring_bufs:%u\r\n"
+        "fastpath_uring_bufsize:%u\r\n",
+        recv, recvb, send, sendb, reap, enter, enterr, ep, nob, sh, bufs, bufsize);
 }
 
 #endif /* HAVE_LIBURING */
