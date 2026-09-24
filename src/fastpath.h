@@ -6,6 +6,10 @@
 
 #define IO_BATCH_MAX 64
 
+/* cmdEntry.woff sentinel: this command did not advance the replication offset, so the origin
+ * client's woff must be left as-is (conservative: never move a WAIT target past what propagated). */
+#define FP_WOFF_NONE (-1LL)
+
 #define FP_ACTIVE 0   /* read by its IO thread, commands flow through batches */
 #define FP_LEAVING 1  /* stopped reading; hands over to main once nothing is in flight */
 #define FP_CLOSING 2  /* stopped reading; main frees it once nothing is in flight */
@@ -78,6 +82,7 @@ typedef struct cmdEntry {
     struct serverCommand *cmd;
     serverDb *db;
     char *reply_big;
+    long long woff; /* Result: replication offset this command reached if it propagated, else FP_WOFF_NONE. Main writes it from the global offset; the IO owner applies it to the origin client so a later WAIT/WAITAOF waits on the right offset. */
     int argc;
     int argv_len;
     int slot;

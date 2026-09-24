@@ -256,3 +256,77 @@ TEST_F(FastpathExecutorTest, ClientInfoOfFastpathClientComesFromAdmissionPeer) {
     close(sv[0]);
     conn->fd = -1;
 }
+
+/* An offloaded write advances the global replication offset on main; the IO owner must copy that
+ * offset onto the origin client's woff when the batch returns, so a WAIT/WAITAOF the client pipelines
+ * afterwards (run on the main path) waits on the right offset. A read-only command leaves woff. */
+TEST_F(FastpathExecutorTest, OffloadedWritePropagatesWoffToOriginClient) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = 626262;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40002);
+    ASSERT_EQ(inet_pton(AF_INET, "192.0.2.90", &sa.sin_addr), 1);
+    ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+    c->woff = 0;
+
+    /* A top-level primary with no backlog/replicas still advances primary_repl_offset by 1 per
+     * propagated write (used for AOF fsync tracking); that is the offset the write "reaches".
+     * With AOF on, propagateNow feeds replicas even with none attached (the WAITAOF path), so the
+     * offset advances here exactly as it would for a real WAITAOF-relevant write. */
+    server.replication_allowed = 1;
+    server.primary_host = NULL;
+    server.aof_state = AOF_ON;
+    server.aof_buf = sdsempty();
+    server.aof_selected_db = 0;
+
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1); /* attach: the thread takes ownership */
+
+    /* A read-only GET must not move woff. */
+    long long off_before = server.primary_repl_offset;
+    const char *getreq = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n";
+    ASSERT_EQ(write(sv[1], getreq, strlen(getreq)), (ssize_t)strlen(getreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(c->woff, 0);                              /* read did not propagate */
+    EXPECT_EQ(server.primary_repl_offset, off_before); /* and did not advance the global offset */
+
+    /* A SET propagates: primary_repl_offset advances (even with no backlog/replicas) and the IO
+     * owner must carry that offset onto the origin client's woff. */
+    const char *setreq = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    ASSERT_EQ(write(sv[1], setreq, strlen(setreq)), (ssize_t)strlen(setreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_GT(server.primary_repl_offset, off_before); /* the write advanced the global offset */
+    EXPECT_EQ(c->woff, server.primary_repl_offset);    /* and it was applied to the origin client */
+
+    /* woff is monotonic: a later read must not lower it. */
+    long long woff_after_set = c->woff;
+    ASSERT_EQ(write(sv[1], getreq, strlen(getreq)), (ssize_t)strlen(getreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(c->woff, woff_after_set);
+
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(sv[1]);
+}
