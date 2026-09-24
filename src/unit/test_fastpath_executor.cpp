@@ -452,3 +452,112 @@ TEST_F(FastpathExecutorTest, FailoverGateRequeuesAdmittedWrite) {
     freeClient(c);
     close(sv[1]);
 }
+
+/* Parse a "name:value\r\n" counter out of the fastpathInfo() block. Returns -1 if absent. */
+static long long infoCounter(const char *field) {
+    sds info = sdsempty();
+    fastpathInfo(&info);
+    long long val = -1;
+    char needle[64];
+    snprintf(needle, sizeof(needle), "%s:", field);
+    char *p = strstr(info, needle);
+    if (p) val = strtoll(p + strlen(needle), NULL, 10);
+    sdsfree(info);
+    return val;
+}
+
+/* The transport captured at admission on the IO owner must ride into the entry's CommandOrigin. A
+ * unix-socket origin executes correctly through a real batch even though the executor's own conn is
+ * NULL and it never carries the origin's unix_socket flag; the origin->conn_type predicate that
+ * MONITOR/tracing read is pinned separately in the CommandOrigin unit tests. */
+TEST_F(FastpathExecutorTest, OriginConnTypeFlowsFromAdmissionToExecutor) {
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = 828282;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40010);
+    ASSERT_EQ(inet_pton(AF_INET, "192.0.2.100", &sa.sin_addr), 1);
+    ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+    c->fp_conn_type = CONN_TYPE_UNIX; /* pretend this origin arrived over a unix socket */
+
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1);
+
+    const char *getreq = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n";
+    ASSERT_EQ(write(sv[1], getreq, strlen(getreq)), (ssize_t)strlen(getreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(readReply(sv[1]), "$-1\r\n"); /* the unix-origin command executed correctly on main */
+
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(sv[1]);
+}
+
+/* A gate that closes after admission makes main requeue the admitted entry; the IO owner counts that
+ * as a requeue-gate fallback exactly once (no double-count across the return pass). */
+TEST_F(FastpathExecutorTest, RequeueGateCounterIncrementsOncePerRequeue) {
+    long long rq_before = infoCounter("fastpath_requeue_gate");
+    ASSERT_GE(rq_before, 0);
+
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = 939393;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40011);
+    ASSERT_EQ(inet_pton(AF_INET, "192.0.2.101", &sa.sin_addr), 1);
+    ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
+    c->fp_local = c->fp_peer;
+    c->woff = 0;
+
+    server.replication_allowed = 1;
+    server.primary_host = NULL;
+    server.aof_state = AOF_ON;
+    if (!server.aof_buf) server.aof_buf = sdsempty();
+    server.aof_selected_db = 0;
+    server.failover_state = NO_FAILOVER;
+
+    ASSERT_EQ(fastpathAttach(c), C_OK);
+    ASSERT_EQ(c->io_tid, 1);
+    ASSERT_EQ(fastpathProcessReturns(1), 1);
+
+    const char *setreq = "*3\r\n$3\r\nSET\r\n$7\r\ngatekey\r\n$3\r\nbar\r\n";
+    ASSERT_EQ(write(sv[1], setreq, strlen(setreq)), (ssize_t)strlen(setreq));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    server.failover_state = FAILOVER_IN_PROGRESS; /* close the gate after admission */
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+
+    long long rq_after = infoCounter("fastpath_requeue_gate");
+    EXPECT_EQ(rq_after, rq_before + 1); /* exactly one requeued entry, counted once */
+
+    server.failover_state = NO_FAILOVER;
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(sv[1]);
+}

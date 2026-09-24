@@ -1436,6 +1436,7 @@ typedef struct {
     PeerIdentity peer;
     PeerIdentity local;
     uint8_t authenticated; /* flag.authenticated of the origin; authRequired() is evaluated live by main. */
+    int8_t conn_type;      /* Origin connection type (CONN_TYPE_*), captured by the IO owner at admission; lets main render transport (MONITOR unix, tracing) without touching the connection. CONN_TYPE_INVALID if unknown. */
 } CommandOrigin;
 
 typedef struct client {
@@ -1512,6 +1513,7 @@ typedef struct client {
     listNode fp_defer_node;               /* Fast path: link in the owning IO thread's deferred FIFO while fp_deferred is set (IO thread only) */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
+    int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
     struct ClientControl *control;        /* Shared control for this connection: allocated once when it first becomes crossing-capable, reclaimed once at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
@@ -3276,6 +3278,7 @@ int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, sock
 int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len);
 int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port);
 uint64_t getClientOriginId(client *c);
+int getClientConnType(client *c);
 sds catClientInfoString(sds s, client *client, int hide_user_data);
 sds catClientInfoShortString(sds s, client *client, int hide_user_data);
 sds getAllClientsInfoString(int type, int hide_user_data);

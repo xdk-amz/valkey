@@ -953,7 +953,7 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     cmdrepr = sdscatprintf(cmdrepr, "%ld.%06ld ", (long)tv.tv_sec, (long)tv.tv_usec);
     if (c->flag.script) {
         cmdrepr = sdscatprintf(cmdrepr, "[%d lua] ", dictid);
-    } else if (c->flag.unix_socket) {
+    } else if (c->origin ? c->origin->conn_type == CONN_TYPE_UNIX : c->flag.unix_socket) {
         cmdrepr = sdscatprintf(cmdrepr, "[%d unix:%s] ", dictid, server.unixsocket);
     } else {
         cmdrepr = sdscatprintf(cmdrepr, "[%d %s] ", dictid, getClientPeerId(c));

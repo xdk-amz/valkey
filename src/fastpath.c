@@ -72,6 +72,13 @@ typedef struct fpThread {
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals;
+    /* Observability: why a client/command left the fast path, and batch-queue pressure. IO-owner-only,
+     * incremented on a decision the owner already makes, so no extra hot-path work. */
+    long long fb_gate;      /* commands that stayed on / returned to main because a dynamic gate was closed at harvest */
+    long long fb_ineligible; /* commands not admitted because their command flags are fast-path ineligible */
+    long long fb_error;     /* commands left on main because the read carried a parse/protocol error */
+    long long rq_gate;      /* entries main handed back unexecuted because a gate closed after admission */
+    long long inflight_hwm; /* high-water mark of batches submitted-but-not-returned (queue depth pressure) */
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -79,7 +86,7 @@ static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per I
 static size_t fastpath_clients = 0;                 /* main thread only */
 static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
-static long long fp_retired[6]; /* main thread only: counters of threads since retired */
+static long long fp_retired[11]; /* main thread only: counters of threads since retired */
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -153,6 +160,11 @@ void fastpathFreeThread(int tid) {
     fp_retired[3] += t->writes;
     fp_retired[4] += t->batches;
     fp_retired[5] += t->deferrals;
+    fp_retired[6] += t->fb_gate;
+    fp_retired[7] += t->fb_ineligible;
+    fp_retired[8] += t->fb_error;
+    fp_retired[9] += t->rq_gate;
+    if (t->inflight_hwm > fp_retired[10]) fp_retired[10] = t->inflight_hwm; /* gauge: keep the peak across retired threads */
     while (fp_slots > 0 && fp_threads[fp_slots - 1].submit.buffer == NULL) fp_slots--;
 }
 
@@ -231,6 +243,7 @@ static int fpCaptureAddrs(client *c) {
     if (peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, salen) != C_OK) return C_ERR;
     salen = sizeof(sa);
     if (getsockname(c->conn->fd, (struct sockaddr *)&sa, &salen) != 0) return C_ERR;
+    c->fp_conn_type = (int8_t)connGetType(c->conn); /* fixed for the connection's life; the origin's transport for MONITOR/tracing */
     return peerIdentityFromSockaddr(&c->fp_local, (struct sockaddr *)&sa, salen);
 }
 
@@ -479,6 +492,7 @@ static void fpSubmit(fpThread *t) {
     t->cur = NULL;
     spscEnqueue(&t->submit, b, true);
     t->inflight++;
+    if (t->inflight > t->inflight_hwm) t->inflight_hwm = t->inflight; /* peak batch-queue depth */
     t->batches++;
 }
 
@@ -609,6 +623,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->origin.authenticated = c->flag.authenticated;
     e->origin.peer = c->fp_peer;
     e->origin.local = c->fp_local;
+    e->origin.conn_type = c->fp_conn_type;
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
@@ -623,11 +638,15 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     int max = server.io_batch_commands;
     cmdQueue *q = &c->cmd_queue;
 
-    if (!fpDynamicGate()) leave = 1; /* a global gate is closed: hand this client to main */
+    if (!fpDynamicGate()) {
+        leave = 1; /* a global gate is closed: hand this client to main */
+        t->fb_gate++;
+    }
 
     if (!leave && c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
+            if (c->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
         } else {
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
             fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
@@ -643,6 +662,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         }
     } else if (c->read_flags & READ_FLAGS_ERROR_MASK) {
         leave = 1;
+        t->fb_error++;
     }
 
     while (!leave && q->off < q->len) {
@@ -651,6 +671,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
         if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
             leave = 1;
+            if (p->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
             break;
         }
         if (!t->cur) t->cur = fpAllocBatch(t, tid);
@@ -914,7 +935,10 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
-            if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+            if (requeued) {
+                t->rq_gate += requeued; /* main handed these back unexecuted (a gate closed after admission) */
+                fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+            }
         } else {
             /* A current handle always resolves in flight, so c==NULL implies stale: never write a reused control, but still balance a current-but-unresolved strand in release builds. */
             const ClientHandle *h = &b->e[i].handle;
@@ -1398,6 +1422,8 @@ void fastpathHandoffDone(client *c, int closing) {
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
               batches = fp_retired[4], deferrals = fp_retired[5];
+    long long fb_gate = fp_retired[6], fb_ineligible = fp_retired[7], fb_error = fp_retired[8], rq_gate = fp_retired[9],
+              inflight_hwm = fp_retired[10];
     int open = 0, quiescing = 0;
     for (int i = 1; i < fp_slots; i++) {
         if (fp_threads[i].submit.buffer == NULL) continue;
@@ -1410,6 +1436,11 @@ void fastpathInfo(sds *info) {
         writes += fp_threads[i].writes;
         batches += fp_threads[i].batches;
         deferrals += fp_threads[i].deferrals;
+        fb_gate += fp_threads[i].fb_gate;
+        fb_ineligible += fp_threads[i].fb_ineligible;
+        fb_error += fp_threads[i].fb_error;
+        rq_gate += fp_threads[i].rq_gate;
+        if (fp_threads[i].inflight_hwm > inflight_hwm) inflight_hwm = fp_threads[i].inflight_hwm;
     }
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
@@ -1420,6 +1451,12 @@ void fastpathInfo(sds *info) {
                          "fastpath_batches:%lld\r\n"
                          "fastpath_deferrals:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
-                         "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out);
+                         "fastpath_net_output_bytes:%lld\r\n"
+                         "fastpath_fallback_gate:%lld\r\n"
+                         "fastpath_fallback_ineligible:%lld\r\n"
+                         "fastpath_fallback_error:%lld\r\n"
+                         "fastpath_requeue_gate:%lld\r\n"
+                         "fastpath_inflight_batches_peak:%lld\r\n",
+                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out, fb_gate,
+                         fb_ineligible, fb_error, rq_gate, inflight_hwm);
 }

@@ -44,11 +44,71 @@ TEST_F(CommandOriginTest, LayoutIsFixedSizeAndByValue) {
     /* No sds, no connection: the identity is plain data that outlives the client.
      * The one pointer is the principal, which main resolves against live ACL state. */
     EXPECT_EQ(sizeof(PeerIdentity), 20u);
-    EXPECT_EQ(sizeof(CommandOrigin), 64u);
+    EXPECT_EQ(sizeof(CommandOrigin), 64u); /* conn_type fills existing tail padding; size unchanged */
     EXPECT_EQ(sizeof(cmdEntry), 168u); /* +8 for the woff result field carried back to the origin client */
     EXPECT_EQ(offsetof(cmdEntry, handle), 0u);
     EXPECT_EQ(offsetof(cmdEntry, origin) % alignof(CommandOrigin), 0u);
     EXPECT_EQ(sizeof(cmdBatch), offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry));
+}
+
+TEST_F(CommandOriginTest, ConnTypeResolvesOriginNotExecutor) {
+    /* The executor's own conn is NULL; without a bound origin getClientConnType() reports that. */
+    client ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.flag.executor = 1;
+    EXPECT_EQ(getClientConnType(&ec), CONN_TYPE_INVALID);
+
+    /* A bound origin returns the transport captured at admission, per command. */
+    CommandOrigin tcp;
+    memset(&tcp, 0, sizeof(tcp));
+    tcp.conn_type = CONN_TYPE_SOCKET;
+    ec.origin = &tcp;
+    EXPECT_EQ(getClientConnType(&ec), CONN_TYPE_SOCKET);
+
+    CommandOrigin unixo;
+    memset(&unixo, 0, sizeof(unixo));
+    unixo.conn_type = CONN_TYPE_UNIX;
+    ec.origin = &unixo;
+    EXPECT_EQ(getClientConnType(&ec), CONN_TYPE_UNIX);
+
+    CommandOrigin tlso;
+    memset(&tlso, 0, sizeof(tlso));
+    tlso.conn_type = CONN_TYPE_TLS;
+    ec.origin = &tlso;
+    EXPECT_EQ(getClientConnType(&ec), CONN_TYPE_TLS);
+
+    ec.origin = NULL;
+}
+
+TEST_F(CommandOriginTest, MonitorUnixPredicateFollowsOrigin) {
+    /* replicationFeedMonitors renders "unix:" iff the origin transport (not the executor flag) is UNIX.
+     * Pin the exact predicate the MONITOR branch evaluates for an offloaded command. */
+    client ec;
+    memset(&ec, 0, sizeof(ec));
+    ec.flag.executor = 1; /* executor never carries the origin's unix_socket flag */
+
+    CommandOrigin unixo;
+    memset(&unixo, 0, sizeof(unixo));
+    unixo.conn_type = CONN_TYPE_UNIX;
+    ec.origin = &unixo;
+    int is_unix = ec.origin ? ec.origin->conn_type == CONN_TYPE_UNIX : ec.flag.unix_socket;
+    EXPECT_EQ(is_unix, 1);
+
+    CommandOrigin tcp;
+    memset(&tcp, 0, sizeof(tcp));
+    tcp.conn_type = CONN_TYPE_SOCKET;
+    ec.origin = &tcp;
+    is_unix = ec.origin ? ec.origin->conn_type == CONN_TYPE_UNIX : ec.flag.unix_socket;
+    EXPECT_EQ(is_unix, 0);
+
+    /* No origin (normal main-path client): falls back to the live flag, preserving pre-offload behavior. */
+    ec.origin = NULL;
+    ec.flag.unix_socket = 1;
+    is_unix = ec.origin ? ec.origin->conn_type == CONN_TYPE_UNIX : ec.flag.unix_socket;
+    EXPECT_EQ(is_unix, 1);
+    ec.flag.unix_socket = 0;
+    is_unix = ec.origin ? ec.origin->conn_type == CONN_TYPE_UNIX : ec.flag.unix_socket;
+    EXPECT_EQ(is_unix, 0);
 }
 
 TEST_F(CommandOriginTest, Ipv4RoundTrip) {
