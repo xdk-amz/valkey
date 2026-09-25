@@ -111,6 +111,14 @@ void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
 
+/* acl-offload: main spins here after bumping the ACL epoch, until every fast-path worker
+ * has left any admission-time ACL rule-set read it may have been inside, so main may then
+ * mutate or free that rule-set memory. Cheap when idle; on the rare ACL-mutation path only. */
+void fastpathAdmissionQuiesce(void);
+/* IO-thread side: mark entry/exit of the admission region that dereferences a user's rule set. */
+void fastpathAdmitReadBegin(int tid);
+void fastpathAdmitReadEnd(int tid);
+
 /* Build a generation-checked handle for a control-bearing client. */
 ClientHandle fastpathHandleFor(client *c);
 /* True when a handle no longer matches its control's generation: the slot was reused. Reads only the

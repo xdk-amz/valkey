@@ -79,6 +79,12 @@ typedef struct fpThread {
     long long fb_error;     /* commands left on main because the read carried a parse/protocol error */
     long long rq_gate;      /* entries main handed back unexecuted because a gate closed after admission */
     long long inflight_hwm; /* high-water mark of batches submitted-but-not-returned (queue depth pressure) */
+    /* acl-offload: admission-read seqlock. The IO owner makes this odd around the region of a read
+     * that dereferences a bound user's rule set (ACL tagging), and even otherwise. Main bumps the
+     * ACL epoch, then waits (fastpathAdmissionQuiesce) until this is even or has advanced past the
+     * odd value it saw, proving no reader still holds a pre-mutation selectors pointer. One relaxed
+     * store on each side of the tag; no lock, no allocation. */
+    _Atomic uint32_t admit_seq;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -200,6 +206,49 @@ int fastpathWorkerReopen(int tid) {
     if (!fastpathWorkerDrained(tid)) return 0;
     atomic_store_explicit(&t->role, FP_ROLE_OPEN, memory_order_release);
     return 1;
+}
+
+/* acl-offload admission seqlock. The IO owner brackets the rule-set-reading region of admission
+ * (ACL tagging: the roles-list header AND each selectors list) with an odd/even publish. The Begin
+ * store is seq_cst and pairs with the seq_cst load in fastpathAdmissionQuiesce: in the single total
+ * order of seq_cst operations, either main's quiesce observes this worker odd (and waits the read
+ * out) OR the worker's odd publish is ordered after main's load, in which case the worker's
+ * subsequent rule-set loads are also ordered after main's epoch bump, so the worker re-snapshots
+ * the new epoch and reads the new (swapped) lists. A plain release store would let those loads hoist
+ * above the odd publish, so seq_cst is required here, not release. */
+void fastpathAdmitReadBegin(int tid) {
+    fpThread *t = &fp_threads[tid];
+    atomic_store_explicit(&t->admit_seq, atomic_load_explicit(&t->admit_seq, memory_order_relaxed) + 1,
+                          memory_order_seq_cst);
+}
+
+void fastpathAdmitReadEnd(int tid) {
+    fpThread *t = &fp_threads[tid];
+    atomic_store_explicit(&t->admit_seq, atomic_load_explicit(&t->admit_seq, memory_order_relaxed) + 1,
+                          memory_order_release);
+}
+
+/* Main-thread side: return once no worker still holds a rule-set pointer from before the caller's
+ * epoch bump. A worker is quiesced for our purpose when its seq is even (not in a read) or has moved
+ * on from the odd value we first saw (that read finished; its pointer is dropped). The first load is
+ * seq_cst to pair with fastpathAdmitReadBegin (see there); the spin load is acquire, enough to
+ * observe the End store that flips it even. Caller must have bumped the ACL epoch first, so any read
+ * that starts after this returns re-snapshots the epoch and will be punted by main, not trusted. */
+void fastpathAdmissionQuiesce(void) {
+    serverAssert(inMainThread());
+    /* Order the caller's prior epoch bump (and selectors/roles swap) before the admit_seq
+     * observations below, pairing with the seq_cst fence in aclOffloadTagCommand. In the single
+     * total order of seq_cst ops, a worker we observe even has not yet snapshotted the old epoch
+     * nor loaded the old rule-set list header, so it will read the new list (or be punted). */
+    atomic_thread_fence(memory_order_seq_cst);
+    for (int tid = 0; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->submit.buffer == NULL) continue;
+        uint32_t seen = atomic_load_explicit(&t->admit_seq, memory_order_seq_cst);
+        if (!(seen & 1u)) continue; /* not inside an admission read */
+        while (atomic_load_explicit(&t->admit_seq, memory_order_acquire) == seen) { /* spin: that read is still live */
+        }
+    }
 }
 
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
@@ -624,6 +673,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->origin.peer = c->fp_peer;
     e->origin.local = c->fp_local;
     e->origin.conn_type = c->fp_conn_type;
+    e->origin.acl_epoch_seen = c->acl_epoch_seen; /* acl-offload: epoch this command's verdict was tagged under */
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
@@ -636,6 +686,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
 static void fpHarvest(fpThread *t, int tid, client *c) {
     int leave = 0;
     int max = server.io_batch_commands;
+    int acl_stop = 0; /* acl-offload: stop tagging for the rest of this read after an identity/db-changing command */
     cmdQueue *q = &c->cmd_queue;
 
     if (!fpDynamicGate()) {
@@ -648,6 +699,10 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             leave = 1;
             if (c->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
         } else {
+            if (!acl_stop) {
+                aclOffloadTagCommand(c, c->parsed_cmd, c->argv, c->argc, c->db->id, &c->read_flags);
+                if (aclOffloadShouldStopTagging(c->parsed_cmd)) acl_stop = 1;
+            }
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
             fpAppendEntry(t->cur, c, c->argv, c->argc, c->argv_len, c->argv_len_sum, c->net_input_bytes_curr_cmd,
                           c->parsed_cmd, c->slot, c->read_flags);
@@ -673,6 +728,10 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             leave = 1;
             if (p->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
             break;
+        }
+        if (!acl_stop) {
+            aclOffloadTagCommand(c, p->cmd, p->argv, p->argc, c->db->id, &p->read_flags);
+            if (aclOffloadShouldStopTagging(p->cmd)) acl_stop = 1;
         }
         if (!t->cur) t->cur = fpAllocBatch(t, tid);
         fpAppendEntry(t->cur, c, p->argv, p->argc, p->argv_len, p->argv_len_sum, p->input_bytes, p->cmd, p->slot,
@@ -735,6 +794,7 @@ static void fpRead(fpThread *t, int tid, client *c) {
         parseInputBuffer(c);
         int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
         prepareCommandQueue(c);
+        aclOffloadBeginRead(c); /* snapshot the ACL epoch these commands are tagged under */
         fpHarvest(t, tid, c);
         /* Stop once the client has left the fast path, a partial command needs more
          * bytes, a parse error is pending for main, or the buffer is drained. */
@@ -1180,6 +1240,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->parsed_cmd = e->cmd;
     ec->slot = e->slot;
     ec->read_flags = e->read_flags;
+    ec->acl_epoch_seen = e->origin.acl_epoch_seen; /* acl-offload: verdict valid only if this still matches the epoch */
     ec->db = e->db;
     ec->resp = e->resp;
     ec->origin = &e->origin;

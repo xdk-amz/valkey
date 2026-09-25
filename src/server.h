@@ -1097,6 +1097,11 @@ typedef struct readyList {
 #define USER_FLAG_ROLE (1 << 3)      /* This user entry represents a role, \
                                         not a regular user. Stored in the  \
                                         Roles rax instead of Users. */
+#define USER_FLAG_BOUND (1 << 5)    /* acl-offload: a client has been bound to this  \
+                                       user (or a member, for a role) at least once, \
+                                       so an IO thread may read its rule set. Set     \
+                                       once, never cleared; main-thread only. Gates   \
+                                       the copy-on-write + quiesce discipline. */
 #define USER_FLAG_RETIRED (1 << 4)   /* Removed from Users but still named by \
                                         fast-path clients; see `successor`. */
 
@@ -1112,10 +1117,18 @@ typedef struct user {
     sds name;         /* The username as an SDS string. */
     uint32_t flags;   /* See USER_FLAG_* */
     list *passwords;  /* A list of SDS valid passwords for this user (NULL for roles). */
-    list *selectors;  /* A list of selectors this user validates commands
+    /* acl-offload: selectors and roles are read by an IO thread during admission concurrently with
+     * main-thread publication (ACLCopyUser/ACLStringSetRole swap them by release store, then quiesce
+     * before freeing the old list). They are _Atomic so every concurrent access is a defined C11
+     * atomic op on the same atomic object, not a plain load racing a cast store. A pointer stays 8
+     * bytes, so this does not change sizeof(user). Main-thread-only accesses read/write them as
+     * ordinary lvalues, which the _Atomic qualifier makes implicit seq_cst atomics (correct, and off
+     * the hot path); the publication sites use explicit release stores and the offload reader an
+     * acquire load. */
+    _Atomic(list *) selectors; /* A list of selectors this user validates commands
                          against. This list will always contain at least
                          one selector for backwards compatibility. */
-    list *roles;      /* For users: the roles held by the user, kept in the
+    _Atomic(list *) roles; /* For users: the roles held by the user, kept in the
                          order they were assigned. Elements are `user *`
                          pointers owned by the Roles rax (NULL for roles). */
     dict *members;    /* For roles: the users holding this role, keyed by their
@@ -1432,11 +1445,16 @@ typedef struct {
  * The IO thread copies fields that only main writes, and only while the client is detached. */
 typedef struct {
     uint64_t client_id;
-    user *principal; /* Live or retired user; main resolves a retired one through its successor. */
+    user *principal; /* The origin's ACL user, captured by value at admission. May be live or (if the
+                      * client was rebound/retired since) RETIRED: fpExecute resolves a retired one
+                      * to its live successor via ACLResolveUser before executing. Any rebind/retire
+                      * that changes what it resolves to also bumps the ACL epoch, so a verdict tagged
+                      * under the old principal is punted rather than trusted against the new one. */
     PeerIdentity peer;
     PeerIdentity local;
     uint8_t authenticated; /* flag.authenticated of the origin; authRequired() is evaluated live by main. */
     int8_t conn_type;      /* Origin connection type (CONN_TYPE_*), captured by the IO owner at admission; lets main render transport (MONITOR unix, tracing) without touching the connection. CONN_TYPE_INVALID if unknown. */
+    uint32_t acl_epoch_seen; /* acl-offload: low 32 bits of the ACL epoch this entry's ALLOW verdict was tagged under; main trusts READ_FLAGS_ACL_ALLOWED only while it still matches. Fills the padding hole after conn_type; no struct growth. */
 } CommandOrigin;
 
 typedef struct client {
@@ -1488,6 +1506,11 @@ typedef struct client {
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
     uint32_t redact_arg_bitmap; /* Bitmap of argument indexes that should be redacted in logs. */
+    uint32_t acl_epoch_seen;    /* acl-offload: low 32 bits of the ACL epoch the IO thread observed before
+                                 * tagging this command's ALLOW verdict; on the executor, copied from the
+                                 * entry before processCommand. Main honours READ_FLAGS_ACL_ALLOWED only
+                                 * while this still equals the global epoch. Fills the padding hole next to
+                                 * redact_arg_bitmap; unused when acl-offload is off. */
     /* Client flags and state indicators */
     union {
         struct {
@@ -2032,6 +2055,7 @@ struct valkeyServer {
     int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
     int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
@@ -2634,6 +2658,13 @@ struct valkeyServer {
     int hotkeys_top_k;               /* Number of top keys to track (Space-Saving K); 0 disables detection. */
     int hotkeys_window_seconds;      /* Length of the QPS accounting window in seconds. */
     struct spaceSavingManager *hotkeys_manager;
+    /* acl-offload counters. Appended at the struct tail so their addition shifts
+     * no existing field's offset or cache-line grouping. */
+    long long stat_acl_offload_hits;             /* verdicts consumed without a main-thread ACL evaluation */
+    long long stat_acl_offload_punts;            /* tagged verdicts rejected (epoch/principal moved), re-evaluated on main */
+    long long stat_acl_offload_quiesce_count;    /* waits for in-flight IO jobs before mutating/freeing ACL rule-set memory */
+    long long stat_acl_offload_quiesce_total_us; /* total time spent in those waits */
+    long long stat_acl_offload_quiesce_max_us;   /* longest single wait */
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -3173,6 +3204,10 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
+#define READ_FLAGS_ACL_ALLOWED (1 << 24) /* acl-offload: an IO thread evaluated this command's ACL     \
+                                            permissions under client->acl_epoch_seen and it passed.    \
+                                            Only ALLOW is recorded; a denial leaves the bit clear and  \
+                                            main runs the stock check to produce the exact error. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                     \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
@@ -3702,6 +3737,16 @@ user *ACLCreateUnlinkedUser(void);
 void ACLFreeUserAndKillClients(user *u);
 user *ACLResolveUser(user *u);
 void ACLFastpathClientReturned(client *c);
+/* acl-offload: IO-thread tagging + main-thread consume, and the copy-on-write/quiesce
+ * lifetime discipline that lets an IO thread read a bound user's rule set safely. */
+void aclOffloadBeginRead(client *c);
+void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int dbid, int *read_flags);
+int aclOffloadShouldStopTagging(struct serverCommand *cmd);
+int aclOffloadConsume(client *c, int *idxptr);
+void aclOffloadBumpEpoch(void);
+void aclOffloadQuiesce(void);
+void aclMarkUserBound(user *u);
+uint32_t aclOffloadEpoch(void);
 void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
 sds getAclErrorMessage(int acl_res, user *user, struct serverCommand *cmd, sds errored_val, int verbose);
 void ACLUpdateDefaultUserPassword(sds password);

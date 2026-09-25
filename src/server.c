@@ -3049,6 +3049,11 @@ void resetServerStats(void) {
     server.stat_net_cluster_slot_import_bytes = 0;
     server.stat_unexpected_error_replies = 0;
     server.stat_total_error_replies = 0;
+    server.stat_acl_offload_hits = 0;
+    server.stat_acl_offload_punts = 0;
+    server.stat_acl_offload_quiesce_count = 0;
+    server.stat_acl_offload_quiesce_total_us = 0;
+    server.stat_acl_offload_quiesce_max_us = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
     server.stat_reply_buffer_shrinks = 0;
@@ -4715,7 +4720,8 @@ void prepareCommandQueue(client *c) {
 /* Undo prepareCommand(), to allow prepareCommand() again after applying command filters. */
 void unprepareCommand(client *c) {
     c->parsed_cmd = NULL;
-    c->read_flags &= ~(READ_FLAGS_COMMAND_NOT_FOUND |
+    c->read_flags &= ~(READ_FLAGS_ACL_ALLOWED | /* acl-offload: argv may have been rewritten by a filter */
+                       READ_FLAGS_COMMAND_NOT_FOUND |
                        READ_FLAGS_BAD_ARITY |
                        READ_FLAGS_CROSSSLOT |
                        READ_FLAGS_NO_KEYS);
@@ -4849,7 +4855,7 @@ int processCommand(client *c) {
     /* Check if the user can run this command according to the current
      * ACLs. */
     int acl_errpos = 0;
-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+    int acl_retval = aclOffloadConsume(c, &acl_errpos);
     if (acl_retval != ACL_OK) {
         addACLLogEntry(c, acl_retval, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, acl_errpos, NULL,
                        NULL);
@@ -7014,6 +7020,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
                 "expire_cycle_cpu_milliseconds:%lld\r\n", server.stat_expire_cycle_time_used / 1000,
                 "evicted_keys:%lld\r\n", server.stat_evictedkeys,
+                "acl_offload_hits:%lld\r\n", server.stat_acl_offload_hits,
+                "acl_offload_punts:%lld\r\n", server.stat_acl_offload_punts,
+                "acl_offload_quiesce_count:%lld\r\n", server.stat_acl_offload_quiesce_count,
+                "acl_offload_quiesce_total_us:%lld\r\n", server.stat_acl_offload_quiesce_total_us,
+                "acl_offload_quiesce_max_us:%lld\r\n", server.stat_acl_offload_quiesce_max_us,
                 "evicted_clients:%lld\r\n", server.stat_evictedclients,
                 "evicted_scripts:%lld\r\n", server.stat_evictedscripts,
                 "total_eviction_exceeded_time:%lld\r\n", (server.stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
