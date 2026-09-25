@@ -253,6 +253,39 @@ start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-thre
         assert_match "*acl_offload_quiesce_total_us:*" $stats
         assert_match "*acl_offload_quiesce_max_us:*" $stats
     }
+
+    test {acl-offload: io-threads-fast-path disable/re-enable keeps results correct} {
+        ao_default_allow {~foo:* +@read +set}
+        # ON: a client attaches and offloaded verdicts are consumed.
+        set a [ao_client]
+        ao_wait_fastpath_clients 1
+        set h0 [ao_hits]
+        for {set i 0} {$i < 30} {incr i} { $a set foo:$i on1 }
+        for {set i 0} {$i < 30} {incr i} { assert_equal OK [$a read] }
+        wait_for_condition 100 20 { [ao_hits] > $h0 } else { fail "no hits while fast path on: [r info stats]" }
+        $a close
+        # DISABLE at runtime: attached clients hand back, nothing new attaches, commands run on main.
+        r config set io-threads-fast-path no
+        ao_wait_fastpath_clients 0
+        set b [ao_client]
+        set h1 [ao_hits]
+        for {set i 0} {$i < 30} {incr i} { $b set foo:$i off }
+        for {set i 0} {$i < 30} {incr i} { assert_equal OK [$b read] }
+        assert_equal 0 [getInfoProperty [r info fastpath] fastpath_clients]
+        assert_equal $h1 [ao_hits]
+        $b get foo:0; assert_equal off [$b read]
+        $b close
+        # RE-ENABLE: attachment and offload resume, results stay correct.
+        r config set io-threads-fast-path yes
+        set c [ao_client]
+        ao_wait_fastpath_clients 1
+        set h2 [ao_hits]
+        for {set i 0} {$i < 30} {incr i} { $c set foo:$i on2 }
+        for {set i 0} {$i < 30} {incr i} { assert_equal OK [$c read] }
+        wait_for_condition 100 20 { [ao_hits] > $h2 } else { fail "no hits after re-enable: [r info stats]" }
+        $c get foo:0; assert_equal on2 [$c read]
+        $c close
+    }
 }
 
 start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload no}} {
