@@ -852,6 +852,15 @@ int aclOffloadConsume(client *c, int *idxptr) {
     return ACLCheckAllPerm(c, idxptr);
 }
 
+/* True iff an ACL reload retires u: u is one of the old users about to be released, so a
+ * fast-path client naming it needs a keep-alive that ACLFastpathClientReturned later drops.
+ * Matched by identity, so a surviving user (an unlinked module user is absent from old_users,
+ * and a same-named new user is a different object) is never retired and takes no keep-alive. */
+int aclReloadRetiresPrincipal(rax *old_users, user *u) {
+    void *found;
+    return raxFind(old_users, (unsigned char *)u->name, sdslen(u->name), &found) && found == u;
+}
+
 /* Main owns the client again: retired principals resolve and drop their reference. */
 void ACLFastpathClientReturned(client *c) {
     user *u = c->user;
@@ -3761,8 +3770,13 @@ static sds ACLLoadFromFile(const char *filename) {
                 }
             }
             if (c->flag.fastpath) {
-                /* IO-owned: its principal is retired and resolves to new_user until the client returns. */
-                if (original != DefaultUser) original->fp_refs++;
+                /* IO-owned. Keep the principal alive across the pending handback only when this
+                 * reload retires it. A surviving user (an unlinked module user) is never retired, so
+                 * a keep-alive on it would never be released: ACLFastpathClientReturned drops refs on
+                 * retired principals only. Such a user stays alive on its own; if its owner frees it
+                 * mid-detach, ACLFreeUserAndKillClients takes the ref then (the client is still linked
+                 * here). */
+                if (aclReloadRetiresPrincipal(old_users, original)) original->fp_refs++;
                 if (!new_user) freeClient(c);
                 continue;
             }
