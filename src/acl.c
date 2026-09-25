@@ -3490,6 +3490,10 @@ static void ACLRemapSurvivingRoleMembers(rax *old_roles) {
                     serverAssert(dictAdd(new_role->members, u, u) == DICT_OK);
             }
         }
+        /* Defensive: the reconciliation above touches member dicts only, never u->roles, so old_list
+         * is unreachable exactly because new_list stays the published pointer. Assert that before
+         * freeing it, so a future edit that re-publishes u->roles here trips CI instead of a UAF. */
+        serverAssert(atomic_load_explicit(&u->roles, memory_order_relaxed) == new_list);
         listRelease(old_list);
         if (u->acl_string) {
             decrRefCount(u->acl_string);
