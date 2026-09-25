@@ -6,7 +6,11 @@
 #include "memory_prefetch.h"
 #include "throttle.h"
 #include "module.h"
+#ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
+#else
+#include "fastpath_no_epoll.h"
+#endif
 #include <sys/uio.h>
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
@@ -254,6 +258,10 @@ void fastpathAdmissionQuiesce(void) {
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
 static int fpDynamicGate(void); /* defined below; global-state capability gate consulted here too */
 static int fpSessionEligible(client *c) {
+#ifndef HAVE_FASTPATH_EPOLL
+    (void)c;
+    return 0; /* fast path requires epoll; the feature is compiled out on this platform */
+#else
     if (!server.io_threads_fast_path) return 0;
     if (!strictOffloadActive() || server.io_threads_num < 2) return 0;
     if (!c->conn || c->flag.fake) return 0;
@@ -268,6 +276,7 @@ static int fpSessionEligible(client *c) {
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
     return 1;
+#endif
 }
 
 int fastpathEligible(client *c) {
