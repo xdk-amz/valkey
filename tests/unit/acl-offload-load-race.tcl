@@ -12,6 +12,13 @@
 # a persistent module user, assigns it the (already-existing) role, and authenticates the calling
 # connection to it. The module user is NOT in the aclfile, so ACL LOAD leaves it surviving and hits
 # the remap path.
+#
+# Run under ThreadSanitizer to prove the survivor remap is data-race-free (build both the server and
+# the module instrumented, and extend the timeout to absorb TSan's slowdown):
+#   make -j SANITIZER=thread && make -C tests/modules SANITIZER=thread
+#   ./runtest --single unit/acl-offload-load-race --timeout 2400
+# The role-holder's admission still reads u->roles (the offload-eligibility check) while ACL LOAD
+# swaps it, so a regression to in-place mutation surfaces here as a TSan report on u->roles.
 
 set modpath [file normalize tests/modules/aclcheck.so]
 
