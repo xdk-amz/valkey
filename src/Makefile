@@ -874,6 +874,21 @@ test-cluster: $(SERVER_NAME) $(ENGINE_CLI_NAME)
 
 check: test
 
+# Verify the fast path compiles cleanly with epoll gated out (the disabled, non-Linux path).
+# Forces the no-epoll build on any host and fails if fastpath.c or io_threads.c still reference
+# epoll. Runtime behavior on a non-epoll platform is compile-validated here, not runtime-validated.
+test-no-epoll-gate:
+	@set -e; d=$$(mktemp -d); \
+	$(CC) $(FINAL_CFLAGS) -I. -DFASTPATH_FORCE_NO_EPOLL -o $$d/fp.o -c fastpath.c; \
+	$(CC) $(FINAL_CFLAGS) -I. -DFASTPATH_FORCE_NO_EPOLL -o $$d/io.o -c io_threads.c; \
+	if nm $$d/fp.o $$d/io.o | grep -qE ' U epoll_(ctl|wait|create1)'; then \
+		echo "no-epoll gate FAILED: epoll symbol referenced"; rm -rf $$d; exit 1; \
+	fi; \
+	rm -rf $$d; \
+	echo "no-epoll gate OK: fast path compiles with epoll disabled and references no epoll symbol"
+
+.PHONY: test-no-epoll-gate
+
 lcov:
 	@lcov --version
 	$(MAKE) gcov

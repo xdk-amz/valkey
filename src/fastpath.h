@@ -4,6 +4,14 @@
 #include "server.h"
 #include "queues.h"
 
+/* The fast path partitions clients onto per-IO-thread epoll instances, so it is compiled only where
+ * epoll exists; elsewhere the feature is disabled and fpSessionEligible() returns 0. Gate on the
+ * existing HAVE_EPOLL contract. FASTPATH_FORCE_NO_EPOLL forces the disabled path for a build test
+ * on an epoll host. */
+#if defined(HAVE_EPOLL) && !defined(FASTPATH_FORCE_NO_EPOLL)
+#define HAVE_FASTPATH_EPOLL 1
+#endif
+
 #define IO_BATCH_MAX 64
 
 #define FP_ACTIVE 0   /* read by its IO thread, commands flow through batches */
