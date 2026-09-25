@@ -3747,6 +3747,7 @@ void aclOffloadBumpEpoch(void);
 void aclOffloadQuiesce(void);
 void aclMarkUserBound(user *u);
 uint32_t aclOffloadEpoch(void);
+int aclReloadRetiresPrincipal(rax *old_users, user *u);
 void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
 sds getAclErrorMessage(int acl_res, user *user, struct serverCommand *cmd, sds errored_val, int verbose);
 void ACLUpdateDefaultUserPassword(sds password);
