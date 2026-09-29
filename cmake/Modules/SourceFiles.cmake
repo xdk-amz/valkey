@@ -24,6 +24,8 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/release.c
     ${CMAKE_SOURCE_DIR}/src/memory_prefetch.c
     ${CMAKE_SOURCE_DIR}/src/io_threads.c
+    ${CMAKE_SOURCE_DIR}/src/fastpath.c
+    ${CMAKE_SOURCE_DIR}/src/poller.c
     ${CMAKE_SOURCE_DIR}/src/networking.c
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/object.c
