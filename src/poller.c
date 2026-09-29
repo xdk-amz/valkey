@@ -19,22 +19,30 @@ typedef struct pollerReg {
     pollerHandler handler;
     void *privdata;
     int mask; /* requested interest */
-    pollerAffinity affinity;
-    int registered;
+    uint8_t affinity;
+    uint8_t registered;
 } pollerReg;
 
 struct poller {
     int epfd;
     int setsize;
+    int maxevents; /* fds one pollerGetFDs reports at most; level-triggered, so the rest fire next time */
     _Atomic(int) count;        /* registered fds; IO threads register/unregister concurrently in a phase */
-    pollerReg *regs;           /* setsize entries, indexed by fd */
-    struct epoll_event *fired; /* setsize entries, epoll_wait scratch */
-    pollerEvent *io_ready;     /* setsize entries; drained by IO threads via io_cursor */
+    pollerReg *regs;           /* regs_cap entries, indexed by fd; grows with the highest fd registered */
+    int regs_cap;
+    struct epoll_event *fired; /* maxevents entries, epoll_wait scratch */
+    pollerEvent *io_ready;     /* maxevents entries; drained by IO threads via io_cursor */
     int io_count;              /* filled by pollerGetFDs (single writer: main) */
     _Atomic(int) io_cursor;    /* next unclaimed IO entry */
-    pollerEvent *main_ready;   /* setsize entries; walked by main */
+    pollerEvent *main_ready;   /* maxevents entries; walked by main */
     int main_count;
 };
+
+#define POLLER_MAX_EVENTS 1024
+
+static int pollerMaxEvents(int setsize) {
+    return setsize < POLLER_MAX_EVENTS ? setsize : POLLER_MAX_EVENTS;
+}
 
 static int maskToEpoll(int mask) {
     int ev = 0;
@@ -48,16 +56,16 @@ poller *pollerCreate(int setsize) {
     poller *p = zcalloc(sizeof(*p));
     if (!p) return NULL;
     p->setsize = setsize;
+    p->maxevents = pollerMaxEvents(setsize);
     p->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (p->epfd < 0) {
         zfree(p);
         return NULL;
     }
-    p->regs = zcalloc(sizeof(pollerReg) * setsize);
-    p->fired = zmalloc(sizeof(struct epoll_event) * setsize);
-    p->io_ready = zmalloc(sizeof(pollerEvent) * setsize);
-    p->main_ready = zmalloc(sizeof(pollerEvent) * setsize);
-    if (!p->regs || !p->fired || !p->io_ready || !p->main_ready) {
+    p->fired = zmalloc(sizeof(struct epoll_event) * p->maxevents);
+    p->io_ready = zmalloc(sizeof(pollerEvent) * p->maxevents);
+    p->main_ready = zmalloc(sizeof(pollerEvent) * p->maxevents);
+    if (!p->fired || !p->io_ready || !p->main_ready) {
         pollerFree(p);
         return NULL;
     }
@@ -76,8 +84,22 @@ void pollerFree(poller *p) {
     zfree(p);
 }
 
+/* Main only: may move the table, so IO threads must not be using it. */
+static int pollerRegsCover(poller *p, int fd) {
+    if (fd < p->regs_cap) return 0;
+    int cap = p->regs_cap ? p->regs_cap : 64;
+    while (cap <= fd) cap *= 2;
+    if (cap > p->setsize) cap = p->setsize;
+    pollerReg *regs = zrealloc(p->regs, sizeof(pollerReg) * cap);
+    memset(regs + p->regs_cap, 0, sizeof(pollerReg) * (cap - p->regs_cap));
+    p->regs = regs;
+    p->regs_cap = cap;
+    return 0;
+}
+
 int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *privdata, pollerAffinity affinity) {
     if (fd < 0 || fd >= p->setsize) return -1;
+    pollerRegsCover(p, fd);
     pollerReg *r = &p->regs[fd];
     if (r->registered) return -1;
     if (affinity != POLLER_AFF_IO && affinity != POLLER_AFF_MAIN) return -1;
@@ -95,7 +117,7 @@ int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *pri
 }
 
 int pollerModify(poller *p, int fd, int mask) {
-    if (fd < 0 || fd >= p->setsize) return -1;
+    if (fd < 0 || fd >= p->regs_cap) return -1;
     pollerReg *r = &p->regs[fd];
     if (!r->registered) return -1;
     if (r->mask == mask) return 0;
@@ -109,6 +131,7 @@ int pollerModify(poller *p, int fd, int mask) {
 
 int pollerUnregister(poller *p, int fd) {
     if (fd < 0 || fd >= p->setsize) return -1;
+    if (fd >= p->regs_cap) return 0;
     pollerReg *r = &p->regs[fd];
     if (!r->registered) return 0;
     /* Kernels before 2.6.9 need a non-null event even for DEL; a closed fd is already gone, so errors are ignored. */
@@ -143,12 +166,12 @@ int pollerGetFDs(poller *p, long long timeout_us) {
     atomic_store_explicit(&p->io_cursor, 0, memory_order_relaxed);
 
     /* EINTR is reported as zero fired fds rather than retried, so a signal cannot extend the wait. */
-    int n = epoll_wait(p->epfd, p->fired, p->setsize, timeout_ms);
+    int n = epoll_wait(p->epfd, p->fired, p->maxevents, timeout_ms);
     if (n < 0) return errno == EINTR ? 0 : -1;
 
     for (int i = 0; i < n; i++) {
         int fd = p->fired[i].data.fd;
-        if (fd < 0 || fd >= p->setsize) continue;
+        if (fd < 0 || fd >= p->regs_cap) continue;
         pollerReg *r = &p->regs[fd];
         if (!r->registered) continue;
         pollerEvent e = {
@@ -204,14 +227,16 @@ int pollerSetSize(const poller *p) {
 int pollerResize(poller *p, int setsize) {
     if (setsize <= 0) return -1;
     if (setsize == p->setsize) return 0;
-    for (int fd = setsize; fd < p->setsize; fd++)
+    for (int fd = setsize; fd < p->regs_cap; fd++)
         if (p->regs[fd].registered) return -1;
-    pollerReg *regs = zrealloc(p->regs, sizeof(pollerReg) * setsize);
-    if (setsize > p->setsize) memset(regs + p->setsize, 0, sizeof(pollerReg) * (setsize - p->setsize));
-    p->regs = regs;
-    p->fired = zrealloc(p->fired, sizeof(struct epoll_event) * setsize);
-    p->io_ready = zrealloc(p->io_ready, sizeof(pollerEvent) * setsize);
-    p->main_ready = zrealloc(p->main_ready, sizeof(pollerEvent) * setsize);
+    if (p->regs_cap > setsize) {
+        p->regs = zrealloc(p->regs, sizeof(pollerReg) * setsize);
+        p->regs_cap = setsize;
+    }
+    p->maxevents = pollerMaxEvents(setsize);
+    p->fired = zrealloc(p->fired, sizeof(struct epoll_event) * p->maxevents);
+    p->io_ready = zrealloc(p->io_ready, sizeof(pollerEvent) * p->maxevents);
+    p->main_ready = zrealloc(p->main_ready, sizeof(pollerEvent) * p->maxevents);
     p->io_count = p->main_count = 0;
     atomic_store_explicit(&p->io_cursor, 0, memory_order_relaxed);
     p->setsize = setsize;
