@@ -593,37 +593,6 @@ void debugCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "assert")) {
         serverAssertWithInfo(c, c->argv[0], 1 == 2);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-prevalidate-hold") && (c->argc == 3 || c->argc == 4)) {
-        long long milliseconds;
-        if (getLongLongFromObjectOrReply(c, c->argv[2], &milliseconds, NULL) != C_OK) return;
-        if (milliseconds < 1 || milliseconds > 5000) {
-            addReplyError(c, "D+ prevalidate hold must be between 1 and 5000 milliseconds");
-        } else if (dplusDebugHoldPrevalidate(milliseconds * 1000) != C_OK) {
-            addReplyError(c, "D+ prevalidate hold requires an instrumented build or is already armed");
-        } else {
-            if (c->argc >= 4 && !strcasecmp(objectGetVal(c->argv[3]), "bump")) dplusDebugPrevalidateBump();
-            addReply(c, shared.ok);
-        }
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-pv-state") && c->argc == 2) {
-        uint64_t holding, consumed;
-        dplusDebugPrevalidateState(&holding, &consumed);
-        addReplyArrayLen(c, 2);
-        addReplyLongLong(c, (long long)holding);
-        addReplyLongLong(c, (long long)consumed);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-shard-version") && c->argc == 3) {
-        /* S5 diagnostic: reply [shard, version] for the key's shard in db->keys. */
-        int dict_index = getKVStoreIndexForKey(objectGetVal(c->argv[2]));
-        hashtable *ht = kvstoreGetHashtable(c->db->keys, dict_index);
-        dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
-        if (!va) {
-            addReplyError(c, "no version array");
-        } else {
-            uint64_t h = hashtableHashKey(ht, objectGetVal(c->argv[2]));
-            unsigned shard = DPLUS_SHARD_INDEX(h);
-            addReplyArrayLen(c, 2);
-            addReplyLongLong(c, (long long)shard);
-            addReplyLongLong(c, (long long)dplusVersionRead(va, shard));
-        }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char *)objectGetVal(c->argv[2]));
         addReply(c, shared.ok);

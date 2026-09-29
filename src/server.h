@@ -3491,18 +3491,6 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
-/* D+: bracket a mutation of a PUBLISHED key's value from command code without exposing
- * dplus internals. Begin computes the shard from the table's own hash fn; End closes it. */
-typedef struct dbKeyBracket {
-    void *va; /* dplusVersionArray* (opaque here) */
-    unsigned shard;
-} dbKeyBracket;
-void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);
-void dbKeyBracketEnd(dbKeyBracket *brk);
-/* Ensure a published RAW string value has capacity for total_len bytes, safely vs speculative
- * readers: unchanged sds when capacity suffices, else a published replacement with the old
- * allocation defer-freed. Call INSIDE a bracket. */
-sds dbGrowPublishedStringValue(robj *o, size_t total_len);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */

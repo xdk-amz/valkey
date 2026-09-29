@@ -9,21 +9,6 @@
 # you have not root-caused.
 
 # ---------------------------------------------------------------------------
-# Class 1: seqlock speculative reads (BY DESIGN).
-# dplusSpeculateBatch executes GETs on IO threads by reading hashtable
-# buckets, entry keys, and robj values WITHOUT locks, racing main's writers
-# (insert/moveEntry/rehashEntry/dbSetValue/memset) by construction. Torn or
-# stale reads are expected and discarded: the sharded seqlock version check
-# (dplusValidateAndReply) rejects any read that overlapped a mutation, and
-# entry/table memory lifetime is guaranteed by quiescence-deferred
-# reclamation (limbo lists), verified by ASan and the expiry-race gauntlet.
-# Every by-design racy read has dplusSpeculateBatch in its stack, so this
-# single entry scopes the whole class. True bugs in this path are covered
-# by: seqlock validation itself, ASan legs, the V4 differential fuzzer,
-# and ownership.tcl.
-race:dplusSpeculateBatch
-
-# ---------------------------------------------------------------------------
 # Class 2: owned-client handshake (FENCE-ORDERED; TSan limitation).
 # The door-2 owned-client handshake (io_read_state / io_write_state /
 # flag.pending_write) uses volatile fields ordered by explicit

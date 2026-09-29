@@ -9,22 +9,9 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-/* S5: second preemption point -- holds the reader AFTER the value copy and
- * BEFORE validation, the window every torn-state test needs. */
-static _Atomic(long long) dplus_debug_prevalidate_hold_us = 0;
-static _Atomic(int) dplus_debug_prevalidate_bump = 0;
-static _Atomic(uint64_t) dplus_debug_prevalidate_consumed = 0;
-static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
-static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
-static _Atomic(int) dplus_debug_reader_holding = 0;
-#endif
 
 /* --- Per-IO-thread command counters (no-enqueue Phase-1) --- */
 dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
-
-/* --- Write-tax gate (per-IO-thread) --- */
-dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS] = {{.history = ~(uint64_t)0}}; /* Start optimistic (all-ones = all speculated) */
 
 /* D5: worker -> main signal that some owned client's output has crossed
  * maxmemory-clients while no completion is flowing (WAITING_WRITABLE hog).
@@ -160,29 +147,20 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
 /* Maximum batch depth for prefetch overlap. Matches server.prefetch_batch_max_size default. */
 #define DPLUS_BATCH_DEPTH 16
 
-/* Per-key state for the batched prefetch + validate pipeline. */
+/* Per-key state for the batched prefetch + reply pipeline. */
 typedef struct dplusBatchEntry {
-    void *key_sds;                           /* SDS key string */
-    uint64_t hash;                           /* Pre-computed hash */
-    unsigned shard;                          /* Version shard index */
-    uint64_t v_before;                       /* Version read before find */
     hashtableIncrementalFindState find_state; /* Incremental find state */
-    int is_first_cmd;                        /* 1 if this is c->argv, 0 if queue */
-    int queue_idx;                           /* Index in cmd_queue (if !is_first_cmd) */
+    int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
+    int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } dplusBatchEntry;
 
-/* Execute the validate+copy+reply phase for a single prefetched entry.
- * Returns 1 on success (reply written), 0 on punt. */
-static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, int resp) {
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
-    (void)resp; /* GET bulk reply is RESP-version-agnostic; misses now punt (E4). */
-
-    /* Get the find result — entry is now in cache from prefetch. */
+/* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
+ * written), 0 on punt. The keyspace is quiescent while IO threads read: main
+ * mutates it only outside the read phase. */
+static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
     void *entry = NULL;
-    bool found = hashtableIncrementalFindGetResult(&e->find_state, &entry);
-
-    if (!found) {
-        /* Key not found — punt on miss (E4): main fires the keymiss notification
+    if (!hashtableIncrementalFindGetResult(&e->find_state, &entry)) {
+        /* Key not found -- punt on miss (E4): main fires the keymiss notification
          * and increments stat_keyspace_misses exactly. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         DPLUS_STAT_ADD(miss_punts, 1);
@@ -190,13 +168,10 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         return 0;
     }
 
-    /* Found an entry. It's an robj*. */
     robj *o = (robj *)entry;
-
-    /* Type check: must be OBJ_STRING. */
     if (objectGetType(o) != OBJ_STRING) return 0;
 
-    /* Expiry check. */
+    /* Expired keys punt: only main may lazily delete them. */
     if (o->hasexpire) {
         mstime_t when = objectGetExpire(o);
         if (when >= 0 && mstime() >= when) {
@@ -207,104 +182,41 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         }
     }
 
-    /* Value extraction: copy BEFORE validation re-read. */
-    char valbuf[DPLUS_MAX_SPECULATIVE_VALUE_LEN + 21];
+    char intbuf[LONG_STR_SIZE];
+    const char *val;
     size_t vallen;
     int encoding = objectGetEncoding(o);
-
     if (encoding == OBJ_ENCODING_INT) {
-        long long intval = (long long)(long)objectGetVal(o);
-        vallen = ll2string(valbuf, sizeof(valbuf), intval);
+        vallen = ll2string(intbuf, sizeof(intbuf), (long long)(long)objectGetVal(o));
+        val = intbuf;
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
-        sds s = objectGetVal(o);
-        vallen = sdslen(s);
+        val = objectGetVal(o);
+        vallen = sdslen((sds)val);
         if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             DPLUS_STAT_ADD(large_value_punts, 1);
 #endif
             return 0;
         }
-        memcpy(valbuf, s, vallen);
     } else {
         return 0;
     }
 
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    /* S5 test-only preemption point: pause between the value copy and the
-     * validation re-read. A mutation running on main during this pause MUST
-     * cause the validation below to fail (T-* torn-window battery). Reuses
-     * the holding/release handshake of the pre-lookup hold. */
-    {
-        long long pv_hold_us = atomic_exchange_explicit(&dplus_debug_prevalidate_hold_us, 0, memory_order_seq_cst);
-        if (unlikely(pv_hold_us > 0)) {
-            atomic_fetch_add_explicit(&dplus_debug_prevalidate_consumed, 1, memory_order_seq_cst);
-            {
-                size_t klen = sdslen((sds)e->key_sds);
-                if (klen > sizeof(dplus_debug_pv_last_key) - 1) klen = sizeof(dplus_debug_pv_last_key) - 1;
-                memcpy(dplus_debug_pv_last_key, e->key_sds, klen);
-                dplus_debug_pv_last_key[klen] = '\0';
-                atomic_store_explicit(&dplus_debug_pv_last_client, c->id, memory_order_seq_cst);
-            }
-            /* Plain bounded sleep -- UNLIKE the pre-lookup hold there is no
-             * release handshake: that loop is released by exclusive
-             * entrants (pressure tests), but torn-window tests mutate on
-             * main WITHOUT entering exclusive, so a wait here would spin to
-             * its panic bound. The test observes 'holding', runs its
-             * mutation (micro to milliseconds), and the reader wakes into
-             * validation on its own. */
-            atomic_store_explicit(&dplus_debug_reader_holding, 1, memory_order_seq_cst);
-            usleep((useconds_t)pv_hold_us);
-            /* Injected writer bracket (T-* torn-window battery): a LIVE
-             * mutation can never land inside this window -- the parked
-             * worker freezes main at the waitForClientIO rendezvous
-             * (verified: zero serverCron heartbeats for the full hold), so
-             * every command-driven mutation serializes after the wake.
-             * Instead, model the concurrent writer minimally: one full
-             * odd/even bracket on this entry's shard. Validation below MUST
-             * fail. Writer-side bracket coverage is proven separately by
-             * the dplus-shard-version probe tests (no timing needed). */
-            if (atomic_exchange_explicit(&dplus_debug_prevalidate_bump, 0, memory_order_seq_cst)) {
-                dplusVersionBracketBegin(va, e->shard);
-                dplusVersionBracketEnd(va, e->shard);
-            }
-            atomic_store_explicit(&dplus_debug_reader_holding, 0, memory_order_seq_cst);
-        }
-    }
-#endif
-
-    /* VALIDATION RE-READ: fenced check that shard version is unchanged.
-     * dplusVersionValidate issues the acquire fence that orders the value
-     * copy above before the version re-read. */
-    if (!dplusVersionValidate(va, e->shard, e->v_before)) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        DPLUS_STAT_ADD(validation_misses, 1);
-#endif
-        return 0;
-    }
-
-    /* Version valid — write reply. */
-    int written = dplusWriteBulkReply(c, valbuf, vallen);
-    if (written <= 0) return 0;
-
+    if (dplusWriteBulkReply(c, val, vallen) <= 0) return 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     DPLUS_STAT_ADD(speculative_hits, 1);
 #endif
     return 1;
 }
 
-/* Called from ioThreadReadQueryFromClient after parsing is complete.
- * Iterates the parsed command queue attempting speculative GETs on a
- * contiguous prefix. Uses batched incremental-find to overlap memory
- * prefetches across multiple keys before executing the serial
- * validate+copy+reply phase with warm caches.
+/* Called from the IO thread after parsing is complete. Executes a contiguous
+ * prefix of GET commands, using batched incremental finds to overlap memory
+ * prefetches across keys before replying in command order.
  *
- * REPLY ORDERING: The contiguous-prefix invariant guarantees that all
- * speculative replies are written into c->buf BEFORE the main thread
- * processes any punted commands (which append their replies after).
- * This preserves pipeline reply ordering without any reordering logic.
+ * REPLY ORDERING: all speculative replies are written into c->buf BEFORE the
+ * main thread processes any punted command, whose replies append after.
  *
- * Returns the number of commands speculatively completed.
- */
+ * Returns the number of commands speculatively completed. */
 int dplusSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
@@ -316,10 +228,7 @@ int dplusSpeculateBatch(client *c, int tid) {
 
     /* ROLE GATE (replica-only deployment): with io-threads-speculation-replica-only
      * set, a primary or standalone server never speculates and runs the stock
-     * read path. primary_host is written by main on REPLICAOF and read here as a
-     * plain word: a stale read only decides whether THIS batch is speculated,
-     * and a speculation racing a role change is no different from one racing
-     * any main-thread write, which the validate step already covers. */
+     * read path. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
 
     /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
@@ -366,21 +275,11 @@ int dplusSpeculateBatch(client *c, int tid) {
      * monitor is attached. */
     if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
 
-    /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
-     * the originals outside the limbo hooks — reads racing a move are the
-     * same UAF class. Punt speculation while defrag is running (rare,
-     * default-off feature; costs nothing otherwise). */
-    if (server.active_defrag_cpu_percent > 0) return 0;
-
-    /* ZERO-COST WRITE-BATCH EXIT: if the first command isn't even a GET,
-     * return before touching any atomics or gate state. Eliminates the r100
-     * write-tax (2 seq_cst ops + gate history shift cost on pure-write batches).
-     * Uses a lazily-cached command pointer (static, idempotent init). */
-    {
-        static struct serverCommand *dplus_get_cmd_fast = NULL;
-        if (!dplus_get_cmd_fast) dplus_get_cmd_fast = lookupCommandByCString("get");
-        if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd_fast) return 0;
-    }
+    /* Lazily cache the GET command pointer -- eliminates repeated case-insensitive
+     * siphash lookups. Only a batch that starts with GET can speculate. */
+    static struct serverCommand *dplus_get_cmd = NULL;
+    if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
+    if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd) return 0;
 
     /* ACL/AUTH GUARD: speculation bypasses processCommand, so neither the
      * NOAUTH check nor ACLCheckAllPerm ever runs on this path. Only clients
@@ -388,142 +287,54 @@ int dplusSpeculateBatch(client *c, int tid) {
      * the stock path which enforces auth/ACL as usual. The byte is written
      * only at rare auth-state changes, so this read does not ping-pong the
      * line. Placed after the GET fast-exit to keep pure-write batches at
-     * zero added cost. ACL admin ops drain in-flight speculation before
-     * gates update (dplusOnAclRulesChanged), closing the temporal window. */
+     * zero added cost. */
     if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
-
-    /* Write-tax gate pointer — declared early so the out: label can update it.
-     * The actual gate CHECK happens below, after first-command eligibility is
-     * determined (to avoid a dead-state where the gate blocks all speculation
-     * including the GET traffic that would recover it). */
-    dplusWriteTaxGate *gate = &dplus_write_tax[tid];
-
-    /* Lazily cache the GET command pointer — eliminates repeated case-insensitive
-     * siphash lookups (7% of worker profile per the per-TID decomposition). */
-    static struct serverCommand *dplus_get_cmd = NULL;
-    if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
      * so their duration must be accumulated per-thread and folded into the
      * GET command's microseconds by dplusAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
 
-    /* --- Phase 1: Collect eligible prefix keys into batch --- */
-    serverDb *db = c->db;
-    int dict_index = 0;
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-    if (!ht) goto out;
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0);
+    if (!ht) return 0;
 
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
-    if (!va) goto out;
-
+    /* STREAMING SLOT-REFILL: a ring of DPLUS_BATCH_DEPTH slots holds in-flight
+     * finds. Each sweep steps every pending find once (one prefetch per slot);
+     * the head slot replies as soon as its find completes, and the fill loop
+     * tops the window back up from the queue, so prefetch depth stays constant
+     * across the eligible prefix. The first ineligible command or punt ends
+     * speculation for the whole read. head..tail are monotonic; slot index =
+     * seq % DPLUS_BATCH_DEPTH; done[] marks completed finds. */
     dplusBatchEntry batch[DPLUS_BATCH_DEPTH];
-    int batch_count = 0;
-
-    /* First command (c->argv / c->parsed_cmd). */
-    if (c->argc == 2 && c->parsed_cmd != NULL &&
-        c->parsed_cmd == dplus_get_cmd &&
-        (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
-
-        /* Write-tax gate: first command IS eligible (GET), so we know the
-         * workload can speculate. Check the gate to decide whether recent
-         * traffic justifies the prefetch investment. If traffic has been
-         * write-heavy, speculation attempts mostly hit validation misses,
-         * wasting prefetch cycles. Skip the batch but shift in a 1 so the
-         * gate recovers once GETs resume. */
-        if (__builtin_popcountll(gate->history) < DPLUS_WRITE_TAX_THRESHOLD) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(intra_batch_write_punts, 1);
-#endif
-            /* Shift in 1 (eligible batch seen) to allow recovery. */
-            gate->history = (gate->history << 1) | 1;
-            goto out;
-        }
-
-        dplusBatchEntry *e = &batch[batch_count];
-        e->key_sds = objectGetVal(c->argv[1]);
-        e->hash = hashtableHashKey(ht, e->key_sds);
-        e->shard = DPLUS_SHARD_INDEX(e->hash);
-        e->v_before = dplusVersionRead(va, e->shard);
-        if (e->v_before & 1) {
-            /* S2.2a: writer bracket open -- punt to main */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(bracket_entry_punts, 1);
-#endif
-            goto out;
-        }
-        e->is_first_cmd = 1;
-        e->queue_idx = -1;
-        batch_count++;
-    } else {
-        /* First command not eligible — nothing to speculate. */
-        goto out;
-    }
-
-    /* Command queue (pipelined commands): STREAMING SLOT-REFILL (fix #1b).
-     * The chunked design processed the prefix in phase-bounded windows of
-     * DPLUS_BATCH_DEPTH: fill 16, step all finds to completion, validate all
-     * 16, repeat. Every chunk boundary was a pipeline bubble — the next
-     * chunk's finds started cold with zero overlap.
-     *
-     * Streaming replaces the phases with a ring of DPLUS_BATCH_DEPTH slots
-     * holding IN-FLIGHT finds. Each sweep steps every pending find once
-     * (one prefetch issued per slot per sweep — the same interleave cadence
-     * that made the chunked design cache-friendly). Replies must be emitted
-     * in command order, so validation+reply happens only at the HEAD slot:
-     * the moment the head's find completes it is validated and replied
-     * (cache-warm), the slot is freed, and the fill loop tops the window
-     * back up from the queue. Prefetch depth stays constant across the
-     * entire eligible prefix — no bubbles. Out-of-order completions simply
-     * wait as completed find states until they become the head; the seqlock
-     * validation at reply time covers the (unchanged) racy window.
-     * The contiguous-prefix rule holds globally: a validation failure or
-     * ineligible command ends speculation for the whole read. */
+    uint8_t done[DPLUS_BATCH_DEPTH];
     cmdQueue *queue = &c->cmd_queue;
     int queue_pos = queue->off;
     int prefix_open = 1;
+    unsigned head = 0, tail = 1;
 
-    /* Ring state: batch[] reused as the slot array. head..tail are monotonic;
-     * slot index = seq % DPLUS_BATCH_DEPTH. done[] marks completed finds so
-     * they are not re-stepped. batch_count==1 from the first-command block
-     * above: seed the ring with it. */
-    unsigned head = 0, tail = 0;
-    uint8_t done[DPLUS_BATCH_DEPTH];
-    hashtableIncrementalFindInit(&batch[0].find_state, ht, batch[0].key_sds);
+    batch[0].is_first_cmd = 1;
+    batch[0].queue_idx = -1;
+    hashtableIncrementalFindInit(&batch[0].find_state, ht, objectGetVal(c->argv[1]));
     done[0] = 0;
-    tail = 1;
-    (void)batch_count;
 
     while (head < tail || prefix_open) {
         /* Fill: top the window up from the queue. */
         while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
-            if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
-                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
+            if (p->cmd != dplus_get_cmd || p->argc != 2) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
             dplusBatchEntry *e = &batch[tail % DPLUS_BATCH_DEPTH];
-            e->key_sds = objectGetVal(p->argv[1]);
-            e->hash = hashtableHashKey(ht, e->key_sds);
-            e->shard = DPLUS_SHARD_INDEX(e->hash);
-            e->v_before = dplusVersionRead(va, e->shard);
-            if (e->v_before & 1) {
-                /* S2.2a: writer bracket open -- refuse at entry */
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-                DPLUS_STAT_ADD(bracket_entry_punts, 1);
-#endif
-                continue;
-            }
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
-            hashtableIncrementalFindInit(&e->find_state, ht, e->key_sds);
+            hashtableIncrementalFindInit(&e->find_state, ht, objectGetVal(p->argv[1]));
             done[tail % DPLUS_BATCH_DEPTH] = 0;
             tail++;
             queue_pos++;
         }
-        if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted — drain */
-        if (head == tail) break; /* nothing in flight and nothing to fill */
+        if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted -- drain */
+        if (head == tail) break;                      /* nothing in flight and nothing to fill */
 
         /* Sweep: one find step per pending slot (one prefetch each). */
         for (unsigned s = head; s < tail; s++) {
@@ -531,39 +342,31 @@ int dplusSpeculateBatch(client *c, int tid) {
             if (!done[i]) done[i] = !hashtableIncrementalFindStep(&batch[i].find_state);
         }
 
-        /* Drain: validate + reply completed HEADS in command order. */
+        /* Drain: reply completed HEADS in command order. */
         while (head < tail && done[head % DPLUS_BATCH_DEPTH]) {
             dplusBatchEntry *e = &batch[head % DPLUS_BATCH_DEPTH];
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             DPLUS_STAT_ADD(speculative_attempts, 1);
 #endif
-            if (dplusValidateAndReply(c, e, ht, c->resp)) {
-                if (e->is_first_cmd) {
-                    c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
-                } else {
-                    queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
-                }
-                speculated++;
-                head++;
-            } else {
-                /* Contiguous-prefix rule: first failure ends speculation
-                 * globally. In-flight slots behind it are abandoned (their
-                 * commands fall through to main execution). */
+            if (!dplusReplyFromEntry(c, e)) {
+                /* Contiguous-prefix rule: in-flight slots behind a punt are
+                 * abandoned and their commands fall through to main. */
                 prefix_open = 0;
-                head = tail; /* discard remaining in-flight slots */
+                head = tail;
                 break;
             }
+            if (e->is_first_cmd)
+                c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            else
+                queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+            speculated++;
+            head++;
         }
     }
-
-out:
-    /* Update write-tax gate: shift in 1 if any speculation succeeded, 0 if punted. */
-    gate->history = (gate->history << 1) | (speculated > 0 ? 1 : 0);
 
     /* Commandstats parity: fold execution time into the per-thread counter
      * (calls are accumulated in dplusConsumeSpeculated). */
     if (speculated > 0) dplus_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
-
     return speculated;
 }
 
@@ -734,44 +537,6 @@ void dplusAggregateStats(void) {
     }
 }
 
-/* S5: lock-free observation of the prevalidate hold -- INFO must NOT be
- * used to poll during a hold: its clients section acquires every worker
- * event-loop mutex (b13 info lock), including the parked worker's, so the
- * INFO reply is assembled mid-hold but delivered only after the hold
- * expires -- the poller acts on stale state. This reads two atomics. */
-void dplusDebugPrevalidateState(uint64_t *holding, uint64_t *consumed) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    *holding = (uint64_t)atomic_load_explicit(&dplus_debug_reader_holding, memory_order_seq_cst);
-    *consumed = atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst);
-#else
-    *holding = 0;
-    *consumed = 0;
-#endif
-}
-
-/* S5: arm the pre-validation hold (see dplusSpeculateBatch). Overwrite
- * semantics: a previously armed-but-unconsumed hold (the reader punted
- * before validation) is replaced, not an error -- tests retry arming and a
- * stale arm must never poison the next attempt. Also reset the release
- * flag: an exclusive entrant (eviction, defrag duty cycle, FLUSH) may have
- * left it set, which would make the hold a no-op. */
-void dplusDebugPrevalidateBump(void) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    atomic_store_explicit(&dplus_debug_prevalidate_bump, 1, memory_order_seq_cst);
-#endif
-}
-
-int dplusDebugHoldPrevalidate(long long usec) {
-#ifndef IO_LOOKUP_OFFLOAD_STATS
-    (void)usec;
-    return C_ERR;
-#else
-    if (usec <= 0 || usec > 5000000) return C_ERR;
-    atomic_store_explicit(&dplus_debug_prevalidate_hold_us, usec, memory_order_seq_cst);
-    return C_OK;
-#endif
-}
-
 /* --- Component 6: INFO section --- */
 /* Door-2 wakeup-coalescing counters (prototype): sums of per-worker plain
  * fields written only by their owning worker — racy-by-design stats reads.
@@ -813,14 +578,8 @@ sds dplusInfoString(sds info) {
     info = sdscatprintf(info,
         "dplus_speculative_attempts:%llu\r\n"
         "dplus_speculative_hits:%llu\r\n"
-        "dplus_validation_misses:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
-        "dplus_prevalidate_consumed:%llu\r\n"
-        "dplus_pv_last_key:%s\r\n"
-        "dplus_pv_last_client:%llu\r\n"
-        "dplus_bracket_entry_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
-        "dplus_intra_batch_write_punts:%llu\r\n"
         "dplus_miss_punts:%llu\r\n"
         "dplus_b13_waiting_transitions:%llu\r\n"
         "dplus_b13_handler_fires:%llu\r\n"
@@ -831,14 +590,8 @@ sds dplusInfoString(sds info) {
         "dplus_b13_info_lock_hold_us:%llu\r\n",
         (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
         (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
-        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
         (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
-        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
-        dplus_debug_pv_last_key,
-        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
-        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
         (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
         (unsigned long long)DPLUS_STAT_SUM(miss_punts),
         (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
         (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),

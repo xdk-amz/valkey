@@ -54,7 +54,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
 static keyStatus expireIfNeeded(serverDb *db, robj *key, robj *val, int flags);
 static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash);
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -213,10 +213,9 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void **oldref = NULL;
     if (update_if_existing) {
-        uint64_t key_hash;
-        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &key_hash);
+        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
         if (oldref != NULL) {
-            dbSetValue(db, key, valref, 1, oldref, &key_hash);
+            dbSetValue(db, key, valref, 1, oldref);
             return;
         }
     } else {
@@ -333,13 +332,11 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * value should be stored.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash) {
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
     robj *val = *valref;
-    uint64_t computed_hash;
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
-        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &computed_hash);
-        if (oldref != NULL) key_hash = &computed_hash;
+        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
     }
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
@@ -360,18 +357,6 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = *oldref;
     }
 
-    /* S2.2 bracket: both branches below mutate the published entry (in-place
-     * ptr/type/encoding swap, or ref replacement via *oldref). Begin before
-     * the first mutating store; End after volatile-items tracking, where the
-     * single trailing bump used to be. Hash MUST come from the table's own
-     * hash function (I3). */
-    hashtable *d_ht = kvstoreGetHashtable(db->keys, getKVStoreIndexForKey(objectGetVal(key)));
-    dplusVersionArray *d_va = d_ht ? hashtableGetVersionArray(d_ht) : NULL;
-    uint64_t d_h = 0;
-    if (d_va) {
-        d_h = key_hash ? *key_hash : hashtableHashKey(d_ht, objectGetVal(key));
-        dplusVersionBracketBegin(d_va, DPLUS_SHARD_INDEX(d_h));
-    }
     if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
         /* Keep old object in the database. Just swap it's ptr, type and
@@ -414,9 +399,6 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* S2.2: close the bracket opened above the swap/replace block. */
-    if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
-
     freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
@@ -424,7 +406,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
-    dbSetValue(db, key, valref, 0, NULL, NULL);
+    dbSetValue(db, key, valref, 0, NULL);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -457,7 +439,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else if (keyfound < 0) {
         dbAddInternal(db, key, valref, 1);
     } else {
-        dbSetValue(db, key, valref, 1, NULL, NULL);
+        dbSetValue(db, key, valref, 1, NULL);
     }
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
@@ -1952,51 +1934,12 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 
-/* --- D+ S3 helpers: bracketing published-value mutations from command code --- */
-
-void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk) {
-    brk->va = NULL;
-    int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-    if (!ht) return;
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
-    if (!va) return;
-    uint64_t h = hashtableHashKey(ht, objectGetVal(key));
-    brk->va = va;
-    brk->shard = DPLUS_SHARD_INDEX(h);
-    dplusVersionBracketBegin(va, brk->shard);
-}
-
-void dbKeyBracketEnd(dbKeyBracket *brk) {
-    if (!brk->va) return;
-    dplusVersionBracketEnd((dplusVersionArray *)brk->va, brk->shard);
-    brk->va = NULL;
-}
-
-sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
-    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
-    sds s = objectGetVal(o);
-    if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
-    /* Replacement publication: same copy a realloc move would perform. */
-    sds news = sdsnewlen(SDS_NOINIT, total_len);
-    memcpy(news, s, sdslen(s));
-    sdssetlen(news, sdslen(s));
-    objectSetVal(o, news);
-    sdsfree(s);
-    return news;
-}
-
 int removeExpire(serverDb *db, robj *key) {
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void *popped;
     if (kvstoreHashtablePop(db->expires, dict_index, objectGetVal(key), &popped)) {
         robj *val = popped;
-        /* D+ S3: the embedded-expiry clear is an in-place 8-byte write on a
-         * published shell (S1.2a finding b) -- bracket it. */
-        dbKeyBracket brk;
-        dbKeyBracketBegin(db, key, &brk);
         robj *newval = objectSetExpire(val, -1);
-        dbKeyBracketEnd(&brk);
         serverAssert(newval == val);
         debugServerAssert(getExpire(db, key) == -1);
         return 1;
@@ -2024,14 +1967,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     val = *valref;
     long long old_when = objectGetExpire(val);
 
-    /* D+ S3: when val already has an expire field, objectSetExpire writes
-     * the embedded 8-byte expiry IN PLACE (no realloc) -- bracket it. The
-     * realloc path's publication is bracketed separately below (S2.2). */
-    dbKeyBracket ttl_brk;
-    int ttl_inplace = val->hasexpire;
-    if (ttl_inplace) dbKeyBracketBegin(db, key, &ttl_brk);
     robj *newval = objectSetExpire(val, when);
-    if (ttl_inplace) dbKeyBracketEnd(&ttl_brk);
     if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetKey(newval));
@@ -2048,17 +1984,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
         /* No old expire. Update the pointer in the keys hashtable, if needed,
          * and add it to the expires hashtable. */
         if (newval != val) {
-            /* Publish the replacement, then bump the shard so in-flight
-             * readers of the old shell fail validation. */
-            hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-            dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
-            uint64_t h = 0;
-            if (va) {
-                h = hashtableHashKey(ht, objectGetVal(key));
-                dplusVersionBracketBegin(va, DPLUS_SHARD_INDEX(h));
-            }
             val = *valref = newval;
-            if (va) dplusVersionBracketEnd(va, DPLUS_SHARD_INDEX(h));
         }
         bool added = kvstoreHashtableAdd(db->expires, dict_index, newval);
         serverAssert(added);
