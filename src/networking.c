@@ -2688,7 +2688,7 @@ void beforeNextClient(client *c) {
         return;
     }
 
-    if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
+    if (!c->flag.ring_epilogue && !c->flag.fastpath) updateClientMemUsageAndBucket(c);
     if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
@@ -3613,7 +3613,7 @@ int postWriteToClient(client *c) {
         }
     }
 
-    if (!(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
+    if (!c->flag.fastpath && !(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
     return C_OK;
 }
 
@@ -4502,7 +4502,7 @@ int processCommandAndResetClient(client *c) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
          * processed command. */
-        if (c->conn) updateClientMemUsageAndBucket(c);
+        if (c->conn && !c->flag.fastpath) updateClientMemUsageAndBucket(c);
     }
 
     if (server.current_client == NULL) deadclient = 1;
@@ -6992,6 +6992,7 @@ int checkClientOutputBufferLimits(client *c) {
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
     if (c->flag.fake) return 0;     /* It is unsafe to free fake clients. */
     if (c->flag.executor) return 0; /* replies return to the IO thread with the batch */
+    if (c->flag.fastpath) return 0; /* IO-owned: COB is enforced through the fast-path control registry, not the client */
     serverAssert(c->conn);
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
@@ -7413,15 +7414,35 @@ void evictClients(void) {
     size_t client_eviction_limit = getClientEvictionLimit();
     if (client_eviction_limit == 0) return;
 
-    /* Variable to track memory of clients marked for close but not yet freed */
-    size_t pending_freed = 0;
+    /* Variable to track memory of clients marked for close but not yet freed. Seed it with the fast-path
+     * entries that were already made terminal (evicted or COB-closed) but whose stat contribution is still
+     * charged until the IO hand-off removes it: like a normal close_asap client re-counted on each call,
+     * this persists that not-yet-freed memory across repeated calls so a lingering terminal fast-path
+     * client does not read as live pressure and evict a healthy client. */
+    size_t pending_freed = fastpathTerminalPendingMem();
 
     while (server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] +
                server.stat_clients_type_memory[CLIENT_TYPE_PUBSUB] >
            client_eviction_limit + pending_freed) {
+        /* Fast-path clients live in a private bucket set keyed by the same size class. When their largest
+         * bucket outranks the normal size class under the cursor, that client is the biggest remaining, so
+         * evict it first to keep selection size-fair across both sets. Its aggregate/stat removal happens
+         * once at hand-off, so count the estimate as pending_freed to avoid over-evicting meanwhile. */
+        int fp_bucket = fastpathEvictionMaxBucket();
+        if (fp_bucket > curr_bucket) {
+            pending_freed += fastpathEvictTopFromBucket(fp_bucket);
+            continue;
+        }
         listNode *ln = listNext(&bucket_iter);
         if (ln) {
             client *c = ln->value;
+            if (c->flag.fastpath) {
+                /* Invariant defense, not normal accounting: an IO-owned client is accounted through the
+                 * fast-path registry and never linked into a normal bucket, so reaching here is impossible.
+                 * If a stale node ever appeared, quarantine it (never free an IO-owned client) and move on. */
+                removeClientFromMemUsageBucket(c, 0);
+                continue;
+            }
             if (c->flag.close_asap) {
                 /* Already scheduled to close. Count memory as freed and skip. */
                 pending_freed += c->last_memory_usage;
@@ -7443,13 +7464,15 @@ void evictClients(void) {
                 pending_freed += c->last_memory_usage;
                 continue;
             }
-        } else {
+        } else if (curr_bucket > 0) {
             curr_bucket--;
-            if (curr_bucket < 0) {
-                serverLog(LL_WARNING, "Over client maxmemory after evicting all evictable clients");
-                break;
-            }
             listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
+        } else if (fp_bucket >= 0) {
+            /* Normal buckets are exhausted but fast-path clients remain: drain them largest first. */
+            pending_freed += fastpathEvictTopFromBucket(fp_bucket);
+        } else {
+            serverLog(LL_WARNING, "Over client maxmemory after evicting all evictable clients");
+            break;
         }
     }
 

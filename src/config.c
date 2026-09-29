@@ -29,6 +29,7 @@
  */
 
 #include "io_threads.h"
+#include "fastpath.h"
 #include "sds.h"
 #include "server.h"
 #include "hotkeys.h"
@@ -3423,6 +3424,7 @@ static int applyClientMaxMemoryUsage(const char **err) {
     listRewind(server.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
+        if (c->flag.fastpath) continue; /* IO-owned: accounted through the fast-path registry, never touched here */
         if (server.maxmemory_clients == 0) {
             /* Remove client from memory usage bucket. */
             removeClientFromMemUsageBucket(c, 0);
@@ -3431,6 +3433,9 @@ static int applyClientMaxMemoryUsage(const char **err) {
             updateClientMemUsageAndBucket(c);
         }
     }
+
+    /* Apply the same enable/disable synchronously to the fast-path registry through its main-only API. */
+    fastpathApplyMaxmemoryClients(server.maxmemory_clients != 0);
 
     if (server.maxmemory_clients == 0) freeServerClientMemUsageBuckets();
     return 1;

@@ -1699,6 +1699,9 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* Handle background operations on databases. */
     databasesCron();
 
+    /* Enforce fast-path client output-buffer limits and re-account maxmemory-clients over a rotating subset of IO-owned controls. */
+    fastpathLimitsCron();
+
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. We don't start the rewrite if there is an
      * active child process (to avoid multiple concurrent fork children) or if
@@ -2004,6 +2007,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * command yields to the event loop. */
         processed += processPendingReplStreamDecode();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
+        fastpathReleaseDurableReplies(); /* held write replies are now durable; publish them, never before the fsync */
         processed += handleClientsWithPendingWrites();
         int last_processed = 0;
         do {
@@ -2114,6 +2118,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * must be done before handleClientsWithPendingWrites,
      * in case of appendfsync=always. */
     if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
+
+    /* Held fast-path write replies are durable at the flush above; publish them now, never before. */
+    fastpathReleaseDurableReplies();
 
     /* Record time consumption of AOF writing. */
     monotime aof_duration = getMonotonicUs() - aof_start_time;
@@ -3032,6 +3039,7 @@ void resetServerStats(void) {
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
+    server.stat_client_idle_timeout_disconnections = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
         server.inst_metric[j].idx = 0;
         server.inst_metric[j].last_sample_base = 0;
@@ -7083,6 +7091,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
+                "client_idle_timeout_disconnections:%lld\r\n", server.stat_client_idle_timeout_disconnections,
                 "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
                 "reply_buffer_expands:%lld\r\n", server.stat_reply_buffer_expands,
                 "eventloop_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].cnt,

@@ -32,7 +32,7 @@
  * Bits so compatible requests coalesce; CLOSE is terminal and outranks the rest. */
 #define CC_REQ_QUIESCE (1u << 0) /* stop admitting; hand back in flight so the owner can be reassigned */
 #define CC_REQ_HANDOFF (1u << 1) /* return the connection to main once nothing is in flight */
-#define CC_REQ_EVICT (1u << 2)   /* free under a memory/QoS limit once replies are released */
+#define CC_REQ_EVICT (1u << 2)   /* terminal memory/QoS free; never waits for buffered replies */
 #define CC_REQ_CLOSE (1u << 3)   /* terminal: free once drained; supersedes every other request */
 
 /* Stable, separately allocated shared control for one crossing-capable connection.
@@ -60,12 +60,14 @@ typedef struct ClientControl {
     _Atomic(uint32_t) requests; /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
     uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
     uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
+    struct FastpathLimitEntry *limit; /* Immutable after fastpathControlEnsure: the connection's one main-owned limit side object. */
 
     /* Producer cache line: written only by main. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_produced; /* Sole writer main: logical reply bytes retained for this client so far; monotonic. */
 
     /* Consumer cache line: written only by the IO owner. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
+    _Atomic(time_t) last_interaction; /* Sole writer the IO owner (main only at attach-init before transfer); unixtime of the last successful fast-path read, acquire-read by main for idle timeout. */
 } ClientControl;
 
 /* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
@@ -106,6 +108,7 @@ typedef struct cmdBatch {
     size_t arena_cap;
     size_t arena_used;
     monotime opened_us;
+    struct cmdBatch *pending_next; /* Main-only intrusive link while held for the appendfsync-always barrier; NULL otherwise. */
     cmdEntry e[IO_BATCH_MAX];
 } cmdBatch;
 
@@ -126,6 +129,8 @@ void fastpathAdmissionQuiesce(void);
 /* IO-thread side: mark entry/exit of the admission region that dereferences a user's rule set. */
 void fastpathAdmitReadBegin(int tid);
 void fastpathAdmitReadEnd(int tid);
+/* Main-only introspection for tests: batches this thread holds for the durability barrier, not yet delivered. */
+size_t fastpathPendingBatches(int tid);
 
 /* Build a generation-checked handle for a control-bearing client. */
 ClientHandle fastpathHandleFor(client *c);
@@ -147,12 +152,63 @@ void fastpathControlReclaim(client *c);
  * outstanding external reply memory; it does not enforce COB or maxmemory-clients. */
 size_t fastpathReplyOutstanding(const ClientControl *cc);
 
+/* Acquire-loaded last-interaction unixtime for a control; read-only, main-only, never a connection deref. */
+time_t fastpathControlLastInteraction(const ClientControl *cc);
+
+/* Count of controls currently in the main-only limit registry. Reads only main-owned bookkeeping. */
+size_t fastpathLimitRegistryCount(void);
+/* Whether this control's limit entry is currently linked into the registry. Reads only main-owned entry state. */
+int fastpathLimitRegistryContains(const ClientControl *cc);
+
+/* Main-only amortized output-buffer-limit and maxmemory-clients enforcement over the registry; call once
+ * per server cron cycle. Checks a rotating subset so every registered control is enforced and re-accounted
+ * about once per second at server.hz. */
+void fastpathLimitsCron(void);
+
+/* Main-only: re-apply maxmemory-clients enable/disable to every registered fast-path entry synchronously.
+ * Each entry's estimated contribution to stat_clients_type_memory[CLIENT_TYPE_NORMAL] and the fast-path
+ * aggregate is kept current either way; enabling rebuckets accounted entries into the private size buckets
+ * and disabling only unbuckets them. Called from the CONFIG SET maxmemory-clients apply, never from the
+ * command path. */
+void fastpathApplyMaxmemoryClients(int enabled);
+
+/* Main-only eviction selectors for the private fast-path size buckets, used only by evictClients.
+ * fastpathEvictionMaxBucket returns the highest non-empty fast-path bucket index, or -1 when none exist,
+ * so the caller can compare it against the largest normal bucket for a size-fair choice. */
+int fastpathEvictionMaxBucket(void);
+/* Terminally evict the head entry of one fast-path bucket: publish an immediate CC_REQ_EVICT, count one
+ * eviction, mark it terminal, and unlink it from the bucket so it is never reselected. Returns the reply
+ * memory estimate that was accounted for it, which the caller adds to pending_freed; the aggregate/stat
+ * removal itself happens once at hand-off. Never dereferences the connection or calls freeClient. */
+size_t fastpathEvictTopFromBucket(int bucket_idx);
+
+/* Main-only: total reply/base memory still charged to stat_clients_type_memory[CLIENT_TYPE_NORMAL] for
+ * terminal fast-path entries awaiting IO hand-off. evictClients seeds its local pending_freed from this on
+ * every call so an in-flight terminal client's not-yet-removed memory is not counted as live pressure and
+ * does not trigger collateral eviction of a healthy client. Reads only main-owned bookkeeping. */
+size_t fastpathTerminalPendingMem(void);
+
+/* Main-only introspection for tests: the total reply-memory estimate currently contributed by fast-path
+ * entries to stat_clients_type_memory[CLIENT_TYPE_NORMAL]. Reads only main-owned bookkeeping. */
+size_t fastpathMaxmemoryAggregate(void);
+/* Main-only introspection for tests: the maxmemory estimate currently accounted for one control, and the
+ * private fast-path bucket index it sits in (-1 when not bucketed). Read only main-owned entry state. */
+size_t fastpathMaxmemoryAccounted(const ClientControl *cc);
+int fastpathMaxmemoryBucketOf(const ClientControl *cc);
+/* Main-only introspection for tests: number of entries linked in one private fast-path size bucket. */
+size_t fastpathMaxmemoryBucketCount(int bucket_idx);
+
 void fastpathInitThread(int tid);
 void fastpathFreeThread(int tid);
 void fastpathClientReadable(int tid, client *c);
 void fastpathClientWritable(int tid, client *c);
 void fastpathSubmitPending(int tid);
 int fastpathProcessReturns(int tid);
+
+/* Main-only: publish every batch held for appendfsync-always durability to its owner return ring, in the
+ * order held, immediately after the beforeSleep AOF flush/fsync so no write reply is observable before its
+ * durability point. Nonblocking and a no-op when nothing is held. */
+void fastpathReleaseDurableReplies(void);
 
 /* Role transitions driven by main; a quiesce is idempotent and never restarts publication. */
 void fastpathWorkerQuiesce(int tid);
