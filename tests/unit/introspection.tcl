@@ -1363,6 +1363,7 @@ start_server {tags {"introspection"}} {
             rdma-bind
             rdma-port
             forkless-infrastructure-enabled
+            acl-offload
         }
 
         if {!$::tls} {
