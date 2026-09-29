@@ -2091,8 +2091,9 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"introspecti
     foreach bgsave_type {"fork" "forkless"} {
         test "CLIENT KILL close the client connection during bgsave - $bgsave_type" {
             r flushall
-            r set k v
-            r config set rdb-key-save-delay 10000000
+            r debug populate 1000
+            # Many short per-key delays, so a cancelled forkless save stops at the next key.
+            r config set rdb-key-save-delay 100000
             r config set bgsave-default-method $bgsave_type
             r bgsave
             wait_for_condition 1000 10 {
