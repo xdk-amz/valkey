@@ -166,7 +166,8 @@ static void stagedReconcile(aeEventLoop *el) {
 /* Collect: the pre-sleep hook, one wait on the poller bounded like aeProcessEvents, the post-sleep hook. */
 static void collectFDs(aeEventLoop *el) {
     if (el->beforesleep) el->beforesleep(el);
-    long long timeout = (el->flags & AE_DONT_WAIT) ? 0 : aeUsUntilEarliestTimer(el);
+    /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
+    long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending()) ? 0 : aeUsUntilEarliestTimer(el);
     int n = pollerGetFDs(sl_poller, timeout);
     if (n < 0) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
