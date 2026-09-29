@@ -461,6 +461,12 @@ int dplusSpeculateBatch(client *c, int tid) {
      * any main-thread write, which the validate step already covers. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
 
+    /* DURABILITY GATE: under appendfsync always no reply may expose a write before its fsync, and a
+     * speculated read replies without waiting for main's fsync point. Plain-word reads of main-written
+     * config, stale only for the batch racing a CONFIG SET. */
+    if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) && server.aof_fsync == AOF_FSYNC_ALWAYS)
+        return 0;
+
     /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
      * execute only at EXEC — speculating a GET here would execute it early
      * and strand it from the transaction (real bug: pipelined MULTI batches

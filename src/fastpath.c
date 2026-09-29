@@ -1781,6 +1781,8 @@ again:
                     /* A non-requeued write dirtied the AOF covered by this fsync. */
                     if (aof_always && !b->e[k].requeued && b->e[k].cmd && (b->e[k].cmd->flags & CMD_WRITE)) hold = 1;
                 }
+                /* A read may have observed a write not yet fsynced; its reply waits for the same fsync. */
+                if (aof_always && sdslen(server.aof_buf) > 0) hold = 1;
             }
             fpReplyChargeBatch(b);
             ec->origin = NULL;

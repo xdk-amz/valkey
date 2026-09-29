@@ -108,6 +108,8 @@ class FastpathAofBarrierTest : public ::testing::Test {
         testOnlyInitIOThreadQueues(); /* forget hand-off messages of the previous test */
         server.aof_state = AOF_OFF;
         server.aof_fsync = AOF_FSYNC_NO;
+        if (server.aof_buf) sdsfree(server.aof_buf);
+        server.aof_buf = sdsempty(); /* nothing written and not yet fsynced */
         fastpathWorkerReopen(1); /* the previous test drained the thread; bring it back to OPEN */
     }
 
@@ -218,6 +220,28 @@ TEST_F(FastpathAofBarrierTest, ReadOnlyBatchReturnsImmediatelyUnderAofAlways) {
     EXPECT_EQ(fastpathPendingBatches(1), 0u); /* not a durable write: not held */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(c->fp_inflight, 0u);
+    EXPECT_EQ(recvNow(peer), "$-1\r\n");
+
+    cleanupOpen(c, peer);
+}
+
+/* A read may observe a write another client made this loop that is not yet fsynced: its reply waits too. */
+TEST_F(FastpathAofBarrierTest, ReadHeldWhileUnfsyncedWritePending) {
+    server.aof_state = AOF_ON;
+    server.aof_fsync = AOF_FSYNC_ALWAYS;
+    server.aof_buf = sdscat(server.aof_buf, "*1\r\n$4\r\nPING\r\n"); /* another client's write, not yet fsynced */
+    int peer;
+    client *c = newFpClient(&peer);
+
+    submitOne(c, peer, GET_NOKEY);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathPendingBatches(1), 1u);
+    EXPECT_EQ(fastpathProcessReturns(1), 0);
+    EXPECT_EQ(recvNow(peer), "");
+
+    sdsclear(server.aof_buf); /* the beforeSleep flush wrote and fsynced it */
+    fastpathReleaseDurableReplies();
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(recvNow(peer), "$-1\r\n");
 
     cleanupOpen(c, peer);

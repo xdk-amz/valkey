@@ -75,3 +75,29 @@ start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appe
         $rd close
     }
 }
+
+start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly yes appendfsync everysec io-threads 4 io-threads-always-active yes save ""}} {
+    r select 0
+    waitForBgrewriteaof r
+    proc fpa_speculated {} { getInfoProperty [r info fastpath] fastpath_speculated }
+
+    test {Fast path appendfsync always: IO-thread reads stop while every reply must wait for the fsync} {
+        r set k v
+        set rd [fp_client]
+        fp_wait_fastpath_clients 1
+        set before [fpa_speculated]
+        for {set round 0} {$round < 50 && [fpa_speculated] == $before} {incr round} {
+            for {set i 0} {$i < 10} {incr i} { $rd get k }
+            for {set i 0} {$i < 10} {incr i} { assert_equal v [$rd read] }
+        }
+        assert_morethan [fpa_speculated] $before
+
+        r config set appendfsync always
+        set before [fpa_speculated]
+        for {set i 0} {$i < 200} {incr i} { $rd get k }
+        for {set i 0} {$i < 200} {incr i} { assert_equal v [$rd read] }
+        assert_equal $before [fpa_speculated]
+        $rd close
+        r config set appendfsync everysec
+    }
+}
