@@ -28,13 +28,6 @@ struct client;
 #define DPLUS_CACHELINE 64
 #define DPLUS_MAX_IO_THREADS 256
 
-/* IO-thread lifecycle hooks. Speculative reads and main-thread mutations are
- * separated by the event-loop phases, so there is no reader state to track. */
-static inline void dplusReaderWorkerOnline(int tid) { (void)tid; }
-static inline void dplusReaderWorkerQuiescent(int tid) { (void)tid; }
-static inline void dplusReaderWorkerOffline(int tid) { (void)tid; }
-static inline void dplusReaderAssertParkSafe(int tid) { (void)tid; }
-
 /* Per-IO-thread counters: IO threads never write shared server stats; main
  * folds these into them once per event-loop iteration. */
 typedef struct dplusThreadStats {
