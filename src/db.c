@@ -417,12 +417,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* S2.2: close the bracket opened above the swap/replace block. */
     if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
 
-    /* D+ entry-lifetime: defer the old object's free past walk quiescence;
-     * with no speculative readers possible the terminal free is routed off
-     * main as before. Mutation ordering is preserved either way. */
-    int limbo_route = DPLUS_LIMBO_OFFLOAD_PREF;
-    if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = DPLUS_LIMBO_ASYNC;
-    if (!dplusDeferFree(old, limbo_route)) freeValueNeverOnMain(key, old, db->id);
+    freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
@@ -544,13 +539,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        /* D+ entry-lifetime: the unlinked object may still be read by an
-         * in-flight speculative walk; defer the free to the quiescence flush,
-         * recording the routing decision now. With no walkers possible the
-         * terminal free is routed off main; `async` no longer selects its route. */
-        int route = DPLUS_LIMBO_SYNC;
-        if (async && lazyfreeShouldBeAsync(key, val, db->id)) route = DPLUS_LIMBO_ASYNC;
-        if (!dplusDeferFree(val, route)) freeValueNeverOnMain(key, val, db->id);
+        /* Terminal frees always leave main, whatever `async` asked for. */
+        UNUSED(async);
+        freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
@@ -2013,15 +2004,12 @@ sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
     serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
     sds s = objectGetVal(o);
     if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
-    /* Replacement publication: same copy a realloc move would perform. The
-     * old buffer stays intact and dereferenceable for in-flight readers and
-     * is freed at quiescence (universal deferred free -- the realloc's
-     * implicit free was the H4/H5 UAF). */
+    /* Replacement publication: same copy a realloc move would perform. */
     sds news = sdsnewlen(SDS_NOINIT, total_len);
     memcpy(news, s, sdslen(s));
     sdssetlen(news, sdslen(s));
     objectSetVal(o, news);
-    if (!dplusDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
+    sdsfree(s);
     return news;
 }
 
@@ -2063,23 +2051,14 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     val = *valref;
     long long old_when = objectGetExpire(val);
 
-    robj *retired = NULL;
-    /* D+ (S1.2a): first-time expire REALLOCATES the shell of a published,
-     * reader-reachable object. The pre-fix code freed the old shell
-     * immediately (and cleared its val_ptr) — a confirmed UAF / NULL-deref
-     * against in-flight speculative readers
-     * (sharded-version-safety-audit-sep4.md, defect 1). The Ex variant keeps
-     * the displaced shell fully intact and hands it back for shell-only
-     * retirement past reader quiescence. */
-    /* D+ S3: when val already has an expire field, objectSetExpireEx writes
+    /* D+ S3: when val already has an expire field, objectSetExpire writes
      * the embedded 8-byte expiry IN PLACE (no realloc) -- bracket it. The
      * realloc path's publication is bracketed separately below (S2.2). */
     dbKeyBracket ttl_brk;
     int ttl_inplace = val->hasexpire;
     if (ttl_inplace) dbKeyBracketBegin(db, key, &ttl_brk);
-    robj *newval = objectSetExpireEx(val, when, &retired);
+    robj *newval = objectSetExpire(val, when);
     if (ttl_inplace) dbKeyBracketEnd(&ttl_brk);
-    serverAssert(retired == NULL || newval != val);
     if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetKey(newval));
@@ -2096,12 +2075,8 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
         /* No old expire. Update the pointer in the keys hashtable, if needed,
          * and add it to the expires hashtable. */
         if (newval != val) {
-            /* Publish the replacement (single pointer store — a concurrent
-             * reader sees either shell; both are dereferenceable), then bump
-             * the shard so in-flight readers of the old shell fail
-             * validation, then retire the displaced shell. Pre-fix this path
-             * had NO bump: a reader could validate successfully against the
-             * freed shell. */
+            /* Publish the replacement, then bump the shard so in-flight
+             * readers of the old shell fail validation. */
             hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
             dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
             uint64_t h = 0;
@@ -2111,15 +2086,6 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
             }
             val = *valref = newval;
             if (va) dplusVersionBracketEnd(va, DPLUS_SHARD_INDEX(h));
-            if (retired) {
-                /* Shell-only free: val_ptr ownership transferred to newval
-                 * (or the value is inline in the shell allocation). RAW
-                 * route = zfree at quiescence flush; fallback zfree is safe
-                 * only because no reader can hold this shell when the defer
-                 * machinery is inactive. */
-                if (!dplusDeferFreeRaw(retired)) zfree(retired);
-                retired = NULL;
-            }
         }
         bool added = kvstoreHashtableAdd(db->expires, dict_index, newval);
         serverAssert(added);

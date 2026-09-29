@@ -194,25 +194,6 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
 #define LAZYFREE_THRESHOLD 64
 
 /* Free an object, if the object is huge enough, free it in async way. */
-/* Hand a pre-judged object straight to BIO lazyfree. Used by the D+ limbo
- * flush, which recorded the async decision at defer time (the key needed by
- * the effort heuristic no longer exists at flush time). Mirrors the
- * freeObjAsync BIO branch, including the shared-object fallback. */
-/* Would freeObjAsync hand this object to BIO? Exposed so the D+ limbo can
- * record the routing decision at defer time (key still alive). */
-int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid) {
-    return lazyfreeGetFreeEffort(key, obj, dbid) > LAZYFREE_THRESHOLD && obj->refcount == 1;
-}
-
-void lazyfreeObjPrejudged(robj *obj) {
-    if (obj->refcount == 1) {
-        atomic_fetch_add_explicit(&lazyfree_objects, 1, memory_order_relaxed);
-        bioCreateLazyFreeJob(lazyfreeFreeObject, 1, obj);
-    } else {
-        decrRefCount(obj);
-    }
-}
-
 void freeObjAsync(robj *key, robj *obj, int dbid) {
     size_t free_effort = lazyfreeGetFreeEffort(key, obj, dbid);
     /* Note that if the object is shared, to reclaim it now it is not

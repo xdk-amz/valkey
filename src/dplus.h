@@ -68,10 +68,10 @@ struct dplusVersionArray {
  * Readers check this before speculating. */
 extern _Atomic(int) dplus_exclusive_mode;
 
-/* Epoch/QSBR reader states. OFFLINE and QUIESCENT never hold speculative
- * pointers; every other value is the epoch announced by an active reader. */
+/* Reader states. OFFLINE and QUIESCENT never hold speculative pointers. */
 #define DPLUS_MAX_IO_THREADS 256
 #define DPLUS_READER_OFFLINE 0
+#define DPLUS_READER_ACTIVE 1
 #define DPLUS_READER_QUIESCENT UINT64_MAX
 
 /* IO-thread lifecycle hooks. A slot is initialized QUIESCENT before thread
@@ -293,23 +293,9 @@ void dplusReaderAssertParkSafe(int tid);
 /* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
  * Called from ioThreadReadQueryFromClient. Returns count of commands
  * speculatively completed. tid = IO thread index (1..N-1). */
-/* Quiescence-deferred reclamation (entry-lifetime-design.md). */
-#define DPLUS_LIMBO_SYNC 0
-#define DPLUS_LIMBO_ASYNC 1
-#define DPLUS_LIMBO_OFFLOAD_PREF 2
-#define DPLUS_LIMBO_RAW 3 /* zfree() at flush — bucket arrays etc. */
-int dplusDeferFree(struct serverObject *o, int route);
-int dplusDeferFreeRaw(void *ptr);
-void dplusReclaimRetired(void);
-void dplusForceReclaimAll(void);
-size_t dplusLimboPeak(void);
-int dplusDebugHoldNextReader(long long usec);
 int dplusDebugHoldPrevalidate(long long usec);
 void dplusDebugPrevalidateState(uint64_t *holding, uint64_t *consumed);
 void dplusDebugPrevalidateBump(void);
-int dplusDebugPinReader(uint64_t *epoch);
-int dplusDebugUnpinReader(void);
-void dplusDebugEpochStats(uint64_t stats[8]);
 
 int dplusSpeculateBatch(struct client *c, int tid);
 
@@ -335,8 +321,8 @@ long long dplusDoorbellCoalesced(void);
  * not a standalone upstream PR. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
 
-/* Component 6: INFO section. Epoch engagement/lifecycle gauges are always
- * available; detailed speculative counters remain build-flag dependent. */
+/* Component 6: INFO section. Reader lifecycle gauges are always available;
+ * detailed speculative counters remain build-flag dependent. */
 sds dplusInfoString(sds info);
 
 #endif /* DPLUS_H */

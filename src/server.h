@@ -3503,8 +3503,6 @@ void dbKeyBracketEnd(dbKeyBracket *brk);
  * readers: unchanged sds when capacity suffices, else a published replacement with the old
  * allocation defer-freed. Call INSIDE a bracket. */
 sds dbGrowPublishedStringValue(robj *o, size_t total_len);
-robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
-robj *objectSetExpireEx(robj *o, long long expire, robj **retired);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
@@ -4182,8 +4180,6 @@ void armNoMainThreadFree(void);
 void disarmNoMainThreadFree(void);
 int noMainThreadFreeArmed(void);
 int inMainThread(void);
-void lazyfreeObjPrejudged(robj *obj);
-int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
 #define assertNoMainThreadFree() serverAssert(!(inMainThread() && noMainThreadFreeArmed()))
 #else

@@ -495,18 +495,9 @@ int performEvictions(void) {
     /* Try to smoke-out bugs (server.also_propagate should be empty here) */
     serverAssert(server.also_propagate.numops == 0);
 
-    /* D+ (B15): eviction accounting measures used-memory deltas around each
-     * delete, but the limbo defers frees — deltas read ~0, mem_freed never
-     * reaches target, clients get spurious OOM (deep-pipelined write bursts
-     * accumulate limbo WITHIN one event-loop iteration, so the beforeSleep
-     * flush can't help). Hold exclusive across the eviction pass: in-flight
-     * speculative walks drain, new ones punt, and (per the delete→re-add
-     * fix) dplusDeferFree frees IMMEDIATELY inside the window — restoring
-     * upstream accounting exactly. Flush pre-existing limbo first so its
-     * memory is reclaimed before we start evicting live keys. Eviction is
-     * already a rare slow path; the drain is bounded by one GET. */
+    /* D+ (B15): hold exclusive across the eviction pass so in-flight
+     * speculative walks drain before evicted values are freed. */
     dplusExclusiveEnter();
-    dplusForceReclaimAll();
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {

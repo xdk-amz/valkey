@@ -2017,10 +2017,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
-    /* D+: fold per-IO-thread speculated command counters into stat_numcommands, then seal this
-     * loop's retirements, advance the epoch and reclaim what no reader can still reach. */
+    /* D+: fold per-IO-thread speculated command counters into stat_numcommands. */
     dplusAggregateStats();
-    dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -4309,13 +4307,8 @@ void call(client *c, int flags) {
     int dplus_exclusive = 0;
     if (server.io_threads_num > 1 && server.execution_nesting == 1) {
         serverCommandProc *proc = c->cmd->proc;
-        int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
-                                     (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
-                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
-                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
         if (proc == evalCommand || proc == evalShaCommand || proc == fcallCommand || proc == execCommand ||
-            proc == keysCommand || proc == flushdbCommand || proc == flushallCommand ||
-            (proc == debugCommand && !dplus_epoch_debug_hook)) {
+            proc == keysCommand || proc == flushdbCommand || proc == flushallCommand || proc == debugCommand) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
         }

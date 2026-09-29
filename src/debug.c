@@ -549,14 +549,6 @@ void debugCommand(client *c) {
             "    Enable or disable the main dict and expire dict resizing.",
             "DPLUS-OWNER",
             "    Return the current client's IO owner id for deterministic tests.",
-            "DPLUS-EPOCH-HOLD <milliseconds>",
-            "    Delay the next real speculative reader after entry (instrumented builds only).",
-            "DPLUS-EPOCH-PIN",
-            "    Pin a synthetic reader in the current D+ epoch for testing.",
-            "DPLUS-EPOCH-UNPIN",
-            "    Release the synthetic D+ epoch reader used by tests.",
-            "DPLUS-EPOCH-STATS",
-            "    Return epoch, retired, reclaimed, forced, advances, scans, gate, and activations.",
             "HASHTABLE-CAN-ABORT-SHRINK <0|1>",
             "    Enable or disable the hashtable shrink abort.",
             "CLIENT-ENFORCE-REPLY-LIST <0|1>",
@@ -601,16 +593,6 @@ void debugCommand(client *c) {
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "assert")) {
         serverAssertWithInfo(c, c->argv[0], 1 == 2);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-hold") && c->argc == 3) {
-        long long milliseconds;
-        if (getLongLongFromObjectOrReply(c, c->argv[2], &milliseconds, NULL) != C_OK) return;
-        if (milliseconds < 1 || milliseconds > 5000) {
-            addReplyError(c, "D+ reader hold must be between 1 and 5000 milliseconds");
-        } else if (dplusDebugHoldNextReader(milliseconds * 1000) != C_OK) {
-            addReplyError(c, "D+ reader hold requires an instrumented build or is already armed");
-        } else {
-            addReply(c, shared.ok);
-        }
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-prevalidate-hold") && (c->argc == 3 || c->argc == 4)) {
         long long milliseconds;
         if (getLongLongFromObjectOrReply(c, c->argv[2], &milliseconds, NULL) != C_OK) return;
@@ -642,22 +624,6 @@ void debugCommand(client *c) {
             addReplyLongLong(c, (long long)shard);
             addReplyLongLong(c, (long long)dplusVersionRead(va, shard));
         }
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") && c->argc == 2) {
-        uint64_t epoch;
-        if (dplusDebugPinReader(&epoch) != C_OK)
-            addReplyError(c, "D+ synthetic epoch reader slot is unavailable or already pinned");
-        else
-            addReplyLongLong(c, (long long)epoch);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") && c->argc == 2) {
-        if (dplusDebugUnpinReader() != C_OK)
-            addReplyError(c, "D+ synthetic epoch reader is not pinned");
-        else
-            addReply(c, shared.ok);
-    } else if (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats") && c->argc == 2) {
-        uint64_t stats[8];
-        dplusDebugEpochStats(stats);
-        addReplyArrayLen(c, 8);
-        for (int i = 0; i < 8; i++) addReplyLongLong(c, (long long)stats[i]);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char *)objectGetVal(c->argv[2]));
         addReply(c, shared.ok);

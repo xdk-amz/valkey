@@ -9,13 +9,9 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-/* --- Component 4: Exclusive mode and epoch reader state --- */
+/* --- Component 4: Exclusive mode and reader state --- */
 _Atomic(int) dplus_exclusive_mode = 0;
-static _Atomic(uint64_t) dplus_reclaim_epoch = 1;
-static _Atomic(int) dplus_reclaim_pressure_gate = 0;
-static int dplus_reclaim_gate_drained = 0; /* main-thread only */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-static _Atomic(long long) dplus_debug_reader_hold_us = 0;
 /* S5: second preemption point -- holds the reader AFTER the value copy and
  * BEFORE validation, the window every torn-state test needs. */
 static _Atomic(long long) dplus_debug_prevalidate_hold_us = 0;
@@ -24,8 +20,6 @@ static _Atomic(uint64_t) dplus_debug_prevalidate_consumed = 0;
 static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
 static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
 static _Atomic(int) dplus_debug_reader_holding = 0;
-static _Atomic(int) dplus_debug_reader_release = 0;
-static _Atomic(int) dplus_debug_pressure_sync = 0;
 #endif
 
 typedef struct dplusReaderEpochSlot {
@@ -39,10 +33,8 @@ static _Atomic(uint64_t) dplus_reader_online[DPLUS_READER_ONLINE_WORDS] = {0};
 
 typedef struct dplusEpochThreadStats {
     uint64_t entries;
-    uint64_t retries;
     uint64_t exclusive_punts;
-    uint64_t pressure_punts;
-    char pad[DPLUS_CACHELINE - 4 * sizeof(uint64_t)];
+    char pad[DPLUS_CACHELINE - 2 * sizeof(uint64_t)];
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusEpochThreadStats;
 
 static dplusEpochThreadStats dplus_epoch_thread_stats[DPLUS_MAX_IO_THREADS] = {0};
@@ -104,52 +96,26 @@ void dplusReaderAssertParkSafe(int tid) {
                       atomic_load_explicit(&dplus_reader_slots[tid].state, memory_order_seq_cst) == DPLUS_READER_OFFLINE);
 }
 
-/* Publish ACTIVE(epoch), then check exclusion and re-read the epoch before the
- * first pointer load. The second epoch read closes the late-announcement race:
- * a reader that publishes an old epoch after a collector scan retries before
- * touching the hashtable. Collector advancement may force a retry here. */
+/* Publish ACTIVE, then check exclusion before the first pointer load. */
 static int dplusReaderEnter(int tid) {
     dplusEpochThreadStats *stats = &dplus_epoch_thread_stats[tid];
     stats->entries++;
-    while (1) {
-        uint64_t epoch = atomic_load_explicit(&dplus_reclaim_epoch, memory_order_seq_cst);
-        atomic_store_explicit(&dplus_reader_slots[tid].state, epoch, memory_order_seq_cst);
-        if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
-            stats->exclusive_punts++;
+    atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_ACTIVE, memory_order_seq_cst);
+    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
+        stats->exclusive_punts++;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(exclusive_punts, 1);
+        DPLUS_STAT_ADD(exclusive_punts, 1);
 #endif
-            dplusReaderWorkerQuiescent(tid);
-            return 0;
-        }
-        if (atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_seq_cst)) {
-            stats->pressure_punts++;
-            dplusReaderWorkerQuiescent(tid);
-            return 0;
-        }
-        if (atomic_load_explicit(&dplus_reclaim_epoch, memory_order_seq_cst) != epoch) {
-            stats->retries++;
-            dplusReaderWorkerQuiescent(tid);
-            continue;
-        }
-        return 1;
+        dplusReaderWorkerQuiescent(tid);
+        return 0;
     }
+    return 1;
 }
 
 /* Exclusive mode remains a counter because nested main/BIO windows are valid.
- * Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. Scan
- * all slots until runtime-resize ordering is proven under the new lifecycle. */
+ * Every ACTIVE slot is a reader; OFFLINE and QUIESCENT are safe. */
 void dplusExclusiveEnter(void) {
     atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    /* Test-only: a debug-held reader models a descheduled thread. ANY
-     * exclusive entrant (hard pressure, eviction, INFO temp-table release,
-     * resize) must be able to preempt it, so the release lives here -- the
-     * held reader then sleeps its configured lag and quiesces, exactly the
-     * scenario the hold exists to exercise. Without this, any non-pressure
-     * exclusive caller would spin against the handshake to the panic bound. */
-    atomic_store_explicit(&dplus_debug_reader_release, 1, memory_order_seq_cst);
-#endif
     for (int word = 0; word < DPLUS_READER_ONLINE_WORDS; word++) {
         uint64_t online = atomic_load_explicit(&dplus_reader_online[word], memory_order_seq_cst);
         while (online) {
@@ -160,7 +126,7 @@ void dplusExclusiveEnter(void) {
             monotime _w = getMonotonicUs();
             while ((state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_seq_cst)) != DPLUS_READER_OFFLINE &&
                    state != DPLUS_READER_QUIESCENT) {
-                if (getMonotonicUs() - _w > 5000000) serverPanic("dplusExclusiveEnter spin timeout on slot %d epoch %llu", i, (unsigned long long)state);
+                if (getMonotonicUs() - _w > 5000000) serverPanic("dplusExclusiveEnter spin timeout on slot %d state %llu", i, (unsigned long long)state);
             }
         }
     }
@@ -539,8 +505,8 @@ int dplusSpeculateBatch(client *c, int tid) {
     static struct serverCommand *dplus_get_cmd = NULL;
     if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
 
-    /* Epoch reader entry publishes ACTIVE(epoch), then checks exclusive mode
-     * and rechecks the epoch before the first speculative pointer load. */
+    /* Reader entry publishes ACTIVE, then checks exclusive mode before the
+     * first speculative pointer load. */
     if (!dplusReaderEnter(tid)) goto out;
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
@@ -579,26 +545,6 @@ int dplusSpeculateBatch(client *c, int tid) {
             gate->history = (gate->history << 1) | 1;
             goto out;
         }
-
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        /* Test-only preemption point: hold one admitted real GET reader after
-         * the final entry recheck and before its first speculative lookup. */
-        long long hold_us = atomic_exchange_explicit(&dplus_debug_reader_hold_us, 0, memory_order_seq_cst);
-        if (unlikely(hold_us > 0)) {
-            atomic_store_explicit(&dplus_debug_reader_holding, 1, memory_order_seq_cst);
-            monotime wait_start = getMonotonicUs();
-            while (!atomic_load_explicit(&dplus_debug_reader_release, memory_order_seq_cst)) {
-                if (getMonotonicUs() - wait_start > 10000000)
-                    serverPanic("timed out waiting to release D+ debug reader");
-                usleep(100);
-            }
-            /* Model a descheduled reader that does not run immediately when
-             * hard pressure asks it to quiesce. */
-            usleep((useconds_t)hold_us);
-            atomic_store_explicit(&dplus_debug_reader_holding, 0, memory_order_seq_cst);
-            atomic_store_explicit(&dplus_debug_reader_release, 0, memory_order_seq_cst);
-        }
-#endif
 
         dplusBatchEntry *e = &batch[batch_count];
         e->key_sds = objectGetVal(c->argv[1]);
@@ -896,378 +842,6 @@ void dplusAggregateStats(void) {
     }
 }
 
-/* --- Component 7: Epoch/QSBR-deferred reclamation (entry lifetime) ---
- *
- * Objects are unlinked before retirement, so only readers already active in
- * the retirement epoch can hold their pointers. beforeSleep seals the current
- * segment, advances the global epoch, and reclaims only segments older than
- * every ACTIVE reader. Normal collection never enters exclusive mode.
- *
- * Fixed-size chunks replace the legacy growable limbo vector. This makes
- * append O(1), avoids geometric copy/realloc costs, and permits bounded
- * reclamation without moving the remaining entries. */
-
-#define DPLUS_RETIRE_CHUNK_ENTRIES 128
-#define DPLUS_RECLAIM_BUDGET_ENTRIES 1024
-#define DPLUS_RECLAIM_BUDGET_US 50
-#define DPLUS_RECLAIM_SOFT_ENTRIES 16384
-#define DPLUS_RECLAIM_HARD_ENTRIES 32768
-#define DPLUS_TEST_READER_SLOT (DPLUS_MAX_IO_THREADS - 1)
-
-typedef struct dplusRetireEntry {
-    void *ptr;
-    uint32_t bytes_lower_bound;
-    uint8_t route;
-} dplusRetireEntry;
-
-typedef struct dplusRetireChunk {
-    struct dplusRetireChunk *next;
-    uint16_t first;
-    uint16_t count;
-    dplusRetireEntry entries[DPLUS_RETIRE_CHUNK_ENTRIES];
-} dplusRetireChunk;
-
-typedef struct dplusRetireSegment {
-    struct dplusRetireSegment *next;
-    uint64_t epoch;
-    size_t entries;
-    size_t bytes_lower_bound;
-    dplusRetireChunk *head;
-    dplusRetireChunk *tail;
-    int safe;
-} dplusRetireSegment;
-
-static dplusRetireSegment *dplus_retire_open = NULL;
-static dplusRetireSegment *dplus_retire_head = NULL;
-static dplusRetireSegment *dplus_retire_tail = NULL;
-static dplusRetireSegment *dplus_retire_segment_freelist = NULL;
-static dplusRetireChunk *dplus_retire_chunk_freelist = NULL;
-
-static size_t dplus_retired_entries = 0;
-static size_t dplus_retired_bytes_lower_bound = 0;
-static size_t dplus_retired_segments = 0;
-static size_t dplus_retired_peak = 0;
-static uint64_t dplus_reclaimed_entries = 0;
-static uint64_t dplus_epoch_advances = 0;
-static uint64_t dplus_epoch_scans = 0;
-static uint64_t dplus_reclaim_budget_exhaustions = 0;
-static uint64_t dplus_forced_reclaims = 0;
-static uint64_t dplus_pressure_activations = 0;
-static uint64_t dplus_pressure_forced_drains = 0;
-static uint64_t dplus_pressure_forced_wait_us = 0;
-
-static dplusRetireChunk *dplusAllocRetireChunk(void) {
-    dplusRetireChunk *chunk = dplus_retire_chunk_freelist;
-    if (chunk) {
-        dplus_retire_chunk_freelist = chunk->next;
-    } else {
-        chunk = zmalloc(sizeof(*chunk));
-    }
-    chunk->next = NULL;
-    chunk->first = 0;
-    chunk->count = 0;
-    return chunk;
-}
-
-static void dplusRecycleRetireChunk(dplusRetireChunk *chunk) {
-    chunk->next = dplus_retire_chunk_freelist;
-    dplus_retire_chunk_freelist = chunk;
-}
-
-static dplusRetireSegment *dplusAllocRetireSegment(void) {
-    dplusRetireSegment *segment = dplus_retire_segment_freelist;
-    if (segment) {
-        dplus_retire_segment_freelist = segment->next;
-    } else {
-        segment = zmalloc(sizeof(*segment));
-    }
-    memset(segment, 0, sizeof(*segment));
-    segment->epoch = atomic_load_explicit(&dplus_reclaim_epoch, memory_order_seq_cst);
-    dplus_retired_segments++;
-    return segment;
-}
-
-static void dplusRecycleRetireSegment(dplusRetireSegment *segment) {
-    serverAssert(segment->head == NULL && segment->tail == NULL && segment->entries == 0);
-    dplus_retired_segments--;
-    segment->next = dplus_retire_segment_freelist;
-    dplus_retire_segment_freelist = segment;
-}
-
-static uint32_t dplusAllocationLowerBound(void *ptr) {
-    size_t bytes = zmalloc_size(ptr);
-    return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
-}
-
-static int dplusAllReadersQuiescent(void) {
-    for (int word = 0; word < DPLUS_READER_ONLINE_WORDS; word++) {
-        uint64_t online = atomic_load_explicit(&dplus_reader_online[word], memory_order_seq_cst);
-        while (online) {
-            int i = word * 64 + __builtin_ctzll(online);
-            online &= online - 1;
-            uint64_t state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_seq_cst);
-            if (state != DPLUS_READER_OFFLINE && state != DPLUS_READER_QUIESCENT) return 0;
-        }
-    }
-    return 1;
-}
-
-static void dplusActivatePressureGate(void) {
-    if (!atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed)) {
-        atomic_store_explicit(&dplus_reclaim_pressure_gate, 1, memory_order_seq_cst);
-        dplus_pressure_activations++;
-    }
-    if (!dplus_reclaim_gate_drained && dplusAllReadersQuiescent()) dplus_reclaim_gate_drained = 1;
-}
-
-static void dplusClearPressureGate(void) {
-    dplus_reclaim_gate_drained = 0;
-    atomic_store_explicit(&dplus_reclaim_pressure_gate, 0, memory_order_seq_cst);
-}
-
-static void dplusForceRetirePressure(void) {
-    monotime start = getMonotonicUs();
-    dplusExclusiveEnter(); /* releases any debug-held reader (see enter) */
-    dplus_pressure_forced_wait_us += getMonotonicUs() - start;
-    dplus_pressure_forced_drains++;
-    /* The pressure gate excluded new readers and exclusive entry drained every
-     * admitted reader. Keep the gate closed and reclaim subsequent writes
-     * immediately until beforeSleep observes an empty backlog. */
-    dplus_reclaim_gate_drained = 1;
-    dplusForceReclaimAll();
-    dplusExclusiveLeave();
-}
-
-static int dplusAppendRetired(void *ptr, int route) {
-    /* No configured workers, or no ownership (speculation is gated on it), means
-     * no speculative pointer can exist: the caller frees on its own route. */
-    if (server.io_threads_num <= 1) return 0;
-    /* Exclusive mode has already drained readers. Immediate free is required
-     * by RENAME/MOVE refcount re-embedding and maxmemory delta accounting. */
-    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
-    serverAssert(inMainThread());
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    /* Deterministic test handshake: do not begin the armed pressure command
-     * until the target real reader reaches the worst preemption point. */
-    if (atomic_exchange_explicit(&dplus_debug_pressure_sync, 0, memory_order_seq_cst)) {
-        monotime start = getMonotonicUs();
-        while (!atomic_load_explicit(&dplus_debug_reader_holding, memory_order_seq_cst)) {
-            if (getMonotonicUs() - start > 5000000)
-                serverPanic("timed out waiting for D+ debug reader hold");
-        }
-    }
-#endif
-    /* Reclaim only entries from completed mutation frames. The current pointer
-     * has not been appended yet, so its caller may still finish safely after
-     * this function returns. */
-    if (dplus_retired_entries >= DPLUS_RECLAIM_HARD_ENTRIES && !dplus_reclaim_gate_drained)
-        dplusForceRetirePressure();
-    /* Once the pressure gate has drained old readers, no new reader can acquire
-     * a pointer. Preserve stock immediate reclamation until backlog reaches 0. */
-    if (dplus_reclaim_gate_drained) return 0;
-
-    if (dplus_retire_open == NULL) dplus_retire_open = dplusAllocRetireSegment();
-    dplusRetireSegment *segment = dplus_retire_open;
-    if (segment->tail == NULL || segment->tail->count == DPLUS_RETIRE_CHUNK_ENTRIES) {
-        dplusRetireChunk *chunk = dplusAllocRetireChunk();
-        if (segment->tail)
-            segment->tail->next = chunk;
-        else
-            segment->head = chunk;
-        segment->tail = chunk;
-    }
-
-    dplusRetireChunk *chunk = segment->tail;
-    dplusRetireEntry *entry = &chunk->entries[chunk->count++];
-    entry->ptr = ptr;
-    entry->route = (uint8_t)route;
-    entry->bytes_lower_bound = dplusAllocationLowerBound(ptr);
-    segment->entries++;
-    segment->bytes_lower_bound += entry->bytes_lower_bound;
-    dplus_retired_entries++;
-    dplus_retired_bytes_lower_bound += entry->bytes_lower_bound;
-    if (dplus_retired_entries > dplus_retired_peak) dplus_retired_peak = dplus_retired_entries;
-    if (dplus_retired_entries >= DPLUS_RECLAIM_SOFT_ENTRIES &&
-        !atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed)) {
-        dplusActivatePressureGate();
-    } else if (atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed) &&
-               !dplus_reclaim_gate_drained && (dplus_retired_entries & 1023) == 0) {
-        /* Recheck at bounded intervals so an active reader that exits during a
-         * large main-thread command batch stops further retirement growth. */
-        dplusActivatePressureGate();
-    }
-    return 1;
-}
-
-int dplusDeferFree(robj *o, int route) {
-    return dplusAppendRetired(o, route);
-}
-
-int dplusDeferFreeRaw(void *ptr) {
-    return dplusAppendRetired(ptr, DPLUS_LIMBO_RAW);
-}
-
-/* Seal retirements from the current event-loop epoch before publishing the
- * next epoch. A worker entering the new epoch observes all preceding unlinks. */
-static void dplusSealRetireEpoch(void) {
-    if (dplus_retire_open == NULL) return;
-    dplusRetireSegment *segment = dplus_retire_open;
-    dplus_retire_open = NULL;
-    serverAssert(segment->entries > 0);
-    if (dplus_retire_tail)
-        dplus_retire_tail->next = segment;
-    else
-        dplus_retire_head = segment;
-    dplus_retire_tail = segment;
-
-    uint64_t old_epoch = atomic_fetch_add_explicit(&dplus_reclaim_epoch, 1, memory_order_seq_cst);
-    serverAssert(old_epoch < DPLUS_READER_QUIESCENT - 1);
-    dplus_epoch_advances++;
-}
-
-static int dplusReaderStateBlocksEpoch(uint64_t state, uint64_t epoch) {
-    return state != DPLUS_READER_OFFLINE && state != DPLUS_READER_QUIESCENT && state <= epoch;
-}
-
-static int dplusRetireSegmentIsSafe(const dplusRetireSegment *segment) {
-    dplus_epoch_scans++;
-    for (int word = 0; word < DPLUS_READER_ONLINE_WORDS; word++) {
-        uint64_t online = atomic_load_explicit(&dplus_reader_online[word], memory_order_seq_cst);
-        while (online) {
-            int i = word * 64 + __builtin_ctzll(online);
-            online &= online - 1;
-            uint64_t state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_seq_cst);
-            if (dplusReaderStateBlocksEpoch(state, segment->epoch)) return 0;
-        }
-    }
-    return 1;
-}
-
-static void dplusReclaimEntry(const dplusRetireEntry *entry) {
-    robj *o = entry->ptr;
-    switch (entry->route) {
-    /* A retired value is a terminal free: it leaves main the same way an
-     * undeferred one does (IO-thread slab, else bio), never inline here. */
-    case DPLUS_LIMBO_OFFLOAD_PREF:
-    case DPLUS_LIMBO_SYNC:
-    case DPLUS_LIMBO_ASYNC: freeValueNeverOnMain(NULL, o, -1); break;
-    case DPLUS_LIMBO_RAW: zfree(o); break;
-    default: serverPanic("invalid D+ retirement route %d", entry->route);
-    }
-}
-
-static int dplusReclaimSealed(int force) {
-    if (dplus_retire_head == NULL) return 1;
-    size_t processed = 0;
-    monotime start = getMonotonicUs();
-    while (dplus_retire_head) {
-        dplusRetireSegment *segment = dplus_retire_head;
-        if (!segment->safe) {
-            if (!force && !dplusRetireSegmentIsSafe(segment)) break;
-            segment->safe = 1;
-        }
-
-        while (segment->head) {
-            if (!force && processed > 0 &&
-                (processed >= DPLUS_RECLAIM_BUDGET_ENTRIES ||
-                 ((processed & 31) == 0 && getMonotonicUs() - start >= DPLUS_RECLAIM_BUDGET_US))) {
-                dplus_reclaim_budget_exhaustions++;
-                return 0;
-            }
-            dplusRetireChunk *chunk = segment->head;
-            dplusRetireEntry *entry = &chunk->entries[chunk->first++];
-            chunk->count--;
-            segment->entries--;
-            segment->bytes_lower_bound -= entry->bytes_lower_bound;
-            dplus_retired_entries--;
-            dplus_retired_bytes_lower_bound -= entry->bytes_lower_bound;
-            dplusReclaimEntry(entry);
-            dplus_reclaimed_entries++;
-            processed++;
-
-            if (chunk->count == 0) {
-                segment->head = chunk->next;
-                if (segment->head == NULL) segment->tail = NULL;
-                dplusRecycleRetireChunk(chunk);
-            }
-        }
-
-        dplus_retire_head = segment->next;
-        if (dplus_retire_head == NULL) dplus_retire_tail = NULL;
-        dplusRecycleRetireSegment(segment);
-    }
-    return dplus_retire_head == NULL;
-}
-
-static void dplusManageRetirePressure(void) {
-    if (!atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed)) return;
-    if (!dplus_reclaim_gate_drained) dplusActivatePressureGate();
-
-    if (dplus_retired_entries >= DPLUS_RECLAIM_HARD_ENTRIES) {
-        /* Hard pressure retains the proven fallback. The pressure gate is
-         * already closed, so this wait covers only readers admitted earlier. */
-        dplusForceRetirePressure();
-    }
-    if (dplus_retired_entries == 0) dplusClearPressureGate();
-}
-
-/* Normal beforeSleep path: publish an epoch boundary and perform bounded work.
- * It never waits unless hard retirement pressure invokes the explicit fallback. */
-void dplusReclaimRetired(void) {
-    dplusSealRetireEpoch();
-    dplusReclaimSealed(0);
-    dplusManageRetirePressure();
-}
-
-/* Hard-pressure path. The caller must already hold exclusive mode, which is
- * the proof that every reader has quiesced. Preserve every recorded free route
- * but remove the normal event-loop work budget. */
-static void dplusTrimRetireFreelists(void) {
-    while (dplus_retire_chunk_freelist) {
-        dplusRetireChunk *next = dplus_retire_chunk_freelist->next;
-        zfree(dplus_retire_chunk_freelist);
-        dplus_retire_chunk_freelist = next;
-    }
-    while (dplus_retire_segment_freelist) {
-        dplusRetireSegment *next = dplus_retire_segment_freelist->next;
-        zfree(dplus_retire_segment_freelist);
-        dplus_retire_segment_freelist = next;
-    }
-}
-
-void dplusForceReclaimAll(void) {
-    serverAssert(atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0);
-    dplus_forced_reclaims++;
-    dplusSealRetireEpoch();
-    dplusReclaimSealed(1);
-    serverAssert(dplus_retire_open == NULL && dplus_retire_head == NULL && dplus_retired_entries == 0);
-    /* Hard memory pressure must not retain metadata sized for a historical
-     * retirement peak. Normal operation still recycles these allocations. */
-    dplusTrimRetireFreelists();
-}
-
-size_t dplusLimboPeak(void) {
-    return dplus_retired_peak;
-}
-
-/* Instrumented-build test hook: delay the next admitted real reader at the
- * worst preemption point, after its final recheck and before pointer access. */
-int dplusDebugHoldNextReader(long long usec) {
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    if (usec <= 0 || usec > 5000000) return C_ERR;
-    long long expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&dplus_debug_reader_hold_us, &expected, usec,
-                                                 memory_order_seq_cst, memory_order_seq_cst))
-        return C_ERR;
-    atomic_store_explicit(&dplus_debug_reader_release, 0, memory_order_seq_cst);
-    atomic_store_explicit(&dplus_debug_pressure_sync, 1, memory_order_seq_cst);
-    return C_OK;
-#else
-    UNUSED(usec);
-    return C_ERR;
-#endif
-}
-
 /* S5: lock-free observation of the prevalidate hold -- INFO must NOT be
  * used to poll during a hold: its clients section acquires every worker
  * event-loop mutex (b13 info lock), including the parked worker's, so the
@@ -1306,43 +880,6 @@ int dplusDebugHoldPrevalidate(long long usec) {
 #endif
 }
 
-/* Deterministic test hook: pin an otherwise unused slot in the current epoch.
- * This is reachable only through DEBUG and refuses to overlap a real worker. */
-int dplusDebugPinReader(uint64_t *epoch) {
-    if (server.io_threads_num > DPLUS_TEST_READER_SLOT) return C_ERR;
-    uint64_t expected = DPLUS_READER_OFFLINE;
-    uint64_t current = atomic_load_explicit(&dplus_reclaim_epoch, memory_order_seq_cst);
-    if (!atomic_compare_exchange_strong_explicit(&dplus_reader_slots[DPLUS_TEST_READER_SLOT].state,
-                                                 &expected, current,
-                                                 memory_order_seq_cst, memory_order_seq_cst))
-        return C_ERR;
-    atomic_fetch_or_explicit(&dplus_reader_online[DPLUS_TEST_READER_SLOT / 64],
-                             UINT64_C(1) << (DPLUS_TEST_READER_SLOT % 64), memory_order_seq_cst);
-    *epoch = current;
-    return C_OK;
-}
-
-int dplusDebugUnpinReader(void) {
-    if (server.io_threads_num > DPLUS_TEST_READER_SLOT) return C_ERR;
-    uint64_t state = atomic_load_explicit(&dplus_reader_slots[DPLUS_TEST_READER_SLOT].state, memory_order_seq_cst);
-    if (state == DPLUS_READER_OFFLINE || state == DPLUS_READER_QUIESCENT) return C_ERR;
-    atomic_store_explicit(&dplus_reader_slots[DPLUS_TEST_READER_SLOT].state, DPLUS_READER_OFFLINE, memory_order_seq_cst);
-    atomic_fetch_and_explicit(&dplus_reader_online[DPLUS_TEST_READER_SLOT / 64],
-                              ~(UINT64_C(1) << (DPLUS_TEST_READER_SLOT % 64)), memory_order_seq_cst);
-    return C_OK;
-}
-
-void dplusDebugEpochStats(uint64_t stats[8]) {
-    stats[0] = atomic_load_explicit(&dplus_reclaim_epoch, memory_order_seq_cst);
-    stats[1] = dplus_retired_entries;
-    stats[2] = dplus_reclaimed_entries;
-    stats[3] = dplus_forced_reclaims;
-    stats[4] = dplus_epoch_advances;
-    stats[5] = dplus_epoch_scans;
-    stats[6] = atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_seq_cst);
-    stats[7] = dplus_pressure_activations;
-}
-
 /* --- Component 6: INFO section --- */
 /* Door-2 wakeup-coalescing counters (prototype): sums of per-worker plain
  * fields written only by their owning worker — racy-by-design stats reads.
@@ -1362,17 +899,11 @@ long long dplusDoorbellCoalesced(void) {
 
 sds dplusInfoString(sds info) {
     /* Worker-owned counters are intentionally sampled without shared-line
-     * writes. Lifecycle states are atomic because main/BIO exclusive scans
+     * writes. Lifecycle states are atomic because main exclusive scans
      * consume the same values for correctness. */
-    uint64_t entries = 0, retries = 0, epoch_exclusive_punts = 0, pressure_punts = 0;
+    uint64_t entries = 0, epoch_exclusive_punts = 0;
     unsigned online = 0, active = 0, quiescent = 0;
     long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
-    int debug_reader_holding = 0;
-    long long debug_reader_hold_us = 0;
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-    debug_reader_holding = atomic_load_explicit(&dplus_debug_reader_holding, memory_order_relaxed);
-    debug_reader_hold_us = atomic_load_explicit(&dplus_debug_reader_hold_us, memory_order_relaxed);
-#endif
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
         uint64_t state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_acquire);
         if (state != DPLUS_READER_OFFLINE) {
@@ -1383,64 +914,26 @@ sds dplusInfoString(sds info) {
                 active++;
         }
         entries += dplus_epoch_thread_stats[i].entries;
-        retries += dplus_epoch_thread_stats[i].retries;
         epoch_exclusive_punts += dplus_epoch_thread_stats[i].exclusive_punts;
-        pressure_punts += dplus_epoch_thread_stats[i].pressure_punts;
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
     }
     info = sdscatprintf(info,
         "# Dplus\r\n"
-        "dplus_reclaim_epoch:%llu\r\n"
         "dplus_epoch_reader_entries:%llu\r\n"
-        "dplus_epoch_reader_retries:%llu\r\n"
         "dplus_epoch_exclusive_punts:%llu\r\n"
-        "dplus_epoch_pressure_punts:%llu\r\n"
-        "dplus_reclaim_pressure_gate:%d\r\n"
-        "dplus_pressure_activations:%llu\r\n"
         "dplus_epoch_workers_online:%u\r\n"
         "dplus_epoch_workers_active:%u\r\n"
         "dplus_epoch_workers_quiescent:%u\r\n"
-        "dplus_retired_entries:%zu\r\n"
-        "dplus_retired_bytes_lower_bound:%zu\r\n"
-        "dplus_retired_segments:%zu\r\n"
-        "dplus_retired_peak:%zu\r\n"
-        "dplus_reclaimed_entries:%llu\r\n"
-        "dplus_epoch_advances:%llu\r\n"
-        "dplus_epoch_scans:%llu\r\n"
-        "dplus_reclaim_budget_exhaustions:%llu\r\n"
-        "dplus_forced_reclaims:%llu\r\n"
-        "dplus_pressure_forced_drains:%llu\r\n"
-        "dplus_pressure_forced_wait_us:%llu\r\n"
-        "dplus_epoch_debug_reader_holding:%d\r\n"
-        "dplus_epoch_debug_reader_hold_us:%lld\r\n"
         "dplus_doorbell_rings:%llu\r\n"
         "dplus_doorbell_coalesced:%llu\r\n"
         "dplus_punted_replies_written:%llu\r\n",
-        (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
         (unsigned long long)entries,
-        (unsigned long long)retries,
         (unsigned long long)epoch_exclusive_punts,
-        (unsigned long long)pressure_punts,
-        atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed),
-        (unsigned long long)dplus_pressure_activations,
         online,
         active,
         quiescent,
-        dplus_retired_entries,
-        dplus_retired_bytes_lower_bound,
-        dplus_retired_segments,
-        dplus_retired_peak,
-        (unsigned long long)dplus_reclaimed_entries,
-        (unsigned long long)dplus_epoch_advances,
-        (unsigned long long)dplus_epoch_scans,
-        (unsigned long long)dplus_reclaim_budget_exhaustions,
-        (unsigned long long)dplus_forced_reclaims,
-        (unsigned long long)dplus_pressure_forced_drains,
-        (unsigned long long)dplus_pressure_forced_wait_us,
-        debug_reader_holding,
-        debug_reader_hold_us,
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
         (unsigned long long)punted_replies);

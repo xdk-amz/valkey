@@ -472,15 +472,7 @@ mstime_t objectGetExpire(const robj *o) {
 /* This functions may reallocate the value. The new allocation is returned and
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
-/* This functions may reallocate the value. The new allocation is returned and
- * the old object's reference counter is decremented and possibly freed. Use the
- * returned object instead of 'o' after calling this function.
- *
- * D+ (S1.2a): objectSetExpireEx threads the retirement out-param through to
- * objectSetKeyAndExpireEx for reader-reachable objects — see the contract
- * there. First-time expire on a published object MUST use the Ex form. */
-robj *objectSetExpireEx(robj *o, long long expire, robj **retired) {
-    if (retired) *retired = NULL;
+robj *objectSetExpire(robj *o, long long expire) {
     if (o->hasexpire) {
         /* Update existing expire field. */
         unsigned char *data = objectEmbeddedData(o);
@@ -489,12 +481,8 @@ robj *objectSetExpireEx(robj *o, long long expire, robj **retired) {
     } else if (expire == EXPIRY_NONE) {
         return o;
     } else {
-        return objectSetKeyAndExpireEx(o, objectGetKey(o), expire, retired);
+        return objectSetKeyAndExpire(o, objectGetKey(o), expire);
     }
-}
-
-robj *objectSetExpire(robj *o, long long expire) {
-    return objectSetExpireEx(o, expire, NULL);
 }
 
 /* Caller is responsible for ensuring that robj does not have an embedded value */
@@ -527,24 +515,8 @@ void objectUnembedVal(robj *o) {
 
 /* This functions may reallocate the value. The new allocation is returned and
  * the old object's reference counter is decremented and possibly freed. Use the
- * returned object instead of 'o' after calling this function.
- *
- * D+ (S1.2a): the Ex variant supports replacement of a READER-REACHABLE
- * object (published in db->keys while IO threads speculate). When 'retired'
- * is non-NULL and this call would have freed the old shell, the old shell is
- * instead returned in *retired, INTACT: it is not freed and — critically —
- * its val_ptr is NOT cleared, so an in-flight speculative reader can still
- * dereference it (it reads the coherent old value and linearizes before the
- * replacement). The caller must retire the shell with dplusDeferFreeRaw()
- * (shell-only zfree at quiescence): val_ptr ownership has transferred to the
- * new object (or, for EMBSTR, the value lives inline in the shell
- * allocation), so a full decrRefCount at flush would double-free. */
-robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired) {
-    if (retired) *retired = NULL;
-    /* Retirement applies only when this call would free the shell. With
-     * refcount > 1 (including shared sentinels) the decrRefCount below only
-     * decrements and other references keep the object alive. */
-    int would_free = (objectGetRefcount(o) == 1);
+ * returned object instead of 'o' after calling this function. */
+robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
     /* T9 fast path: if the object already carries the correct embedded key and
      * a matching expire, it was built store-ready (e.g. at parse time on an IO
      * thread) and can be installed with no allocation or copy. */
@@ -561,10 +533,7 @@ robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **r
         objectSetLRU(new, objectGetLRU(o));
         objectCopyMetadata(new, o);
         bgIteration_updateDbEntryPtr(o, new);
-        if (retired && would_free)
-            *retired = o;
-        else
-            decrRefCount(o);
+        decrRefCount(o);
         return new;
     }
 
@@ -573,11 +542,7 @@ robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **r
     if (objectGetRefcount(o) == 1) {
         /* Reuse the ptr. There are no other references to o. */
         ptr = o->val_ptr;
-        /* Clearing val_ptr prevents the decrRefCount below from freeing the
-         * transferred pointer — but it is also a NULL-deref landmine for an
-         * in-flight speculative reader. On the retirement path we leave the
-         * shell fully intact and skip the decrRefCount entirely. */
-        if (!(retired && would_free)) o->val_ptr = NULL;
+        o->val_ptr = NULL;
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_INT) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
@@ -595,15 +560,8 @@ robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **r
     objectSetLRU(new, objectGetLRU(o));
     objectCopyMetadata(new, o);
     bgIteration_updateDbEntryPtr(o, new);
-    if (retired && would_free)
-        *retired = o;
-    else
-        decrRefCount(o);
+    decrRefCount(o);
     return new;
-}
-
-robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
-    return objectSetKeyAndExpireEx(o, key, expire, NULL);
 }
 
 /* Same as CreateRawStringObject, can return NULL if allocation fails */
