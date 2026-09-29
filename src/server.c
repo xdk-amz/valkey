@@ -4301,22 +4301,7 @@ void call(client *c, int flags) {
         }
     }
 
-    /* D+: exclusive mode for commands whose partial state a speculative read must not observe
-     * (multi-key atomic operations). Plain writes are covered by the sharded version bump. Only
-     * the top-level command enters; nested calls (EVAL/EXEC bodies) are already covered. */
-    int dplus_exclusive = 0;
-    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
-        serverCommandProc *proc = c->cmd->proc;
-        if (proc == evalCommand || proc == evalShaCommand || proc == fcallCommand || proc == execCommand ||
-            proc == keysCommand || proc == flushdbCommand || proc == flushallCommand || proc == debugCommand) {
-            dplusExclusiveEnter();
-            dplus_exclusive = 1;
-        }
-    }
-
     c->cmd->proc(c);
-
-    if (dplus_exclusive) dplusExclusiveLeave();
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;

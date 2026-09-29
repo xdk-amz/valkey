@@ -4,7 +4,6 @@
 #include "functions.h"
 #include "cluster.h"
 #include "module.h"
-#include "dplus.h"
 
 #include <stdatomic.h>
 
@@ -229,17 +228,9 @@ void emptyDbAsync(serverDb *db) {
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
     }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires, *oldkeyswithexpires = db->keys_with_volatile_items;
-    /* D+ (S1.2c / sweep H9): a speculative reader that resolved db->keys
-     * before this swap would walk the old kvstore while (or after) the BIO
-     * thread frees it — UAF. Gate the swap: in-flight walks drain, new ones
-     * resolve the fresh empty kvstore. FLUSHDB/FLUSHALL ASYNC is rare; the
-     * drain is bounded by one in-flight read. The BIO handoff itself stays
-     * async and unordered — safety comes from the drain, not the free. */
-    dplusExclusiveEnter();
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
-    dplusExclusiveLeave();
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
     bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldkeyswithexpires);
 }

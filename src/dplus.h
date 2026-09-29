@@ -61,24 +61,14 @@ struct dplusVersionArray {
     dplusVersionLine lines[DPLUS_VERSION_LINES];
 };
 
-/* --- Component 4: Exclusive mode --- */
-
-/* Global exclusive_mode flag. Set by commands that require full atomicity
- * (EVAL, MULTI-EXEC, KEYS, DEBUG, FLUSHALL/FLUSHDB, active defrag start).
- * Readers check this before speculating. */
-extern _Atomic(int) dplus_exclusive_mode;
-
-/* Reader states. OFFLINE and QUIESCENT never hold speculative pointers. */
 #define DPLUS_MAX_IO_THREADS 256
-#define DPLUS_READER_OFFLINE 0
-#define DPLUS_READER_ACTIVE 1
-#define DPLUS_READER_QUIESCENT UINT64_MAX
 
-/* IO-thread lifecycle hooks. A slot is initialized QUIESCENT before thread
- * creation and becomes OFFLINE only after pthread_join completes. */
-void dplusReaderWorkerOnline(int tid);
-void dplusReaderWorkerQuiescent(int tid);
-void dplusReaderWorkerOffline(int tid);
+/* IO-thread lifecycle hooks. Speculative reads and main-thread mutations are
+ * separated by the event-loop phases, so there is no reader state to track. */
+static inline void dplusReaderWorkerOnline(int tid) { (void)tid; }
+static inline void dplusReaderWorkerQuiescent(int tid) { (void)tid; }
+static inline void dplusReaderWorkerOffline(int tid) { (void)tid; }
+static inline void dplusReaderAssertParkSafe(int tid) { (void)tid; }
 
 /* --- Per-IO-thread command counters (no-enqueue Phase-1) ---
  *
@@ -127,7 +117,6 @@ typedef struct {
     _Atomic(uint64_t) speculative_attempts;
     _Atomic(uint64_t) speculative_hits;
     _Atomic(uint64_t) validation_misses;
-    _Atomic(uint64_t) exclusive_punts;
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
     _Atomic(uint64_t) intra_batch_write_punts;
@@ -265,10 +254,6 @@ uint64_t hashtableHashKey(hashtable *ht, const void *key);
 /* Component 2: Version array accessor (implemented in hashtable.c) */
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 
-/* Component 4: Exclusive mode helpers (implemented in dplus.c) */
-void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
-void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
-
 /* ACL/AUTH gate for speculation (main-thread writers; workers read the
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
 void dplusRecomputeSpecAclOk(struct client *c);
@@ -279,16 +264,6 @@ void dplusOnMonitorsChanged(void);
 
 /* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
 struct client;
-
-/* D+ (S1.5): OOM-pinning invariant. A worker's reader slot must be QUIESCENT
- * or OFFLINE whenever the worker parks/sleeps -- an ACTIVE(epoch) slot held
- * across a park pins retirement segments (memory grows unboundedly) and
- * stalls every exclusive-gate entrant up to the 5s panic bound. All
- * speculation exit paths publish quiescence (dplusSpeculateBatch 'out:',
- * ReaderEnter punt paths, thread cancellation cleanup); this assert catches
- * any future path that forgets. Debug builds only -- reads a seq_cst slot
- * the worker itself owns, so it is race-free by the single-writer rule. */
-void dplusReaderAssertParkSafe(int tid);
 
 /* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
  * Called from ioThreadReadQueryFromClient. Returns count of commands

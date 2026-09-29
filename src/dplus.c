@@ -9,8 +9,6 @@
 #include <stdatomic.h>
 #include <unistd.h>
 
-/* --- Component 4: Exclusive mode and reader state --- */
-_Atomic(int) dplus_exclusive_mode = 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 /* S5: second preemption point -- holds the reader AFTER the value copy and
  * BEFORE validation, the window every torn-state test needs. */
@@ -21,26 +19,6 @@ static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
 static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
 static _Atomic(int) dplus_debug_reader_holding = 0;
 #endif
-
-typedef struct dplusReaderEpochSlot {
-    _Atomic(uint64_t) state;
-    char pad[DPLUS_CACHELINE - sizeof(_Atomic(uint64_t))];
-} __attribute__((aligned(DPLUS_CACHELINE))) dplusReaderEpochSlot;
-
-static dplusReaderEpochSlot dplus_reader_slots[DPLUS_MAX_IO_THREADS] = {0};
-#define DPLUS_READER_ONLINE_WORDS (DPLUS_MAX_IO_THREADS / 64)
-static _Atomic(uint64_t) dplus_reader_online[DPLUS_READER_ONLINE_WORDS] = {0};
-
-typedef struct dplusEpochThreadStats {
-    uint64_t entries;
-    uint64_t exclusive_punts;
-    char pad[DPLUS_CACHELINE - 2 * sizeof(uint64_t)];
-} __attribute__((aligned(DPLUS_CACHELINE))) dplusEpochThreadStats;
-
-static dplusEpochThreadStats dplus_epoch_thread_stats[DPLUS_MAX_IO_THREADS] = {0};
-
-static_assert(sizeof(dplusReaderEpochSlot) == DPLUS_CACHELINE, "epoch reader slot must occupy one cache line");
-static_assert(sizeof(dplusEpochThreadStats) == DPLUS_CACHELINE, "epoch reader stats must occupy one cache line");
 
 /* --- Per-IO-thread command counters (no-enqueue Phase-1) --- */
 dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
@@ -67,74 +45,6 @@ uint64_t dplusStatsSum(size_t field_offset) {
     return sum;
 }
 #endif
-
-/* --- Component 4: Exclusive mode implementation --- */
-
-/* A slot is published before its thread can read speculative pointers and is
- * excluded only after join, preventing slot-reuse ABA during runtime resize. */
-void dplusReaderWorkerOnline(int tid) {
-    serverAssert(tid > 0 && tid < DPLUS_MAX_IO_THREADS);
-    atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_QUIESCENT, memory_order_seq_cst);
-    atomic_fetch_or_explicit(&dplus_reader_online[tid / 64], UINT64_C(1) << (tid % 64), memory_order_seq_cst);
-}
-
-void dplusReaderWorkerQuiescent(int tid) {
-    if (tid <= 0 || tid >= DPLUS_MAX_IO_THREADS) return;
-    atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_QUIESCENT, memory_order_seq_cst);
-}
-
-void dplusReaderWorkerOffline(int tid) {
-    serverAssert(tid > 0 && tid < DPLUS_MAX_IO_THREADS);
-    atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_OFFLINE, memory_order_seq_cst);
-    atomic_fetch_and_explicit(&dplus_reader_online[tid / 64], ~(UINT64_C(1) << (tid % 64)), memory_order_seq_cst);
-}
-
-/* D+ (S1.5): see dplus.h. Called at worker park points. */
-void dplusReaderAssertParkSafe(int tid) {
-    if (tid <= 0 || tid >= DPLUS_MAX_IO_THREADS) return;
-    debugServerAssert(atomic_load_explicit(&dplus_reader_slots[tid].state, memory_order_seq_cst) == DPLUS_READER_QUIESCENT ||
-                      atomic_load_explicit(&dplus_reader_slots[tid].state, memory_order_seq_cst) == DPLUS_READER_OFFLINE);
-}
-
-/* Publish ACTIVE, then check exclusion before the first pointer load. */
-static int dplusReaderEnter(int tid) {
-    dplusEpochThreadStats *stats = &dplus_epoch_thread_stats[tid];
-    stats->entries++;
-    atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_ACTIVE, memory_order_seq_cst);
-    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_seq_cst)) {
-        stats->exclusive_punts++;
-#ifdef IO_LOOKUP_OFFLOAD_STATS
-        DPLUS_STAT_ADD(exclusive_punts, 1);
-#endif
-        dplusReaderWorkerQuiescent(tid);
-        return 0;
-    }
-    return 1;
-}
-
-/* Exclusive mode remains a counter because nested main/BIO windows are valid.
- * Every ACTIVE slot is a reader; OFFLINE and QUIESCENT are safe. */
-void dplusExclusiveEnter(void) {
-    atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
-    for (int word = 0; word < DPLUS_READER_ONLINE_WORDS; word++) {
-        uint64_t online = atomic_load_explicit(&dplus_reader_online[word], memory_order_seq_cst);
-        while (online) {
-            int i = word * 64 + __builtin_ctzll(online);
-            online &= online - 1;
-            uint64_t state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_seq_cst);
-            if (state == DPLUS_READER_OFFLINE || state == DPLUS_READER_QUIESCENT) continue;
-            monotime _w = getMonotonicUs();
-            while ((state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_seq_cst)) != DPLUS_READER_OFFLINE &&
-                   state != DPLUS_READER_QUIESCENT) {
-                if (getMonotonicUs() - _w > 5000000) serverPanic("dplusExclusiveEnter spin timeout on slot %d state %llu", i, (unsigned long long)state);
-            }
-        }
-    }
-}
-
-void dplusExclusiveLeave(void) {
-    atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
-}
 
 /* --- ACL/AUTH gate for speculation --- */
 
@@ -179,18 +89,13 @@ void dplusRecomputeSpecAclOk(client *c) {
 }
 
 /* ACL rules changed (ACL SETUSER/DELUSER/LOAD, module SetUserACL).
- * MAIN THREAD ONLY. Enter exclusive FIRST: blocks new speculation and drains
- * in-flight batches that passed the OLD gate (they serialize before the
- * change — stock-equivalent semantics, F12-C temporal-window class), then
- * recompute every client's gate under the new rules. Rare admin op — the
- * blanket client walk is deliberate simplicity. */
+ * MAIN THREAD ONLY. Recompute every client's gate under the new rules. Rare
+ * admin op -- the blanket client walk is deliberate simplicity. */
 void dplusOnAclRulesChanged(void) {
-    dplusExclusiveEnter();
     listIter li;
     listNode *ln;
     listRewind(server.clients, &li);
     while ((ln = listNext(&li))) dplusRecomputeSpecAclOk((client *)listNodeValue(ln));
-    dplusExclusiveLeave();
 }
 
 /* F6: module command-result SUCCESS subscribers require an exact per-command
@@ -198,30 +103,23 @@ void dplusOnAclRulesChanged(void) {
  * must be off while any such subscriber exists. Speculated GETs can only be
  * SUCCESS events (failures always punt), so only the success listener count
  * matters. Published gate read by workers each batch; transitions are rare
- * module admin ops (subscribe / unload) and drain in-flight speculation via
- * exclusive mode, same temporal-window treatment as ACL changes. */
+ * module admin ops (subscribe / unload). */
 _Atomic int dplus_module_cmdresult_gate = 0;
 
 void dplusOnCommandResultListenersChanged(int success_listeners) {
-    dplusExclusiveEnter();
     atomic_store_explicit(&dplus_module_cmdresult_gate, success_listeners > 0, memory_order_release);
-    dplusExclusiveLeave();
 }
 
 /* F1: MONITOR feeds every executed command to attached monitor clients from
  * main (replicationFeedMonitors in call()); speculated GETs bypass call(), so
  * ~all speculative reads are invisible to MONITOR. Monitors are a rare
  * diagnostic feature, so gate speculation OFF while any monitor is attached --
- * MONITOR then observes the exact stock command stream. Published by main under
- * an exclusive drain (in-flight speculation that passed the old gate settles
- * first), same temporal treatment as the module/ACL gates; zero cost when no
+ * MONITOR then observes the exact stock command stream. Zero cost when no
  * monitor (one acquire load of a main-written int per batch). */
 _Atomic int dplus_monitor_gate = 0;
 
 void dplusOnMonitorsChanged(void) {
-    dplusExclusiveEnter();
     atomic_store_explicit(&dplus_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
-    dplusExclusiveLeave();
 }
 
 /* --- Component 2: Speculative GET — reply helpers --- */
@@ -505,10 +403,6 @@ int dplusSpeculateBatch(client *c, int tid) {
     static struct serverCommand *dplus_get_cmd = NULL;
     if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
 
-    /* Reader entry publishes ACTIVE, then checks exclusive mode before the
-     * first speculative pointer load. */
-    if (!dplusReaderEnter(tid)) goto out;
-
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
      * so their duration must be accumulated per-thread and folded into the
      * GET command's microseconds by dplusAggregateStats (as with calls). */
@@ -670,8 +564,6 @@ out:
      * (calls are accumulated in dplusConsumeSpeculated). */
     if (speculated > 0) dplus_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
 
-    /* Publish quiescence on every post-entry exit path. */
-    dplusReaderWorkerQuiescent(tid);
     return speculated;
 }
 
@@ -899,41 +791,21 @@ long long dplusDoorbellCoalesced(void) {
 
 sds dplusInfoString(sds info) {
     /* Worker-owned counters are intentionally sampled without shared-line
-     * writes. Lifecycle states are atomic because main exclusive scans
-     * consume the same values for correctness. */
-    uint64_t entries = 0, epoch_exclusive_punts = 0;
-    unsigned online = 0, active = 0, quiescent = 0;
-    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
+     * writes. */
+    long long speculated = 0, doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
     for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
-        uint64_t state = atomic_load_explicit(&dplus_reader_slots[i].state, memory_order_acquire);
-        if (state != DPLUS_READER_OFFLINE) {
-            online++;
-            if (state == DPLUS_READER_QUIESCENT)
-                quiescent++;
-            else
-                active++;
-        }
-        entries += dplus_epoch_thread_stats[i].entries;
-        epoch_exclusive_punts += dplus_epoch_thread_stats[i].exclusive_punts;
+        speculated += dplus_thread_stats[i].commands_processed;
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
     }
     info = sdscatprintf(info,
         "# Dplus\r\n"
-        "dplus_epoch_reader_entries:%llu\r\n"
-        "dplus_epoch_exclusive_punts:%llu\r\n"
-        "dplus_epoch_workers_online:%u\r\n"
-        "dplus_epoch_workers_active:%u\r\n"
-        "dplus_epoch_workers_quiescent:%u\r\n"
+        "dplus_speculated_commands:%lld\r\n"
         "dplus_doorbell_rings:%llu\r\n"
         "dplus_doorbell_coalesced:%llu\r\n"
         "dplus_punted_replies_written:%llu\r\n",
-        (unsigned long long)entries,
-        (unsigned long long)epoch_exclusive_punts,
-        online,
-        active,
-        quiescent,
+        speculated,
         (unsigned long long)doorbell_rings,
         (unsigned long long)doorbell_coalesced,
         (unsigned long long)punted_replies);
@@ -942,7 +814,6 @@ sds dplusInfoString(sds info) {
         "dplus_speculative_attempts:%llu\r\n"
         "dplus_speculative_hits:%llu\r\n"
         "dplus_validation_misses:%llu\r\n"
-        "dplus_exclusive_punts:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
         "dplus_prevalidate_consumed:%llu\r\n"
         "dplus_pv_last_key:%s\r\n"
@@ -961,7 +832,6 @@ sds dplusInfoString(sds info) {
         (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
         (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
         (unsigned long long)DPLUS_STAT_SUM(validation_misses),
-        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
         (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
         (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
         dplus_debug_pv_last_key,

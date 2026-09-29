@@ -1580,16 +1580,9 @@ void renameGenericCommand(client *c, int nx) {
          * with the same name. */
         dbDelete(c->db, c->argv[2]);
     }
-    /* D+ (B10): hold exclusive across delete→re-add. The table's decref
-     * must apply immediately — a limbo-deferred decref leaves the value's
-     * refcount inflated, and the key re-embed (objectSetKeyAndExpire)
-     * panics for non-string types with refcount > 1. The drain also makes
-     * the old shell's free safe against in-flight speculative walks. */
-    dplusExclusiveEnter();
     dbDelete(c->db, c->argv[1]);
     dbAdd(c->db, c->argv[2], &o);
     if (expire != -1) o = setExpire(c, c->db, c->argv[2], expire);
-    dplusExclusiveLeave();
     signalModifiedKey(c, c->db, c->argv[1]);
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
@@ -1664,13 +1657,10 @@ void moveCommand(client *c) {
     }
 
     incrRefCount(o); /* ref counter = 2 */
-    /* D+ (B10): exclusive across delete→re-add — see renameGenericCommand. */
-    dplusExclusiveEnter();
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);
     if (expire != -1) o = setExpire(c, dst, c->argv[1], expire);
-    dplusExclusiveLeave();
 
     /* OK! key moved */
     signalModifiedKey(c, src, c->argv[1]);
@@ -1857,14 +1847,6 @@ int dbSwapDatabases(int id1, int id2) {
     scanDatabaseForDeletedKeys(db1, db2);
     scanDatabaseForDeletedKeys(db2, db1);
 
-    /* D+ (S1.3): the table-pointer swap yanks db->keys out from under
-     * speculative readers -- a reader that resolved the old kvstore may
-     * compute a reply from a table that no longer belongs to its db
-     * (linearization violation even when nothing is freed). Drain in-flight
-     * walks and punt new ones for the duration of the swap; SWAPDB is rare
-     * and the drain is bounded by one in-flight read. */
-    dplusExclusiveEnter();
-
     /* Swap hash tables. Note that we don't swap blocking_keys,
      * ready_keys and watched_keys, since we want clients to
      * remain in the same DB they were. */
@@ -1877,8 +1859,6 @@ int dbSwapDatabases(int id1, int id2) {
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
     copyDbExpiry(db2, &aux);
-
-    dplusExclusiveLeave();
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1912,11 +1892,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);
 
-        /* D+ (S1.3): same table-pointer-swap hazard as dbSwapDatabases,
-         * plus the displaced tables are freed shortly after this returns
-         * (old main db discarded post-replication-load). Gate the swap. */
-        dplusExclusiveEnter();
-
         /* Swap hash tables. Note that we don't swap blocking_keys,
          * ready_keys and watched_keys, since clients
          * remain in the same DB they were. */
@@ -1929,8 +1904,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         newdb->expires = aux.expires;
         newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
         copyDbExpiry(newdb, &aux);
-
-        dplusExclusiveLeave();
 
         /* Now we need to handle clients blocked on lists: as an effect
          * of swapping the two DBs, a client that was waiting for list
