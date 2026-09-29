@@ -413,3 +413,62 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         close $fd
     }
 }
+
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+    test {Staged stress: clients handed back when staged mode stops rejoin when it resumes} {
+        r client setname ss-control
+        r select 0
+        set fds [ss_open 12 ss:rj]
+        # Clients main must keep: one inside MULTI, one subscribed, one named.
+        set multi [ss_fp_client ss:rjm]
+        puts -nonewline $multi [ss_resp multi]
+        flush $multi
+        assert_equal {+OK} [ss_read_reply $multi]
+        set sub [ss_fp_client ss:rjs]
+        puts -nonewline $sub [ss_resp subscribe ss:rjch]
+        flush $sub
+        assert_equal {subscribe ss:rjch :1} [ss_read_reply $sub]
+        set named [ss_fp_client ss:rjn]
+        puts -nonewline $named [ss_resp client setname ss-named]
+        flush $named
+        assert_equal {+OK} [ss_read_reply $named]
+        ss_wait_fastpath_clients 12
+        set seen 0
+        foreach {off on} {{io-threads 1} {io-threads 4} {io-threads-fast-path no} {io-threads-fast-path yes}
+                          {io-threads 1} {io-threads 4} {io-threads-strict-offload no} {io-threads-strict-offload yes}
+                          {io-threads 1} {io-threads 4} {io-threads-fast-path no} {io-threads-fast-path yes}} {
+            # A pipeline in flight across the stop and one across the restart.
+            set i 0
+            foreach fd $fds {
+                set p ""
+                for {set k 0} {$k < 20} {incr k} { append p [ss_resp incr ss:rj:c$i] }
+                puts -nonewline $fd $p
+                flush $fd
+                incr i
+            }
+            assert_equal OK [r config set {*}$off]
+            ss_wait_fastpath_clients 0
+            set i 0
+            foreach fd $fds {
+                for {set k 1} {$k <= 20} {incr k} { assert_equal ":[expr {$seen + $k}]" [ss_read_reply $fd] }
+                incr i
+            }
+            incr seen 20
+            assert_equal OK [r config set {*}$on]
+            ss_wait_fastpath_clients 12
+            ss_incr_round $fds ss:rj $seen 5
+            incr seen 5
+            assert_equal 12 [ss_fastpath_clients]
+        }
+        for {set i 0} {$i < 12} {incr i} { assert_equal $seen [r get ss:rj:c$i] }
+        # The kept clients still work on main and keep their state.
+        puts -nonewline $multi "[ss_resp incr ss:rjm][ss_resp exec]"
+        flush $multi
+        assert_equal {+QUEUED :2} [ss_read_replies $multi 2]
+        assert_equal 1 [r publish ss:rjch hi]
+        assert_equal {message ss:rjch hi} [ss_read_reply $sub]
+        assert_match {*name=ss-named*} [r client list]
+        foreach fd [concat $fds [list $multi $sub $named]] { close $fd }
+        ss_wait_fastpath_clients 0
+    }
+}

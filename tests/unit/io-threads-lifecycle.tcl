@@ -141,13 +141,15 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         set c [lc_client]
         $c set lc:b v
         assert_equal OK [$c read]
-        lc_wait_fastpath_clients 1
-        # Clients handed off by the previous shrink keep working on the main path.
+        # Clients handed off by the previous shrink rejoin the fast path with the new one.
+        lc_wait_fastpath_clients 9
+        set total 0
         foreach old $::lc_clients {
             $old incr lc:c
-            assert_match {[0-9]*} [$old read]
-            $old close
+            assert_equal [incr total] [$old read]
         }
+        assert_equal 9 [lc_fastpath_clients]
+        foreach old $::lc_clients { $old close }
         $c close
         lc_wait_fastpath_clients 0
     }
@@ -164,7 +166,18 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         lc_assert_incr_replies $clients lc:d $total
         lc_wait_running 15
         lc_wait_settled
+        # Every client handed back on the way down is on the fast path again.
+        lc_wait_fastpath_clients 6
+        lc_pipeline_incr $clients lc:d 10
+        set i 0
+        foreach c $clients {
+            for {set j 1} {$j <= 10} {incr j} { assert_equal [expr {$total + $j}] [$c read] }
+            assert_equal [expr {$total + 10}] [r get lc:d$i]
+            incr i
+        }
+        assert_equal 6 [lc_fastpath_clients]
         foreach c $clients { $c close }
+        lc_wait_fastpath_clients 0
     }
 }
 

@@ -19,8 +19,9 @@ stock IO offload (read/write/accept/poll jobs, client partitioning, strict-offlo
 and the IO thread park policy are off, so every non-fast-path client is served by main
 through ae. Free offload stays on: workers drain their job inboxes at the start of every
 phase. On entry main waits (bounded) for in-flight stock jobs to land, then adopts clients
-that were accepted meanwhile and have run nothing. On exit main hands every fast-path client
-back to the main path.
+that were accepted meanwhile and have run nothing, plus clients the last exit handed back
+that are still eligible. On exit main hands every fast-path client back to the main path and
+marks it (`fp_readmit`) to rejoin on the next entry.
 
 ## One iteration
 

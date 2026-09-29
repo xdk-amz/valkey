@@ -62,6 +62,8 @@ static inline int fpStaged(void) {
     return atomic_load_explicit(&fp_staged, memory_order_relaxed);
 }
 
+static int fp_staged_admit = 0; /* main only: new staged clients are admitted */
+
 static inline int fpDepth(void) {
     return atomic_load_explicit(&fp_depth, memory_order_relaxed);
 }
@@ -679,6 +681,7 @@ int fastpathReadmitAuthenticated(client *c) {
         c->flag.fp_readmit = 0;
         return 0;
     }
+    if (!fp_staged_admit) return 0; /* admission needs staged mode; the flag is kept until it starts */
     if (!fpQuiescent(c) || (c->flag.partitioned && c->flag.pending_read)) return 0;
     c->flag.fp_readmit = 0;
     if (!fpSessionEligible(c)) return 0;
@@ -724,8 +727,12 @@ void fastpathHandoffDone(client *c, int closing) {
     }
     if (processPendingCommandAndInputBuffer(c) != C_OK) return;
     if (authenticating || c->flag.fp_readmit) {
-        c->flag.fp_readmit = 0;
-        if (fpReadmit(c)) return;
+        if (!fp_staged_admit) {
+            c->flag.fp_readmit = 1; /* no admission while staged mode is off: rejoins when it starts */
+        } else {
+            c->flag.fp_readmit = 0;
+            if (fpReadmit(c)) return;
+        }
     }
     beforeNextClient(c);
 }
@@ -761,8 +768,6 @@ void fastpathInfo(sds *info) {
  * its own batch list, and delivers those batches in the following reply phase, so one client's
  * replies are always written by the thread that produced its entries, in order.
  * --------------------------------------------------------------------------------------------- */
-
-static int fp_staged_admit = 0; /* main only: new staged clients are admitted */
 
 int fastpathStagedOn(void) {
     return fpStaged();
@@ -925,7 +930,10 @@ void fastpathStagedReleaseAll(void) {
         client *c = listNodeValue(listFirst(&fp_staged_clients));
         serverAssert(c->fp_inflight == 0);
         pollerUnregister(stagedPoller(), c->conn->fd);
-        if (c->control->lifecycle == FP_ACTIVE) c->control->lifecycle = FP_LEAVING;
+        if (c->control->lifecycle == FP_ACTIVE) {
+            c->control->lifecycle = FP_LEAVING;
+            c->flag.fp_readmit = 1; /* left only because staged mode stopped: rejoins when it starts */
+        }
         fpStagedHandoff(c);
     }
 }
@@ -939,9 +947,11 @@ void fastpathStagedAdoptClients(void) {
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
         if (c->flag.fastpath || c->flag.executor || !c->conn) continue;
-        /* Only clients that have run nothing yet; one that already ran a command on main stays there. */
-        if (c->control || c->commands_processed || c->argc || c->flag.pending_command) continue;
+        /* Clients that have run nothing yet, or that left only because staged mode stopped; one that
+         * ran an unsupported command on main stays there. */
+        if (!c->flag.fp_readmit && (c->control || c->commands_processed || c->argc || c->flag.pending_command))
+            continue;
         if (!fpSessionEligible(c)) continue;
-        fpReadmit(c);
+        if (fpReadmit(c)) c->flag.fp_readmit = 0;
     }
 }
