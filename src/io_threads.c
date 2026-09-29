@@ -361,8 +361,14 @@ static int clientIsPartitionable(client *c) {
     return 1;
 }
 
+/* Flags that describe the command held in argv; processCommand() needs them if it runs again. */
+#define READ_FLAGS_CURRENT_COMMAND                                                                  \
+    (READ_FLAGS_PARSING_COMPLETED | READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY | READ_FLAGS_NO_KEYS | \
+     READ_FLAGS_CROSSSLOT)
+
 static void setClientReadFlagsForOffload(client *c) {
-    c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    /* A client that cannot parse (e.g. blocked) still holds its current command in argv. */
+    c->read_flags = canParseCommand(c) ? 0 : (c->read_flags & READ_FLAGS_CURRENT_COMMAND) | READ_FLAGS_DONT_PARSE;
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 }

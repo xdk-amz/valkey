@@ -7348,7 +7348,9 @@ int processClientIOReadsDone(client *c) {
         }
     }
 
-    if (c->argc > 0) {
+    /* A blocked client's argv is the command it blocked on, already executed;
+     * its pending state belongs to the blocking code. */
+    if (c->argc > 0 && !c->flag.blocked) {
         c->flag.pending_command = 1;
     }
 
