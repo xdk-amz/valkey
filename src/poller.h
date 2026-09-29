@@ -11,7 +11,8 @@
 
 #include "fastpath_no_epoll.h"
 
-#ifdef HAVE_FASTPATH_EPOLL
+/* Declared on every platform so fast-path code compiles unchanged; without epoll the calls are
+ * stubs that register nothing and report no events, and staged mode never turns on. */
 
 #include <stddef.h>
 
@@ -76,5 +77,4 @@ int pollerSetSize(const poller *p);
  * outside the new size. Resets both ready sets. */
 int pollerResize(poller *p, int setsize);
 
-#endif /* HAVE_FASTPATH_EPOLL */
 #endif /* POLLER_H */

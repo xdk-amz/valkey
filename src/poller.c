@@ -243,4 +243,63 @@ int pollerResize(poller *p, int setsize) {
     return 0;
 }
 
+#else /* !HAVE_FASTPATH_EPOLL */
+
+
+poller *pollerCreate(int setsize) {
+    (void)setsize;
+    return NULL;
+}
+void pollerFree(poller *p) {
+    (void)p;
+}
+int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *privdata, pollerAffinity affinity) {
+    (void)p, (void)fd, (void)mask, (void)handler, (void)privdata, (void)affinity;
+    return -1;
+}
+int pollerModify(poller *p, int fd, int mask) {
+    (void)p, (void)fd, (void)mask;
+    return -1;
+}
+int pollerUnregister(poller *p, int fd) {
+    (void)p, (void)fd;
+    return 0;
+}
+int pollerGetFDs(poller *p, long long timeout_us) {
+    (void)p, (void)timeout_us;
+    return -1;
+}
+int pollerClaimIO(poller *p, pollerEvent *out) {
+    (void)p, (void)out;
+    return 0;
+}
+int pollerIOCount(const poller *p) {
+    (void)p;
+    return 0;
+}
+int pollerMainCount(const poller *p) {
+    (void)p;
+    return 0;
+}
+const pollerEvent *pollerMainAt(const poller *p, int i) {
+    (void)p, (void)i;
+    return NULL;
+}
+int pollerFd(const poller *p) {
+    (void)p;
+    return -1;
+}
+int pollerCount(const poller *p) {
+    (void)p;
+    return 0;
+}
+int pollerSetSize(const poller *p) {
+    (void)p;
+    return 0;
+}
+int pollerResize(poller *p, int setsize) {
+    (void)p, (void)setsize;
+    return -1;
+}
+
 #endif /* HAVE_FASTPATH_EPOLL */
