@@ -42,9 +42,6 @@ static inline void cpuRelax(void) {
 
 /* io_epoll_seq lets main wait out stale references from the last epoll pass. */
 static int io_epfd[IO_THREADS_MAX_NUM];
-int ioThreadEpollFd(int tid) {
-    return io_epfd[tid];
-}
 static _Atomic uint64_t io_epoll_seq[IO_THREADS_MAX_NUM];
 static unsigned partition_rr = 0;      /* main-thread only */
 static size_t partitioned_clients = 0; /* main-thread only */
@@ -520,12 +517,6 @@ static int ioThreadPollPartition(int id) {
     int processed = 0;
     for (int i = 0; i < n; i++) {
         client *c = (client *)evs[i].data.ptr;
-        if (c->flag.fastpath) {
-            if (evs[i].events & EPOLLOUT) fastpathClientWritable(id, c);
-            if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) fastpathClientReadable(id, c);
-            processed++;
-            continue;
-        }
         uint8_t expected = CLIENT_IDLE;
         if (!__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_PENDING_IO, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -1200,9 +1191,6 @@ static void *IOThreadMain(void *myid) {
 
         if (io_epfd[id] > 0) processed += ioThreadPollPartition(id);
 
-        processed += fastpathProcessReturns(id);
-        fastpathSubmitPending(id);
-
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
             int has_pending = 0;
@@ -1367,13 +1355,11 @@ static void ioWorkerRetire(int tid) {
     spscCommit(&io_private_inbox[tid]); /* the last jobs main batched for it */
     ioWorkerUnpark(tid);
     atomic_store_explicit(&io_worker_state[tid], IO_WORKER_QUIESCING, memory_order_release);
-    fastpathWorkerQuiesce(tid);
     unpartitionWorkerClients(tid);
 }
 
 /* Preconditions for STOPPING: nothing main owns still names the thread and nothing can reach it. */
 static int ioWorkerDrained(int tid) {
-    if (!fastpathWorkerDrained(tid)) return 0;
     if (listLength(io_partition_clients[tid]) > 0) return 0;
     while (processCommandRingOne(tid, 0) > 0) { /* completions a partitioned client left behind */
     }
@@ -1382,18 +1368,6 @@ static int ioWorkerDrained(int tid) {
     /* The shared inbox is drained by whichever threads remain; the last one finishes it. */
     if (io_ready_num <= 1 && getPendingIOThreadsJobs() > 0) return 0;
     return 1;
-}
-
-/* Fast-path role of a running thread follows the configuration; a quiesce completes before a reopen. */
-static int ioWorkerReconcileFastpath(int tid) {
-    int want = server.io_threads_fast_path && server.io_threads_strict_offload && server.io_threads_num >= 2;
-    int role = fastpathWorkerRole(tid);
-    if (!want) {
-        fastpathWorkerQuiesce(tid);
-        return role == FP_ROLE_QUIESCING || fastpathWorkerOwnedClients(tid) > 0;
-    }
-    if (role == FP_ROLE_OPEN) return 0;
-    return !fastpathWorkerReopen(tid);
 }
 
 static void ioThreadsInitShared(void) {
@@ -1467,11 +1441,6 @@ static int ioThreadsConvergeOnce(int teardown) {
             pending = 1;
             break;
         }
-    }
-
-    for (int tid = 1; tid < io_worker_hwm; tid++) {
-        if (ioWorkerState(tid) != IO_WORKER_RUNNING) continue;
-        if (ioWorkerReconcileFastpath(tid)) pending = 1;
     }
 
     io_converging = pending;
@@ -2307,8 +2276,6 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 client *c = (client *)data;
                 serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                 write_jobs[write_count++] = c;
-            } else if (job_type == JOB_RES_FP_CLOSE || job_type == JOB_RES_FP_HANDOFF) {
-                fastpathHandoffDone((client *)data, job_type == JOB_RES_FP_CLOSE);
             } else if (job_type == JOB_RES_WRITE_SLAB) {
 
                 if (write_count) {
@@ -2365,11 +2332,9 @@ static int processOutboxBatch(mpscQueue *outbox) {
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
-    int fp_processed = fastpathDrain();
+    if (getPendingIOResponsesCount() == 0) return 0;
 
-    if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) return fp_processed;
-
-    int total_processed = fp_processed + processCommandRing();
+    int total_processed = processCommandRing();
     int batches = 0;
     while (batches++ < IO_RESPONSE_BATCHES_PER_CALL) {
         /* 1. Strict Priority: First, drain high-priority events (cluster bus, replication, and slot migration jobs) */

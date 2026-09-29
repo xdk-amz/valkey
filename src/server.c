@@ -2192,7 +2192,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * connection has pending data). Fast-path batches arrive on rings the
      * event loop knows nothing about, so main polls while such clients exist;
      * the staged loop waits on its poller instead. */
-    aeSetDontWait(server.el, dont_sleep || (fastpathClientCount() > 0 && !stagedLoopActive()));
+    aeSetDontWait(server.el, dont_sleep);
 
     updateCopyAvoidPressure(current_time);
 

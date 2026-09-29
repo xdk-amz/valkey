@@ -38,8 +38,6 @@ typedef enum {
     JOB_RES_CLUSTER_WRITE,
     JOB_RES_CLUSTER_ACCEPT,
     JOB_RES_WRITE_SLAB, /* the write slab coming back with every client written */
-    JOB_RES_FP_CLOSE,   /* fast path: the IO thread is done with a closing client, main frees it */
-    JOB_RES_FP_HANDOFF, /* fast path: the IO thread hands a client to the main path */
     JOB_RES_COUNT
 } JobResult;
 static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
@@ -61,7 +59,6 @@ void armPartitionedClientRead(client *c);
 int partitionedClientHold(client *c);
 void ioThreadQueueReadCompletion(client *c);
 void reconcileLazyWrite(client *c);
-int ioThreadEpollFd(int tid);
 void partitionedClientRelease(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);

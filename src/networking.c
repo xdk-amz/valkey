@@ -2401,13 +2401,13 @@ void clearClientConnectionState(client *c) {
 int freeClient(client *c) {
     listNode *ln;
 
-    /* Fast-path teardown waits for every in-flight batch to return. */
+    /* A staged client is freed once main took it back after a reply barrier. */
     if (c->flag.fastpath) {
         fastpathRequestDetach(c);
         freeClientAsync(c);
         return 0;
     }
-    /* Handed back with a detach still in its IO thread's ring: the pointer must stay valid until consumed. */
+    /* A recorded close not yet applied: the pointer must stay valid until main unmapped the client. */
     if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) {
         freeClientAsync(c);
         return 0;
@@ -2720,8 +2720,8 @@ int freeClientsInAsyncFreeQueue(void) {
             c->flag.protected_rdb_channel = 0;
         }
 
-        if (c->flag.fastpath) continue; /* freed when its IO thread reports JOB_RES_FP_CLOSE */
-        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue; /* its IO thread may still meet the pointer */
+        if (c->flag.fastpath) continue; /* main unmaps it after the reply phase */
+        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue;
 
         reconcileLazyWrite(c);
         partitionedClientDetach(c);

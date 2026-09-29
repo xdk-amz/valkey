@@ -60,11 +60,10 @@ proc cc_wait_workers_open {n} {
     }
 }
 
-# Every retirement finished and no worker is still quiescing.
+# Every retirement finished.
 proc cc_wait_settled {} {
     wait_for_condition 500 20 {
-        [getInfoProperty [r info server] io_threads_retiring] == 0 &&
-        [getInfoProperty [r info fastpath] fastpath_workers_quiescing] == 0
+        [getInfoProperty [r info server] io_threads_retiring] == 0
     } else {
         fail "workers did not settle: [r info server] [r info fastpath]"
     }

@@ -6,15 +6,10 @@
 
 #define IO_BATCH_MAX 64
 
-#define FP_ACTIVE 0   /* read by its IO thread, commands flow through batches */
-#define FP_LEAVING 1  /* stopped reading; hands over to main once nothing is in flight */
-#define FP_CLOSING 2  /* stopped reading; main frees it once nothing is in flight */
+#define FP_ACTIVE 0   /* read by IO threads, commands flow through batches */
+#define FP_LEAVING 1  /* stopped reading; main takes it back after the reply phase */
+#define FP_CLOSING 2  /* stopped reading; main frees it after the reply phase */
 #define FP_DETACHED 3 /* main owns it again */
-
-/* Fast-path role of one IO thread: main opens and quiesces it, the thread publishes drained. */
-#define FP_ROLE_OPEN 0      /* admits clients, publishes batches */
-#define FP_ROLE_QUIESCING 1 /* admits nothing, publishes nothing; hands off or closes every owned client */
-#define FP_ROLE_DRAINED 2   /* owns no client, batch or ring entry; main may reopen or destroy it */
 
 /* Stable, separately allocated shared control for one crossing-capable connection.
  * Holds only intentionally cross-thread state: identity and lifecycle. The concrete client remains the owner-only ClientConnection; never place
@@ -26,8 +21,6 @@ typedef struct ClientControl {
     uint32_t generation;        /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
     uint8_t lifecycle;          /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
     uint8_t closing;            /* Main only: freeClient asked to close it; its entries are skipped. */
-    uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
-    uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
 } ClientControl;
 
 /* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
@@ -39,7 +32,7 @@ typedef struct ClientHandle {
     uint32_t owner_slot;    /* Index in the owning IO thread's private connection table. */
 } ClientHandle;
 
-/* Ring publication transfers each entry from its IO thread to main and back. */
+/* Produced by an IO thread in the read phase, executed by main in the write phase, replied by the same IO thread. */
 typedef struct cmdEntry {
     ClientHandle handle; /* Owning connection's control by generation-checked reference; main never reaches the connection through it, and the IO owner resolves it back to its own client. */
     robj **argv;
@@ -73,7 +66,6 @@ typedef struct cmdBatch {
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);
-int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
@@ -89,22 +81,11 @@ int fastpathHandleStale(const ClientHandle *h);
 /* Allocate and initialize the connection's ClientControl once, on first crossing-capable admission; a
  * no-op if it already has one. Reclaimed only by fastpathControlReclaim at free. */
 int fastpathControlEnsure(client *c);
-/* The single final reclaimer: free the connection's ClientControl at client teardown once nothing pins it. */
+/* The single final reclaimer: free the connection's ClientControl at client teardown. */
 void fastpathControlReclaim(client *c);
 
 void fastpathInitThread(int tid);
 void fastpathFreeThread(int tid);
-void fastpathClientReadable(int tid, client *c);
-void fastpathClientWritable(int tid, client *c);
-void fastpathSubmitPending(int tid);
-int fastpathProcessReturns(int tid);
-
-/* Role transitions driven by main; a quiesce is idempotent and never restarts publication. */
-void fastpathWorkerQuiesce(int tid);
-int fastpathWorkerReopen(int tid);
-int fastpathWorkerDrained(int tid);
-int fastpathWorkerRole(int tid);
-size_t fastpathWorkerOwnedClients(int tid);
 
 /* Staged loop (driven by staged_loop.c; see docs/staged-event-loop.md). */
 int fastpathStagedOn(void);

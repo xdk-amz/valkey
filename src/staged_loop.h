@@ -26,6 +26,8 @@ struct phaseBarrier;
 void stagedMain(struct aeEventLoop *el);
 /* Main thread: staged mode is on for the current iteration. */
 int stagedLoopActive(void);
+/* Main thread: IO threads enrolled in the staged loop. */
+int stagedWorkerCount(void);
 /* Main, from processEventsWhileBlocked: one nested read/write/reply pass so fast-path clients get
  * their BUSY/LOADING replies while main is blocked. A no-op outside staged mode or when nested. */
 void stagedNestedIteration(void);

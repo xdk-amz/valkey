@@ -31,6 +31,10 @@ int stagedLoopActive(void) {
     return sl_on || sl_want;
 }
 
+int stagedWorkerCount(void) {
+    return sl_workers;
+}
+
 poller *stagedPoller(void) {
     return sl_poller;
 }
@@ -268,6 +272,9 @@ void stagedMain(struct aeEventLoop *el) {
     aeMain(el);
 }
 int stagedLoopActive(void) {
+    return 0;
+}
+int stagedWorkerCount(void) {
     return 0;
 }
 void stagedNestedIteration(void) {

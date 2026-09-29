@@ -31,10 +31,10 @@ proc lc_wait_fastpath_clients {n} {
     }
 }
 
-# Every retirement finished and every running worker's role matches the configuration.
+# Every retirement finished.
 proc lc_wait_settled {} {
     wait_for_condition 500 20 {
-        [lc_retiring] == 0 && [getInfoProperty [r info fastpath] fastpath_workers_quiescing] == 0
+        [lc_retiring] == 0
     } else {
         fail "workers did not settle: [r info server] [r info fastpath]"
     }
