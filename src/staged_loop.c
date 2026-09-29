@@ -224,9 +224,10 @@ void stagedNestedIteration(void) {
     if (!sl_on || sl_depth) return;
     sl_depth = 1;
     fastpathStagedSetDepth(1);
-    if (pollerGetFDs(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) stagedRunPhase(STAGED_PHASE_READ);
+    if ((pollerGetFDs(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) || ioThreadsInboxPending())
+        stagedRunPhase(STAGED_PHASE_READ);
     fastpathStagedExecute();
-    if (fastpathStagedRepliesPending()) stagedRunPhase(STAGED_PHASE_REPLY);
+    if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
     fastpathStagedSetDepth(0);
     sl_depth = 0;
 }

@@ -1622,6 +1622,8 @@ int trySendReadToIOThreads(client *c) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
+    if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;
     reconcileLazyWrite(c);
     if (c->flag.close_asap) return C_ERR;
