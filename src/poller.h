@@ -43,7 +43,9 @@ typedef struct poller poller;
 poller *pollerCreate(int setsize);
 void pollerFree(poller *p);
 
-/* Register, change, or drop an fd; 0 on success, -1 on failure. Register fails on a duplicate
+/* Register, change, or drop an fd; 0 on success, -1 on failure. Each fd's slot has one writer at a
+ * time: main between phases, or the IO thread that claimed the fd during a phase, so IO threads may
+ * modify and unregister different fds concurrently; the registered count is atomic for that reason. Register fails on a duplicate
  * fd, an fd outside setsize, or an epoll_ctl error. Modify fails on an fd that is not
  * registered. Unregister of an fd that is not registered is a no-op returning 0.
  * POLLER_NONE keeps the fd registered; errors and hangups are still reported. */
@@ -68,6 +70,10 @@ const pollerEvent *pollerMainAt(const poller *p, int i);
 
 int pollerFd(const poller *p);    /* underlying epoll fd, for debug/nesting */
 int pollerCount(const poller *p); /* number of registered fds */
+int pollerSetSize(const poller *p);
+/* Main, between phases: change setsize like aeResizeSetSize. Fails if a registered fd would fall
+ * outside the new size. Resets both ready sets. */
+int pollerResize(poller *p, int setsize);
 
 #endif /* HAVE_FASTPATH_EPOLL */
 #endif /* POLLER_H */

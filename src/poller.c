@@ -26,7 +26,7 @@ typedef struct pollerReg {
 struct poller {
     int epfd;
     int setsize;
-    int count;                 /* registered fds */
+    _Atomic(int) count;        /* registered fds; IO threads register/unregister concurrently in a phase */
     pollerReg *regs;           /* setsize entries, indexed by fd */
     struct epoll_event *fired; /* setsize entries, epoll_wait scratch */
     pollerEvent *io_ready;     /* setsize entries; drained by IO threads via io_cursor */
@@ -62,6 +62,7 @@ poller *pollerCreate(int setsize) {
         return NULL;
     }
     atomic_init(&p->io_cursor, 0);
+    atomic_init(&p->count, 0);
     return p;
 }
 
@@ -89,7 +90,7 @@ int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *pri
     r->mask = mask;
     r->affinity = affinity;
     r->registered = 1;
-    p->count++;
+    atomic_fetch_add_explicit(&p->count, 1, memory_order_relaxed);
     return 0;
 }
 
@@ -114,7 +115,7 @@ int pollerUnregister(poller *p, int fd) {
     struct epoll_event ee = {0};
     epoll_ctl(p->epfd, EPOLL_CTL_DEL, fd, &ee);
     memset(r, 0, sizeof(*r));
-    p->count--;
+    atomic_fetch_sub_explicit(&p->count, 1, memory_order_relaxed);
     return 0;
 }
 
@@ -193,7 +194,28 @@ int pollerFd(const poller *p) {
 }
 
 int pollerCount(const poller *p) {
-    return p->count;
+    return atomic_load_explicit(&((poller *)p)->count, memory_order_relaxed);
+}
+
+int pollerSetSize(const poller *p) {
+    return p->setsize;
+}
+
+int pollerResize(poller *p, int setsize) {
+    if (setsize <= 0) return -1;
+    if (setsize == p->setsize) return 0;
+    for (int fd = setsize; fd < p->setsize; fd++)
+        if (p->regs[fd].registered) return -1;
+    pollerReg *regs = zrealloc(p->regs, sizeof(pollerReg) * setsize);
+    if (setsize > p->setsize) memset(regs + p->setsize, 0, sizeof(pollerReg) * (setsize - p->setsize));
+    p->regs = regs;
+    p->fired = zrealloc(p->fired, sizeof(struct epoll_event) * setsize);
+    p->io_ready = zrealloc(p->io_ready, sizeof(pollerEvent) * setsize);
+    p->main_ready = zrealloc(p->main_ready, sizeof(pollerEvent) * setsize);
+    p->io_count = p->main_count = 0;
+    atomic_store_explicit(&p->io_cursor, 0, memory_order_relaxed);
+    p->setsize = setsize;
+    return 0;
 }
 
 #endif /* HAVE_FASTPATH_EPOLL */
