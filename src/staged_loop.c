@@ -9,6 +9,7 @@
 
 #include "poller.h"
 #include "phase_barrier.h"
+#include <sched.h>
 
 static poller *sl_poller = NULL;
 static phaseBarrier sl_barrier;
@@ -99,6 +100,29 @@ static int stagedWanted(void) {
     return 1;
 }
 
+/* Main: place the epoll thread on the union of the enrolled IO threads' CPUs, minus main's own when
+ * main is pinned to fewer CPUs than that union. */
+static void stagedPlaceEpollThread(void) {
+    cpu_set_t all, mine;
+    CPU_ZERO(&all);
+    for (int tid = 1; tid <= sl_workers; tid++) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        if (ioThreadGetAffinity(tid, &one, sizeof(one)) == 0) CPU_OR(&all, &all, &one);
+    }
+    if (CPU_COUNT(&all) == 0) return;
+    CPU_ZERO(&mine);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) < CPU_COUNT(&all)) {
+        cpu_set_t others;
+        CPU_ZERO(&others);
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+            if (CPU_ISSET(cpu, &all) && !CPU_ISSET(cpu, &mine)) CPU_SET(cpu, &others);
+        if (CPU_COUNT(&others) > 0) all = others;
+    }
+    if (pollerSetThreadAffinity(sl_poller, &all, sizeof(all)) != 0)
+        serverLog(LL_WARNING, "Staged event loop: cannot set the epoll thread's CPU affinity");
+}
+
 /* Main, between phases: enroll IO threads 1..want. Leavers pass one SYNC phase so none is left
  * waiting on the barrier; newcomers wait from the current sequence. */
 static void stagedSetWorkers(int want) {
@@ -115,7 +139,10 @@ static void stagedSetWorkers(int want) {
         atomic_store_explicit(&sl_enrolled[tid], 1, memory_order_release);
     }
     sl_workers = want;
-    if (want) ioThreadsStagedUnpark();
+    if (want) {
+        ioThreadsStagedUnpark();
+        stagedPlaceEpollThread();
+    }
 }
 
 /* Main, at the iteration boundary: follow the configuration and the live IO thread count. */
@@ -126,6 +153,7 @@ static void stagedReconcile(aeEventLoop *el) {
         fastpathStagedReleaseAll();
         fastpathStagedSet(0);
         pollerUnregister(sl_poller, sl_ae_fd);
+        pollerStop(sl_poller);
         sl_ae_fd = -1;
         sl_on = 0;
         sl_want = 0;
@@ -156,6 +184,8 @@ static void stagedReconcile(aeEventLoop *el) {
     }
     stagedSetWorkers(ioThreadsReadyNum() - 1);
     if (!sl_on) {
+        if (pollerStart(sl_poller) != 0)
+            serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
         sl_on = 1;
         fastpathStagedSet(1);
         fastpathStagedAdoptClients();
@@ -163,12 +193,13 @@ static void stagedReconcile(aeEventLoop *el) {
     }
 }
 
-/* Collect: the pre-sleep hook, one wait on the poller bounded like aeProcessEvents, the post-sleep hook. */
+/* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
+ * accumulated, bounded like aeProcessEvents), the post-sleep hook. */
 static void collectFDs(aeEventLoop *el) {
     if (el->beforesleep) el->beforesleep(el);
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
     long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending()) ? 0 : aeUsUntilEarliestTimer(el);
-    int n = pollerGetFDs(sl_poller, timeout);
+    int n = pollerGetNextBatch(sl_poller, timeout);
     if (n < 0) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
         n = 0;
@@ -184,7 +215,7 @@ static void readPhase(void) {
 
 /* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. */
 static void writePhase(aeEventLoop *el) {
-    int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration reuses the ready sets */
+    int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
     fastpathStagedExecute();
     if (ae_ready) aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
 }
@@ -224,7 +255,7 @@ void stagedNestedIteration(void) {
     if (!sl_on || sl_depth) return;
     sl_depth = 1;
     fastpathStagedSetDepth(1);
-    if ((pollerGetFDs(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) || ioThreadsInboxPending())
+    if ((pollerGetNextBatch(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) || ioThreadsInboxPending())
         stagedRunPhase(STAGED_PHASE_READ);
     fastpathStagedExecute();
     if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
@@ -238,6 +269,7 @@ void stagedDrainWorkers(void) {
 
 void stagedStopWorkers(void) {
     if (sl_barrier_ready) phaseBarrierShutdown(&sl_barrier);
+    if (sl_poller) pollerStop(sl_poller);
 }
 
 int stagedResize(int setsize) {

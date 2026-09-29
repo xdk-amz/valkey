@@ -145,7 +145,7 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     /* Two pipelined commands: GET on a missing key and SET, both plain data commands. */
     const char *req = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
-    pollerGetFDs(stagedPoller(), 0);
+    pollerGetNextBatch(stagedPoller(), 0);
     fastpathStagedReadPhase(1);
     ASSERT_EQ(c->fp_inflight, 2u);
 

@@ -133,6 +133,64 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         assert_equal PONG [r ping]
     }
 
+    test {Staged loop: a pipeline longer than one read is served in full with no further input} {
+        set fd [sl_socket]
+        puts -nonewline $fd [sl_resp set sl:big:k v]
+        flush $fd
+        assert_equal {+OK} [sl_read_reply $fd]
+        sl_wait_fastpath_clients 1
+        # Hundreds of KB in one burst, then silence: every read after the first is driven by the
+        # poller, not by a new readiness edge.
+        set n 20000
+        set payload ""
+        for {set i 0} {$i < $n} {incr i} { append payload [sl_resp incr sl:big:n] }
+        for {set i 0} {$i < 2000} {incr i} { append payload [sl_resp get sl:big:k] }
+        set bigval [string repeat y 300000]
+        append payload [sl_resp set sl:big:v $bigval] [sl_resp strlen sl:big:v]
+        puts -nonewline $fd $payload
+        flush $fd
+        set replies [sl_read_replies $fd [expr {$n + 2002}]]
+        assert_equal ":$n" [lindex $replies [expr {$n - 1}]]
+        assert_equal v [lindex $replies [expr {$n + 1999}]]
+        assert_equal {+OK} [lindex $replies end-1]
+        assert_equal {:300000} [lindex $replies end]
+        assert_equal 1 [sl_fastpath_clients]
+        close $fd
+        sl_wait_fastpath_clients 0
+    }
+
+    test {Staged loop: replies larger than the socket buffer are completed on writable events} {
+        r set sl:wide [string repeat z 1000000]
+        set fd [sl_socket]
+        puts -nonewline $fd [sl_resp set sl:wide:x 1]
+        flush $fd
+        assert_equal {+OK} [sl_read_reply $fd]
+        sl_wait_fastpath_clients 1
+        # 16 MB of replies to a peer that does not read yet: the server's writes stop short, and
+        # the rest goes out only as the socket drains.
+        set payload ""
+        for {set i 0} {$i < 8} {incr i} { append payload [sl_resp get sl:wide] }
+        append payload [sl_resp incr sl:wide:x]
+        for {set i 0} {$i < 8} {incr i} { append payload [sl_resp get sl:wide] }
+        puts -nonewline $fd $payload
+        flush $fd
+        after 300
+        set replies [sl_read_replies $fd 17]
+        for {set i 0} {$i < 17} {incr i} {
+            if {$i == 8} {
+                assert_equal {:2} [lindex $replies $i]
+            } else {
+                assert_equal 1000000 [string length [lindex $replies $i]]
+            }
+        }
+        assert_equal 1 [sl_fastpath_clients]
+        puts -nonewline $fd [sl_resp get sl:wide:x]
+        flush $fd
+        assert_equal 2 [sl_read_reply $fd]
+        close $fd
+        sl_wait_fastpath_clients 0
+    }
+
     test {Staged loop: fast-path clients get BUSY while a script blocks main} {
         r config set busy-reply-threshold 100
         set fd [sl_socket]

@@ -88,6 +88,7 @@ int updateIOThreads(const char **err);
 int ioThreadsStagedIdle(void);
 int ioThreadsInboxPending(void);
 void ioThreadsStagedUnpark(void);
+int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize);
 int applyIOThreadsFastpathConfig(const char **err);
 /* Worker lifecycle: main reconciles live threads with the configuration from beforeSleep. */
 void ioThreadsConverge(void);

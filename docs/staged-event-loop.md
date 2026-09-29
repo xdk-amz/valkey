@@ -27,10 +27,12 @@ marks it (`fp_readmit`) to rejoin on the next entry.
 
 `stagedLoopIteration()` calls, in order:
 
-1. `collectFDs`: `beforeSleep`, one `pollerGetFDs()` wait bounded like `aeProcessEvents`
-   (zero if `AE_DONT_WAIT`, else the nearest timer), `afterSleep`.
+1. `collectFDs`: `beforeSleep`, `pollerGetNextBatch()` (the batch the epoll thread gathered
+   since the last call; it waits only when that batch is empty, bounded like `aeProcessEvents`:
+   zero if `AE_DONT_WAIT` or jobs are queued, else the nearest timer), `afterSleep`.
 2. `readPhase`: opens `STAGED_PHASE_READ` when a client fd is ready or a job is queued.
-   Each IO thread claims ready fds through the poller's atomic cursor, reads and parses,
+   Each IO thread claims ready fds through the poller's atomic cursor (PRIORITY, then IO),
+   reads and parses,
    answers the leading run of GETs itself (`fpSpeculate`), and puts the first other
    command and everything pipelined behind it into its current `cmdBatch`, across clients
    until the batch is full. Full batches go on the thread's own batch list.
@@ -50,12 +52,72 @@ optimization.
 
 ## Poller and ae
 
-Client sockets are the only IO-affinity fds (`POLLER_AFF_IO`). ae keeps every main fd; its
-own epoll fd is registered once as the single `POLLER_AFF_MAIN` entry, and ae dispatches
-its fds in the write phase, so fd reuse checks, `AE_BARRIER` and QoS priority handling are
-unchanged. The poller's fd table grows with the highest registered fd and one wait reports
-at most 1024 fds (level-triggered, the rest fire next time). `pollerRegister` is main only,
-between phases; an IO thread may modify or unregister the fd it claimed during a phase.
+### Epoll thread and batches
+
+The poller owns one thread, `io_epoll`, started when staged mode starts and joined when it
+stops (and at process exit). It blocks in `epoll_wait` on the poller's epoll set and appends
+every fired fd to the poller's `next` buffer. Consumers read only the `active` buffer. No fd
+is owned by any thread; the thread only reports.
+
+Main never touches either buffer. At the head of each iteration it calls
+`pollerGetNextBatch(p, timeout_us)`, which is safe at any time outside a read phase:
+
+- it retires `active` (re-arming the MAIN fds it reported, see below, and emptying it),
+- if `next` is empty and the timeout is not zero, it waits on a condition variable until the
+  epoll thread (or a requeue) posts an fd or the timeout passes,
+- it makes `next` the new `active` and hands the epoll thread the emptied buffer.
+
+With work already queued it returns without a syscall (bar MAIN re-arms). All locking is inside
+`poller.c`: one mutex guards `next`, the swap and the thread control; `active` is written only
+by main in the swap and reaches IO threads through the read barrier. Without a running thread
+(unit tests, or a failed start) `pollerGetNextBatch` waits on epoll itself.
+
+`pollerResize` pauses the thread, resizes, and resumes it; queued entries are kept. Stop joins
+the thread and empties both buffers, after every client fd was unregistered.
+
+The thread is placed on the union of the enrolled IO threads' CPU masks, minus main's CPUs
+when main is pinned to fewer than that union, at staged start and whenever the IO thread count
+changes. It is created with that mask, so it never runs on main's core first. It may share
+cores with IO threads.
+
+### Edge-triggered IO fds
+
+PRIORITY and IO fds are registered with `EPOLLET`: an fd is reported once per readiness edge,
+so the epoll thread never re-reports an unread fd and never spins. The rules that follow:
+
+- A handler that stops before `EAGAIN` hands the fd back with `pollerRequeue(p, fd, mask)`,
+  which queues it in `next`. The staged read handler does one read per claim and requeues when
+  that read filled its buffer (`readToQueryBuf` returned true); the rest of its loop consumes
+  the query buffer completely or leaves the fast path. A nested iteration that skips a client
+  with entries still on main requeues the edge it consumed.
+- A partial write adds `POLLER_WRITABLE` interest (`EPOLL_CTL_MOD`); the kernel reports the
+  edge when space frees. `EPOLL_CTL_ADD` and `EPOLL_CTL_MOD` both report current readiness,
+  so attaching a client with bytes already queued, or dropping write interest, loses nothing.
+- An fd may be queued in `next` while it is being served from `active`; a later claim that
+  reads `EAGAIN` is harmless. Each buffer holds an fd at most once; repeat reports merge masks.
+
+### Generations
+
+Every register and unregister of an fd starts a new generation of its slot. The generation is
+carried in the epoll tag and in every queued entry; a claim whose generation no longer matches
+(the fd was dropped, or closed and reused, since it was queued) is skipped.
+
+### Affinity classes
+
+- `POLLER_AFF_IO`: client sockets. IO threads claim them in the read phase, any thread any fd.
+- `POLLER_AFF_PRIORITY`: IO-thread fds claimed before every IO fd of the same batch. Nothing
+  registers it yet. It is meant for fds whose service delays others: a replica's primary link
+  if it moves to an IO thread, cluster bus links, and clients holding a large unsent reply.
+- `POLLER_AFF_MAIN`: ae's own epoll fd, the only one. ae keeps every main fd (listeners,
+  replication, cluster bus, module pipes, non-fast-path clients) and dispatches them in the
+  write phase, so fd reuse checks, `AE_BARRIER` and QoS priority handling are unchanged. MAIN
+  fds are level-triggered with `EPOLLONESHOT`, re-armed when main retires the batch that
+  reported them. Edge-triggered would lose readiness: ae drains a bounded number of events per
+  call, so its fd can stay readable with no new edge. Plain level-triggered would make the epoll
+  thread spin on it until main runs ae. One-shot gives one report per main pass.
+
+`pollerRegister` is main only, between phases or in the write phase; an IO thread may modify or
+unregister the fd it claimed during a phase.
 
 ## Workers
 
@@ -72,7 +134,7 @@ shuts the barrier down.
   them and changes it only between phases or in the write phase.
 - A batch entry names its client by pointer. A staged client is freed only after main took it
   back following the reply phase of every iteration that produced entries for it.
-- A client's fd appears once per collect, so within one iteration exactly one IO thread
+- A client's fd appears at most once per batch, so within one iteration exactly one IO thread
   reads it, owns its entries, and writes its replies. A client's replies stay in order.
 - A client's socket, query buffer, parser state and output buffer are touched only by that
   thread in the read and reply phases. Main reads a batch entry's borrowed argv and writes
@@ -100,8 +162,8 @@ never overtakes an earlier write of the same connection.
 ## Blocked main
 
 `processEventsWhileBlocked` runs one nested iteration at depth 1 (`stagedNestedIteration`):
-read without executing reads on IO threads, write, reply. Clients whose outer-iteration
-entries are still on main are skipped. Every nested command reaches `processCommand`, which
+take the next batch without waiting, read without executing reads on IO threads, write, reply.
+Clients whose outer-iteration entries are still on main are skipped and requeued. Every nested command reaches `processCommand`, which
 answers BUSY or LOADING. Leaves and closes seen at depth 1 are handled at the outer boundary.
 
 ## Removals
@@ -122,6 +184,9 @@ The barrier replaces the machinery two free-running loops needed, and none of it
 
 ## Open risks
 
-- Single core: the barrier sleeps on a condition variable after a short spin.
+- Single core: the barrier sleeps on a condition variable after a short spin; the epoll thread
+  blocks in the kernel.
+- A signal no longer interrupts main's wait for a batch; it is handled by the next cron, at
+  most one timer period later.
 - A module command that yields (`RM_Yield`) inside a batch runs the nested iteration.
 - Client timeouts apply to staged clients: clientsCron runs between phases and closes idle ones.

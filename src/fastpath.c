@@ -331,7 +331,9 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
 
 static void fpRead(fpThread *t, int tid, client *c) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
-    readToQueryBuf(c);
+    /* The fd is edge-triggered: a read that filled its buffer may have left bytes in the socket that
+     * no new edge will report, so the next batch reads the client again. */
+    int more = readToQueryBuf(c);
     t->reads++;
     if (c->nread <= 0) {
         /* The client may still point at this thread's shared query buffer:
@@ -370,6 +372,7 @@ static void fpRead(fpThread *t, int tid, client *c) {
         c->read_flags = 0;
     }
     trimClientQueryBuffer(c);
+    if (more && c->control->lifecycle == FP_ACTIVE) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
 }
 
 static void fpEnableWriteInterest(client *c, int on) {
@@ -838,13 +841,17 @@ void fastpathStagedSet(int on) {
 
 /* IO thread, read phase: the handler of a staged client's ready fd. */
 static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity affinity) {
-    UNUSED(fd);
     UNUSED(affinity);
     client *c = privdata;
     int tid = fp_cur_tid;
     fpThread *t = &fp_threads[tid];
-    /* A nested iteration skips clients whose entries of the outer iteration are still on main. */
-    if (c->control->lifecycle != FP_ACTIVE || c->fp_inflight > 0) return;
+    if (c->control->lifecycle != FP_ACTIVE) return;
+    /* A nested iteration skips clients whose entries of the outer iteration are still on main; the
+     * edge it consumed is handed to the next batch. */
+    if (c->fp_inflight > 0) {
+        pollerRequeue(stagedPoller(), fd, mask);
+        return;
+    }
     if (mask & POLLER_WRITABLE) {
         if (fpFlushOut(t, c)) fpEnableWriteInterest(c, 0);
         if (c->control->lifecycle != FP_ACTIVE) return;

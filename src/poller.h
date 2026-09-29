@@ -3,11 +3,17 @@
 
 /* First-class fd poller for the staged fast-path loop, kept separate from ae.
  *
- * Main calls pollerGetFDs() once at the top of an iteration. It demultiplexes the fired fds
- * by each fd's registered affinity into two ready sets: an IO set the read-phase IO threads
- * drain through an atomic cursor, and a main set main walks in the write phase. A registered
- * fd carries its handler, private data, interest mask and affinity; the ready entry carries a
- * snapshot of those so a consumer needs no second lookup. */
+ * A dedicated epoll thread (io_epoll) waits on the epoll set for as long as the poller is started
+ * and appends every fired fd to the "next" ready buffer. Consumers read only the "active" buffer.
+ * Main calls pollerGetNextBatch() once per iteration: it makes what accumulated in next the new
+ * active buffer and hands the epoll thread an empty next, blocking only while next is empty.
+ * Each buffer holds three classes by registered affinity: PRIORITY and IO fds, which the read-phase
+ * IO threads claim through an atomic cursor (PRIORITY first), and MAIN fds, which main walks in
+ * the write phase. Without a started thread, pollerGetNextBatch waits on epoll itself.
+ *
+ * IO and PRIORITY fds are edge-triggered: an fd is reported once per readiness edge, so a
+ * consumer that stops before EAGAIN must hand the fd back with pollerRequeue(). MAIN fds are
+ * one-shot level-triggered and are re-armed when the batch that reported them is replaced. */
 
 #include "fastpath_no_epoll.h"
 
@@ -24,13 +30,14 @@
 
 /* Which stage consumes a ready fd and on which thread its handler runs. */
 typedef enum {
-    POLLER_AFF_IO = 0,   /* client sockets: IO threads, read phase */
-    POLLER_AFF_MAIN = 1, /* listeners, cluster bus, replication links, module/pipe fds: main, write phase */
+    POLLER_AFF_IO = 0,       /* client sockets: IO threads, read phase */
+    POLLER_AFF_MAIN = 1,     /* ae's fd (listeners, cluster bus, replication, module pipes): main, write phase */
+    POLLER_AFF_PRIORITY = 2, /* IO threads, read phase, claimed before every IO fd */
 } pollerAffinity;
 
 typedef void (*pollerHandler)(int fd, int mask, void *privdata, pollerAffinity affinity);
 
-/* One ready fd published by pollerGetFDs, self-describing so a consumer needs no registry lookup. */
+/* One claimed ready fd, resolved against its current registration. */
 typedef struct pollerEvent {
     void *privdata;
     pollerHandler handler;
@@ -42,39 +49,60 @@ typedef struct pollerEvent {
 typedef struct poller poller;
 
 poller *pollerCreate(int setsize);
+/* Stops the epoll thread first if it runs. */
 void pollerFree(poller *p);
 
 /* Register, change, or drop an fd; 0 on success, -1 on failure. Each fd's slot has one writer at a
  * time: main between phases, or the IO thread that claimed the fd during a phase, so IO threads may
  * modify and unregister different fds concurrently; the registered count is atomic for that reason.
- * pollerRegister is main only, between phases: it may grow the fd table. Register fails on a duplicate
+ * pollerRegister is main only, outside the read and reply phases: it may grow the fd table. Register fails on a duplicate
  * fd, an fd outside setsize, or an epoll_ctl error. Modify fails on an fd that is not
  * registered. Unregister of an fd that is not registered is a no-op returning 0.
- * POLLER_NONE keeps the fd registered; errors and hangups are still reported. */
+ * POLLER_NONE keeps the fd registered; errors and hangups are still reported.
+ * Every register and unregister starts a new generation of the fd's slot: a ready entry queued
+ * under an older generation is dropped when claimed. */
 int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *privdata, pollerAffinity affinity);
 int pollerModify(poller *p, int fd, int mask);
 int pollerUnregister(poller *p, int fd);
 
-/* Block up to timeout_us (negative = forever, 0 = return immediately, positive rounds up to
- * whole ms), fill both ready sets, and return the total number of fired fds, 0 on timeout or
- * EINTR, -1 on an epoll error. Resets both ready sets first. Main only; must not overlap a
- * read phase that is still claiming from the IO set. */
-int pollerGetFDs(poller *p, long long timeout_us);
+/* Main only, while no read phase claims from the active buffer. Retires the active buffer and
+ * makes the accumulated next buffer active. Blocks while next is empty, up to timeout_us
+ * (negative = forever, 0 = never). Returns the number of fds in the new active buffer, 0 on
+ * timeout, -1 on an epoll error of the inline wait. With work pending it makes no syscall
+ * except re-arming the MAIN fds the retired buffer reported. */
+int pollerGetNextBatch(poller *p, long long timeout_us);
 
-/* IO ready set: consumed by IO threads. Claim the next entry with an atomic cursor; returns 1
- * and fills out on success, 0 when the set is exhausted. Safe to call from many threads. */
+/* Owner of a registered PRIORITY or IO fd (the IO thread that claimed it, or main between phases):
+ * queue it in the next buffer with the given fired mask, so the next batch serves it without a new
+ * readiness edge. At most one entry per fd per buffer; masks of repeats are merged. */
+void pollerRequeue(poller *p, int fd, int mask);
+
+/* Active PRIORITY and IO entries: consumed by IO threads. Claims PRIORITY entries first, then IO,
+ * through an atomic cursor; returns 1 and fills out on success, 0 when both are exhausted.
+ * Entries whose fd changed generation since they were queued are skipped. Safe from many threads. */
 int pollerClaimIO(poller *p, pollerEvent *out);
-int pollerIOCount(const poller *p);
+int pollerIOCount(const poller *p); /* PRIORITY plus IO entries in the active buffer */
 
-/* Main ready set: walked by main in the write phase. */
+/* Active MAIN entries: walked by main. pollerMainAt returns 1 and fills out, 0 for a stale entry
+ * or an index out of range. */
 int pollerMainCount(const poller *p);
-const pollerEvent *pollerMainAt(const poller *p, int i);
+int pollerMainAt(const poller *p, int i, pollerEvent *out);
+
+/* Main: start the epoll thread, named io_epoll, on the CPU set last given to
+ * pollerSetThreadAffinity (the creator's otherwise). 0 on success or when already started. */
+int pollerStart(poller *p);
+/* Main: join the epoll thread and empty both buffers. No-op when not started. */
+void pollerStop(poller *p);
+int pollerThreadRunning(const poller *p);
+/* Main: CPU set (a cpu_set_t of cpusetsize bytes) for the epoll thread, applied now when it runs
+ * and at every later start. 0 on success. */
+int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize);
 
 int pollerFd(const poller *p);    /* underlying epoll fd, for debug/nesting */
 int pollerCount(const poller *p); /* number of registered fds */
 int pollerSetSize(const poller *p);
 /* Main, between phases: change setsize like aeResizeSetSize. Fails if a registered fd would fall
- * outside the new size. Resets both ready sets. */
+ * outside the new size. Pauses a running epoll thread; queued entries are kept. */
 int pollerResize(poller *p, int setsize);
 
 #endif /* POLLER_H */

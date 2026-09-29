@@ -137,7 +137,7 @@ class FastpathStagedTest : public ::testing::Test {
     }
 
     static void readPhase() {
-        pollerGetFDs(stagedPoller(), 0);
+        pollerGetNextBatch(stagedPoller(), 0);
         fastpathStagedReadPhase(1);
     }
 

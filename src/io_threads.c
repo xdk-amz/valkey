@@ -756,6 +756,19 @@ int ioThreadsInboxPending(void) {
     return !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_HIGH]) || !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
 }
 
+/* Main: CPU mask of IO thread tid into a cpu_set_t of cpusetsize bytes; 0 on success. */
+int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize) {
+#ifdef __linux__
+    if (tid <= 0 || tid >= IO_THREADS_MAX_NUM || io_threads[tid] == 0) return -1;
+    return pthread_getaffinity_np(io_threads[tid], cpusetsize, (cpu_set_t *)cpuset) == 0 ? 0 : -1;
+#else
+    UNUSED(tid);
+    UNUSED(cpuset);
+    UNUSED(cpusetsize);
+    return -1;
+#endif
+}
+
 /* Staged workers are never parked on their mutex; every ready thread counts as active. */
 void ioThreadsStagedUnpark(void) {
     for (int i = 1; i < io_ready_num; i++) ioWorkerUnpark(i);
