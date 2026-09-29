@@ -369,7 +369,10 @@ static int clientIsPartitionable(client *c) {
 }
 
 static void setClientReadFlagsForOffload(client *c) {
+    /* A blocked command stays in argv and re-executes after unblock with its parse-time slot outcome. */
+    int keep = c->flag.pending_command ? c->read_flags & (READ_FLAGS_NO_KEYS | READ_FLAGS_CROSSSLOT) : 0;
     c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    c->read_flags |= keep;
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 }
