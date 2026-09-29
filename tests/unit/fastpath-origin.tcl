@@ -105,13 +105,19 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         assert {$id_a != $id_b}
         assert {$peer_a ne $peer_b}
 
+        # Park main so both commands are collected by the same iteration; with one IO
+        # thread they then share one batch.
+        set ctl [fp_ctl_client]
         set batches [getInfoProperty [r info fastpath] fastpath_batches]
+        $ctl debug sleep 0.3
+        after 50
         $a get denied:a
         $b get denied:b
+        assert_equal OK [$ctl read]
         assert_error {*NOPERM*} {$a read}
         assert_error {*NOPERM*} {$b read}
-        # Both commands were held into the same batch.
         assert_equal [expr {$batches + 1}] [getInfoProperty [r info fastpath] fastpath_batches]
+        $ctl close
 
         set ea [lindex [fp_acl_log_entries_for_object denied:a] 0]
         set eb [lindex [fp_acl_log_entries_for_object denied:b] 0]
@@ -320,11 +326,8 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         after 50
         $a set deluser:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
         fp_wait_fastpath_clients 0
@@ -345,11 +348,8 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         after 50
         $a set kill:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
         fp_wait_fastpath_clients 0
@@ -455,11 +455,8 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
         after 50
         $a set gone:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal OK [$ctl read]
         fp_wait_fastpath_clients 0

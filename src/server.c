@@ -60,6 +60,7 @@
 #include "throttle_repl.h"
 #include "util.h"
 #include "forkless.h"
+#include "staged_loop.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -2191,8 +2192,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
      * connection has pending data). Fast-path batches arrive on rings the
-     * event loop knows nothing about, so main polls while such clients exist. */
-    aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
+     * event loop knows nothing about, so main polls while such clients exist;
+     * the staged loop waits on its poller instead. */
+    aeSetDontWait(server.el, dont_sleep || (fastpathClientCount() > 0 && !stagedLoopActive()));
 
     updateCopyAvoidPressure(current_time);
 
@@ -8416,7 +8418,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
+    stagedMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
 }

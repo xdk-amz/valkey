@@ -88,6 +88,9 @@ int trySendClusterReadToIOThreads(struct clusterLink *link);
 int trySendClusterWriteToIOThreads(struct clusterLink *link);
 int trySendClusterAcceptToIOThreads(connection *conn);
 int updateIOThreads(const char **err);
+int ioThreadsStagedIdle(void);
+int ioThreadsInboxPending(void);
+void ioThreadsStagedUnpark(void);
 int applyIOThreadsFastpathConfig(const char **err);
 /* Worker lifecycle: main reconciles live threads with the configuration from beforeSleep. */
 void ioThreadsConverge(void);

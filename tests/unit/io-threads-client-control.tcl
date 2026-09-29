@@ -166,8 +166,9 @@ start_server {tags {"io-threads-client-control external:skip tls:skip"} override
         $ctl client setname cc-ctl
         assert_equal OK [$ctl read]
         set batches [cc_batches]
-        # DEBUG SLEEP holds main; the client's batch publishes while it sleeps, then
-        # the reconfigure lands. The late batch must run once, in order, before close.
+        # DEBUG SLEEP holds main, then the reconfigure lands in the same write phase.
+        # IO threads read only between write phases, so the pipeline is read either
+        # before the reconfigure or by main after it; either way it runs once, in order.
         set payload [cc_resp debug sleep 0.4]
         append payload [cc_resp config set io-threads 1]
         $ctl write $payload
@@ -175,11 +176,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip"} override
         after 50
         for {set j 0} {$j < 40} {incr j} { $c incr cc:d }
         $c flush
-        wait_for_condition 100 20 {
-            [cc_batches] > $batches
-        } else {
-            fail "no batch published while main slept"
-        }
         assert_equal OK [$ctl read]
         assert_equal OK [$ctl read]
         for {set j 1} {$j <= 40} {incr j} { assert_equal $j [$c read] }

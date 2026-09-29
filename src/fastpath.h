@@ -144,4 +144,16 @@ int fastpathWorkerDrained(int tid);
 int fastpathWorkerRole(int tid);
 size_t fastpathWorkerOwnedClients(int tid);
 
+/* Staged loop (driven by staged_loop.c; see docs/staged-event-loop.md). */
+int fastpathStagedOn(void);
+void fastpathStagedSet(int on);
+void fastpathStagedSetDepth(int depth);
+void fastpathStagedReadPhase(int tid);
+int fastpathStagedExecute(void);
+int fastpathStagedRepliesPending(void);
+void fastpathStagedReplyPhase(int tid);
+void fastpathStagedFinish(void);
+void fastpathStagedReleaseAll(void);
+void fastpathStagedAdoptClients(void);
+
 #endif

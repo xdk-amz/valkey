@@ -46,6 +46,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "staged_loop.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -7208,6 +7209,9 @@ void processEventsWhileBlocked(void) {
         if (!events) break;
     }
 
+    /* Fast-path clients are not on ae: give them one nested staged pass. */
+    stagedNestedIteration();
+
     whileBlockedCron();
 
     ProcessingEventsWhileBlocked--;
@@ -7234,6 +7238,8 @@ int postponeClientRead(client *c) {
 int strictOffloadActive(void) {
     /* Re-entrant event processing cannot drain deferred reads. */
     if (ProcessingEventsWhileBlocked) return 0;
+    /* The staged loop serves every non-fast-path client on main in its write phase. */
+    if (stagedLoopActive()) return 0;
     return server.io_threads_strict_offload && server.io_threads_num >= 2;
 }
 

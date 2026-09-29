@@ -231,11 +231,8 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
             after 50
             for {set j 0} {$j < 40} {incr j} { $c incr lc:i }
             $c flush
-            wait_for_condition 100 20 {
-                [getInfoProperty [r info fastpath] fastpath_batches] > $batches
-            } else {
-                fail "commands were not published while main slept"
-            }
+            # IO threads read only between main's write phases: the pipeline is read after
+            # the reconfigure, by whichever path owns the client then, and runs once in order.
             assert_equal OK [$ctl read]
             assert_equal OK [$ctl read]
             for {set j 1} {$j <= 40} {incr j} { assert_equal $j [$c read] }

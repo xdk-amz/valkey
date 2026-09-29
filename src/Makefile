@@ -565,6 +565,7 @@ ENGINE_SERVER_OBJ = \
     fastpath.o \
     poller.o \
     phase_barrier.o \
+    staged_loop.o \
     kvstore.o \
     latency.o \
     lazyfree.o \

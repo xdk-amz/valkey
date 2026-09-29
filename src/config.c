@@ -29,6 +29,7 @@
  */
 
 #include "io_threads.h"
+#include "staged_loop.h"
 #include "sds.h"
 #include "server.h"
 #include "hotkeys.h"
@@ -2836,6 +2837,10 @@ static int updateMaxclients(const char **err) {
             *err = "The event loop API is not able to handle the specified number of clients";
             return 0;
         }
+    }
+    if (stagedResize(server.maxclients + CONFIG_FDSET_INCR) != 0) {
+        *err = "The staged event loop poller is not able to handle the specified number of clients";
+        return 0;
     }
     return 1;
 }

@@ -27,6 +27,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/fastpath.c
     ${CMAKE_SOURCE_DIR}/src/poller.c
     ${CMAKE_SOURCE_DIR}/src/phase_barrier.c
+    ${CMAKE_SOURCE_DIR}/src/staged_loop.c
     ${CMAKE_SOURCE_DIR}/src/networking.c
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/object.c

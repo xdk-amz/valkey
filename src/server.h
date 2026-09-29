@@ -1513,6 +1513,7 @@ typedef struct client {
     sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
     listNode io_owner_node;               /* Registry link of the IO thread that owns the socket: linked by that thread for fast-path clients, by main for partitioned ones */
     listNode fp_defer_node;               /* Fast path: link in the owning IO thread's deferred FIFO while fp_deferred is set (IO thread only) */
+    listNode fp_stage_node;               /* Staged loop: link in the leaving list of the IO thread that saw the client leave */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
