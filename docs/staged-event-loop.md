@@ -121,4 +121,4 @@ The barrier replaces the machinery two free-running loops needed, and none of it
 
 - Single core: the barrier sleeps on a condition variable after a short spin.
 - A module command that yields (`RM_Yield`) inside a batch runs the nested iteration.
-- Client timeouts do not apply to staged clients (clientsCron skips them, as before).
+- Client timeouts apply to staged clients: clientsCron runs between phases and closes idle ones.
