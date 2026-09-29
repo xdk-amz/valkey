@@ -214,12 +214,15 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
             catch {$rd4 read} err
             assert_match {I/O error reading reply} $err
 
-            # verify the prefetch stats are as expected
+            # verify the prefetch stats are as expected; the staged loop runs these new clients on
+            # main without the stock prefetch batch
             set info [r info stats]
-            set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
-            assert_range $prefetch_entries 2 15; # With slower machines, the number of prefetch entries can be lower
-            set prefetch_batches [getInfoProperty $info io_threaded_total_prefetch_batches]
-            assert_range $prefetch_batches 1 7; # With slower machines, the number of batches can be higher
+            if {[s fastpath_workers_open] == 0} {
+                set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+                assert_range $prefetch_entries 2 15; # With slower machines, the number of prefetch entries can be lower
+                set prefetch_batches [getInfoProperty $info io_threaded_total_prefetch_batches]
+                assert_range $prefetch_batches 1 7; # With slower machines, the number of batches can be higher
+            }
 
             # Verify the final state
             $rd15 get a

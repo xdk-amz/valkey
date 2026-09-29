@@ -25,6 +25,7 @@ typedef struct fpThread {
     cmdBatch *freelist[FP_FREELIST_MAX];
     int nfree;
     long long reads, net_input_bytes, net_output_bytes, writes, batches, speculated;
+    long long reads_synced, writes_synced; /* main only: reads/writes already folded into server stats */
     /* Staged loop. Batches this thread published in the read phase, per nesting depth: written by the
      * thread in the read phase, executed by main in the write phase, delivered and recycled by the same
      * thread in the reply phase. staged_leaving holds the clients this thread saw leave; main hands
@@ -117,6 +118,8 @@ void fastpathFreeThread(int tid) {
         zfree(b);
     }
     t->ready = 0;
+    server.stat_io_reads_processed += t->reads - t->reads_synced;
+    server.stat_io_writes_processed += t->writes - t->writes_synced;
     fp_retired[0] += t->reads;
     fp_retired[1] += t->net_input_bytes;
     fp_retired[2] += t->net_output_bytes;
@@ -914,6 +917,14 @@ static void fpStagedHandoff(client *c) {
 /* Main, after the reply phase: hand back the clients IO threads saw leave, then unmap the clients main
  * asked to close. */
 void fastpathStagedFinish(void) {
+    for (int tid = 1; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (!t->ready) continue;
+        server.stat_io_reads_processed += t->reads - t->reads_synced;
+        server.stat_io_writes_processed += t->writes - t->writes_synced;
+        t->reads_synced = t->reads;
+        t->writes_synced = t->writes;
+    }
     if (!fpStaged()) return;
     for (int tid = 1; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];

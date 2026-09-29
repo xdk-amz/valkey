@@ -188,10 +188,10 @@ static void writePhase(aeEventLoop *el) {
     if (ae_ready) aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
 }
 
-/* Reply: IO threads write the replies of their own batches; the barrier closes the phase, then main
- * takes back the clients that left and unmaps the ones it closed. */
+/* Reply: IO threads write the replies of their own batches and any main-path write jobs; the barrier
+ * closes the phase, then main takes back the clients that left and unmaps the ones it closed. */
 static void replyPhase(void) {
-    if (fastpathStagedRepliesPending()) stagedRunPhase(STAGED_PHASE_REPLY);
+    if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
     fastpathStagedFinish();
 }
 

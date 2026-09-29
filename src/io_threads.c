@@ -1622,7 +1622,6 @@ int trySendReadToIOThreads(client *c) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
-    if (stagedLoopActive()) return C_ERR;
     if (!c->conn) return C_ERR;
     reconcileLazyWrite(c);
     if (c->flag.close_asap) return C_ERR;
