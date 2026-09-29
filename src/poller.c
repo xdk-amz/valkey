@@ -149,7 +149,7 @@ static void postLocked(poller *p, int fd, uint32_t gen, int cls, int mask) {
         s->fd = -1;
     }
     if (b->n[cls] == b->cap[cls]) {
-        int cap = b->cap[cls] ? b->cap[cls] * 2 : (cls == POLLER_AFF_IO ? 256 : 8);
+        int cap = b->cap[cls] * 2;
         b->e[cls] = zrealloc(b->e[cls], sizeof(pollerSlot) * cap);
         b->cap[cls] = cap;
     }
@@ -199,7 +199,14 @@ poller *pollerCreate(int setsize) {
         return NULL;
     }
     p->fired = zmalloc(sizeof(struct epoll_event) * p->maxevents);
-    for (int i = 0; i < 2; i++) p->buf[i].pos = zcalloc(sizeof(uint32_t) * setsize);
+    for (int i = 0; i < 2; i++) {
+        pollerBuf *b = &p->buf[i];
+        b->pos = zcalloc(sizeof(uint32_t) * setsize);
+        /* Sized up front so the epoll thread does not allocate: a buffer holds each fd at most once. */
+        b->cap[POLLER_AFF_IO] = setsize;
+        b->cap[POLLER_AFF_MAIN] = b->cap[POLLER_AFF_PRIORITY] = 16;
+        for (int c = 0; c < POLLER_NCLASS; c++) b->e[c] = zmalloc(sizeof(pollerSlot) * b->cap[c]);
+    }
     atomic_init(&p->cursor, 0);
     atomic_init(&p->count, 0);
     return p;
@@ -426,7 +433,7 @@ static void *pollerThreadMain(void *arg) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
     pthread_setname_np(pthread_self(), "io_epoll");
 
-    struct epoll_event *ev = zmalloc(sizeof(struct epoll_event) * POLLER_MAX_EVENTS);
+    struct epoll_event ev[POLLER_MAX_EVENTS];
     for (;;) {
         int n = epoll_wait(p->epfd, ev, POLLER_MAX_EVENTS, -1);
         if (n < 0 && errno != EINTR) {
@@ -454,7 +461,6 @@ static void *pollerThreadMain(void *arg) {
     pthread_cond_broadcast(&p->ctl_cv);
     pthread_cond_broadcast(&p->ready_cv);
     pthread_mutex_unlock(&p->lock);
-    zfree(ev);
     return NULL;
 }
 
@@ -561,6 +567,10 @@ int pollerResize(poller *p, int setsize) {
                 if (b->e[c][k].fd >= setsize) b->e[c][k].fd = -1;
         b->pos = zrealloc(b->pos, sizeof(uint32_t) * setsize);
         if (setsize > p->setsize) memset(b->pos + p->setsize, 0, sizeof(uint32_t) * (setsize - p->setsize));
+        if (b->cap[POLLER_AFF_IO] < setsize) {
+            b->e[POLLER_AFF_IO] = zrealloc(b->e[POLLER_AFF_IO], sizeof(pollerSlot) * setsize);
+            b->cap[POLLER_AFF_IO] = setsize;
+        }
     }
     p->maxevents = pollerMaxEvents(setsize);
     p->fired = zrealloc(p->fired, sizeof(struct epoll_event) * p->maxevents);
