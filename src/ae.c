@@ -657,6 +657,24 @@ int aeWait(int fd, int mask, long long milliseconds) {
     }
 }
 
+int64_t aeUsUntilEarliestTimer(aeEventLoop *eventLoop) {
+    return usUntilEarliestTimer(eventLoop);
+}
+
+int aeProcessTimeEvents(aeEventLoop *eventLoop) {
+    return processTimeEvents(eventLoop);
+}
+
+/* The multiplexer's own fd, so another poller can watch the whole loop as one level-triggered fd. */
+int aeGetPollFd(aeEventLoop *eventLoop) {
+#if !defined(HAVE_EVPORT) && defined(HAVE_EPOLL)
+    return ((aeApiState *)eventLoop->apidata)->epfd;
+#else
+    (void)eventLoop;
+    return -1;
+#endif
+}
+
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
