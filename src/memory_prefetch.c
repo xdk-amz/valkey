@@ -476,6 +476,8 @@ void prefetchBatchRun(void) {
         if (key->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(key));
     }
     for (size_t i = 0; i < batch->key_count; i++) batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
+    for (size_t i = 0; i < batch->key_count; i++)
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
         hashtablePrefetch(batch->keys_tables);
