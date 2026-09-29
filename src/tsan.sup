@@ -67,7 +67,6 @@ race:connSocketSetReadHandler
 race:connSocketSetWriteHandler
 race:dplusAggregateStats
 race:dplusConsumeSpeculated
-race:dplusDoorbellRings
 race:dplusInfoString
 race:invoke_callback
 race:ioThreadReadQueryFromClient

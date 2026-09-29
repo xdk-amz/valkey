@@ -24,11 +24,8 @@
 #include <stdbool.h>
 
 struct client;
-struct serverObject;
 
-/* Cache line size for alignment. */
 #define DPLUS_CACHELINE 64
-
 #define DPLUS_MAX_IO_THREADS 256
 
 /* IO-thread lifecycle hooks. Speculative reads and main-thread mutations are
@@ -38,22 +35,12 @@ static inline void dplusReaderWorkerQuiescent(int tid) { (void)tid; }
 static inline void dplusReaderWorkerOffline(int tid) { (void)tid; }
 static inline void dplusReaderAssertParkSafe(int tid) { (void)tid; }
 
-/* --- Per-IO-thread command counters (no-enqueue Phase-1) ---
- *
- * When IO threads consume speculated commands locally, they must NOT write
- * to shared stat_numcommands (cache-line bouncing per command kills throughput).
- * Instead, each IO thread accumulates into its own cache-line-aligned counter.
- * The main thread aggregates (add-and-zero) once per event-loop iteration in
- * beforeSleep — a per-LOOP touch, not per-command. */
+/* Per-IO-thread counters: IO threads never write shared server stats; main
+ * folds these into them once per event-loop iteration. */
 typedef struct dplusThreadStats {
     long long commands_processed; /* speculated commands consumed on this thread */
     long long usec;               /* wall time spent executing them (for commandstats) */
-    long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
-    long long owned_net_bytes;    /* bytes written by those completions */
-    long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
-    long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
-    long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    long long keyspace_hits;      /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long keyspace_hits;      /* speculative GET hits (bypass main's stat_keyspace_hits) */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -67,13 +54,6 @@ typedef struct {
     _Atomic(uint64_t) large_value_punts;
     _Atomic(uint64_t) expired_replies;
     _Atomic(uint64_t) miss_punts;
-    _Atomic(uint64_t) b13_waiting_transitions;
-    _Atomic(uint64_t) b13_handler_fires;
-    _Atomic(uint64_t) b13_read_suspends;
-    _Atomic(uint64_t) b13_rearms;
-    _Atomic(uint64_t) b13_info_lock_calls;
-    _Atomic(uint64_t) b13_info_lock_wait_us;
-    _Atomic(uint64_t) b13_info_lock_hold_us;
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusStats;
 
 /* One slot per thread, each on its own cache lines. A counter is written only
@@ -91,12 +71,6 @@ uint64_t dplusStatsSum(size_t field_offset);
 #define DPLUS_STAT_SUM(field) dplusStatsSum(offsetof(dplusStats, field))
 #endif
 
-/* D5: owned-client over-limit signal (correctness machinery — present in
- * flagless builds, NOT gated on IO_LOOKUP_OFFLOAD_STATS). */
-extern _Atomic int dplus_client_mem_pressure;
-
-/* --- API declarations --- */
-
 /* ACL/AUTH gate for speculation (main-thread writers; workers read the
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */
 void dplusRecomputeSpecAclOk(struct client *c);
@@ -105,35 +79,24 @@ void dplusOnAclRulesChanged(void);
 void dplusOnCommandResultListenersChanged(int success_listeners);
 void dplusOnMonitorsChanged(void);
 
-/* Component 2: Speculative GET execution on IO thread (implemented in dplus.c) */
-struct client;
-
-/* Component 2/5: IO-thread batch speculation (implemented in dplus.c).
- * Called from ioThreadReadQueryFromClient. Returns count of commands
- * speculatively completed. tid = IO thread index (1..N-1). */
-
+/* IO thread: reply to a GET prefix of the parsed commands; returns how many.
+ * tid = IO thread index (1..N-1). */
 int dplusSpeculateBatch(struct client *c, int tid);
 
-/* Component 5: IO-thread consumption (implemented in dplus.c).
- * Called from ioThreadReadQueryFromClient AFTER dplusSpeculateBatch succeeds.
- * Consumes the N speculated commands at the IO thread: frees argv, advances
- * cmd_queue, increments per-thread stats. The main thread never sees these
- * commands. Returns count of commands consumed. */
+/* IO thread, after dplusSpeculateBatch: free the argv of the speculated
+ * commands, advance the command queue and count them per thread. */
 void dplusConsumeSpeculated(struct client *c, int count, int tid);
 
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.
  * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
 void dplusAggregateStats(void);
-/* Door-2 wakeup-coalescing counters (prototype instrumentation). */
-long long dplusDoorbellRings(void);
-long long dplusDoorbellCoalesced(void);
 
 /* Maximum embedded value size for speculative copy. Larger values punt.
  * The value-size sweep showed a smooth gradient with no cliff up to 1KB. */
 #define DPLUS_MAX_SPECULATIVE_VALUE_LEN 1024
 
-/* Component 6: INFO section. Reader lifecycle gauges are always available;
- * detailed speculative counters remain build-flag dependent. */
+/* INFO dplus: speculated command count; detailed counters need
+ * -DIO_LOOKUP_OFFLOAD_STATS. */
 sds dplusInfoString(sds info);
 
 #endif /* DPLUS_H */

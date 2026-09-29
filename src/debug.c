@@ -547,8 +547,6 @@ void debugCommand(client *c) {
             "    Grace period in seconds for replica main channel to establish psync.",
             "DICT-RESIZING <0|1>",
             "    Enable or disable the main dict and expire dict resizing.",
-            "DPLUS-OWNER",
-            "    Return the current client's IO owner id for deterministic tests.",
             "HASHTABLE-CAN-ABORT-SHRINK <0|1>",
             "    Enable or disable the hashtable shrink abort.",
             "CLIENT-ENFORCE-REPLY-LIST <0|1>",

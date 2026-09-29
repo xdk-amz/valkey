@@ -1,5 +1,4 @@
-/* D+ Read-Side Prototype — Speculative GET execution on IO threads.
- * See dplus.h for architecture overview and reply-ordering guarantee. */
+/* D+ -- GET execution on IO threads. See dplus.h. */
 
 #include "server.h"
 #include "dplus.h"
@@ -7,17 +6,8 @@
 
 #include <string.h>
 #include <stdatomic.h>
-#include <unistd.h>
 
-
-/* --- Per-IO-thread command counters (no-enqueue Phase-1) --- */
 dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
-
-/* D5: worker -> main signal that some owned client's output has crossed
- * maxmemory-clients while no completion is flowing (WAITING_WRITABLE hog).
- * Consumed (exchange 0) by evictClients on main. NOT stats -- must exist
- * in flagless builds (correctness machinery, not diagnostics). */
-_Atomic int dplus_client_mem_pressure = 0;
 
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -135,12 +125,6 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
     if (c->buf_peak < c->bufpos) c->buf_peak = c->bufpos;
     return (int)total;
 }
-
-/* D+ (S1.5): the single-GET speculative path (dplusSpeculativeGet) was
- * removed as dead code -- it had NO epoch reader-slot bracketing
- * (dplusReaderEnter/Quiescent), so any future caller would dereference
- * published objects with no lifetime protection. The batch path
- * (dplusSpeculateBatch) is the only speculation entry point.  */
 
 /* --- Component 2/5: IO-thread batch speculation with batched prefetch --- */
 
@@ -447,21 +431,6 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
      * punt to main via E4; large/expired/torn also punt). Count them per-thread
      * so main can fold into stat_keyspace_hits, which the worker path bypasses. */
     dplus_thread_stats[tid].keyspace_hits += consumed;
-
-    /* D5: a WAITING_WRITABLE client keeps speculating reads (B13) while its
-     * peer refuses to drain the socket, so its output grows with NO completion
-     * ever reaching main — main's eviction sums stay stale for a full cron
-     * period while CLIENT LIST reads fresh memory, and a hog can be observed
-     * over maxmemory-clients without being evicted. If this client's output
-     * alone exceeds the whole budget, raise the pressure flag; evictClients
-     * (per-command + per-drain on main) refreshes owned accounting when set.
-     * Racy config read + relaxed flag: established pattern, main re-verifies. */
-    if (consumed > 0 && server.maxmemory_clients != 0) {
-        size_t out = atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed) +
-                     c->reply_bytes + (size_t)c->bufpos;
-        if (out > (size_t)server.maxmemory_clients)
-            atomic_store_explicit(&dplus_client_mem_pressure, 1, memory_order_release);
-    }
 }
 
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.
@@ -494,8 +463,6 @@ void dplusAggregateStats(void) {
      * latest increment), which the next fold picks up — never loses. */
     static long long seen_calls[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
-    static long long seen_writes[DPLUS_MAX_IO_THREADS] = {0};
-    static long long seen_net_bytes[DPLUS_MAX_IO_THREADS] = {0};
     static long long seen_hits[DPLUS_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
@@ -522,84 +489,25 @@ void dplusAggregateStats(void) {
             seen_usec[i] = us;
             if (get_cmd) get_cmd->microseconds += delta;
         }
-        /* Fix #2 (main-free completion): fold worker-side write completions
-         * into the global write stats. Same monotonic-delta scheme. */
-        long long w = dplus_thread_stats[i].owned_writes;
-        if (w > seen_writes[i]) {
-            server.stat_total_writes_processed += w - seen_writes[i];
-            seen_writes[i] = w;
-        }
-        long long b = dplus_thread_stats[i].owned_net_bytes;
-        if (b > seen_net_bytes[i]) {
-            server.stat_net_output_bytes += b - seen_net_bytes[i];
-            seen_net_bytes[i] = b;
-        }
     }
-}
-
-/* --- Component 6: INFO section --- */
-/* Door-2 wakeup-coalescing counters (prototype): sums of per-worker plain
- * fields written only by their owning worker — racy-by-design stats reads.
- * Always compiled (not gated on IO_LOOKUP_OFFLOAD_STATS) so the coalescing
- * A/B can read them from a default build's INFO stats. */
-long long dplusDoorbellRings(void) {
-    long long sum = 0;
-    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_thread_stats[i].doorbell_rings;
-    return sum;
-}
-
-long long dplusDoorbellCoalesced(void) {
-    long long sum = 0;
-    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) sum += dplus_thread_stats[i].doorbell_coalesced;
-    return sum;
 }
 
 sds dplusInfoString(sds info) {
-    /* Worker-owned counters are intentionally sampled without shared-line
-     * writes. */
-    long long speculated = 0, doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
-    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
-        speculated += dplus_thread_stats[i].commands_processed;
-        doorbell_rings += dplus_thread_stats[i].doorbell_rings;
-        doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
-        punted_replies += dplus_thread_stats[i].punted_replies_written;
-    }
-    info = sdscatprintf(info,
-        "# Dplus\r\n"
-        "dplus_speculated_commands:%lld\r\n"
-        "dplus_doorbell_rings:%llu\r\n"
-        "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
-        speculated,
-        (unsigned long long)doorbell_rings,
-        (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+    long long speculated = 0;
+    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) speculated += dplus_thread_stats[i].commands_processed;
+    info = sdscatprintf(info, "# Dplus\r\ndplus_speculated_commands:%lld\r\n", speculated);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
         "dplus_speculative_attempts:%llu\r\n"
         "dplus_speculative_hits:%llu\r\n"
         "dplus_large_value_punts:%llu\r\n"
         "dplus_expired_replies:%llu\r\n"
-        "dplus_miss_punts:%llu\r\n"
-        "dplus_b13_waiting_transitions:%llu\r\n"
-        "dplus_b13_handler_fires:%llu\r\n"
-        "dplus_b13_read_suspends:%llu\r\n"
-        "dplus_b13_rearms:%llu\r\n"
-        "dplus_b13_info_lock_calls:%llu\r\n"
-        "dplus_b13_info_lock_wait_us:%llu\r\n"
-        "dplus_b13_info_lock_hold_us:%llu\r\n",
+        "dplus_miss_punts:%llu\r\n",
         (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
         (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
         (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
         (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
-        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
-        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
-        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
-        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
+        (unsigned long long)DPLUS_STAT_SUM(miss_punts));
 #endif
     return info;
 }
