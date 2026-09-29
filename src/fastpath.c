@@ -19,17 +19,6 @@ static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs on
 static_assert(sizeof(cmdEntry) == 160, "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
-/* The two reply counters each sit on their own cache line so the main producer and the IO consumer
- * never share a line, and neither shares the identity/control line at offset 0. */
-static_assert(_Alignof(ClientControl) == CACHE_LINE_SIZE, "ClientControl aligns to a cache line for its counter lines");
-static_assert(offsetof(ClientControl, reply_bytes_produced) == CACHE_LINE_SIZE,
-              "reply_bytes_produced starts the producer line, past the identity/control line");
-static_assert(offsetof(ClientControl, reply_bytes_released) == 2 * CACHE_LINE_SIZE,
-              "reply_bytes_released starts its own consumer line, distinct from the producer line");
-static_assert(offsetof(ClientControl, reply_bytes_released) - offsetof(ClientControl, reply_bytes_produced) >=
-                  CACHE_LINE_SIZE,
-              "the two reply counters never share a cache line");
-static_assert(sizeof(ClientControl) == 3 * CACHE_LINE_SIZE, "identity/control line plus the two counter lines");
 
 #define FP_RING_SIZE 1024        /* batches per ring; batches, not commands */
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
@@ -278,7 +267,7 @@ static int fpCaptureAddrs(client *c) {
  * connection is freed. The IO owner bumps generation whenever it assigns a private resolution slot. */
 int fastpathControlEnsure(client *c) {
     if (c->control) return C_OK;
-    ClientControl *cc = zmalloc_cache_aligned(sizeof(ClientControl));
+    ClientControl *cc = zmalloc(sizeof(ClientControl));
     if (!cc) return C_ERR;
     cc->client_id = c->id;
     cc->generation = 1;
@@ -288,8 +277,6 @@ int fastpathControlEnsure(client *c) {
     cc->pin_refs = 0;
     cc->pin_bits = 0;
     atomic_init(&cc->requests, 0u);
-    atomic_init(&cc->reply_bytes_produced, (size_t)0);
-    atomic_init(&cc->reply_bytes_released, (size_t)0);
     c->control = cc;
     return C_OK;
 }
@@ -301,7 +288,7 @@ int fastpathControlEnsure(client *c) {
  *   PIN_DETACH - a terminal detach record is still in the owner's return ring (held request..consumed),
  *                so the owner may still meet the pointer.
  * Every pin is taken and dropped on main (the sole caller of attach/detach/handoff/reclaim), so pin_refs
- * needs no atomic. Reply memory is a separate gate read from its own counters, not a pin. */
+ * needs no atomic. */
 #define CC_PIN_OWNER (1u << 0)
 #define CC_PIN_DETACH (1u << 1)
 
@@ -324,17 +311,15 @@ static void fastpathControlUnpin(client *c, uint32_t pin) {
     cc->pin_refs--;
 }
 
-/* True once every lifetime gate has cleared: no owner and no detach record pin the control, and every
- * external reply charged to it has been released. Only then may the control be freed; a client whose
- * control is still pinned or still owes released replies is not yet reclaimable. */
+/* True once no owner and no detach record pin the control; only then may it be freed. */
 static int fastpathControlReclaimable(const ClientControl *cc) {
-    return cc->pin_refs == 0 && fastpathReplyOutstanding(cc) == 0;
+    return cc->pin_refs == 0;
 }
 
 /* The one and only reclaimer for a ClientControl, called from freeClient once the connection is fully
  * torn down. By this point freeClient has already waited out the fast-path and unconsumed-detach gates,
- * so both pins are dropped; this asserts that lifetime invariant (no owner, no detach record, no
- * outstanding replies) before freeing and clearing the connection's link. */
+ * so both pins are dropped; this asserts that lifetime invariant (no owner, no detach record) before
+ * freeing and clearing the connection's link. */
 void fastpathControlReclaim(client *c) {
     if (!c->control) return;
     serverAssert(fastpathControlReclaimable(c->control));
@@ -373,12 +358,11 @@ void fastpathControlRequest(ClientControl *cc, uint32_t req) {
         atomic_store_explicit(&fp_threads[cc->owner_tid].req_pending, 1, memory_order_release);
 }
 
-/* The single dominant request the owner should act on, given the pending bitmask and whether the
- * client's external replies are all released (EVICT waits for that; the others do not). Returns 0 when
- * nothing is actionable yet. Pure precedence, no side effects, so the owner's execution stays deterministic. */
-static uint32_t fpRequestWinner(uint32_t reqs, int replies_released) {
+/* The single dominant request the owner should act on, given the pending bitmask; 0 when none.
+ * Pure precedence, no side effects, so the owner's execution stays deterministic. */
+static uint32_t fpRequestWinner(uint32_t reqs) {
     if (reqs & CC_REQ_CLOSE) return CC_REQ_CLOSE;
-    if (reqs & CC_REQ_EVICT) return replies_released ? CC_REQ_EVICT : 0;
+    if (reqs & CC_REQ_EVICT) return CC_REQ_EVICT;
     if (reqs & CC_REQ_HANDOFF) return CC_REQ_HANDOFF;
     if (reqs & CC_REQ_QUIESCE) return CC_REQ_QUIESCE;
     return 0;
@@ -400,66 +384,6 @@ ClientHandle fastpathHandleFor(client *c) {
  * connection, so a reused slot is caught without touching freed connection storage. */
 int fastpathHandleStale(const ClientHandle *h) {
     return h->control == NULL || h->control->generation != h->generation;
-}
-
-/* Logical reply bytes an entry retains for its client: the arena run or the spilled heap block, never
- * both (main sets one or the other) and never allocator-rounded capacity, so produce and release count
- * the same unit. Zero for a requeued or reply-less entry, so charging it is a no-op. */
-static inline size_t fpEntryReplyBytes(const cmdEntry *e) {
-    return e->reply_big ? e->reply_big_len : e->reply_len;
-}
-
-/* Main publishes all reply charges before returning the batch, coalescing adjacent entries for one
- * control so pipelined commands share one producer-counter update. */
-static void fpReplyChargeBatch(cmdBatch *b) {
-    int i = 0;
-    while (i < b->count) {
-        ClientHandle *handle = &b->e[i].handle;
-        ClientControl *cc = handle->control;
-        uint32_t generation = handle->generation;
-        size_t bytes = 0;
-        int j = i;
-        while (j < b->count && b->e[j].handle.control == cc && b->e[j].handle.generation == generation) {
-            bytes += fpEntryReplyBytes(&b->e[j]);
-            j++;
-        }
-        if (bytes > 0 && !fastpathHandleStale(handle)) {
-            size_t produced = atomic_load_explicit(&cc->reply_bytes_produced, memory_order_relaxed);
-            atomic_store_explicit(&cc->reply_bytes_produced, produced + bytes, memory_order_release);
-        }
-        i = j;
-    }
-}
-
-/* The IO owner publishes releases before reclaiming batch storage, coalescing adjacent entries for one
- * control and preserving released <= produced for each generation. */
-static void fpReplyReleaseBatch(cmdBatch *b) {
-    int i = 0;
-    while (i < b->count) {
-        ClientHandle *handle = &b->e[i].handle;
-        ClientControl *cc = handle->control;
-        uint32_t generation = handle->generation;
-        size_t bytes = 0;
-        int j = i;
-        while (j < b->count && b->e[j].handle.control == cc && b->e[j].handle.generation == generation) {
-            bytes += fpEntryReplyBytes(&b->e[j]);
-            j++;
-        }
-        if (bytes > 0 && !fastpathHandleStale(handle)) {
-            size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
-            atomic_store_explicit(&cc->reply_bytes_released, released + bytes, memory_order_release);
-        }
-        i = j;
-    }
-}
-
-/* Reply bytes charged to a control but not yet released: produced minus released, read with acquire so a
- * charge and a release are both visible. The unsigned difference stays correct across benign wraparound
- * while outstanding < SIZE_MAX. Read-only: this does not enforce COB or maxmemory-clients. */
-size_t fastpathReplyOutstanding(const ClientControl *cc) {
-    size_t produced = atomic_load_explicit(&cc->reply_bytes_produced, memory_order_acquire);
-    size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_acquire);
-    return produced - released;
 }
 
 static int fpStagedAttach(client *c);
@@ -639,16 +563,13 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
  * runs this; a request is a published intent, the transition is the owner's alone, so no other domain
  * mutates the client's lifecycle. Reads the bitmask with acquire to pair with the publisher's release.
  * Maps the dominant request onto the existing leave transitions rather than a second lifecycle model:
- * CLOSE/EVICT free the connection (FP_CLOSING), HANDOFF/QUIESCE return it to main (FP_LEAVING). EVICT
- * defers until the client's external replies are all released so no charged reply memory is dropped
- * mid-flight. Executed bits are cleared with release; the transition is idempotent (fpBeginLeave is a
+ * CLOSE/EVICT free the connection (FP_CLOSING), HANDOFF/QUIESCE return it to main (FP_LEAVING). Executed bits are cleared with release; the transition is idempotent (fpBeginLeave is a
  * no-op once the client is no longer FP_ACTIVE), so a duplicate or late request does nothing. */
 static void fpExecuteRequests(fpThread *t, client *c) {
     ClientControl *cc = c->control;
     uint32_t reqs = atomic_load_explicit(&cc->requests, memory_order_acquire);
     if (reqs == 0) return;
-    uint32_t win = fpRequestWinner(reqs, fastpathReplyOutstanding(cc) == 0);
-    if (win == 0) return; /* an EVICT still waiting on outstanding replies: revisit on a later pass */
+    uint32_t win = fpRequestWinner(reqs);
     if (cc->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
     else if ((win & CC_REQ_TERMINAL) && cc->lifecycle == FP_LEAVING)
         cc->lifecycle = FP_CLOSING; /* a close arriving after a handoff started still frees it */
@@ -990,7 +911,6 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         }
         i = j;
     }
-    if (!fpStaged()) fpReplyReleaseBatch(b);
     for (int k = 0; k < b->count; k++) {
         cmdEntry *e = &b->e[k];
         if (e->reply_big) zfree(e->reply_big);
@@ -1252,7 +1172,7 @@ release_argv:
 }
 
 /* Prefetch the keys a batch touches before main executes it. */
-static void fpPrefetchBatch(cmdBatch *b, int reply_counters) {
+static void fpPrefetchBatch(cmdBatch *b) {
     getKeysResult result;
     initGetKeysResult(&result);
     int room = 1;
@@ -1262,7 +1182,6 @@ static void fpPrefetchBatch(cmdBatch *b, int reply_counters) {
         ClientControl *cc = e->handle.control;
         if (cc != last_control) {
             __builtin_prefetch(cc);
-            if (reply_counters) __builtin_prefetch(&cc->reply_bytes_produced, 1, 1);
             last_control = cc;
         }
         if (!e->cmd || (e->read_flags & READ_FLAGS_BAD_ARITY)) continue;
@@ -1305,9 +1224,8 @@ again:
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
-            if (use_prefetch && !paused) fpPrefetchBatch(b, 1);
+            if (use_prefetch && !paused) fpPrefetchBatch(b);
             for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
-            fpReplyChargeBatch(b);
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
@@ -1611,7 +1529,7 @@ int fastpathStagedExecute(void) {
         client *ec = fpExecutor(tid);
         for (int i = 0; i < t->sbn[d]; i++) {
             cmdBatch *b = t->sb[d][i];
-            if (use_prefetch && !paused) fpPrefetchBatch(b, 0);
+            if (use_prefetch && !paused) fpPrefetchBatch(b);
             for (int k = 0; k < b->count; k++) fpExecute(ec, b, &b->e[k]);
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */

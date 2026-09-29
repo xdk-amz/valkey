@@ -24,26 +24,16 @@
  * Bits so compatible requests coalesce; CLOSE is terminal and outranks the rest. */
 #define CC_REQ_QUIESCE (1u << 0) /* stop admitting; hand back in flight so the owner can be reassigned */
 #define CC_REQ_HANDOFF (1u << 1) /* return the connection to main once nothing is in flight */
-#define CC_REQ_EVICT (1u << 2)   /* free under a memory/QoS limit once replies are released */
+#define CC_REQ_EVICT (1u << 2)   /* free under a memory/QoS limit */
 #define CC_REQ_CLOSE (1u << 3)   /* terminal: free once drained; supersedes every other request */
 
 /* Stable, separately allocated shared control for one crossing-capable connection.
- * Holds only intentionally cross-thread state: identity, current owner, lifecycle, pending
- * requests, and reply-memory accounting. The concrete client remains the owner-only
- * ClientConnection; never place connection/socket/TLS/parser/querybuf/output/poller/general
- * client flags here, and take no lock around it. Referenced only through a generation-checked
- * ClientHandle so a stale reference is detected without dereferencing a freed connection.
- * Reply-memory accounting is two unsigned monotonic counters, each with a single writer, so
- * outstanding = produced - released needs no contended read-modify-write and no lock. Both count
- * the SAME unit: logical reply bytes retained for the client (never allocator-rounded capacity),
- * so the difference is meaningful; producer and consumer must never mix units. Wraparound is
- * benign because the unsigned difference stays correct while outstanding < SIZE_MAX. The two
- * counters live on separate cache lines (below) so the main producer and the IO consumer never
- * contend on the same line. Memory ordering: the writer publishes with release, the reader (and
- * the reclamation gate) loads with acquire so a produced charge is visible before its bytes are
- * observed, and a release is visible before the control is reclaimed. */
+ * Holds only intentionally cross-thread state: identity, current owner, lifecycle and pending
+ * requests. The concrete client remains the owner-only ClientConnection; never place
+ * connection/socket/TLS/parser/querybuf/output/poller/general client flags here, and take no lock
+ * around it. Referenced only through a generation-checked ClientHandle so a stale reference is
+ * detected without dereferencing a freed connection. */
 typedef struct ClientControl {
-    /* Identity + control cache line: mostly-immutable identity and owner-published fields. */
     uint64_t client_id;         /* Immutable: the connection's stable client id, set once at init. */
     uint32_t generation;        /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
     uint8_t owner_domain;       /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
@@ -52,12 +42,6 @@ typedef struct ClientControl {
     _Atomic(uint32_t) requests; /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
     uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
     uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
-
-    /* Producer cache line: written only by main. */
-    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_produced; /* Sole writer main: logical reply bytes retained for this client so far; monotonic. */
-
-    /* Consumer cache line: written only by the IO owner. */
-    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
 } ClientControl;
 
 /* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
@@ -125,10 +109,6 @@ int fastpathControlEnsure(client *c);
 void fastpathControlRequest(ClientControl *cc, uint32_t req);
 /* The single final reclaimer: free the connection's ClientControl at client teardown once nothing pins it. */
 void fastpathControlReclaim(client *c);
-
-/* Reply bytes charged to a control but not yet released (produced - released). Read-only: reports the
- * outstanding external reply memory; it does not enforce COB or maxmemory-clients. */
-size_t fastpathReplyOutstanding(const ClientControl *cc);
 
 void fastpathInitThread(int tid);
 void fastpathFreeThread(int tid);
