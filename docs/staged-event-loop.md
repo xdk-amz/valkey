@@ -91,9 +91,11 @@ never overtakes an earlier write of the same connection.
 - A client that leaves (EOF, write error, query buffer limit, unsupported command, paused
   entries handed back) is unregistered from the poller by the IO thread that saw it and
   linked on that thread's leaving list. Main hands it back after the reply phase.
-- `freeClient` on a staged client records the close on its control and in a main close list.
-  `fpExecute` skips its entries; main unmaps it after the reply phase and the async free
-  queue frees it.
+- `freeClient` and `freeClientAsync` on a staged client record the close on its control and in a
+  main close list. `fpExecute` skips its entries; main unmaps it after the reply phase and the
+  async free queue frees it. Both run on main only.
+- Unwritten replies past the normal output buffer limit, or a read past the query buffer limit,
+  make the client leave; main applies the stock limit handling when it takes the client back.
 
 ## Blocked main
 

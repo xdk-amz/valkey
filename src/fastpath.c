@@ -389,11 +389,23 @@ static int fpFlushOut(fpThread *t, client *c) {
     return 1;
 }
 
+/* Unwritten replies past the normal class limit: the client leaves and main applies the limit when
+ * it takes the bytes back. The limit counts what does not fit the static buffer, as on main. */
+static void fpCheckOutLimit(fpThread *t, client *c) {
+    clientBufferLimitsConfig *l = &server.client_obuf_limits[CLIENT_TYPE_NORMAL];
+    size_t len = sdslen(c->fp_out);
+    if (len <= c->buf_usable_size) return;
+    size_t used = len - c->buf_usable_size;
+    if ((l->hard_limit_bytes && used >= l->hard_limit_bytes) || (l->soft_limit_bytes && used >= l->soft_limit_bytes))
+        fpBeginLeave(t, c, FP_LEAVING);
+}
+
 /* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     if (c->control->lifecycle == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
+        fpCheckOutLimit(t, c);
         return;
     }
     ssize_t n = writev(c->conn->fd, iov, iovcnt);
@@ -416,7 +428,10 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
         c->fp_out = sdscatlen(c->fp_out, (char *)iov[i].iov_base + n, iov[i].iov_len - n);
         n = 0;
     }
-    if (c->fp_out && sdslen(c->fp_out) > 0) fpEnableWriteInterest(c, 1);
+    if (c->fp_out && sdslen(c->fp_out) > 0) {
+        fpEnableWriteInterest(c, 1);
+        fpCheckOutLimit(t, c);
+    }
 }
 
 static parsedCommand fpEntryToParsed(cmdEntry *e) {
@@ -718,6 +733,11 @@ void fastpathHandoffDone(client *c, int closing) {
         if (sdslen(out) > 0) addReplyProto(c, out, sdslen(out));
         sdsfree(out);
     }
+    if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
+        handleQbLimitReached(c);
+        return;
+    }
+    if (c->flag.close_asap) return; /* the returned replies passed the output buffer limit */
     int authenticating = c->parsed_cmd && (c->parsed_cmd->proc == authCommand || c->parsed_cmd->proc == helloCommand);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;

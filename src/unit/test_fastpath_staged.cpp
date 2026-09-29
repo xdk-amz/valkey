@@ -272,6 +272,70 @@ TEST_F(FastpathStagedTest, CloseSkipsEntriesAndFreesAfterReplyBarrier) {
     close(peer);
 }
 
+/* freeClientAsync on a staged client records the same close as freeClient. */
+TEST_F(FastpathStagedTest, AsyncFreeRecordsCloseAndFreesAfterReplyBarrier) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    send(peer, "*3\r\n$3\r\nSET\r\n$4\r\nst:f\r\n$1\r\n1\r\n");
+    readPhase();
+    EXPECT_EQ(c->fp_inflight, 1u);
+
+    freeClientAsync(c);
+    EXPECT_EQ(c->flag.fp_detach_sent, 1u);
+    EXPECT_EQ(c->control->closing, 1u);
+    EXPECT_EQ(freeClientsInAsyncFreeQueue(), 0);
+    fastpathStagedExecute();
+    robj *key = createStringObject("st:f", 4);
+    EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr);
+    decrRefCount(key);
+    if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    EXPECT_EQ(freeClientsInAsyncFreeQueue(), 1);
+    close(peer);
+}
+
+/* A client idle on the fast path is released by freeClientAsync at the next iteration. */
+TEST_F(FastpathStagedTest, AsyncFreeOfIdleClientFreesNextIteration) {
+    int peer;
+    client *c = newStagedClient(&peer);
+    freeClientAsync(c);
+    freeClientAsync(c); /* repeated requests record one close */
+    EXPECT_EQ(freeClientsInAsyncFreeQueue(), 0);
+    iteration();
+    EXPECT_EQ(freeClientsInAsyncFreeQueue(), 1);
+    EXPECT_EQ(fastpathClientCount(), 0u);
+    close(peer);
+}
+
+/* Unwritten replies past the normal output buffer limit hand the client back, and main closes it. */
+TEST_F(FastpathStagedTest, OutputBufferLimitClosesClient) {
+    clientBufferLimitsConfig saved = server.client_obuf_limits[CLIENT_TYPE_NORMAL];
+    server.client_obuf_limits[CLIENT_TYPE_NORMAL].hard_limit_bytes = 64 * 1024;
+    long long closed = server.stat_client_outbuf_limit_disconnections;
+    int peer;
+    client *c = newStagedClient(&peer);
+    int sz = 4096;
+    setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    setsockopt(c->conn->fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+    fcntl(c->conn->fd, F_SETFL, fcntl(c->conn->fd, F_GETFL) | O_NONBLOCK); /* as accepted sockets are */
+    std::string big(32 * 1024, 'y');
+    send(peer, "*3\r\n$3\r\nSET\r\n$5\r\nobufk\r\n$" + std::to_string(big.size()) + "\r\n" + big + "\r\n");
+    for (int i = 0; i < 16 && recv(peer).empty(); i++) iteration();
+
+    std::string get = "*2\r\n$3\r\nGET\r\n$5\r\nobufk\r\n";
+    for (int i = 0; i < 64 && c->flag.fastpath; i++) {
+        send(peer, get);
+        iteration();
+    }
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    EXPECT_EQ(c->flag.close_asap, 1u);
+    EXPECT_EQ(server.stat_client_outbuf_limit_disconnections, closed + 1);
+    EXPECT_EQ(freeClientsInAsyncFreeQueue(), 1);
+    close(peer);
+    server.client_obuf_limits[CLIENT_TYPE_NORMAL] = saved;
+}
+
 /* Turning staged mode off hands every staged client back to main. */
 TEST_F(FastpathStagedTest, ReleaseAllHandsEveryClientBack) {
     int pa, pb;

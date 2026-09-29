@@ -2403,7 +2403,6 @@ int freeClient(client *c) {
 
     /* A staged client is freed once main took it back after a reply barrier. */
     if (c->flag.fastpath) {
-        fastpathRequestDetach(c);
         freeClientAsync(c);
         return 0;
     }
@@ -2556,6 +2555,9 @@ int freeClient(client *c) {
  * a context where calling freeClient() is not possible, because the client
  * should be valid for the continuation of the flow of the program. */
 void freeClientAsync(client *c) {
+    debugServerAssert(inMainThread());
+    /* A staged client needs the close recorded, or it stays on the fast path and is never freed. */
+    if (c->flag.fastpath) fastpathRequestDetach(c);
     if (c->flag.close_asap || c->flag.script) return;
     c->flag.close_asap = 1;
     debugServerAssertWithInfo(c, NULL, listSearchKey(server.clients_to_close, c) == NULL);
