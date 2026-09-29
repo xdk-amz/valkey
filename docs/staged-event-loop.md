@@ -67,8 +67,10 @@ shuts the barrier down.
 
 ## Ownership
 
-- Staged clients belong to the IO side as a whole, not to one thread. Their owner slots,
-  registry and owned list live in `fp_threads[0]` and change only on main between phases.
+- Staged clients belong to the IO side as a whole, not to one thread. Main keeps the list of
+  them and changes it only between phases or in the write phase.
+- A batch entry names its client by pointer. A staged client is freed only after main took it
+  back following the reply phase of every iteration that produced entries for it.
 - A client's fd appears once per collect, so within one iteration exactly one IO thread
   reads it, owns its entries, and writes its replies. A client's replies stay in order.
 - A client's socket, query buffer, parser state and output buffer are touched only by that
@@ -99,21 +101,21 @@ read without executing reads on IO threads, write, reply. Clients whose outer-it
 entries are still on main are skipped. Every nested command reaches `processCommand`, which
 answers BUSY or LOADING. Leaves and closes seen at depth 1 are handled at the outer boundary.
 
-## Machinery the barrier replaces
+## Removals
 
-Staged mode no longer uses any of the following; they remain compiled for the concurrent
-loop's unit tests until they are removed:
+The barrier replaces the machinery two free-running loops needed, and none of it exists:
 
-- Submit/return rings, `inflight` accounting, deferral FIFO, hold/drain timers and the worker
-  quiesce roles: batches are published at the read barrier and returned at the reply barrier.
+- Submit/return rings, in-flight accounting, the deferral FIFO, worker quiesce roles and the
+  `io-batch-inflight`, `io-batch-hold-us` and `io-batch-drain-us` configs: batches are
+  published at the read barrier and returned at the reply barrier.
 - Reply byte accounting: every reply produced in a write phase is delivered in the next reply
   phase.
-- `CC_REQ_*` close records, `fp_detaching` and the detach pin: main applies closes between
-  phases.
-- Per-thread epoll and per-thread ownership of fast-path clients.
-
-The D+ keyspace machinery (seqlock versions, exclusive mode, epoch reclamation) is replaced
-by the same barrier and is removed separately.
+- `CC_REQ_*` lifecycle requests, detach ring records and control pins: main records a close on
+  the control and applies it after the reply phase.
+- Generation-checked handles and owner slots: an entry's client outlives the iteration.
+- Per-thread epoll for fast-path clients: the staged poller serves them. The per-thread epoll
+  stays for partitioned clients of the stock IO-thread loop.
+- The D+ seqlock versions, exclusive mode, epoch reclamation and reader lifecycle hooks.
 
 ## Open risks
 
