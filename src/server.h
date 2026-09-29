@@ -1289,9 +1289,9 @@ typedef struct ClientFlags {
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
     uint64_t partitioned : 1;              /* Socket readiness is watched by the IO thread in io_tid, not by the main event loop. */
     uint64_t ring_epilogue : 1; /* beforeNextClient called from the ring's read epilogue (main thread only) */
-    uint64_t fastpath : 1;       /* Owned by an IO thread end to end; main executes its commands from batches and never touches it. */
+    uint64_t fastpath : 1;       /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
     uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
-    uint64_t fp_detach_sent : 1; /* Main asked the owning IO thread to detach this fast-path client. */
+    uint64_t fp_detach_sent : 1; /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
     uint64_t fp_readmit : 1;     /* Authenticated on main; joins the fast path once main has nothing further to do for it. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
@@ -1506,15 +1506,15 @@ typedef struct client {
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
-    uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
-    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
-    sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
+    uint32_t fp_inflight;                 /* Fast path: commands of this client batched for main and not yet replied */
+    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue */
+    sds fp_out;                           /* Fast path: output not yet written */
     listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
     listNode fp_stage_node;               /* Staged loop: link in the leaving list of the IO thread that saw the client leave */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
-    struct ClientControl *control;        /* Shared control for this connection: allocated once when it first becomes crossing-capable, reclaimed once at free. NULL until then. */
+    struct ClientControl *control;        /* Fast-path control: allocated at the first fast-path admission, reclaimed at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
