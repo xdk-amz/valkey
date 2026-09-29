@@ -305,9 +305,9 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
 
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
 
-/* Reads at the head of what a client just sent execute here, on its owning IO thread: a
- * contiguous prefix of GETs is answered from the keyspace under D+ version validation and the
- * replies go straight to the socket. The first command that cannot be executed here, and every
+/* Reads at the head of what a client just sent execute here, in the read phase, on the IO thread
+ * reading the client: a contiguous prefix of GETs is answered from the keyspace and the replies go
+ * straight to the socket. The first command that cannot be executed here, and every
  * command after it, goes to main in the batch, so a read never overtakes an earlier write of the
  * same connection. For the same reason nothing is executed here while the client still has
  * commands pending on main. */
