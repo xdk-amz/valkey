@@ -57,7 +57,6 @@ typedef struct fpThread {
     uint32_t owner_slots_free;
     uint32_t owner_slots_used;
     _Atomic int role; /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
-    _Atomic int req_pending; /* set by any request publisher, cleared before the owner scans; a hint that some owned client has a pending CC_REQ_* */
     size_t main_clients;   /* main only: clients routed here and not yet taken back */
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
@@ -271,12 +270,10 @@ int fastpathControlEnsure(client *c) {
     if (!cc) return C_ERR;
     cc->client_id = c->id;
     cc->generation = 1;
-    cc->owner_domain = CC_OWNER_MAIN; /* still main's until the attach hands it to the IO thread */
-    cc->owner_tid = 0;
     cc->lifecycle = FP_DETACHED;
     cc->pin_refs = 0;
     cc->pin_bits = 0;
-    atomic_init(&cc->requests, 0u);
+    cc->closing = 0;
     c->control = cc;
     return C_OK;
 }
@@ -327,47 +324,6 @@ void fastpathControlReclaim(client *c) {
     c->control = NULL;
 }
 
-/* CC_REQ_* precedence, high to low: CLOSE dominates every other request; EVICT (a memory/QoS free)
- * outranks a plain HANDOFF and a QUIESCE; HANDOFF (return to main) outranks QUIESCE (reassignable
- * hand-back). One winner decides the terminal disposition; the rest are subsumed. */
-#define CC_REQ_TERMINAL (CC_REQ_CLOSE | CC_REQ_EVICT) /* the connection is freed, not reassigned */
-
-/* Any authorized caller (main or the owner itself) publishes a lifecycle request against the control.
- * Nonblocking and idempotent: a bit already set is a no-op, and there is no synchronous or completion
- * handshake back to the caller, only the bit. Compatible requests coalesce into the same word.
- * Publishing CLOSE clears the requests it supersedes so the owner never has to re-resolve a dominated
- * bit. Release ordering pairs with the owner's acquire load in fpExecuteRequests so the request is
- * visible before the owner acts, and any state the caller wrote before requesting is visible with it. */
-void fastpathControlRequest(ClientControl *cc, uint32_t req) {
-    if (req == 0) return;
-    if (req & CC_REQ_CLOSE) req = CC_REQ_CLOSE; /* terminal: it subsumes QUIESCE/HANDOFF/EVICT */
-    uint32_t cur = atomic_load_explicit(&cc->requests, memory_order_relaxed);
-    uint32_t next;
-    do {
-        if (cur & CC_REQ_CLOSE) return;         /* already closing; nothing outranks it */
-        next = cur | req;
-        if (req & CC_REQ_CLOSE) next = CC_REQ_CLOSE; /* drop the bits CLOSE supersedes */
-        if (next == cur) return;                /* idempotent: bit already present */
-    } while (!atomic_compare_exchange_weak_explicit(&cc->requests, &cur, next, memory_order_release,
-                                                    memory_order_relaxed));
-    /* Signal the owning IO thread so an idle owner (no traffic, nothing in flight) still observes the
-     * request on its next pass without main walking into the owner's registry. owner_domain/owner_tid
-     * are published by the owner with release at attach/handoff; a benign stale read only sets an extra
-     * hint, which the scan clears harmlessly. */
-    if (cc->owner_domain == CC_OWNER_IO)
-        atomic_store_explicit(&fp_threads[cc->owner_tid].req_pending, 1, memory_order_release);
-}
-
-/* The single dominant request the owner should act on, given the pending bitmask; 0 when none.
- * Pure precedence, no side effects, so the owner's execution stays deterministic. */
-static uint32_t fpRequestWinner(uint32_t reqs) {
-    if (reqs & CC_REQ_CLOSE) return CC_REQ_CLOSE;
-    if (reqs & CC_REQ_EVICT) return CC_REQ_EVICT;
-    if (reqs & CC_REQ_HANDOFF) return CC_REQ_HANDOFF;
-    if (reqs & CC_REQ_QUIESCE) return CC_REQ_QUIESCE;
-    return 0;
-}
-
 /* A handle captures the connection's control and the generation current at capture; a later mismatch
  * means the slot was reused. A control-bearing client always has a control by the time it can be
  * published into an entry (admission calls fastpathControlEnsure first). */
@@ -413,11 +369,9 @@ int fastpathAttach(client *c) {
     c->fp_out = NULL;
     c->flag.fp_deferred = 0;
     listInitNode(&c->fp_defer_node, c);
-    /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
-     * next writer of these fields. control->lifecycle is the single source of truth for the state. */
-    c->control->owner_domain = CC_OWNER_IO;
-    c->control->owner_tid = (uint8_t)tid;
+    /* control->lifecycle is the single source of truth for the state; the IO thread is its next writer. */
     c->control->lifecycle = FP_ACTIVE;
+    c->control->closing = 0;
     fastpathControlPin(c, CC_PIN_OWNER); /* IO now owns the connection; hold until handoff returns it to main */
     listInitNode(&c->io_owner_node, c);
     fastpath_clients++;
@@ -557,23 +511,6 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     listUnlinkNode(&t->owned, &c->io_owner_node);
     listLinkNodeTail(&t->leaving, &c->io_owner_node);
     if (hold_cur && fpCurHasClient(t, c)) t->cur_hold = 1;
-}
-
-/* Owner-side execution of pending lifecycle requests for one client this thread owns. Only the owner
- * runs this; a request is a published intent, the transition is the owner's alone, so no other domain
- * mutates the client's lifecycle. Reads the bitmask with acquire to pair with the publisher's release.
- * Maps the dominant request onto the existing leave transitions rather than a second lifecycle model:
- * CLOSE/EVICT free the connection (FP_CLOSING), HANDOFF/QUIESCE return it to main (FP_LEAVING). Executed bits are cleared with release; the transition is idempotent (fpBeginLeave is a
- * no-op once the client is no longer FP_ACTIVE), so a duplicate or late request does nothing. */
-static void fpExecuteRequests(fpThread *t, client *c) {
-    ClientControl *cc = c->control;
-    uint32_t reqs = atomic_load_explicit(&cc->requests, memory_order_acquire);
-    if (reqs == 0) return;
-    uint32_t win = fpRequestWinner(reqs);
-    if (cc->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
-    else if ((win & CC_REQ_TERMINAL) && cc->lifecycle == FP_LEAVING)
-        cc->lifecycle = FP_CLOSING; /* a close arriving after a handoff started still frees it */
-    atomic_fetch_and_explicit(&cc->requests, ~win, memory_order_release);
 }
 
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
@@ -1004,21 +941,6 @@ static void fpQuiesceStep(fpThread *t) {
     }
 }
 
-/* Owner-side sweep of pending lifecycle requests. Runs only when a publisher signalled this thread, so
- * an idle owner costs nothing until a request arrives. The signal is cleared before the walk so a
- * request published during it re-arms the flag and is caught next pass rather than lost. Only owned
- * (still FP_ACTIVE) clients carry actionable requests; leaving/closing clients are already past the
- * decision fpExecuteRequests would make. */
-static void fpDrainRequests(fpThread *t) {
-    if (!atomic_exchange_explicit(&t->req_pending, 0, memory_order_acquire)) return;
-    listNode *ln = t->owned.head;
-    while (ln) {
-        listNode *next = ln->next;
-        fpExecuteRequests(t, listNodeValue(ln));
-        ln = next;
-    }
-}
-
 /* Attach and detach requests name clients by pointer only until the registry confirms ownership. */
 static void fpTakeClient(fpThread *t, client *c) {
     fpRegister(t, c);
@@ -1062,11 +984,9 @@ int fastpathProcessReturns(int tid) {
         total += (int)n;
     }
     if (atomic_load_explicit(&t->role, memory_order_acquire) == FP_ROLE_QUIESCING) {
-        fpDrainRequests(t); /* a CLOSE arriving mid-quiesce still upgrades a leaving client to closing */
         fpQuiesceStep(t);
         return total;
     }
-    fpDrainRequests(t);
     if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
     fpServeDeferred(t, tid);
@@ -1084,14 +1004,13 @@ static client *fpExecutor(int tid) {
     return ec;
 }
 
-/* Controls of clients main asked to close; their queued commands must not run, as with close_asap.
- * Keyed by the stable control pointer so main tests an entry by its handle without touching the connection. */
+/* Controls of clients main asked to close through the return ring, with the ring position of the request. */
 static rax *fp_detaching = NULL;
 
+/* A client main asked to close runs no more queued commands, as with close_asap. Read from the control
+ * so main tests an entry without touching the connection. */
 static int fpControlDetaching(ClientControl *cc) {
-    if (cc && fpStaged()) return (atomic_load_explicit(&cc->requests, memory_order_relaxed) & CC_REQ_CLOSE) != 0;
-    return cc && fp_detaching && raxSize(fp_detaching) > 0 &&
-           raxFind(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL);
+    return cc && cc->closing;
 }
 
 /* The executor borrows argv and writes replies into the batch arena. */
@@ -1243,14 +1162,13 @@ void fastpathRequestDetach(client *c) {
     fpThread *t = &fp_threads[c->io_tid];
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
+    c->control->closing = 1;
     if (fpStaged()) {
         /* The write phase skips its entries; main unmaps it after the reply phase. */
-        atomic_fetch_or_explicit(&c->control->requests, CC_REQ_CLOSE, memory_order_relaxed);
         if (!fp_staged_closing) fp_staged_closing = listCreate();
         listAddNodeTail(fp_staged_closing, c);
         return;
     }
-    fastpathControlRequest(c->control, CC_REQ_CLOSE); /* record the terminal request on the control; the ring carries the pointer safely */
     fastpathControlPin(c, CC_PIN_DETACH); /* a detach record now sits in the ring; hold until the owner consumes it */
     t->detach_pending++;
     if (!fp_detaching) fp_detaching = raxNew();
@@ -1334,8 +1252,6 @@ void fastpathHandoffDone(client *c, int closing) {
     c->flag.fastpath = 0;
     /* Main is the owner again; publish the terminal state on the single source of truth. control is
      * still live here (reclaimed only at freeClient), so the read/write is safe. */
-    c->control->owner_domain = CC_OWNER_MAIN;
-    c->control->owner_tid = 0;
     c->control->lifecycle = FP_DETACHED;
     fastpathControlUnpin(c, CC_PIN_OWNER); /* IO no longer owns it; drop the ownership pin as main takes over */
     fastpath_clients--;
@@ -1459,10 +1375,8 @@ static int fpStagedAttach(client *c) {
     listInitNode(&c->fp_defer_node, c);
     listInitNode(&c->fp_stage_node, c);
     listInitNode(&c->io_owner_node, c);
-    c->control->owner_domain = CC_OWNER_IO;
-    c->control->owner_tid = 0;
     c->control->lifecycle = FP_ACTIVE;
-    atomic_store_explicit(&c->control->requests, 0u, memory_order_relaxed);
+    c->control->closing = 0;
     fastpathControlPin(c, CC_PIN_OWNER);
     fpStagedRegister(c);
     fastpath_clients++;
@@ -1566,7 +1480,7 @@ static void fpStagedHandoff(client *c) {
 }
 
 /* Main, after the reply phase: hand back the clients IO threads saw leave, then unmap the clients main
- * asked to close. Replaces the close/handoff jobs and CC_REQ_CLOSE ring records of the concurrent loop. */
+ * asked to close. */
 void fastpathStagedFinish(void) {
     if (!fpStaged()) return;
     for (int tid = 1; tid < fp_slots; tid++) {

@@ -16,30 +16,16 @@
 #define FP_ROLE_QUIESCING 1 /* admits nothing, publishes nothing; hands off or closes every owned client */
 #define FP_ROLE_DRAINED 2   /* owns no client, batch or ring entry; main may reopen or destroy it */
 
-/* Which domain currently owns the connection; the owner is the only party that executes requests. */
-#define CC_OWNER_MAIN 0 /* main event loop owns the ClientConnection (partitioned / normal path) */
-#define CC_OWNER_IO 1   /* an IO thread owns it end to end (fast path) */
-
-/* Pending lifecycle requests published against a control; the owner clears each once executed.
- * Bits so compatible requests coalesce; CLOSE is terminal and outranks the rest. */
-#define CC_REQ_QUIESCE (1u << 0) /* stop admitting; hand back in flight so the owner can be reassigned */
-#define CC_REQ_HANDOFF (1u << 1) /* return the connection to main once nothing is in flight */
-#define CC_REQ_EVICT (1u << 2)   /* free under a memory/QoS limit */
-#define CC_REQ_CLOSE (1u << 3)   /* terminal: free once drained; supersedes every other request */
-
 /* Stable, separately allocated shared control for one crossing-capable connection.
- * Holds only intentionally cross-thread state: identity, current owner, lifecycle and pending
- * requests. The concrete client remains the owner-only ClientConnection; never place
+ * Holds only intentionally cross-thread state: identity and lifecycle. The concrete client remains the owner-only ClientConnection; never place
  * connection/socket/TLS/parser/querybuf/output/poller/general client flags here, and take no lock
  * around it. Referenced only through a generation-checked ClientHandle so a stale reference is
  * detected without dereferencing a freed connection. */
 typedef struct ClientControl {
     uint64_t client_id;         /* Immutable: the connection's stable client id, set once at init. */
     uint32_t generation;        /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
-    uint8_t owner_domain;       /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
-    uint8_t owner_tid;          /* Owning IO thread id when owner_domain == CC_OWNER_IO; meaningless for main. */
     uint8_t lifecycle;          /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
-    _Atomic(uint32_t) requests; /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
+    uint8_t closing;            /* Main only: freeClient asked to close it; its entries are skipped. */
     uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
     uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
 } ClientControl;
@@ -103,10 +89,6 @@ int fastpathHandleStale(const ClientHandle *h);
 /* Allocate and initialize the connection's ClientControl once, on first crossing-capable admission; a
  * no-op if it already has one. Reclaimed only by fastpathControlReclaim at free. */
 int fastpathControlEnsure(client *c);
-/* Publish a lifecycle request (CC_REQ_*) against a control. Any authorized caller may publish;
- * nonblocking and idempotent, with no completion handshake. Only the owning domain executes it.
- * Compatible requests coalesce; CLOSE supersedes the rest. */
-void fastpathControlRequest(ClientControl *cc, uint32_t req);
 /* The single final reclaimer: free the connection's ClientControl at client teardown once nothing pins it. */
 void fastpathControlReclaim(client *c);
 
