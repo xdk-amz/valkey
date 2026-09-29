@@ -239,11 +239,29 @@ int stagedResize(int setsize) {
     return pollerResize(sl_poller, setsize);
 }
 
+/* Unit tests run the staged phases inline on one thread; no worker is enrolled. */
+int testOnlyStagedStart(void) {
+    if (!stagedInit()) return -1;
+    fastpathStagedSet(1);
+    return 0;
+}
+
+void testOnlyStagedStop(void) {
+    fastpathStagedReleaseAll();
+    fastpathStagedSet(0);
+}
+
 #else /* !HAVE_FASTPATH_EPOLL */
 
 int stagedResize(int setsize) {
     UNUSED(setsize);
     return 0;
+}
+
+int testOnlyStagedStart(void) {
+    return -1;
+}
+void testOnlyStagedStop(void) {
 }
 
 void stagedMain(struct aeEventLoop *el) {

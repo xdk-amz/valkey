@@ -43,4 +43,8 @@ struct phaseBarrier *stagedBarrier(void);
  * wait from on a new enrollment. *seen and *gen are the thread's own, kept across calls. */
 int stagedWorkerEnrolled(int tid, uint64_t *seen, uint32_t *gen);
 
+/* Unit tests: turn staged fast-path admission on and off without enrolling workers; 0 on success. */
+int testOnlyStagedStart(void);
+void testOnlyStagedStop(void);
+
 #endif /* STAGED_LOOP_H */

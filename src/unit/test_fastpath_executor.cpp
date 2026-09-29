@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* Runs a fast-path batch through the main-thread executor while the
- * originating client's memory is unmapped: main resolves every entry through
- * its ClientHandle + CommandOrigin and never dereferences the connection, so
- * the unmapped client cannot fault, and origin data must still be intact. */
+/* Runs a staged write phase while the originating client's memory is
+ * unmapped: main executes every entry from its borrowed argv and
+ * CommandOrigin and never dereferences the client, so the unmapped client
+ * cannot fault, and origin data must still be intact. */
 
 #include "generated_wrappers.hpp"
 
@@ -23,7 +23,9 @@ extern "C" {
 #include "fastpath.h"
 #include "io_threads.h"
 #include "module.h"
+#include "poller.h"
 #include "server.h"
+#include "staged_loop.h"
 extern hashtableType commandSetType;
 extern dictType keylistDictType;
 void createSharedObjects(void);
@@ -44,6 +46,8 @@ class FastpathExecutorTest : public ::testing::Test {
         server.main_thread_id = pthread_self();
         server.client_max_querybuf_len = 1024ll * 1024 * 1024;
         server.proto_max_bulk_len = 512ll * 1024 * 1024;
+        server.maxclients = 1000;
+        server.el = aeCreateEventLoop(1024);
         createSharedObjects();
         moduleInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
@@ -79,7 +83,6 @@ class FastpathExecutorTest : public ::testing::Test {
         server.io_threads_fast_path = 1;
         server.io_threads_strict_offload = 1;
         server.io_batch_commands = 16;
-        server.io_batch_inflight = 16;
         connTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
@@ -93,7 +96,12 @@ class FastpathExecutorTest : public ::testing::Test {
     }
 
     void SetUp() override {
-        testOnlyInitIOThreadQueues(); /* forget hand-off messages of the previous test */
+        testOnlyInitIOThreadQueues();
+        ASSERT_EQ(testOnlyStagedStart(), 0);
+    }
+
+    void TearDown() override {
+        testOnlyStagedStop();
     }
 
     /* Read whatever the executor produced for the client from the other end of the pair. */
@@ -130,39 +138,37 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     ASSERT_EQ(peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)), C_OK);
     c->fp_local = c->fp_peer;
 
-    /* Admit through the real flow so the connection gets a ClientControl and the IO thread owns it;
-     * its control is a separate allocation, reachable while the client's own pages are unmapped. */
+    /* Admit through the real flow so the connection gets a ClientControl; the control is a separate
+     * allocation, reachable while the client's own pages are unmapped. */
     ASSERT_EQ(fastpathAttach(c), C_OK);
-    ASSERT_EQ(c->io_tid, 1);
-    ASSERT_EQ(fastpathProcessReturns(1), 1); /* the attach request: thread takes ownership */
 
     /* Two pipelined commands: GET on a missing key and SET, both plain data commands. */
     const char *req = "*2\r\n$3\r\nGET\r\n$5\r\nnokey\r\n*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
-    fastpathClientReadable(1, c);
+    pollerGetFDs(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
     ASSERT_EQ(c->fp_inflight, 2u);
-    fastpathSubmitPending(1);
 
-    /* Main runs the batch while the client is unreachable: it must resolve via handle + origin only. */
+    /* The write phase runs while the client is unreachable: it must use the entries and origin only. */
     ASSERT_EQ(mprotect(c, maplen, PROT_NONE), 0);
-    EXPECT_EQ(fastpathDrain(), 2);
+    EXPECT_EQ(fastpathStagedExecute(), 2);
     ASSERT_EQ(mprotect(c, maplen, PROT_READ | PROT_WRITE), 0);
 
-    /* Back on the IO thread the handle resolves to the client again: replies go out, entries released. */
-    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    /* The reply phase writes both replies to the client. */
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(readReply(sv[1]), "$-1\r\n+OK\r\n");
     robj *key = createStringObject("foo", 3);
     EXPECT_NE(lookupKeyRead(server.db[0], key), nullptr);
     decrRefCount(key);
 
-    /* Quiesce so the thread hands the client back and unregisters it (no freeClient on mmap'd pages);
-     * main completes the hand-off, then reclaim its separately allocated control so nothing is owned. */
-    fastpathWorkerQuiesce(1);
-    fastpathProcessReturns(1);
-    fastpathHandoffDone(c, 0); /* main takes the client back: drops the owner pin and the routed count */
-    EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
+    /* Hand the client back (no freeClient on mmap'd pages), then reclaim its separately allocated control. */
+    testOnlyStagedStop();
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    connSetReadHandler(conn, NULL);
     fastpathControlReclaim(c);
+    ASSERT_EQ(testOnlyStagedStart(), 0);
 
     close(sv[1]);
     close(sv[0]);
