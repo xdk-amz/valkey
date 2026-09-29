@@ -2689,7 +2689,7 @@ void beforeNextClient(client *c) {
     }
 
     if (!c->flag.ring_epilogue && !c->flag.fastpath) updateClientMemUsageAndBucket(c);
-    if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
+    if (c->flag.fp_readmit && fastpathTryReadmit(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {

@@ -278,6 +278,11 @@ void fastpathAdmissionQuiesce(void) {
 
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
 static int fpDynamicGate(void); /* defined below; global-state capability gate consulted here too */
+/* mstate outlives EXEC; only an open transaction or a live WATCH keeps the client on main. */
+static int fpWatching(client *c) {
+    return c->mstate && listLength(&c->mstate->watched_keys) > 0;
+}
+
 static int fpSessionEligible(client *c) {
 #ifndef HAVE_FASTPATH_EPOLL
     (void)c;
@@ -293,7 +298,7 @@ static int fpSessionEligible(client *c) {
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
-    if (c->mstate || c->flag.pubsub || c->flag.tracking || c->name) return 0;
+    if (c->flag.multi || fpWatching(c) || c->flag.pubsub || c->flag.tracking) return 0;
     if (c->flag.no_touch || c->flag.reply_off || c->flag.reply_skip || c->flag.reply_skip_next) return 0;
     if (c->flag.import_source) return 0;
     return 1;
@@ -669,6 +674,7 @@ int fastpathControlEnsure(client *c) {
     atomic_init(&cc->reply_bytes_produced, (size_t)0);
     atomic_init(&cc->reply_bytes_released, (size_t)0);
     atomic_init(&cc->last_interaction, (time_t)0);
+    cc->name = NULL;
     e->control = cc;
     e->bucketed = false; /* zcalloc already cleared base/accounted/reg state; a fresh entry names no bucket */
     e->reg_state = FP_LIMIT_UNLINKED;
@@ -882,6 +888,7 @@ int fastpathAttach(client *c) {
     c->control->owner_domain = CC_OWNER_IO;
     c->control->owner_tid = (uint8_t)tid;
     c->control->lifecycle = FP_ACTIVE;
+    c->control->name = c->name;
     fastpathControlPin(c, CC_PIN_OWNER); /* IO now owns the connection; hold until handoff returns it to main */
     listInitNode(&c->io_owner_node, c);
     fastpath_clients++;
@@ -1381,8 +1388,10 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         int j = i;
         int requeued = 0;
         long long strand_woff = 0;
+        struct serverCommand *strand_last = NULL;
         while (j < b->count && b->e[j].handle.control == cc) {
             cmdEntry *e = &b->e[j];
+            if (!e->requeued && e->cmd) strand_last = e->cmd;
             if (e->requeued) {
                 requeued++;
             } else if (e->reply_big) {
@@ -1402,6 +1411,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
             c->commands_processed += (j - i) - requeued;
+            if (strand_last) c->lastcmd = strand_last; /* CLIENT LIST cmd= */
             if (requeued) {
                 t->rq_gate += requeued; /* main handed these back unexecuted (a gate closed after admission) */
                 fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
@@ -1656,6 +1666,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->db = e->db;
     ec->resp = e->resp;
     ec->origin = &e->origin;
+    ec->name = e->handle.control ? e->handle.control->name : NULL; /* SLOWLOG, COMMANDLOG and ACL LOG name the origin */
     ec->buf = b->arena + b->arena_used;
     ec->buf_usable_size = b->arena_cap - b->arena_used;
     ec->bufpos = 0;
@@ -1695,6 +1706,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->bufpos = 0;
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
+    ec->name = NULL;
 release_argv:
     /* IO threads receive only sole-reference argv objects for terminal frees. */
     for (int j = 0; j < e->argc; j++) {
@@ -1874,16 +1886,26 @@ static int fpReadmit(client *c) {
     return 0;
 }
 
-/* Called by main for a client it owns (partitioned or event-loop) after AUTH ran on it. Returns 1 once the
- * client is on the fast path; a client that is not yet quiescent keeps the flag and is retried next time. */
-int fastpathReadmitAuthenticated(client *c) {
+/* Ineligibility the client or the server can undo later (EXEC, UNWATCH, UNSUBSCRIBE, TRACKING OFF, unblock, gate). */
+static int fpIneligibleTransient(client *c) {
+    return c->flag.multi || fpWatching(c) || c->flag.pubsub || c->flag.tracking || c->flag.blocked ||
+           c->flag.unblocked || !fpDynamicGate();
+}
+
+/* Called by main for a client it owns (partitioned or event-loop) after a command ran on it. Returns 1 once the
+ * client is on the fast path; a client that is not yet quiescent, or only transiently ineligible, keeps the flag
+ * and is retried after its next command. */
+int fastpathTryReadmit(client *c) {
     if (c->flag.fastpath || c->flag.executor) {
         c->flag.fp_readmit = 0;
         return 0;
     }
     if (!fpQuiescent(c) || (c->flag.partitioned && c->flag.pending_read)) return 0;
+    if (!fpSessionEligible(c)) {
+        if (!fpIneligibleTransient(c)) c->flag.fp_readmit = 0;
+        return 0;
+    }
     c->flag.fp_readmit = 0;
-    if (!fpSessionEligible(c)) return 0;
     int was_partitioned = c->flag.partitioned;
     if (was_partitioned) unpartitionClient(c);
     if (fpReadmit(c)) return 1;
@@ -1901,6 +1923,7 @@ void fastpathHandoffDone(client *c, int closing) {
     c->control->owner_domain = CC_OWNER_MAIN;
     c->control->owner_tid = 0;
     c->control->lifecycle = FP_DETACHED;
+    c->control->name = NULL; /* main owns the name again; SETNAME may now replace it */
     c->last_interaction = fastpathControlLastInteraction(c->control); /* acquire the IO owner's stamp back before normal idle-timeout maintenance resumes */
     fastpathControlUnpin(c, CC_PIN_OWNER); /* IO no longer owns it; drop the ownership pin as main takes over */
     fpLimitRegistryRemove(c); /* main owns it again; unlink before normal-client maintenance resumes */
@@ -1925,19 +1948,39 @@ void fastpathHandoffDone(client *c, int closing) {
         if (sdslen(out) > 0) addReplyProto(c, out, sdslen(out));
         sdsfree(out);
     }
-    int authenticating = c->parsed_cmd && (c->parsed_cmd->proc == authCommand || c->parsed_cmd->proc == helloCommand);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;
     if (c->read_flags & READ_FLAGS_ERROR_MASK) {
         handleParseError(c); /* replies, sets close_after_reply; the write path closes it */
         return;
     }
+    c->flag.fp_readmit = 1; /* the command that sent it to main does not keep it there */
     if (processPendingCommandAndInputBuffer(c) != C_OK) return;
-    if (authenticating || c->flag.fp_readmit) {
-        c->flag.fp_readmit = 0;
-        if (fpReadmit(c)) return;
-    }
+    if (c->flag.fp_readmit && fastpathTryReadmit(c)) return;
     beforeNextClient(c);
+}
+
+static long long fp_net_in_base = 0, fp_net_out_base = 0;
+
+/* Bytes fast-path clients moved since the last CONFIG RESETSTAT, for the server-wide net totals. */
+void fastpathNetBytes(long long *in, long long *out) {
+    long long i = fp_retired[1], o = fp_retired[2];
+    for (int k = 1; k < fp_slots; k++) {
+        if (fp_threads[k].submit.buffer == NULL) continue;
+        i += fp_threads[k].net_input_bytes;
+        o += fp_threads[k].net_output_bytes;
+    }
+    *in = i - fp_net_in_base;
+    *out = o - fp_net_out_base;
+}
+
+/* The IO-owned counters are never written by main; a reset moves the baseline instead. */
+void fastpathResetNetStats(void) {
+    long long in, out;
+    fp_net_in_base = fp_net_out_base = 0;
+    fastpathNetBytes(&in, &out);
+    fp_net_in_base = in;
+    fp_net_out_base = out;
 }
 
 void fastpathInfo(sds *info) {

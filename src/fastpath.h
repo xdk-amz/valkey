@@ -61,6 +61,7 @@ typedef struct ClientControl {
     uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
     uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
     struct FastpathLimitEntry *limit; /* Immutable after fastpathControlEnsure: the connection's one main-owned limit side object. */
+    robj *name;                 /* Main-only, set at attach: the client's CLIENT SETNAME, borrowed; SETNAME runs only while detached. */
 
     /* Producer cache line: written only by main. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_produced; /* Sole writer main: logical reply bytes retained for this client so far; monotonic. */
@@ -114,13 +115,15 @@ typedef struct cmdBatch {
 
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
-int fastpathReadmitAuthenticated(client *c);
+int fastpathTryReadmit(client *c);
 int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
+void fastpathNetBytes(long long *in, long long *out);
+void fastpathResetNetStats(void);
 
 /* acl-offload: main spins here after bumping the ACL epoch, until every fast-path worker
  * has left any admission-time ACL rule-set read it may have been inside, so main may then

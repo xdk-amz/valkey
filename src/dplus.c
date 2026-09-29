@@ -778,6 +778,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         c->argv = NULL;
         c->argc = 0;
         c->cmd = NULL;
+        if (c->parsed_cmd) c->lastcmd = c->parsed_cmd;
         c->parsed_cmd = NULL;
         c->argv_len_sum = 0;
         c->argv_len = 0;
@@ -793,6 +794,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
         p->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
         queue->off++;
+        if (p->cmd) c->lastcmd = p->cmd;
         /* Free argv for the consumed command. */
         for (int j = 0; j < p->argc; j++) {
             decrRefCount(p->argv[j]);
