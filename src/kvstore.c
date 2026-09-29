@@ -887,6 +887,12 @@ void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key) {
     return hashtableFindRef(ht, key);
 }
 
+void **kvstoreHashtableFindRefWithHash(kvstore *kvs, int didx, const void *key, uint64_t *hash_out) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    if (!ht) return NULL;
+    return hashtableFindRefWithHash(ht, key, hash_out);
+}
+
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry) {
     hashtable *ht = createHashtableIfNeeded(kvs, didx);
     bool ret = hashtableAdd(ht, entry);

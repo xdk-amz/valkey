@@ -40,6 +40,7 @@
 
 #include "server.h"
 #include "ordered_index.h"
+#include "dplus.h" /* S1.2b exclusive gate */
 #include "hashtable.h"
 #include "eval.h"
 #include "script.h"
@@ -1151,6 +1152,19 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
     mstime_t latency;
     latencyStartMonitor(latency);
 
+    /* D+ (S1.2b): defrag reallocates object shells, sds keys, skiplist and
+     * quicklist nodes, and inner hashtable buckets, freeing the originals
+     * IMMEDIATELY (allocatorDefragFree) and rewriting live pointers in
+     * place — every one of those frees and swaps is a UAF/torn-walk hazard
+     * against an in-flight speculative reader, with no shard bumps anywhere
+     * in this file (audit: the defrag hole). Follow the B15 eviction
+     * precedent: hold the exclusive gate across the bounded duty cycle —
+     * in-flight walks drain (bounded by one GET), new speculation punts,
+     * frees stay immediate so defrag's accounting is unchanged. Defrag is
+     * already a rare, latency-budgeted slow path; refining to per-swap
+     * bump+defer is performance-gated later work (Phase 3 territory). */
+    dplusExclusiveEnter();
+
     do {
         if (!defrag.current_stage) {
             defrag.current_stage = listNodeValue(listFirst(defrag.remaining_stages));
@@ -1171,6 +1185,8 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
          * we'll start another stage.  This can happen when defrag is running infrequently, and
          * starvation protection has increased the duty-cycle. */
     } while (haveMoreWork && getMonotonicUs() <= endtime - server.active_defrag_cycle_us);
+
+    dplusExclusiveLeave();
 
     latencyEndMonitor(latency);
     latencyAddSampleIfNeeded("active-defrag-cycle", latency);

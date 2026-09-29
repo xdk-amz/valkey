@@ -517,8 +517,18 @@ void setrangeCommand(client *c) {
         o = dbUnshareStringValue(c->db, c->argv[1], o);
     }
 
-    objectSetVal(o, sdsgrowzero(objectGetVal(o), offset + sdslen(value)));
-    memcpy((char *)objectGetVal(o) + offset, value, sdslen(value));
+    /* D+ S3 (sweep H5): same pattern as APPEND -- grow may realloc+free
+     * under a reader, and the memcpy is an unversioned byte mutation.
+     * Capacity is ensured inside the bracket so sdsgrowzero never moves
+     * the allocation (it only extends len and zero-fills in place). */
+    {
+        dbKeyBracket brk;
+        dbKeyBracketBegin(c->db, c->argv[1], &brk);
+        sds grown = dbGrowPublishedStringValue(o, offset + sdslen(value));
+        objectSetVal(o, sdsgrowzero(grown, offset + sdslen(value)));
+        memcpy((char *)objectGetVal(o) + offset, value, sdslen(value));
+        dbKeyBracketEnd(&brk);
+    }
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING, "setrange", c->argv[1], c->db->id);
     server.dirty++;
@@ -752,7 +762,14 @@ void incrDecrCommand(client *c, long long incr) {
     if (o && o->refcount == 1 && objectGetEncoding(o) == OBJ_ENCODING_INT &&
         value >= LONG_MIN && value <= LONG_MAX) {
         new = o;
+        /* D+ S3 (audit defect 3 / sweep H3): in-place tagged-int rewrite of a
+         * published value had NO version bump -- a speculative reader could
+         * return the stale integer and validate. Bracket the single store;
+         * no free involved (tagged pointer). */
+        dbKeyBracket brk;
+        dbKeyBracketBegin(c->db, c->argv[1], &brk);
         objectSetVal(o, (void *)((long)value));
+        dbKeyBracketEnd(&brk);
     } else {
         new = createStringObjectFromLongLongForValue(value);
         if (o) {
@@ -1024,10 +1041,21 @@ void appendCommand(client *c) {
         if (checkStringLength(c, stringObjectLen(o), sdslen(objectGetVal(append))) != C_OK)
             return;
 
-        /* Append the value */
+        /* Append the value.
+         * D+ S3 (sweep H4): sdscatlen on the published sds could realloc,
+         * FREEING the buffer an in-flight reader is copying (UAF), with no
+         * bump on the byte mutation. Bracket the whole mutation; when growth
+         * is needed, dbGrowPublishedStringValue publishes a replacement
+         * buffer (the same copy realloc would do) and defer-frees the old
+         * one, so sdscatlen below never reallocs. */
         o = dbUnshareStringValue(c->db, c->argv[1], o);
-        objectSetVal(o, sdscatlen(objectGetVal(o), objectGetVal(append), sdslen(objectGetVal(append))));
+        size_t append_len = sdslen(objectGetVal(append));
+        dbKeyBracket brk;
+        dbKeyBracketBegin(c->db, c->argv[1], &brk);
+        sds grown = dbGrowPublishedStringValue(o, stringObjectLen(o) + append_len);
+        objectSetVal(o, sdscatlen(grown, objectGetVal(append), append_len));
         totlen = sdslen(objectGetVal(o));
+        dbKeyBracketEnd(&brk);
     }
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING, "append", c->argv[1], c->db->id);

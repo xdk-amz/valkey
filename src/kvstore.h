@@ -85,6 +85,7 @@ unsigned long kvstoreHashtableScanDefrag(kvstore *kvs,
 unsigned long kvstoreHashtableDefragTables(kvstore *kvs, unsigned long cursor, void *(*defragfn)(void *));
 bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found);
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key);
+void **kvstoreHashtableFindRefWithHash(kvstore *kvs, int didx, const void *key, uint64_t *hash_out);
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry);
 
 bool kvstoreHashtableFindPositionForInsert(kvstore *kvs, int didx, void *key, hashtablePosition *position, void **existing);

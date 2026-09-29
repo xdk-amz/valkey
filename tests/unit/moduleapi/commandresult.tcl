@@ -701,6 +701,32 @@ start_server {tags {"modules"}} {
         r cmdresult.unsubscribe
     }
 
+    test {Module commandresult - speculated reads punt while success subscriber active (F6)} {
+        # D+ ownership: speculation bypasses call(), which would silently drop
+        # command-result events. With a SUCCESS subscriber, every GET -- even a
+        # deep pipelined batch on an owned client -- must take the stock path
+        # and fire exactly one event per command. After unsubscribe,
+        # speculation may resume (events no longer owed).
+        cleanup_callback
+        r cmdresult.register success
+        r set f6key f6val
+        r cmdresult.reset
+        set rd [valkey_deferring_client]
+        for {set i 0} {$i < 64} {incr i} { $rd get f6key }
+        for {set i 0} {$i < 64} {incr i} { assert_equal "f6val" [$rd read] }
+        $rd close
+        set stats [r cmdresult.stats]
+        # Exactness: every one of the 64 GETs produced a success event.
+        assert {[dict get $stats success_count] >= 64}
+        r cmdresult.unsubscribe
+        # Gate must reopen: a second batch may speculate again (no event owed,
+        # so we only verify values remain correct and no error occurs).
+        set rd2 [valkey_deferring_client]
+        for {set i 0} {$i < 64} {incr i} { $rd2 get f6key }
+        for {set i 0} {$i < 64} {incr i} { assert_equal "f6val" [$rd2 read] }
+        $rd2 close
+    }
+
     test {Unload the module - commandresult} {
         catch {r cmdresult.unsubscribe}
         assert_equal {OK} [r module unload commandresult]

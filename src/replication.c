@@ -2660,7 +2660,7 @@ int tryReadBulkPayloadMetadata(connection *conn, char *buf, char *eofmark, char 
         /* nread here is returned by connSyncReadLine(), which calls syncReadLine() and
          * convert "\r\n" to '\0' so 1 byte is lost. */
         if (inBioThread())
-            server.bio_stat_net_repl_input_bytes += nread + 1;
+            atomic_fetch_add_explicit(&server.bio_stat_net_repl_input_bytes, nread + 1, memory_order_relaxed);
         else
             server.stat_net_repl_input_bytes += nread + 1;
     }
@@ -3083,7 +3083,7 @@ int tryReadBulkPayload(connection *conn, char *buf, int usemark, ssize_t *nread_
         return C_ERR;
     }
 
-    server.bio_stat_net_repl_input_bytes += nread;
+    atomic_fetch_add_explicit(&server.bio_stat_net_repl_input_bytes, nread, memory_order_relaxed);
     *nread_out = nread;
     return C_OK;
 }
