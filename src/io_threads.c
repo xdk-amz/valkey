@@ -2329,11 +2329,19 @@ static int processOutboxBatch(mpscQueue *outbox) {
 }
 
 /* Response draining is bounded so main returns to the event loop under sustained load. */
+static int io_responses_depth = 0;
+
+/* True while main is executing commands drained from IO thread responses. */
+int inIOThreadsResponses(void) {
+    return io_responses_depth > 0;
+}
+
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
     if (getPendingIOResponsesCount() == 0) return 0;
 
+    io_responses_depth++;
     int total_processed = processCommandRing();
     int batches = 0;
     while (batches++ < IO_RESPONSE_BATCHES_PER_CALL) {
@@ -2350,5 +2358,6 @@ int processIOThreadsResponses(void) {
         if (processed == 0) break;
     }
     flushWriteSlab();
+    io_responses_depth--;
     return total_processed;
 }

@@ -626,9 +626,11 @@ int performEvictions(void) {
                  * so the off-main frees land before the next re-poll, keeping
                  * key eviction from racing ahead of memory that is already
                  * on its way back. */
+                /* Eviction can run inside a response drain; a nested drain
+                 * would reuse the prefetch batch the outer one is filling. */
                 if (server.active_io_threads_num > 1) {
                     commitIOJobs();
-                    processIOThreadsResponses();
+                    if (!inIOThreadsResponses()) processIOThreadsResponses();
                 }
 
                 /* Normally our stop condition is the ability to release
