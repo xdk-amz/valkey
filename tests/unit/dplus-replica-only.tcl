@@ -1,29 +1,27 @@
 # io-threads-speculation-replica-only: with the flag set, a primary or
 # standalone server never speculates reads on IO threads (stock read path);
-# a replica does. The flagless observable is dplus_epoch_reader_entries in
-# INFO dplus, which every speculation attempt increments once it passes the
-# entry gates.
+# a replica does. The observable is dplus_speculated_commands in INFO dplus.
 
-proc epoch_entries {r} {
+proc speculated {r} {
     set payload [$r info dplus]
-    if {![regexp {dplus_epoch_reader_entries:(\d+)} $payload -> value]} {
-        fail "missing dplus_epoch_reader_entries in INFO dplus"
+    if {![regexp {dplus_speculated_commands:(\d+)} $payload -> value]} {
+        fail "missing dplus_speculated_commands in INFO dplus"
     }
     return $value
 }
 
-# Pipeline GETs from a fresh client of server $level and return the change in epoch
-# entries. The client sends nothing before its first GET: a SELECT would move it off the
+# Pipeline GETs from a fresh client of server $level and return the change in
+# speculated commands. The client sends nothing before its first GET: a SELECT would move it off the
 # fast path, and only fast-path clients execute reads on their IO thread.
 proc pump_gets {r key {level 0}} {
     set rd [valkey_deferring_client_by_addr [srv $level host] [srv $level port]]
-    set before [epoch_entries $r]
+    set before [speculated $r]
     for {set round 0} {$round < 20} {incr round} {
         for {set i 0} {$i < 10} {incr i} { $rd get $key }
         for {set i 0} {$i < 10} {incr i} { $rd read }
     }
     $rd close
-    return [expr {[epoch_entries $r] - $before}]
+    return [expr {[speculated $r] - $before}]
 }
 
 start_server {tags {"dplus-replica-only"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
