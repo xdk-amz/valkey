@@ -46,7 +46,7 @@ TEST_F(CommandOriginTest, LayoutIsFixedSizeAndByValue) {
     EXPECT_EQ(sizeof(PeerIdentity), 20u);
     EXPECT_EQ(sizeof(CommandOrigin), 64u);
     EXPECT_EQ(sizeof(cmdEntry), 168u);
-    EXPECT_EQ(offsetof(cmdEntry, handle), 0u);
+    EXPECT_EQ(offsetof(cmdEntry, c), 0u);
     EXPECT_EQ(offsetof(cmdEntry, origin) % alignof(CommandOrigin), 0u);
     EXPECT_EQ(sizeof(cmdBatch), offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry));
 }

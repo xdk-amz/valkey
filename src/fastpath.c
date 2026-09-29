@@ -12,37 +12,18 @@
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
-/* Keep crossing-capable records compact: ClientHandle fits without growing the base command entry. */
-static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
-              "ClientHandle is a compact {control ref, generation, owner slot}");
-static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs only pointer alignment");
 static_assert(sizeof(cmdEntry) == 160, "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
 
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
-#define FP_OWNER_SLOT_NONE UINT32_MAX
-
-typedef struct fpOwnerSlot {
-    ClientControl *control;
-    union {
-        client *connection;
-        uint32_t next_free;
-    };
-} fpOwnerSlot;
 
 typedef struct fpThread {
     int ready;     /* initialized by fastpathInitThread */
     cmdBatch *cur; /* batch being assembled */
     cmdBatch *freelist[FP_FREELIST_MAX];
     int nfree;
-    list owned;               /* staged owner only: every staged client */
-    fpOwnerSlot *owner_slots; /* staged owner only: O(1) handle-to-connection resolution */
-    uint32_t owner_slots_len;
-    uint32_t owner_slots_cap;
-    uint32_t owner_slots_free;
-    uint32_t owner_slots_used;
     long long reads, net_input_bytes, net_output_bytes, writes, batches, speculated;
     /* Staged loop. Batches this thread published in the read phase, per nesting depth: written by the
      * thread in the read phase, executed by main in the write phase, delivered and recycled by the same
@@ -60,13 +41,15 @@ static fpThread fp_threads[IO_THREADS_MAX_NUM];
 static client *fp_exec_client[STAGED_MAX_DEPTH][IO_THREADS_MAX_NUM];
 /* Staged loop state. fp_staged and fp_depth change only between phases (main), so IO threads read them
  * inside a phase after the barrier published them. Staged clients are owned by the IO side as a whole,
- * not by one thread: their owner slots and owned list live in fp_threads[0] and are changed
- * only by main, between phases. fp_staged_closing lists clients main asked to close. */
+ * not by one thread: fp_staged_clients lists them and changes only on main, between phases or in the
+ * write phase. fp_staged_closing lists clients main asked to close. A staged client is freed only
+ * after main took it back following the reply barrier of every iteration that produced entries for
+ * it, so an entry names its client by plain pointer. */
 static _Atomic int fp_staged = 0;
 static _Atomic int fp_depth = 0;
 static list *fp_staged_closing = NULL;
+static list fp_staged_clients;
 static _Thread_local int fp_cur_tid = 0; /* IO thread running the current staged phase */
-#define FP_STAGED_OWNER (&fp_threads[0])
 static size_t fastpath_clients = 0;                 /* main thread only */
 static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static long long fp_retired[6]; /* main thread only: counters of threads since retired */
@@ -176,13 +159,12 @@ static int fpCaptureAddrs(client *c) {
 }
 
 /* One connection, one ClientControl: allocated before its first fast-path admission and kept until the
- * connection is freed. The IO owner bumps generation whenever it assigns a private resolution slot. */
+ * connection is freed. */
 int fastpathControlEnsure(client *c) {
     if (c->control) return C_OK;
     ClientControl *cc = zmalloc(sizeof(ClientControl));
     if (!cc) return C_ERR;
     cc->client_id = c->id;
-    cc->generation = 1;
     cc->lifecycle = FP_DETACHED;
     cc->closing = 0;
     c->control = cc;
@@ -197,24 +179,6 @@ void fastpathControlReclaim(client *c) {
     serverAssert(c->control->lifecycle == FP_DETACHED);
     zfree(c->control);
     c->control = NULL;
-}
-
-/* A handle captures the connection's control and the generation current at capture; a later mismatch
- * means the slot was reused. A control-bearing client always has a control by the time it can be
- * published into an entry (admission calls fastpathControlEnsure first). */
-ClientHandle fastpathHandleFor(client *c) {
-    serverAssert(c->control && c->fp_owner_slot != FP_OWNER_SLOT_NONE);
-    return (ClientHandle){
-        .control = c->control,
-        .generation = c->control->generation,
-        .owner_slot = c->fp_owner_slot,
-    };
-}
-
-/* Stale iff the control's generation moved on from the snapshot; reads only the control, never a
- * connection, so a reused slot is caught without touching freed connection storage. */
-int fastpathHandleStale(const ClientHandle *h) {
-    return h->control == NULL || h->control->generation != h->generation;
 }
 
 static int fpCommandAllowed(struct serverCommand *cmd) {
@@ -240,51 +204,6 @@ static void fpSubmit(fpThread *t) {
     t->batches++;
 }
 
-/* The IO owner assigns a compact private slot before it can publish commands for the connection. */
-static void fpOwnerSlotAssign(fpThread *t, client *c) {
-    uint32_t index;
-    if (t->owner_slots_free != FP_OWNER_SLOT_NONE) {
-        index = t->owner_slots_free;
-        t->owner_slots_free = t->owner_slots[index].next_free;
-    } else {
-        if (t->owner_slots_len == t->owner_slots_cap) {
-            uint32_t cap = t->owner_slots_cap ? t->owner_slots_cap * 2 : 64;
-            serverAssert(cap > t->owner_slots_cap);
-            t->owner_slots = zrealloc(t->owner_slots, (size_t)cap * sizeof(*t->owner_slots));
-            t->owner_slots_cap = cap;
-        }
-        index = t->owner_slots_len++;
-    }
-    ClientControl *cc = c->control;
-    if (++cc->generation == 0) cc->generation++;
-    t->owner_slots[index].control = cc;
-    t->owner_slots[index].connection = c;
-    t->owner_slots_used++;
-    c->fp_owner_slot = index;
-}
-
-static void fpOwnerSlotRelease(fpThread *t, client *c) {
-    uint32_t index = c->fp_owner_slot;
-    serverAssert(index < t->owner_slots_len);
-    serverAssert(t->owner_slots[index].control == c->control);
-    serverAssert(t->owner_slots[index].connection == c);
-    t->owner_slots[index].control = NULL;
-    t->owner_slots[index].next_free = t->owner_slots_free;
-    t->owner_slots_free = index;
-    serverAssert(t->owner_slots_used > 0);
-    t->owner_slots_used--;
-    c->fp_owner_slot = FP_OWNER_SLOT_NONE;
-}
-
-/* Resolve only through the staged owner table, validating both slot and generation. */
-static client *fpResolve(const ClientHandle *h) {
-    fpThread *t = FP_STAGED_OWNER;
-    if (fastpathHandleStale(h) || h->owner_slot >= t->owner_slots_len) return NULL;
-    fpOwnerSlot *slot = &t->owner_slots[h->owner_slot];
-    if (slot->control != h->control) return NULL;
-    return slot->connection;
-}
-
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
  * the reply phase. */
 static void fpBeginLeave(fpThread *t, client *c, int state) {
@@ -297,7 +216,8 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
 static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
                           unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
-    e->handle = fastpathHandleFor(c);
+    e->c = c;
+    e->control = c->control;
     e->argv = argv;
     e->argc = argc;
     e->argv_len = argv_len;
@@ -557,12 +477,11 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
     struct iovec iov[IO_BATCH_MAX];
     int i = 0;
     while (i < b->count) {
-        client *c = fpResolve(&b->e[i].handle);
-        ClientControl *cc = b->e[i].handle.control;
+        client *c = b->e[i].c;
         int n = 0;
         int j = i;
         int requeued = 0;
-        while (j < b->count && b->e[j].handle.control == cc) {
+        while (j < b->count && b->e[j].c == c) {
             cmdEntry *e = &b->e[j];
             if (e->requeued) {
                 requeued++;
@@ -573,12 +492,10 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             }
             j++;
         }
-        if (c) {
-            if (n) fpSend(t, c, iov, n);
-            c->fp_inflight -= (j - i);
-            c->commands_processed += (j - i) - requeued;
-            if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
-        }
+        if (n) fpSend(t, c, iov, n);
+        c->fp_inflight -= (j - i);
+        c->commands_processed += (j - i) - requeued;
+        if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
         i = j;
     }
     for (int k = 0; k < b->count; k++) {
@@ -618,7 +535,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     size_t saved_usable = ec->buf_usable_size;
     user *principal = e->origin.principal;
 
-    if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
+    if (fpControlDetaching(e->control)) goto release_argv; /* no reply: the IO thread is closing it */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
         e->requeued = 1; /* the main path postpones it like any other client's command */
         return;
@@ -697,7 +614,7 @@ static void fpPrefetchBatch(cmdBatch *b) {
     ClientControl *last_control = NULL;
     for (int k = 0; k < b->count && room; k++) {
         cmdEntry *e = &b->e[k];
-        ClientControl *cc = e->handle.control;
+        ClientControl *cc = e->control;
         if (cc != last_control) {
             __builtin_prefetch(cc);
             last_control = cc;
@@ -843,8 +760,7 @@ void fastpathInfo(sds *info) {
  * fast-path halves of the read, write and reply phases. A staged client belongs to no single IO
  * thread: whichever thread claims its ready fd in a read phase reads it, publishes its entries on
  * its own batch list, and delivers those batches in the following reply phase, so one client's
- * replies are always written by the thread that produced its entries, in order. Main changes the
- * owner table only between phases, when no IO thread resolves a handle.
+ * replies are always written by the thread that produced its entries, in order.
  * --------------------------------------------------------------------------------------------- */
 
 static int fp_staged_admit = 0; /* main only: new staged clients are admitted */
@@ -856,18 +772,6 @@ int fastpathStagedOn(void) {
 void fastpathStagedSetDepth(int depth) {
     serverAssert(depth >= 0 && depth < STAGED_MAX_DEPTH);
     atomic_store_explicit(&fp_depth, depth, memory_order_relaxed);
-}
-
-static void fpStagedRegister(client *c) {
-    fpThread *g = FP_STAGED_OWNER;
-    fpOwnerSlotAssign(g, c);
-    listLinkNodeTail(&g->owned, &c->io_owner_node);
-}
-
-static void fpStagedUnregister(client *c) {
-    fpThread *g = FP_STAGED_OWNER;
-    listUnlinkNode(&g->owned, &c->io_owner_node);
-    fpOwnerSlotRelease(g, c);
 }
 
 static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity affinity);
@@ -883,26 +787,23 @@ int fastpathAttach(client *c) {
     c->flag.fastpath = 1;
     c->fp_inflight = 0;
     c->fp_held = 0;
-    c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
     listInitNode(&c->fp_stage_node, c);
     listInitNode(&c->io_owner_node, c);
     c->control->lifecycle = FP_ACTIVE;
     c->control->closing = 0;
-    fpStagedRegister(c);
+    listLinkNodeTail(&fp_staged_clients, &c->io_owner_node);
     fastpath_clients++;
     return C_OK;
 }
 
 /* Main, between phases. Turning off first hands every staged client back (fastpathStagedReleaseAll). */
 void fastpathStagedSet(int on) {
-    fpThread *g = FP_STAGED_OWNER;
     if (on) {
-        if (g->owner_slots_cap == 0) g->owner_slots_free = FP_OWNER_SLOT_NONE;
         fp_staged_admit = 1;
         atomic_store_explicit(&fp_staged, 1, memory_order_relaxed);
     } else {
-        serverAssert(listLength(&g->owned) == 0 && fastpath_clients == 0);
+        serverAssert(listLength(&fp_staged_clients) == 0 && fastpath_clients == 0);
         fp_staged_admit = 0;
         atomic_store_explicit(&fp_staged, 0, memory_order_relaxed);
     }
@@ -982,7 +883,7 @@ void fastpathStagedReplyPhase(int tid) {
 
 static void fpStagedHandoff(client *c) {
     int closing = c->control->lifecycle == FP_CLOSING;
-    fpStagedUnregister(c);
+    listUnlinkNode(&fp_staged_clients, &c->io_owner_node);
     fastpathHandoffDone(c, closing);
 }
 
@@ -1021,9 +922,8 @@ void fastpathStagedReleaseAll(void) {
     if (!fpStaged()) return;
     fp_staged_admit = 0;
     fastpathStagedFinish();
-    fpThread *g = FP_STAGED_OWNER;
-    while (listLength(&g->owned) > 0) {
-        client *c = listNodeValue(listFirst(&g->owned));
+    while (listLength(&fp_staged_clients) > 0) {
+        client *c = listNodeValue(listFirst(&fp_staged_clients));
         serverAssert(c->fp_inflight == 0);
         pollerUnregister(stagedPoller(), c->conn->fd);
         if (c->control->lifecycle == FP_ACTIVE) c->control->lifecycle = FP_LEAVING;
