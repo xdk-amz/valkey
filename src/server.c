@@ -1290,7 +1290,12 @@ static void clientsCron(int clients_this_cycle) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
-        if (c->flag.fastpath) continue; /* owned by an IO thread; main touches nothing of it */
+        if (c->flag.fastpath) {
+            /* Crons run between staged phases, so the idle timeout may close a staged client; the
+             * close takes effect after the next reply phase. Nothing else here applies to it. */
+            if (fastpathStagedOn()) clientsCronHandleTimeout(c, now);
+            continue;
+        }
         reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
