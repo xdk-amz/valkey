@@ -187,7 +187,7 @@ start_server {} {
 }
 
 test {Filtering based on the fast-path origin client id} {
-    start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+    start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
         r module load $testmodule log-key 0
         r client setname control ;# named clients stay on the main path
         r select 0

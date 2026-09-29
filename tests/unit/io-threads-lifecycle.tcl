@@ -302,7 +302,6 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
     }
 
     test {Lifecycle: batch backpressure during quiescing does not deadlock} {
-        assert_equal OK [r config set io-batch-inflight 1]
         set clients [lc_open_counters 8 lc:l]
         lc_pipeline_incr $clients lc:l 200
         assert_equal OK [r config set io-threads 1]
@@ -310,7 +309,6 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         lc_assert_incr_replies $clients lc:l 300
         lc_wait_settled
         foreach c $clients { $c close }
-        assert_equal OK [r config set io-batch-inflight 16]
         assert_equal OK [r config set io-threads 4]
         lc_wait_running 3
         lc_wait_workers_open 3

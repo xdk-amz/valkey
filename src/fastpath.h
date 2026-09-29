@@ -48,7 +48,6 @@ typedef struct cmdBatch {
     char *arena;
     size_t arena_cap;
     size_t arena_used;
-    monotime opened_us;
     cmdEntry e[IO_BATCH_MAX];
 } cmdBatch;
 

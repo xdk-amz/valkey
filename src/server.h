@@ -2028,9 +2028,6 @@ struct valkeyServer {
     int prefetch_ring_stride;                 /* Command ring: prefetch keys of one command in N (1 = every command) */
     int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
-    int io_batch_inflight;                    /* Fast path: batches in flight per IO thread */
-    int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
-    int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */

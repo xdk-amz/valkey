@@ -85,7 +85,7 @@ proc fp_monitor_line_matching {m pattern} {
     fail "no MONITOR line matching $pattern"
 }
 
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000 enable-debug-command yes}} {
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     # Named clients stay on the main path, so the control connection is never counted.
@@ -395,7 +395,7 @@ proc fp_write_acl {dir bob_rules} {
 }
 fp_write_acl $fp_acl_dir {~* &* +@all}
 
-start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2 io-batch-hold-us 10000]] {
+start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2]] {
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients
 
@@ -469,7 +469,7 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
 }
 
 # With the default user password-protected no client is admitted at accept; it joins the fast path after AUTH.
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {requirepass fppw io-threads 2 io-batch-hold-us 10000}} {
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {requirepass fppw io-threads 2}} {
     r auth fppw
     r client setname fp-control
     r select 0

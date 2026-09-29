@@ -330,7 +330,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip"} override
     }
 
     test {Control: queue backpressure during a lifecycle transition does not deadlock} {
-        assert_equal OK [r config set io-batch-inflight 1]
         set clients {}
         for {set i 0} {$i < 8} {incr i} {
             set c [cc_open_counter cc:j$i]
@@ -340,8 +339,8 @@ start_server {tags {"io-threads-client-control external:skip tls:skip"} override
         set i 0
         foreach c $clients { for {set j 0} {$j < 200} {incr j} { $c incr cc:j$i }; incr i }
         foreach c $clients { $c flush }
-        # Handoff every client to main while the in-flight window is one batch deep:
-        # publication cannot outrun return, so the transition must still drain.
+        # Hand every client back to main with its pipelines still arriving:
+        # every reply is delivered, in order, across the transition.
         assert_equal OK [r config set io-threads 1]
         set i 0
         foreach c $clients {
@@ -352,7 +351,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip"} override
         cc_wait_settled
         cc_assert_healthy
         foreach c $clients { $c close }
-        assert_equal OK [r config set io-batch-inflight 16]
         assert_equal OK [r config set io-threads 4]
         cc_wait_running 3
         cc_wait_workers_open 3

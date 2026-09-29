@@ -3593,9 +3593,6 @@ standardConfig static_configs[] = {
     createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-inflight", NULL, MODIFIABLE_CONFIG, 1, 512, server.io_batch_inflight, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-drain-us", NULL, MODIFIABLE_CONFIG, 0, 1000, server.io_batch_drain_us, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-hold-us", NULL, MODIFIABLE_CONFIG, 0, 10000, server.io_batch_hold_us, 50, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */
     createIntConfig("list-max-listpack-size", "list-max-ziplist-size", MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.list_max_listpack_size, -2, INTEGER_CONFIG, NULL, NULL),

@@ -78,7 +78,6 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     b->count = 0;
     b->io_tid = tid;
     b->arena_used = 0;
-    b->opened_us = getMonotonicUs();
     return b;
 }
 
