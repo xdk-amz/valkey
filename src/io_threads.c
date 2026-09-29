@@ -1388,9 +1388,12 @@ static int ioThreadsConvergeOnce(int teardown) {
     int pending = 0;
     int rc = C_OK;
 
-    for (int tid = io_worker_hwm - 1; tid >= 1 && tid >= target; tid--) {
+    /* Slots below the target still finish a retirement a lowered target started, or they are
+     * never freed and never recreated. */
+    for (int tid = io_worker_hwm - 1; tid >= 1; tid--) {
         int st = ioWorkerState(tid);
         if (st == IO_WORKER_ABSENT) continue;
+        if (tid < target && st == IO_WORKER_RUNNING) continue;
         if (st == IO_WORKER_RUNNING) {
             ioWorkerRetire(tid);
             st = IO_WORKER_QUIESCING;
