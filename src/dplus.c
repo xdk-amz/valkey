@@ -42,8 +42,10 @@ uint64_t dplusStatsSum(size_t field_offset) {
  * punts only, never a bypass. */
 void dplusRecomputeSpecAclOk(client *c) {
     uint8_t ok = 0;
-    if (c->flag.authenticated) {
-        if (c->user == NULL) {
+    /* ACL LOAD retires the user a fast-path client still points at; its successor holds the rules. */
+    user *u = c->user && (c->user->flags & USER_FLAG_RETIRED) ? ACLResolveUser(c->user) : c->user;
+    if (c->flag.authenticated && (u || !c->user)) {
+        if (u == NULL) {
             /* No associated user = unrestricted context (stock semantics). */
             ok = 1;
         } else {
@@ -57,7 +59,7 @@ void dplusRecomputeSpecAclOk(client *c) {
             argv[0] = createStringObject("get", 3);
             argv[1] = createStringObject("k", 1);
             int dbid = c->db ? c->db->id : 0;
-            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(c->user, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
+            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
             decrRefCount(argv[0]);
             decrRefCount(argv[1]);
         }
