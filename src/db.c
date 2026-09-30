@@ -243,9 +243,31 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 }
 
 /* Returns which dict index should be used with kvstore for a given key, computed from the key itself. */
+/* Standalone shard of a key. Nothing depends on it beyond being stable per key, so it skips
+ * hash tags and hashes a word at a time. */
+static int keyspaceShard(sds key) {
+    if (key == repl_apply_key) return repl_apply_shard;
+    const unsigned char *s = (const unsigned char *)key;
+    size_t len = sdslen(key);
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ len;
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+        s += 8;
+        len -= 8;
+    }
+    uint64_t w = 0;
+    for (size_t i = 0; i < len; i++) w |= (uint64_t)s[i] << (8 * i);
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 29;
+    return (int)(h & ((1u << server.keyspace_shard_bits) - 1));
+}
+
 int getKVStoreIndexForKey(sds key) {
     if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
-    if (server.keyspace_shard_bits) return (int)keyHashSlot(key, (int)sdslen(key)) & ((1 << server.keyspace_shard_bits) - 1);
+    if (server.keyspace_shard_bits) return keyspaceShard(key);
     return 0;
 }
 

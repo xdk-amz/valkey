@@ -27,5 +27,8 @@ void replApplyRunLane(int tid);
 
 /* Set on a thread while it applies a lane. Paths gated off by replApplyDefer must not run. */
 extern _Thread_local int repl_apply_in_lane;
+/* The key a lane is applying and its shard, so the db paths do not rehash it. */
+extern _Thread_local const char *repl_apply_key;
+extern _Thread_local int repl_apply_shard;
 
 #endif /* REPL_APPLY_H */

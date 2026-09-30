@@ -9,11 +9,14 @@
 #include "module.h"
 
 _Thread_local int repl_apply_in_lane = 0;
+_Thread_local const char *repl_apply_key = NULL;
+_Thread_local int repl_apply_shard = 0;
 
 typedef struct {
     serverDb *db;
     robj **argv;
     int argc;
+    int shard;
     long long pxat; /* -1: no expire */
 } replApplyOp;
 
@@ -65,13 +68,14 @@ int replApplyDefer(client *c) {
     if (!replApplyAllowed(c) || !replApplyEligible(c, &pxat)) return 0;
     if (ra_pending == 0) ra_nlanes = stagedWorkerCount() + 1;
 
-    int lane = getKVStoreIndexForKey(objectGetVal(c->argv[1])) % ra_nlanes;
+    int shard = getKVStoreIndexForKey(objectGetVal(c->argv[1]));
+    int lane = shard % ra_nlanes;
     replApplyLane *l = &ra_lanes[lane];
     if (l->len == l->cap) {
         l->cap = l->cap ? l->cap * 2 : 256;
         l->ops = zrealloc(l->ops, sizeof(replApplyOp) * l->cap);
     }
-    l->ops[l->len++] = (replApplyOp){.db = c->db, .argv = c->argv, .argc = c->argc, .pxat = pxat};
+    l->ops[l->len++] = (replApplyOp){.db = c->db, .argv = c->argv, .argc = c->argc, .shard = shard, .pxat = pxat};
     ra_pending++;
     hotkeysRecordLookup(c->argv[1], c->db->id, LOOKUP_WRITE);
 
@@ -91,12 +95,15 @@ static void replApplyOne(replApplyOp *op) {
     robj **argv = op->argv;
     robj *key = argv[1];
     robj *val = argv[2];
+    repl_apply_key = objectGetVal(key);
+    repl_apply_shard = op->shard;
     if (!val->hasembkey) val = tryObjectEncoding(val);
     int flags = lookupKeyWriteWithFlags(op->db, key, LOOKUP_NOHOTKEYS) ? SETKEY_ALREADY_EXIST : SETKEY_DOESNT_EXIST;
     flags |= SETKEY_NO_SIGNAL;
     if (op->pxat >= 0) flags |= SETKEY_KEEPTTL;
     setKey(NULL, op->db, key, &val, flags);
     if (op->pxat >= 0) setExpire(NULL, op->db, key, op->pxat);
+    repl_apply_key = NULL;
     for (int j = 0; j < op->argc; j++)
         if (j != 2) decrRefCount(argv[j]);
     zfree(argv);
