@@ -48,6 +48,7 @@
 #include "dict.h"
 #include "monotonic.h"
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define UNUSED(V) ((void)V)
 
@@ -59,21 +60,19 @@
 static hashtable *kvstoreIteratorNextHashtable(kvstoreIterator *kvs_it);
 
 /* While set, threads may mutate different hashtables of the same kvstore at once; the counters
- * shared across hashtables are then updated under kvs_shared_lock. Toggled only when no such
- * thread runs. */
-static int kvs_concurrent = 0;
+ * shared across hashtables are then updated under kvs_shared_lock. */
+static _Atomic int kvs_concurrent = 0;
 static pthread_mutex_t kvs_shared_lock = PTHREAD_MUTEX_INITIALIZER;
-#define KVS_SHARED_LOCK()                                        \
-    do {                                                         \
-        if (kvs_concurrent) pthread_mutex_lock(&kvs_shared_lock); \
-    } while (0)
-#define KVS_SHARED_UNLOCK()                                        \
-    do {                                                           \
-        if (kvs_concurrent) pthread_mutex_unlock(&kvs_shared_lock); \
-    } while (0)
+/* The lock decision is taken once per critical section: a thread outside the concurrent window
+ * (a bio thread releasing a detached kvstore) must not see the flag flip between lock and unlock. */
+#define KVS_SHARED_LOCK()                  \
+    int kvs_locked_ = atomic_load_explicit(&kvs_concurrent, memory_order_relaxed); \
+    if (kvs_locked_) pthread_mutex_lock(&kvs_shared_lock)
+#define KVS_SHARED_UNLOCK() \
+    if (kvs_locked_) pthread_mutex_unlock(&kvs_shared_lock)
 
 void kvstoreSetConcurrent(int on) {
-    kvs_concurrent = on;
+    atomic_store_explicit(&kvs_concurrent, on, memory_order_relaxed);
 }
 
 struct _kvstore {
