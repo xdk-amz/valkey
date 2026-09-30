@@ -20,6 +20,8 @@ struct client;
 int replApplyDefer(struct client *c);
 /* Main: apply every held command before anything else observes the keyspace. */
 void replApplyFlush(struct client *c);
+/* Main: the primary's writes may be held for parallel apply, so main need not prefetch them. */
+int replApplyMayDefer(void);
 /* Main: commands held and not yet applied. */
 int replApplyPending(void);
 /* Staged thread tid (0 = main): apply its lane during an APPLY phase. */

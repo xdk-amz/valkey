@@ -22,6 +22,7 @@ static int sl_depth = 0;     /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;    /* ae's own epoll fd, the single main-affinity entry */
 static int sl_warned = 0;
+static int sl_main_lane = 1; /* main takes a lane in APPLY phases */
 
 /* Enrollment: main writes the sequence a newly enrolled worker waits from, then bumps its generation,
  * then sets enrolled, all between phases. A worker adopts the sequence once per generation. */
@@ -124,6 +125,23 @@ static void stagedPlaceEpollThread(void) {
         serverLog(LL_WARNING, "Staged event loop: cannot set the epoll thread's CPU affinity");
 }
 
+/* Main is pinned to CPUs a worker also runs on, so a lane on main would only take turns with it. */
+static int stagedMainSharesWorkerCpu(void) {
+    cpu_set_t mine;
+    CPU_ZERO(&mine);
+    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) != 0) return 0;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0 || CPU_COUNT(&mine) >= ncpu) return 0;
+    for (int tid = 1; tid <= sl_workers; tid++) {
+        cpu_set_t one, both;
+        CPU_ZERO(&one);
+        if (ioThreadGetAffinity(tid, &one, sizeof(one)) != 0) continue;
+        CPU_AND(&both, &one, &mine);
+        if (CPU_COUNT(&both) > 0) return 1;
+    }
+    return 0;
+}
+
 /* Main, between phases: enroll IO threads 1..want. Leavers pass one SYNC phase so none is left
  * waiting on the barrier; newcomers wait from the current sequence. */
 static void stagedSetWorkers(int want) {
@@ -144,6 +162,7 @@ static void stagedSetWorkers(int want) {
         ioThreadsStagedUnpark();
         stagedPlaceEpollThread();
     }
+    sl_main_lane = !stagedMainSharesWorkerCpu();
 }
 
 /* Main, at the iteration boundary: follow the configuration and the live IO thread count. */
@@ -272,6 +291,10 @@ int stagedApplyReady(void) {
     return sl_on && !sl_depth && sl_workers > 0;
 }
 
+int stagedMainTakesLane(void) {
+    return sl_main_lane;
+}
+
 void stagedRunApplyPhase(int with_workers) {
     if (!with_workers) {
         replApplyRunLane(0);
@@ -280,7 +303,7 @@ void stagedRunApplyPhase(int with_workers) {
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_APPLY);
     serverAssert(rc == 0);
     sl_opens++;
-    replApplyRunLane(0);
+    if (sl_main_lane) replApplyRunLane(0);
     phaseBarrierWaitAllDone(&sl_barrier);
 }
 
@@ -334,6 +357,9 @@ void stagedDrainWorkers(void) {
 }
 int stagedApplyReady(void) {
     return 0;
+}
+int stagedMainTakesLane(void) {
+    return 1;
 }
 void stagedRunApplyPhase(int with_workers) {
     UNUSED(with_workers);

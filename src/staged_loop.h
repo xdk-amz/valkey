@@ -39,7 +39,9 @@ void stagedStopWorkers(void);
 
 /* Main: staged workers can take an APPLY phase now (staged on, not nested, workers enrolled). */
 int stagedApplyReady(void);
-/* Main: run an APPLY phase, main taking lane 0; with_workers 0 runs lane 0 alone. */
+/* Main: main takes a lane in APPLY phases (it is not pinned onto a worker's CPUs). */
+int stagedMainTakesLane(void);
+/* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
 void stagedRunApplyPhase(int with_workers);
 
 /* Main: grow the poller with maxclients, as ae grows; 0 on success. */

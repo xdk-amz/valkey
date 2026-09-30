@@ -4681,12 +4681,13 @@ static int addKeysToIncrFindBatch(client *c,
             kvstore_idx = keyHashSlot(objectGetVal(first_key), sdslen(objectGetVal(first_key)));
         }
         hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
-        if (ht != NULL) {
-            for (int i = 0; i < numkeys && num < max; i++) {
-                hashtableIncrementalFindState *incr_state = &incr_states[num++];
-                robj *keyobj = argv[result.keys[i].pos];
-                hashtableIncrementalFindInit(incr_state, ht, objectGetVal(keyobj));
-            }
+        for (int i = 0; i < numkeys && num < max; i++) {
+            robj *keyobj = argv[result.keys[i].pos];
+            /* Standalone shards hold keys by their own hash, not by the first key's. */
+            if (!server.cluster_enabled && server.keyspace_shard_bits)
+                ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(keyobj)));
+            if (ht == NULL) continue;
+            hashtableIncrementalFindInit(&incr_states[num++], ht, objectGetVal(keyobj));
         }
     }
     getKeysFreeResult(&result);
@@ -4699,6 +4700,7 @@ static int addKeysToIncrFindBatch(client *c,
  * is used with I/O threading. */
 static void prefetchCommandQueueKeys(client *c) {
     if (c->read_flags & READ_FLAGS_PREFETCHED) return;
+    if (c->flag.primary && replApplyMayDefer()) return; /* the lanes, not main, touch these keys */
     c->read_flags |= READ_FLAGS_PREFETCHED;
 
     /* Prefetching states */

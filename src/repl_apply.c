@@ -30,7 +30,12 @@ typedef struct {
 static replApplyLane ra_lanes[IO_THREADS_MAX_NUM];
 static int ra_nlanes = 0; /* lanes of the held batch; fixed until it is applied */
 static int ra_pending = 0;
+static int ra_main_lane = 1; /* lane 0 runs on main; otherwise lane i runs on IO thread i + 1 */
 static struct serverCommand *ra_set_cmd = NULL;
+
+int replApplyMayDefer(void) {
+    return server.replica_parallel_apply && server.keyspace_shard_bits && stagedApplyReady();
+}
 
 int replApplyPending(void) {
     return ra_pending;
@@ -66,7 +71,10 @@ static int replApplyEligible(client *c, long long *pxat) {
 int replApplyDefer(client *c) {
     long long pxat;
     if (!replApplyAllowed(c) || !replApplyEligible(c, &pxat)) return 0;
-    if (ra_pending == 0) ra_nlanes = stagedWorkerCount() + 1;
+    if (ra_pending == 0) {
+        ra_main_lane = stagedMainTakesLane();
+        ra_nlanes = stagedWorkerCount() + ra_main_lane;
+    }
 
     int shard = getKVStoreIndexForKey(objectGetVal(c->argv[1]));
     int lane = shard % ra_nlanes;
@@ -110,8 +118,9 @@ static void replApplyOne(replApplyOp *op) {
 }
 
 void replApplyRunLane(int tid) {
-    if (tid >= ra_nlanes) return;
-    replApplyLane *l = &ra_lanes[tid];
+    int lane = ra_main_lane ? tid : tid - 1;
+    if (lane < 0 || lane >= ra_nlanes) return;
+    replApplyLane *l = &ra_lanes[lane];
     if (!l->len) return;
     repl_apply_in_lane = 1;
     monotime start = getMonotonicUs();
@@ -125,7 +134,7 @@ void replApplyFlush(client *c) {
     client *old = server.current_client;
     server.current_client = c; /* replicated writes never see a key as expired */
     kvstoreSetConcurrent(1);
-    stagedRunApplyPhase(ra_nlanes > 1);
+    stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
     kvstoreSetConcurrent(0);
     server.current_client = old;
 
