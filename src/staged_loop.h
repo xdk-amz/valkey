@@ -17,6 +17,7 @@
 #define STAGED_PHASE_REPLY 2
 #define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
 #define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
+#define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
 
 struct aeEventLoop;
 struct poller;
@@ -35,6 +36,11 @@ void stagedNestedIteration(void);
 void stagedDrainWorkers(void);
 /* Main, process exit: wake every staged worker so it can stop. */
 void stagedStopWorkers(void);
+
+/* Main: staged workers can take an APPLY phase now (staged on, not nested, workers enrolled). */
+int stagedApplyReady(void);
+/* Main: run an APPLY phase, main taking lane 0; with_workers 0 runs lane 0 alone. */
+void stagedRunApplyPhase(int with_workers);
 
 /* Main: grow the poller with maxclients, as ae grows; 0 on success. */
 int stagedResize(int setsize);

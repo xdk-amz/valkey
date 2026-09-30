@@ -15048,6 +15048,24 @@ size_t moduleCount(void) {
     return listLength(modules);
 }
 
+/* Some module sees individual commands or key changes: a command filter, a server event or
+ * keyspace listener, a command result listener, or a module data type that may be unlinked. */
+int moduleObservesWrites(void) {
+    if (listLength(moduleCommandFilters) || listLength(ValkeyModule_EventListeners)) return 1;
+    if (moduleNotifyKeyspaceSubscribersCnt()) return 1;
+    if (commandResultSuccessListeners || commandResultFailureListeners || commandResultRejectedListeners ||
+        commandResultACLRejectedListeners)
+        return 1;
+    listIter li;
+    listNode *ln;
+    listRewind(modules, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModule *m = listNodeValue(ln);
+        if (listLength(m->types)) return 1;
+    }
+    return 0;
+}
+
 /* --------------------------------------------------------------------------
  * ## Key eviction API
  * -------------------------------------------------------------------------- */

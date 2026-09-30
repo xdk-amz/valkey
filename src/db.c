@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "listpack.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
@@ -230,8 +231,10 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     dbTrackKeyWithVolatileItems(db, val);
     initObjectLRUOrLFU(val);
     kvstoreHashtableAdd(db->keys, dict_index, val);
-    signalKeyAsReady(db, key, val->type);
-    notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    if (!repl_apply_in_lane) {
+        signalKeyAsReady(db, key, val->type);
+        notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    }
     *valref = val;
 }
 
@@ -241,13 +244,16 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 
 /* Returns which dict index should be used with kvstore for a given key, computed from the key itself. */
 int getKVStoreIndexForKey(sds key) {
-    return server.cluster_enabled ? (int)keyHashSlot(key, (int)sdslen(key)) : 0;
+    if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
+    if (server.keyspace_shard_bits) return (int)keyHashSlot(key, (int)sdslen(key)) & ((1 << server.keyspace_shard_bits) - 1);
+    return 0;
 }
 
 /* Same as getKVStoreIndexForKey(), but reuses the slot cached on the client rather than hashing the key.
  * Only valid for keys the currently executing command declared, since the cached slot is that command's. */
 int getKVStoreIndexUsingCachedSlot(sds key) {
-    return server.cluster_enabled ? getCachedKeySlot(key) : 0;
+    if (server.cluster_enabled) return getCachedKeySlot(key);
+    return server.keyspace_shard_bits ? getKVStoreIndexForKey(key) : 0;
 }
 
 /* Returns the slot cached on the client for the currently executing command, computing it from the key
@@ -342,7 +348,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     robj *old = *oldref;
     robj *new;
 
-    if (overwrite) {
+    if (overwrite && !repl_apply_in_lane) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain old */
         incrRefCount(old);
@@ -2302,6 +2308,7 @@ static int dbExpandGeneric(kvstore *kvs, uint64_t db_size, int try_expand) {
         db_size = db_size / slots;
         ret = kvstoreExpand(kvs, db_size, try_expand, dbExpandSkipSlot);
     } else {
+        if (server.keyspace_shard_bits) db_size >>= server.keyspace_shard_bits;
         ret = kvstoreExpand(kvs, db_size, try_expand, NULL);
     }
 

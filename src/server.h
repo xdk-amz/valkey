@@ -2021,6 +2021,8 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int keyspace_shard_bits;    /* Standalone: split each db into 2^bits hashtables by key slot. */
+    int replica_parallel_apply; /* Replica: apply eligible replicated writes on the staged IO threads. */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
@@ -2060,6 +2062,8 @@ struct valkeyServer {
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
     long long stat_numcommands;                    /* Number of processed commands */
+    long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
+    long long stat_repl_apply_phases;              /* APPLY phases run */
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */

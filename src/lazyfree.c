@@ -226,6 +226,8 @@ void emptyDbAsync(serverDb *db) {
     if (server.cluster_enabled) {
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
+    } else {
+        slot_count_bits = server.keyspace_shard_bits;
     }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires, *oldkeyswithexpires = db->keys_with_volatile_items;
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);

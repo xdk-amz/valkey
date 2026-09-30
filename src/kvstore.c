@@ -47,6 +47,7 @@
 #include "serverassert.h"
 #include "dict.h"
 #include "monotonic.h"
+#include <pthread.h>
 
 #define UNUSED(V) ((void)V)
 
@@ -56,6 +57,24 @@
 #define MAX_HASHTABLES_BITS 16
 
 static hashtable *kvstoreIteratorNextHashtable(kvstoreIterator *kvs_it);
+
+/* While set, threads may mutate different hashtables of the same kvstore at once; the counters
+ * shared across hashtables are then updated under kvs_shared_lock. Toggled only when no such
+ * thread runs. */
+static int kvs_concurrent = 0;
+static pthread_mutex_t kvs_shared_lock = PTHREAD_MUTEX_INITIALIZER;
+#define KVS_SHARED_LOCK()                                        \
+    do {                                                         \
+        if (kvs_concurrent) pthread_mutex_lock(&kvs_shared_lock); \
+    } while (0)
+#define KVS_SHARED_UNLOCK()                                        \
+    do {                                                           \
+        if (kvs_concurrent) pthread_mutex_unlock(&kvs_shared_lock); \
+    } while (0)
+
+void kvstoreSetConcurrent(int on) {
+    kvs_concurrent = on;
+}
 
 struct _kvstore {
     int flags;
@@ -156,7 +175,15 @@ int kvstoreIsImporting(kvstore *kvs, int didx) {
 /* Updates binary index tree (also known as Fenwick tree), increasing key count for a given hashtable.
  * You can read more about this data structure here https://en.wikipedia.org/wiki/Fenwick_tree
  * Time complexity is O(log(kvs->num_hashtables)). */
+static void cumulativeKeyCountAddLocked(kvstore *kvs, int didx, long delta);
+
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
+    KVS_SHARED_LOCK();
+    cumulativeKeyCountAddLocked(kvs, didx, delta);
+    KVS_SHARED_UNLOCK();
+}
+
+static void cumulativeKeyCountAddLocked(kvstore *kvs, int didx, long delta) {
     /* Fast return for importing dictionaries, which will be accumulated in
      * metrics once we are done importing. */
     if (kvstoreIsImporting(kvs, didx)) {
@@ -200,8 +227,10 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
      * by hashtableCreate above, we don't know which hashtable it is for, because
      * the metadata has yet been initialized. Account for the newly created
      * hashtable here instead. */
+    KVS_SHARED_LOCK();
     kvs->overhead_hashtable_lut += hashtableMemUsage(kvs->hashtables[didx]);
     kvs->allocated_hashtables++;
+    KVS_SHARED_UNLOCK();
     return kvs->hashtables[didx];
 }
 
@@ -234,6 +263,7 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
 void kvstoreHashtableRehashingStarted(hashtable *ht) {
     kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
     kvstore *kvs = metadata->kvs;
+    KVS_SHARED_LOCK();
     listAddNodeTail(kvs->rehashing, ht);
     metadata->rehashing_node = listLast(kvs->rehashing);
 
@@ -241,6 +271,7 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count += to; /* Started rehashing (Add the new ht size) */
     kvs->overhead_hashtable_rehashing += from * HASHTABLE_BUCKET_SIZE;
+    KVS_SHARED_UNLOCK();
 }
 
 /* Remove hash table from the rehashing list.
@@ -250,6 +281,7 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
 void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
     kvstore *kvs = metadata->kvs;
+    KVS_SHARED_LOCK();
     if (metadata->rehashing_node) {
         listDelNode(kvs->rehashing, metadata->rehashing_node);
         metadata->rehashing_node = NULL;
@@ -259,6 +291,7 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     hashtableRehashingInfo(ht, &from, &to);
     kvs->bucket_count -= from; /* Finished rehashing (Remove the old ht size) */
     kvs->overhead_hashtable_rehashing -= from * HASHTABLE_BUCKET_SIZE;
+    KVS_SHARED_UNLOCK();
 }
 
 /* Hashtable callback to keep track of memory usage. */
@@ -269,7 +302,9 @@ void kvstoreHashtableTrackMemUsage(hashtable *ht, ssize_t delta) {
          * hasn't been initialized yet. */
         return;
     }
+    KVS_SHARED_LOCK();
     metadata->kvs->overhead_hashtable_lut += delta;
+    KVS_SHARED_UNLOCK();
 }
 
 /* Returns the size of the DB hashtable metadata in bytes. */

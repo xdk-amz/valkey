@@ -4,6 +4,7 @@
 #include "staged_loop.h"
 #include "fastpath.h"
 #include "io_threads.h"
+#include "repl_apply.h"
 
 #ifdef HAVE_FASTPATH_EPOLL
 
@@ -267,6 +268,22 @@ void stagedDrainWorkers(void) {
     if (sl_on) stagedRunPhase(STAGED_PHASE_DRAIN);
 }
 
+int stagedApplyReady(void) {
+    return sl_on && !sl_depth && sl_workers > 0;
+}
+
+void stagedRunApplyPhase(int with_workers) {
+    if (!with_workers) {
+        replApplyRunLane(0);
+        return;
+    }
+    int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_APPLY);
+    serverAssert(rc == 0);
+    sl_opens++;
+    replApplyRunLane(0);
+    phaseBarrierWaitAllDone(&sl_barrier);
+}
+
 void stagedStopWorkers(void) {
     if (sl_barrier_ready) phaseBarrierShutdown(&sl_barrier);
     if (sl_poller) pollerStop(sl_poller);
@@ -314,6 +331,13 @@ int stagedWorkerCount(void) {
 void stagedNestedIteration(void) {
 }
 void stagedDrainWorkers(void) {
+}
+int stagedApplyReady(void) {
+    return 0;
+}
+void stagedRunApplyPhase(int with_workers) {
+    UNUSED(with_workers);
+    replApplyRunLane(0);
 }
 void stagedStopWorkers(void) {
 }

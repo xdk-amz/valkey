@@ -386,7 +386,8 @@ static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, 
     robj *member = (member_idx > 0 && member_idx < argc) ? argv[member_idx] : NULL;
     for (int i = 0; i < num_keys && batch->key_count < batch->max_prefetch_size; i++) {
         batch->keys[batch->key_count] = argv[result->keys[i].pos];
-        batch->slots[batch->key_count] = slot >= 0 ? slot : 0;
+        batch->slots[batch->key_count] =
+            slot >= 0 ? slot : getKVStoreIndexForKey(objectGetVal(argv[result->keys[i].pos]));
         /* Table resolution is deferred to prefetchCommands(): inline command
          * execution between now and then can free/replace this slot's
          * hashtable (cluster slot ops / DEL-empties) — a cached pointer here

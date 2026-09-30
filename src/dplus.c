@@ -279,7 +279,7 @@ int dplusSpeculateBatch(client *c, int tid) {
      * GET command's microseconds by dplusAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
 
-    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0);
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(c->argv[1])));
     if (!ht) return 0;
 
     /* STREAMING SLOT-REFILL: a ring of DPLUS_BATCH_DEPTH slots holds in-flight
@@ -309,10 +309,15 @@ int dplusSpeculateBatch(client *c, int tid) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
+            hashtable *pht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(p->argv[1])));
+            if (!pht) {
+                prefix_open = 0; /* an unallocated shard ends the prefix; main answers it */
+                break;
+            }
             dplusBatchEntry *e = &batch[tail % DPLUS_BATCH_DEPTH];
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
-            hashtableIncrementalFindInit(&e->find_state, ht, objectGetVal(p->argv[1]));
+            hashtableIncrementalFindInit(&e->find_state, pht, objectGetVal(p->argv[1]));
             done[tail % DPLUS_BATCH_DEPTH] = 0;
             tail++;
             queue_pos++;

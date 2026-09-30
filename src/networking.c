@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -4759,7 +4760,19 @@ static void prefetchCommandQueueKeys(client *c) {
     }
 }
 
+static int processInputBufferLoop(client *c);
+
+/* Held replicated writes are applied before the caller sees the buffer's effects. */
 int processInputBuffer(client *c) {
+    int rc = processInputBufferLoop(c);
+    if (rc == C_OK)
+        replApplyFlush(c);
+    else
+        serverAssert(!replApplyPending());
+    return rc;
+}
+
+static int processInputBufferLoop(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
@@ -4803,6 +4816,14 @@ int processInputBuffer(client *c) {
              * This avoids unintentionally modifying the shared qb during processCommand as we may use
              * the shared qb for other clients during processEventsWhileBlocked */
             resetSharedQueryBuf(c);
+        }
+
+        if (c->flag.primary) {
+            if (replApplyDefer(c)) {
+                commandProcessed(c);
+                continue;
+            }
+            replApplyFlush(c);
         }
 
         /* We are finally ready to execute the command. */

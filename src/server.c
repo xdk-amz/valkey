@@ -2999,6 +2999,8 @@ void resetServerStats(void) {
 
     dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     server.stat_numcommands = 0;
+    server.stat_repl_parallel_applied = 0;
+    server.stat_repl_apply_phases = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredfields = 0;
@@ -3114,6 +3116,8 @@ serverDb *createDatabase(int id) {
     if (server.cluster_enabled) {
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
+    } else {
+        slot_count_bits = server.keyspace_shard_bits;
     }
 
     serverDb *db = zmalloc(sizeof(serverDb));
@@ -6991,6 +6995,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
+                "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,

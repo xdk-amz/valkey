@@ -301,6 +301,10 @@ void throttle_removeClient(client *c) {
     }
 }
 
+bool throttle_anyThrottlers(void) {
+    return throttler_list != NULL && listLength(throttler_list) > 0;
+}
+
 bool throttle_throttleClientIfNeeded(client *c) {
     /* Skip internal clients and clients already checked for this command.
      * Prevents re-throttling after unblocking. */

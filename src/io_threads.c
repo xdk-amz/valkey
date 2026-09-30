@@ -11,6 +11,7 @@
 #include "connhelpers.h"
 #include "fastpath.h"
 #include "staged_loop.h"
+#include "repl_apply.h"
 #include "phase_barrier.h"
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
@@ -1158,6 +1159,8 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
             fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_APPLY)
+            replApplyRunLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
         atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
@@ -2007,7 +2010,7 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
 
 /* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
-    if (inline_reclaim_depth) { /* emergency reclaim frees inline */
+    if (inline_reclaim_depth || repl_apply_in_lane) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
         return;
     }
