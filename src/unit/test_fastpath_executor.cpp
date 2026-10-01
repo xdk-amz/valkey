@@ -13,10 +13,13 @@
 
 #include <arpa/inet.h>
 #include <cstring>
+#include <fcntl.h>
+#include <string>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 extern "C" {
 #include "connection.h"
@@ -560,4 +563,186 @@ TEST_F(FastpathExecutorTest, RequeueGateCounterIncrementsOncePerRequeue) {
     fastpathControlReclaim(c);
     freeClient(c);
     close(sv[1]);
+}
+
+/* An attached fast-path client on one end of a socketpair; the test owns the other end. */
+static client *fpCopyAvoidClient(int sv[2], uint64_t id) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->id = id;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40020);
+    inet_pton(AF_INET, "192.0.2.120", &sa.sin_addr);
+    peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa));
+    c->fp_local = c->fp_peer;
+    c->woff = 0;
+    server.failover_state = NO_FAILOVER;
+    if (fastpathAttach(c) != C_OK) return NULL;
+    fastpathProcessReturns(1); /* attach: the thread takes ownership */
+    return c;
+}
+
+static robj *fpCopyAvoidStore(const char *key, size_t vlen, char seed) {
+    sds v = sdsnewlen(NULL, vlen);
+    for (size_t i = 0; i < vlen; i++) v[i] = (char)(seed + i % 23);
+    robj *k = createStringObject(key, strlen(key));
+    robj *o = createObject(OBJ_STRING, v);
+    setKey(NULL, server.db[0], k, &o, 0);
+    robj *stored = lookupKeyRead(server.db[0], k);
+    decrRefCount(k);
+    return stored;
+}
+
+static void fpCopyAvoidDelete(const char *key) {
+    robj *k = createStringObject(key, strlen(key));
+    dbDelete(server.db[0], k);
+    decrRefCount(k);
+}
+
+static std::string fpBulk(robj *o) {
+    size_t len = sdslen((sds)objectGetVal(o));
+    return "$" + std::to_string(len) + "\r\n" + std::string((char *)objectGetVal(o), len) + "\r\n";
+}
+
+/* Reads until want bytes arrived, letting the IO owner flush what the socket refused earlier. */
+static std::string fpReadAll(int fd, size_t want, client *c) {
+    std::string got;
+    std::vector<char> buf(65536);
+    for (int guard = 0; guard < 200000 && got.size() < want; guard++) {
+        ssize_t n = recv(fd, buf.data(), buf.size(), MSG_DONTWAIT);
+        if (n > 0) {
+            got.append(buf.data(), n);
+            continue;
+        }
+        fastpathClientWritable(1, c);
+    }
+    return got;
+}
+
+static void fpCopyAvoidFinish(client *c, int peer) {
+    fastpathWorkerQuiesce(1);
+    fastpathProcessReturns(1);
+    fastpathHandoffDone(c, 0);
+    fastpathControlReclaim(c);
+    freeClient(c);
+    close(peer);
+}
+
+/* A large GET goes out by reference: main counts it as copy-avoided, the value stays referenced while
+ * the IO owner sends it, and only main drops that reference, on the batch's extra trip. */
+TEST_F(FastpathExecutorTest, CopyAvoidedReplyIsSentByReferenceAndReleasedOnMain) {
+    int saved_min_threads = server.min_io_threads_copy_avoid;
+    server.min_io_threads_copy_avoid = 1;
+    robj *val = fpCopyAvoidStore("ca:big", 64 * 1024, 'a');
+    ASSERT_EQ(val->refcount, 1u);
+
+    int sv[2];
+    client *c = fpCopyAvoidClient(sv, 727001);
+    ASSERT_NE(c, nullptr);
+
+    long long avoided = server.stat_reply_copy_avoided;
+    const char *req = "*2\r\n$3\r\nGET\r\n$6\r\nca:big\r\n";
+    ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(server.stat_reply_copy_avoided, avoided + 1);
+    EXPECT_EQ(val->refcount, 2u); /* the reply holds the value */
+
+    EXPECT_EQ(fastpathProcessReturns(1), 1); /* delivered; the batch goes back for the release */
+    EXPECT_EQ(val->refcount, 2u);            /* the IO owner never drops it */
+    EXPECT_EQ(fastpathDrain(), 0);           /* the release trip runs no command */
+    EXPECT_EQ(val->refcount, 1u);
+    EXPECT_EQ(fastpathProcessReturns(1), 1); /* the released batch is recycled */
+
+    std::string want = fpBulk(val);
+    EXPECT_EQ(fpReadAll(sv[1], want.size(), c), want);
+    EXPECT_EQ(fastpathReplyOutstanding(c->control), 0u);
+
+    fpCopyAvoidFinish(c, sv[1]);
+    fpCopyAvoidDelete("ca:big");
+    server.min_io_threads_copy_avoid = saved_min_threads;
+}
+
+/* When the socket takes only part of a referenced reply, the rest is copied to the client's own output
+ * before the release trip, so the value can be released while the reply is still being sent. */
+TEST_F(FastpathExecutorTest, CopyAvoidedReplySurvivesPartialWriteAfterRelease) {
+    int saved_min_threads = server.min_io_threads_copy_avoid;
+    server.min_io_threads_copy_avoid = 1;
+    robj *val = fpCopyAvoidStore("ca:huge", 1024 * 1024, 'k');
+
+    int sv[2];
+    client *c = fpCopyAvoidClient(sv, 727002);
+    ASSERT_NE(c, nullptr);
+    int small = 4096;
+    ASSERT_EQ(setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    ASSERT_EQ(fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL) | O_NONBLOCK), 0);
+
+    const char *req = "*2\r\n$3\r\nGET\r\n$7\r\nca:huge\r\n";
+    ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_GT(sdslen(c->fp_out), 0u); /* the socket refused most of it */
+    EXPECT_EQ(fastpathDrain(), 0);
+    EXPECT_EQ(val->refcount, 1u); /* released although the reply is still being sent */
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+
+    std::string want = fpBulk(val);
+    fpCopyAvoidDelete("ca:huge"); /* the residue is the client's own copy */
+    EXPECT_EQ(fpReadAll(sv[1], want.size(), c), want);
+    EXPECT_EQ(fastpathReplyOutstanding(c->control), 0u);
+
+    fpCopyAvoidFinish(c, sv[1]);
+    server.min_io_threads_copy_avoid = saved_min_threads;
+}
+
+/* An MGET whose reply spills out of the arena mixes plain blocks and referenced elements; the flattened
+ * region keeps their order and every reference is released. */
+TEST_F(FastpathExecutorTest, CopyAvoidedSpillKeepsOrderAcrossPlainAndReferencedParts) {
+    int saved_min_threads = server.min_io_threads_copy_avoid;
+    int saved_min_size = server.min_string_size_copy_avoid_threaded;
+    server.min_io_threads_copy_avoid = 0;
+    server.min_string_size_copy_avoid_threaded = 32 * 1024;
+    robj *plain = fpCopyAvoidStore("ca:mid", 20 * 1024, 'p'); /* below the size gate: copied */
+    robj *big1 = fpCopyAvoidStore("ca:b1", 64 * 1024, 'q');
+    robj *big2 = fpCopyAvoidStore("ca:b2", 96 * 1024, 'r');
+
+    int sv[2];
+    client *c = fpCopyAvoidClient(sv, 727003);
+    ASSERT_NE(c, nullptr);
+
+    long long avoided = server.stat_reply_copy_avoided;
+    const char *req = "*6\r\n$4\r\nMGET\r\n$6\r\nca:mid\r\n$5\r\nca:b1\r\n$4\r\nnope\r\n$5\r\nca:b2\r\n$6\r\nca:mid\r\n";
+    ASSERT_EQ(write(sv[1], req, strlen(req)), (ssize_t)strlen(req));
+    fastpathClientReadable(1, c);
+    fastpathSubmitPending(1);
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(server.stat_reply_copy_avoided, avoided + 2);
+    EXPECT_EQ(big1->refcount, 2u);
+    EXPECT_EQ(big2->refcount, 2u);
+    EXPECT_EQ(plain->refcount, 1u); /* copied, never referenced */
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(fastpathDrain(), 0);
+    EXPECT_EQ(big1->refcount, 1u);
+    EXPECT_EQ(big2->refcount, 1u);
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+
+    std::string want = "*5\r\n" + fpBulk(plain) + fpBulk(big1) + "$-1\r\n" + fpBulk(big2) + fpBulk(plain);
+    EXPECT_EQ(fpReadAll(sv[1], want.size(), c), want);
+    EXPECT_EQ(fastpathReplyOutstanding(c->control), 0u);
+
+    fpCopyAvoidFinish(c, sv[1]);
+    fpCopyAvoidDelete("ca:mid");
+    fpCopyAvoidDelete("ca:b1");
+    fpCopyAvoidDelete("ca:b2");
+    server.min_io_threads_copy_avoid = saved_min_threads;
+    server.min_string_size_copy_avoid_threaded = saved_min_size;
 }

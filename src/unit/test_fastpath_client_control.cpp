@@ -315,9 +315,10 @@ TEST_F(FastpathClientControlTest, HandleAndControlLayoutIsCompact) {
     EXPECT_EQ(alignof(ClientHandle), alignof(void *));
 
     /* The detached entry leads with the handle, not a connection pointer. The command-entry budget is
-     * the base branch's 160 bytes plus the 8-byte woff result field this branch carries back. */
+     * the base branch's 160 bytes plus the 8-byte woff result field this branch carries back, plus the
+     * 8-byte wire length of a copy-avoided reply. */
     EXPECT_EQ(offsetof(cmdEntry, handle), 0u);
-    EXPECT_EQ(sizeof(cmdEntry), 168u);
+    EXPECT_EQ(sizeof(cmdEntry), 176u);
     EXPECT_EQ(sizeof(cmdBatch), offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry));
 
     /* The control aligns to a cache line, and its two reply counters sit on their own lines so the

@@ -91,6 +91,7 @@ typedef struct cmdEntry {
     serverDb *db;
     char *reply_big;
     long long woff; /* Origin client's write offset: prior value in, resulting offset out; the IO owner applies it back before handoff. */
+    size_t reply_wire; /* Bytes an encoded reply sends; its region holds string references owned by the batch. */
     int argc;
     int argv_len;
     int slot;
@@ -100,6 +101,7 @@ typedef struct cmdEntry {
     uint32_t reply_big_len;
     uint8_t resp;
     uint8_t requeued;     /* Main did not execute it; the IO thread hands it back for the main path. */
+    uint8_t reply_encoded;
     CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
 } cmdEntry;
 
@@ -111,6 +113,10 @@ typedef struct cmdBatch {
     size_t arena_used;
     monotime opened_us;
     struct cmdBatch *pending_next; /* Main-only intrusive link while held for the appendfsync-always barrier; NULL otherwise. */
+    robj **refs;                   /* Strings encoded replies point at; main takes and drops these references. */
+    uint32_t nrefs;
+    uint32_t refs_cap;
+    uint8_t release;               /* Delivered and sent back so main can drop refs; it carries no commands. */
     cmdEntry e[IO_BATCH_MAX];
 } cmdBatch;
 

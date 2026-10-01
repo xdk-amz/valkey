@@ -324,7 +324,7 @@ static int shouldDeferPushMessage(client *c) {
  * that use _writeToClient handler to write replies to client connection */
 static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (server.copy_avoid_mode == COPY_AVOID_MODE_OFF) return 0;
-    if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
+    if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
@@ -3506,6 +3506,140 @@ void releaseReplyReferences(client *c) {
             releaseBufReferences(o->buf, o->used, c);
         }
     }
+}
+
+/* Fast path: an executor's reply leaves main as a region inside its batch. The encoding stays
+ * private to this file. */
+
+/* Main only. Moves the region's string references to refs, which own them until replyReleaseRefs,
+ * settles slot stats of untracked headers as releaseBufReferences does, and returns the bytes the
+ * region sends. */
+size_t replyRegionTakeRefs(char *buf, size_t len, robj ***refs, uint32_t *nrefs, uint32_t *cap) {
+    size_t wire = 0;
+    char *ptr = buf;
+    while (ptr < buf + len) {
+        payloadHeader *header = (payloadHeader *)ptr;
+        ptr += sizeof(payloadHeader);
+        if (isStrRefPayload(header->payload_type)) {
+            size_t reply_len = 0;
+            bulkStrRef *str_ref = (bulkStrRef *)ptr;
+            for (size_t left = header->payload_len; left > 0; left -= sizeof(bulkStrRef), str_ref++) {
+                size_t str_len = sdslen(str_ref->str);
+                if (header->payload_type == BULK_STR_REF) reply_len += digits10(str_len) + 3 + str_len + 2;
+                else reply_len += str_len;
+                if (*nrefs == *cap) {
+                    *cap = *cap ? *cap * 2 : 16;
+                    *refs = zrealloc(*refs, sizeof(robj *) * *cap);
+                }
+                (*refs)[(*nrefs)++] = str_ref->obj;
+            }
+            header->reply_len = reply_len;
+            if (!header->track_bytes) clusterSlotStatsAddNetworkBytesOutForSlot(header->slot, reply_len);
+            wire += reply_len;
+        } else {
+            wire += header->payload_len;
+        }
+        ptr += header->payload_len;
+    }
+    serverAssert(ptr == buf + len);
+    return wire;
+}
+
+/* Main only: drop references taken by replyRegionTakeRefs. */
+void replyReleaseRefs(robj **refs, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) freeValueNeverOnMain(NULL, refs[i], -1);
+}
+
+/* Emits a region's wire bytes in order. A transient segment points at scratch memory that is valid
+ * only during the call. Touches only the region and the strings it references, which stay immutable
+ * while referenced, so the IO owner may walk it. */
+void replyRegionWalk(const char *buf, size_t len, replySegmentFn *emit, void *ctx) {
+    static const char crlf[] = "\r\n";
+    const char *ptr = buf;
+    while (ptr < buf + len) {
+        const payloadHeader *header = (const payloadHeader *)ptr;
+        ptr += sizeof(payloadHeader);
+        if (header->payload_type == PLAIN_REPLY) {
+            emit(ctx, ptr, header->payload_len, 0);
+        } else {
+            const bulkStrRef *str_ref = (const bulkStrRef *)ptr;
+            for (size_t left = header->payload_len; left > 0; left -= sizeof(bulkStrRef), str_ref++) {
+                size_t str_len = sdslen(str_ref->str);
+                if (header->payload_type == BULK_STR_REF) {
+                    char prefix[BULK_STR_LEN_PREFIX_MAX_SIZE];
+                    prefix[0] = '$';
+                    size_t num_len = ll2string(prefix + 1, sizeof(prefix) - 3, str_len);
+                    prefix[num_len + 1] = '\r';
+                    prefix[num_len + 2] = '\n';
+                    emit(ctx, prefix, num_len + 3, 1);
+                    emit(ctx, str_ref->str, str_len, 0);
+                    emit(ctx, crlf, 2, 0);
+                } else {
+                    emit(ctx, str_ref->str, str_len, 0);
+                }
+            }
+        }
+        ptr += header->payload_len;
+    }
+}
+
+/* Main only: whether the client's buffer or any reply block carries headers. */
+int replyIsEncoded(client *c) {
+    if (c->bufpos > 0 && c->flag.buf_encoded) return 1;
+    listIter iter;
+    listNode *ln;
+    listRewind(c->reply, &iter);
+    while ((ln = listNext(&iter))) {
+        clientReplyBlock *o = listNodeValue(ln);
+        if (o && o->flag.buf_encoded) return 1;
+    }
+    return 0;
+}
+
+/* Main only: the client's buffer and reply list as one encoded region, plain pieces wrapped in
+ * plain headers so references keep their order. Empties the list; the region owns the references. */
+char *replyFlattenEncoded(client *c, size_t *len_out) {
+    size_t total = c->bufpos > 0 ? (size_t)c->bufpos + (c->flag.buf_encoded ? 0 : sizeof(payloadHeader)) : 0;
+    listIter iter;
+    listNode *ln;
+    listRewind(c->reply, &iter);
+    while ((ln = listNext(&iter))) {
+        clientReplyBlock *o = listNodeValue(ln);
+        if (o->used) total += o->used + (o->flag.buf_encoded ? 0 : sizeof(payloadHeader));
+    }
+    char *out = zmalloc(total);
+    size_t off = 0;
+    int encoded = c->flag.buf_encoded;
+    char *piece = c->buf;
+    size_t used = c->bufpos;
+    listRewind(c->reply, &iter);
+    for (;;) {
+        if (used) {
+            if (!encoded) {
+                payloadHeader *h = (payloadHeader *)(out + off);
+                h->payload_type = PLAIN_REPLY;
+                h->payload_len = used;
+                h->reply_len = 0;
+                h->slot = -1;
+                h->track_bytes = 0;
+                h->reserved = 0;
+                h->tracked_for_cob = 0;
+                off += sizeof(payloadHeader);
+            }
+            memcpy(out + off, piece, used);
+            off += used;
+        }
+        if ((ln = listNext(&iter)) == NULL) break;
+        clientReplyBlock *o = listNodeValue(ln);
+        encoded = o->flag.buf_encoded;
+        piece = o->buf;
+        used = o->used;
+    }
+    serverAssert(off == total);
+    listEmpty(c->reply);
+    c->reply_bytes = 0;
+    *len_out = total;
+    return out;
 }
 
 static void _postWriteToClient(client *c) {

@@ -382,6 +382,8 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
     }
 
     test {Copy avoidance spill to reply list returns omem to zero after drain} {
+        # c->reply exists only on the main reply path; fast-path clients are covered below.
+        r config set io-threads-fast-path no
         r config set min-io-threads-avoid-copy-reply 1
         r config set io-threads 4
         r config set commandlog-reply-larger-than 1
@@ -460,7 +462,74 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         r config set commandlog-reply-larger-than -1
         r config set min-io-threads-avoid-copy-reply 0
         r config set io-threads 1
+        r config set io-threads-fast-path yes
 
         assert_equal 0 $omem
+    }
+
+    test {Copy-avoided fast-path replies return omem to zero after drain} {
+        r config set min-io-threads-avoid-copy-reply 1
+        r config set io-threads 4
+        r config set client-output-buffer-limit {normal 0 0 0}
+        # A connection accepted before the threads run is not offered the fast path.
+        wait_for_condition 100 50 {
+            [getInfoProperty [r info server] io_threads_active] eq 1
+        } else {
+            fail "IO threads did not start"
+        }
+
+        set value [string repeat "q" [expr 16*1024]]
+        r set spill_key $value
+        set avoided [s reply_copy_avoided]
+
+        set fpc [getInfoProperty [r info fastpath] fastpath_clients]
+        set rd [valkey_deferring_client]
+        $rd client id
+        set client_id [$rd read]
+        $rd get spill_key
+        $rd flush
+        assert_equal $value [$rd read]
+        wait_for_condition 100 50 {
+            [getInfoProperty [r info fastpath] fastpath_clients] > $fpc
+        } else {
+            fail "Client did not join the fast path"
+        }
+
+        set cmd_count 1300
+        set pipeline ""
+        for {set i 0} {$i < $cmd_count} {incr i} {
+            append pipeline "get spill_key\r\n"
+        }
+        $rd write $pipeline
+        $rd flush
+
+        # The replies the socket refuses wait in the client's output, still charged to it.
+        wait_for_condition 200 100 {
+            [get_field_in_client_list $client_id [r client list] omem] > 0
+        } else {
+            fail "Unsent fast-path replies were never charged"
+        }
+        assert_morethan [s reply_copy_avoided] $avoided
+
+        set reply_len [expr {[string length $value] + [string length [string length $value]] + 5}]
+        set remaining [expr {$reply_len * $cmd_count}]
+        while {$remaining > 0} {
+            set chunk [$rd rawread [expr {min($remaining, 65536)}]]
+            set chunk_len [string length $chunk]
+            if {$chunk_len == 0} {
+                fail "Socket drained unexpectedly after reading [expr {$reply_len * $cmd_count - $remaining}] bytes"
+            }
+            incr remaining -$chunk_len
+        }
+
+        wait_for_condition 200 100 {
+            [get_field_in_client_list $client_id [r client list] omem] == 0
+        } else {
+            fail "omem stayed at [get_field_in_client_list $client_id [r client list] omem] after drain"
+        }
+
+        $rd close
+        r config set min-io-threads-avoid-copy-reply 0
+        r config set io-threads 1
     }
 }

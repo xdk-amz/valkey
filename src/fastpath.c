@@ -20,7 +20,7 @@ extern int ProcessingEventsWhileBlocked; /* networking.c */
 static_assert(sizeof(ClientHandle) == 2 * sizeof(void *),
               "ClientHandle is a compact {control ref, generation, owner slot}");
 static_assert(_Alignof(ClientHandle) == _Alignof(void *), "ClientHandle needs only pointer alignment");
-static_assert(sizeof(cmdEntry) == 168, "cmdEntry layout changed; re-measure before/after for the report");
+static_assert(sizeof(cmdEntry) == 176, "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
 static_assert(offsetof(cmdBatch, pending_next) < offsetof(cmdBatch, e),
@@ -131,6 +131,9 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
         b = zmalloc(sizeof(cmdBatch));
         b->arena = zmalloc(FP_ARENA_SIZE);
         b->arena_cap = FP_ARENA_SIZE;
+        b->refs = NULL;
+        b->nrefs = b->refs_cap = 0;
+        b->release = 0;
     }
     b->count = 0;
     b->io_tid = tid;
@@ -139,22 +142,24 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     return b;
 }
 
+static void fpFreeBatch(cmdBatch *b) {
+    serverAssert(b->nrefs == 0); /* references are dropped on main before a batch is recycled */
+    zfree(b->refs);
+    zfree(b->arena);
+    zfree(b);
+}
+
 static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     if (t->nfree < FP_FREELIST_MAX) {
         t->freelist[t->nfree++] = b;
     } else {
-        zfree(b->arena);
-        zfree(b);
+        fpFreeBatch(b);
     }
 }
 
 /* Batches pooled during a burst go back to the allocator once the thread has nothing in flight. */
 static void fpTrimFreelist(fpThread *t) {
-    while (t->nfree > FP_FREELIST_IDLE) {
-        cmdBatch *b = t->freelist[--t->nfree];
-        zfree(b->arena);
-        zfree(b);
-    }
+    while (t->nfree > FP_FREELIST_IDLE) fpFreeBatch(t->freelist[--t->nfree]);
 }
 
 void fastpathInitThread(int tid) {
@@ -182,11 +187,7 @@ void fastpathFreeThread(int tid) {
     serverAssert(t->main_clients == 0 && t->detach_pending == 0 && listLength(t->ret_overflow) == 0);
     spscFree(&t->submit);
     spscFree(&t->ret);
-    while (t->nfree > 0) {
-        cmdBatch *b = t->freelist[--t->nfree];
-        zfree(b->arena);
-        zfree(b);
-    }
+    while (t->nfree > 0) fpFreeBatch(t->freelist[--t->nfree]);
     raxFree(t->registry);
     t->registry = NULL;
     zfree(t->owner_slots);
@@ -837,8 +838,10 @@ int fastpathHandleStale(const ClientHandle *h) {
 
 /* Logical reply bytes an entry retains for its client: the arena run or the spilled heap block, never
  * both (main sets one or the other) and never allocator-rounded capacity, so produce and release count
- * the same unit. Zero for a requeued or reply-less entry, so charging it is a no-op. */
+ * the same unit. An encoded reply counts the bytes it sends, referenced strings included. Zero for a
+ * requeued or reply-less entry, so charging it is a no-op. */
 static inline size_t fpEntryReplyBytes(const cmdEntry *e) {
+    if (e->reply_encoded) return e->reply_wire;
     return e->reply_big ? e->reply_big_len : e->reply_len;
 }
 
@@ -1155,6 +1158,8 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
+    e->reply_wire = 0;
+    e->reply_encoded = 0;
     e->requeued = 0;
     e->woff = c->woff; /* prior causal state in; main executes against it and returns the resulting offset */
     c->fp_inflight++;
@@ -1464,14 +1469,46 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
     fpBeginLeave(t, c, FP_LEAVING, 1);
 }
 
+#define FP_OUT_IOV 128
+#define FP_OUT_PREFIX (LONG_STR_SIZE + 3)
+
+/* A strand's reply segments, sent through fpSend each time the vector fills. Once a send leaves residue,
+ * later segments queue behind it in fp_out, so splitting a strand keeps its byte order. */
+typedef struct fpOut {
+    fpThread *t;
+    client *c;
+    int n, npfx;
+    size_t released;
+    struct iovec iov[FP_OUT_IOV];
+    char prefix[FP_OUT_IOV][FP_OUT_PREFIX];
+} fpOut;
+
+static void fpOutFlush(fpOut *o) {
+    if (o->n) o->released += fpSend(o->t, o->c, o->iov, o->n);
+    o->n = o->npfx = 0;
+}
+
+static void fpOutAdd(void *ctx, const char *p, size_t len, int transient) {
+    fpOut *o = ctx;
+    if (len == 0) return;
+    if (o->n == FP_OUT_IOV) fpOutFlush(o);
+    if (transient) {
+        serverAssert(len <= FP_OUT_PREFIX);
+        memcpy(o->prefix[o->npfx], p, len);
+        p = o->prefix[o->npfx++];
+    }
+    o->iov[o->n].iov_base = (void *)p;
+    o->iov[o->n].iov_len = len;
+    o->n++;
+}
+
 /* Consecutive entries for one client share a writev. */
 static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
-    struct iovec iov[IO_BATCH_MAX];
+    fpOut out;
     int i = 0;
     while (i < b->count) {
         client *c = fpResolve(t, &b->e[i].handle);
         ClientControl *cc = b->e[i].handle.control;
-        int n = 0;
         int j = i;
         int requeued = 0;
         long long strand_woff = 0;
@@ -1481,13 +1518,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             cmdEntry *e = &b->e[j];
             strand_argv += fpArgvBytes(e->argv_len_sum, e->argc);
             if (!e->requeued && e->cmd) strand_last = e->cmd;
-            if (e->requeued) {
-                requeued++;
-            } else if (e->reply_big) {
-                iov[n].iov_base = e->reply_big, iov[n].iov_len = e->reply_big_len, n++;
-            } else if (e->reply_len) {
-                iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
-            }
+            if (e->requeued) requeued++;
             if (!e->requeued && e->woff > strand_woff) strand_woff = e->woff; /* highest offset any executed entry reached */
             j++;
         }
@@ -1496,8 +1527,17 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
              * (ACTIVE, or LEAVING for the WAIT/WAITAOF requeue); not CLOSING/DETACHED. */
             uint8_t lc = c->control->lifecycle;
             if (strand_woff > c->woff && (lc == FP_ACTIVE || lc == FP_LEAVING)) c->woff = strand_woff;
-            size_t released = n ? fpSend(t, c, iov, n) : 0;
-            fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
+            out.t = t, out.c = c, out.n = out.npfx = 0, out.released = 0;
+            for (int k = i; k < j; k++) {
+                cmdEntry *e = &b->e[k];
+                if (e->requeued) continue;
+                char *region = e->reply_big ? e->reply_big : b->arena + e->reply_off;
+                size_t len = e->reply_big ? e->reply_big_len : e->reply_len;
+                if (e->reply_encoded) replyRegionWalk(region, len, fpOutAdd, &out);
+                else fpOutAdd(&out, region, len, 0);
+            }
+            fpOutFlush(&out);
+            fpControlReleaseBytes(cc, out.released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
             c->fp_inflight_argv -= strand_argv;
             c->commands_processed += (j - i) - requeued;
@@ -1685,9 +1725,21 @@ int fastpathProcessReturns(int tid) {
                 continue;
             }
             cmdBatch *b = (cmdBatch *)v;
+            if (b->release) { /* main dropped its references: the batch is free */
+                b->release = 0;
+                fpRecycleBatch(t, b);
+                t->inflight--;
+                continue;
+            }
             /* Peeked, not cleared: a request against a control still behind an unconsumed attach in this ring must survive for the post-loop drain. */
             if (atomic_load_explicit(&t->req_pending, memory_order_acquire)) fpExecuteBatchRequests(t, b);
             fpDeliverBatch(t, b);
+            if (b->nrefs) {
+                /* Every referenced byte was sent or copied: main drops the references, still in flight. */
+                b->release = 1;
+                spscEnqueue(&t->submit, b, true);
+                continue;
+            }
             fpRecycleBatch(t, b);
             t->inflight--;
         }
@@ -1771,6 +1823,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->buf_usable_size = b->arena_cap - b->arena_used;
     ec->bufpos = 0;
     ec->flag.buf_encoded = 0;
+    ec->last_header = NULL;
     ec->flag.pending_command = 1;
 
     ec->woff = e->woff; /* execute against the origin's prior causal state, not another client's */
@@ -1780,30 +1833,46 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     e->reply_off = (uint32_t)b->arena_used;
     e->reply_len = (uint32_t)ec->bufpos;
     b->arena_used += ec->bufpos;
+    int encoded = replyIsEncoded(ec);
     if (listLength(ec->reply) > 0) {
-        size_t total = ec->bufpos;
-        listIter li;
-        listNode *ln;
-        listRewind(ec->reply, &li);
-        while ((ln = listNext(&li))) total += ((clientReplyBlock *)listNodeValue(ln))->used;
-        char *big = zmalloc(total);
-        memcpy(big, ec->buf, ec->bufpos);
-        size_t off = ec->bufpos;
-        listRewind(ec->reply, &li);
-        while ((ln = listNext(&li))) {
-            clientReplyBlock *o = listNodeValue(ln);
-            memcpy(big + off, o->buf, o->used);
-            off += o->used;
+        size_t total = 0;
+        char *big;
+        if (encoded) {
+            big = replyFlattenEncoded(ec, &total);
+        } else {
+            total = ec->bufpos;
+            listIter li;
+            listNode *ln;
+            listRewind(ec->reply, &li);
+            while ((ln = listNext(&li))) total += ((clientReplyBlock *)listNodeValue(ln))->used;
+            big = zmalloc(total);
+            memcpy(big, ec->buf, ec->bufpos);
+            size_t off = ec->bufpos;
+            listRewind(ec->reply, &li);
+            while ((ln = listNext(&li))) {
+                clientReplyBlock *o = listNodeValue(ln);
+                memcpy(big + off, o->buf, o->used);
+                off += o->used;
+            }
+            listEmpty(ec->reply);
+            ec->reply_bytes = 0;
         }
-        listEmpty(ec->reply);
-        ec->reply_bytes = 0;
         b->arena_used -= ec->bufpos;
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
         e->reply_big_len = (uint32_t)total;
     }
+    if (encoded) {
+        /* Copy-avoided strings stay referenced until the IO owner has sent or copied them. */
+        char *region = e->reply_big ? e->reply_big : b->arena + e->reply_off;
+        size_t len = e->reply_big ? e->reply_big_len : e->reply_len;
+        e->reply_wire = replyRegionTakeRefs(region, len, &b->refs, &b->nrefs, &b->refs_cap);
+        e->reply_encoded = 1;
+    }
     ec->bufpos = 0;
+    ec->flag.buf_encoded = 0;
+    ec->last_header = NULL;
     ec->buf = saved_buf;
     ec->buf_usable_size = saved_usable;
     ec->name = NULL;
@@ -1883,6 +1952,12 @@ again:
         client *ec = fpExecutor(tid);
         for (size_t i = 0; i < n; i++) {
             cmdBatch *b = items[i];
+            if (b->release) {
+                replyReleaseRefs(b->refs, b->nrefs);
+                b->nrefs = 0;
+                spscEnqueue(&t->ret, b, false); /* carries no replies, so it may pass a held batch */
+                continue;
+            }
             if (use_prefetch && !gated) {
                 getKeysResult result;
                 initGetKeysResult(&result);
