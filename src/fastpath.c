@@ -49,6 +49,7 @@ static_assert(offsetof(ClientControl, limit) + sizeof(struct FastpathLimitEntry 
 #define FP_RING_SIZE 1024        /* batches per ring; batches, not commands */
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
+#define FP_FREELIST_IDLE 4 /* batches a thread with nothing in flight keeps pooled */
 #define FP_CLIENT_INFLIGHT_MAX 256 /* commands of one client on main at once */
 #define FP_TAG_DETACH ((uintptr_t)1) /* return-ring entry is a client to close, not a batch */
 #define FP_TAG_ATTACH ((uintptr_t)2) /* return-ring entry is a client the IO thread takes ownership of */
@@ -142,6 +143,15 @@ static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     if (t->nfree < FP_FREELIST_MAX) {
         t->freelist[t->nfree++] = b;
     } else {
+        zfree(b->arena);
+        zfree(b);
+    }
+}
+
+/* Batches pooled during a burst go back to the allocator once the thread has nothing in flight. */
+static void fpTrimFreelist(fpThread *t) {
+    while (t->nfree > FP_FREELIST_IDLE) {
+        cmdBatch *b = t->freelist[--t->nfree];
         zfree(b->arena);
         zfree(b);
     }
@@ -1686,6 +1696,7 @@ int fastpathProcessReturns(int tid) {
     if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
     fpServeDeferred(t, tid);
+    if (t->inflight == 0 && !t->cur && t->nfree > FP_FREELIST_IDLE) fpTrimFreelist(t);
     return total;
 }
 
