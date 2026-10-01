@@ -1381,10 +1381,13 @@ static int ioThreadsConvergeOnce(int teardown) {
     int pending = 0;
     int rc = C_OK;
 
-    for (int tid = io_worker_hwm - 1; tid >= 1 && tid >= target; tid--) {
+    /* A slot that began retiring under a lower target finishes retiring even once the target
+     * covers it again: the creation pass below waits for it to be gone. */
+    for (int tid = io_worker_hwm - 1; tid >= 1; tid--) {
         int st = ioWorkerState(tid);
         if (st == IO_WORKER_ABSENT) continue;
         if (st == IO_WORKER_RUNNING) {
+            if (tid < target) continue;
             ioWorkerRetire(tid);
             st = IO_WORKER_QUIESCING;
         }
