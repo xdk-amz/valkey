@@ -921,6 +921,14 @@ size_t fastpathInputMem(const ClientControl *cc) {
     return atomic_load_explicit(&cc->input_mem, memory_order_relaxed);
 }
 
+/* Main: memory of an IO-owned client from what main and its owner publish, never from the client itself. */
+size_t fastpathClientMemory(const ClientControl *cc, size_t *output_mem) {
+    size_t out = fastpathReplyOutstanding(cc);
+    if (output_mem) *output_mem = out;
+    const FastpathLimitEntry *e = cc->limit;
+    return (e->base_captured ? e->base_usage : 0) + out + fastpathInputMem(cc);
+}
+
 /* IO owner (and main at attach-init) writes the idle stamp with release so main's acquire load sees the latest interaction. */
 static void fpControlSetLastInteraction(ClientControl *cc, time_t t) {
     atomic_store_explicit(&cc->last_interaction, t, memory_order_release);
@@ -1527,9 +1535,9 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
 }
 
 /* Clients that stopped reading and now have nothing in flight are handed to
- * the main thread: to be freed (closing) or taken over (leaving). Buffered
- * output goes out first while the role is open; a quiescing thread hands the
- * residue over with the client so a slow reader cannot hold it. */
+ * the main thread: to be freed (closing) or taken over (leaving). What the
+ * socket accepts is written here first; the residue goes to main with the
+ * client, so a slow reader cannot hold back the hand-off. */
 static void fpFinishLeaving(fpThread *t) {
     if (listLength(&t->leaving) == 0) return;
     int open = atomic_load_explicit(&t->role, memory_order_relaxed) == FP_ROLE_OPEN;
@@ -1539,9 +1547,7 @@ static void fpFinishLeaving(fpThread *t) {
         client *c = listNodeValue(ln);
         ln = next;
         if (c->fp_inflight > 0) continue;
-        /* Only a still-leaving client retries a partial drain; a fatal flush upgraded it to FP_CLOSING and must proceed. */
-        if (c->control->lifecycle == FP_LEAVING && open && !fpFlushOut(t, c) && c->control->lifecycle == FP_LEAVING)
-            continue;
+        if (c->control->lifecycle == FP_LEAVING && open) fpFlushOut(t, c); /* a fatal write turns it into a close */
         /* Residue leaves the retained set exactly once here, posted before the hand-off so fastpathHandoffDone never re-releases it. */
         if (c->fp_out && sdslen(c->fp_out) > 0) fpControlReleaseBytes(c->control, sdslen(c->fp_out));
         fpUnregister(t, c);

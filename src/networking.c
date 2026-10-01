@@ -5193,7 +5193,9 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     *p = '\0';
 
     /* Compute the total memory consumed by this client. */
-    size_t obufmem, total_mem = getClientMemoryUsage(client, &obufmem);
+    size_t obufmem;
+    size_t total_mem = client->flag.fastpath && client->control ? fastpathClientMemory(client->control, &obufmem)
+                                                                : getClientMemoryUsage(client, &obufmem);
 
     size_t used_blocks_of_repl_buf = 0;
     if (client->repl_data && client->repl_data->ref_repl_buf_node) {

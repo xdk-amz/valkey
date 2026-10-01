@@ -156,6 +156,7 @@ void fastpathControlReclaim(client *c);
  * outstanding external reply memory; it does not enforce COB or maxmemory-clients. */
 size_t fastpathReplyOutstanding(const ClientControl *cc);
 size_t fastpathInputMem(const ClientControl *cc);
+size_t fastpathClientMemory(const ClientControl *cc, size_t *output_mem);
 
 /* Acquire-loaded last-interaction unixtime for a control; read-only, main-only, never a connection deref. */
 time_t fastpathControlLastInteraction(const ClientControl *cc);
