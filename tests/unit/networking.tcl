@@ -181,9 +181,7 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
     # Skip if non io-threads mode - as it is relevant only for io-threads mode
     if {[r config get io-threads] ne "io-threads 1"} {
         test {prefetch works as expected when killing a client from the middle of prefetch commands batch} {
-            # This exercises the legacy io-threads prefetch batch. A client that sends SELECT first
-            # would otherwise rejoin the fast path (which has its own read path and does not feed this
-            # batch), so disable the fast path to keep every client on the legacy prefetch path.
+            # The legacy prefetch batch is under test; fast-path clients have their own read path.
             r config set io-threads-fast-path no
 
             # Create 16 (prefetch batch size) +1 clients
@@ -219,11 +217,12 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
             catch {$rd4 read} err
             assert_match {I/O error reading reply} $err
 
-            # The commands were served from a prefetch batch (the killed client's slot was dropped
-            # from it without disturbing the rest).
+            # verify the prefetch stats are as expected
             set info [r info stats]
+            set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            assert_range $prefetch_entries 2 15; # With slower machines, the number of prefetch entries can be lower
             set prefetch_batches [getInfoProperty $info io_threaded_total_prefetch_batches]
-            assert_range $prefetch_batches 1 15; # With slower machines, the number of batches can be higher
+            assert_range $prefetch_batches 1 7; # With slower machines, the number of batches can be higher
 
             # Verify the final state
             $rd15 get a
@@ -297,6 +296,14 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
             assert_equal $prefetch_entries $new_prefetch_entries
       }
 
+      # Writes done by IO threads on the legacy and the fast-path write paths.
+      proc offloaded_writes {r} {
+          set info [$r info stats fastpath]
+          set fp [getInfoProperty $info fastpath_writes]
+          if {$fp eq {}} { set fp 0 }
+          expr {[getInfoProperty $info io_threaded_writes_processed] + $fp}
+      }
+
       start_server {} {
             test {replicas writes are offloaded to IO threads} {
                 set primary [srv -1 client]
@@ -312,10 +319,8 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
                     fail "Replication not started."
                 }
                 
-                # get the current io-threaded write counter. The replica link is never on the fast
-                # path, so its propagation write is offloaded on the legacy io-threaded write path.
-                set info [$primary info stats]
-                set io_threaded_writes_processed [getInfoProperty $info io_threaded_writes_processed]
+                # get the current count of writes offloaded to IO threads, on either write path
+                set io_threaded_writes_processed [offloaded_writes $primary]
                 
                 # Send a write command to the primary
                 $primary set a 1
@@ -327,12 +332,10 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
                     fail "Replication not propagated."
                 }
                 
-                # Get the new counter. The propagation write to the replica is offloaded to an IO
-                # thread. The write to the set-client itself may instead be offloaded on the fast path
-                # (counted under fastpath_writes), so assert only on the replica propagation here.
-                set info [$primary info stats]
-                set new_io_threaded_writes_processed [getInfoProperty $info io_threaded_writes_processed]
-                assert {$new_io_threaded_writes_processed >= $io_threaded_writes_processed + 1} ;
+                # Get the new count of offloaded writes
+                set new_io_threaded_writes_processed [offloaded_writes $primary]
+                # Assert new is old + 3, 3 for the write to the info-client, set-client and to the replica.
+                assert {$new_io_threaded_writes_processed >= $io_threaded_writes_processed + 3} ;
     
                 # Verify the write was propagated to the replica
                 assert_equal {1} [$replica get a]
