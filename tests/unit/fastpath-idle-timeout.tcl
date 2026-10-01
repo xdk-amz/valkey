@@ -56,8 +56,10 @@ start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {i
         fpit_wait_fastpath_clients 1
 
         # Interact faster than the timeout: each successful read advances the stamp, so it never expires.
+        # Ping the control connection too, so it is not itself idle-reaped while this loop only drives $a.
         for {set i 0} {$i < 6} {incr i} {
             after 300
+            r ping
             $a ping
             assert_equal PONG [$a read]
         }
