@@ -215,6 +215,14 @@ sds fpMakeValue(size_t vlen) {
     return v;
 }
 
+/* Stores a value straight into db 0, so no fast-path client holds the large request it would take. */
+void fpStoreValue(const char *key, size_t vlen) {
+    robj *k = createStringObject(key, strlen(key));
+    robj *o = createObject(OBJ_STRING, fpMakeValue(vlen));
+    setKey(NULL, server.db[0], k, &o, 0);
+    decrRefCount(k);
+}
+
 /* fastpathClientReadable reads once, so a request split across reads needs repeated non-blocking reads and the finite guard stops a stalled parse from spinning forever. */
 void fpReadUntilInflight(client *c, unsigned int want) {
     fpSetNonBlock(c->conn->fd);
@@ -1756,9 +1764,10 @@ TEST_F(FastpathClientControlTest, AttachStripsNormalAccountingAndDefersUntilCron
     fpDisableMaxmemory();
 }
 
-/* The cron accounts base + outstanding reply bytes into the NORMAL total and the matching private bucket:
- * the estimate rises by exactly the outstanding reply bytes when a reply is retained and falls back to the
- * base once it is delivered, updating both the aggregate and the bucket each time. */
+/* The cron accounts base + outstanding reply bytes + input the owner holds into the NORMAL total and the
+ * matching private bucket: the estimate rises while a reply is retained and its command's arguments are
+ * held, and falls back to the base once the reply is delivered, updating both the aggregate and the bucket
+ * each time. */
 TEST_F(FastpathClientControlTest, CronAccountsBasePlusOutstandingIntoNormalTotalAndBucket) {
     size_t base_normal = server.stat_clients_type_memory[CLIENT_TYPE_NORMAL];
     size_t base_agg = fastpathMaxmemoryAggregate();
@@ -1776,21 +1785,24 @@ TEST_F(FastpathClientControlTest, CronAccountsBasePlusOutstandingIntoNormalTotal
     EXPECT_EQ(fastpathMaxmemoryAggregate(), base_agg + acc_base);
     EXPECT_EQ(fastpathMaxmemoryBucketOf(cc), fpExpectedBucketIndex(acc_base));
 
-    /* A retained INCR reply raises outstanding; the next cron adds exactly those bytes to the estimate. */
+    /* A retained INCR reply raises outstanding and its arguments stay held until the batch returns. */
     send(peer, "*2\r\n$4\r\nINCR\r\n$5\r\nmmc:a\r\n");
     fastpathClientReadable(1, c);
     fastpathSubmitPending(1);
     EXPECT_EQ(fastpathDrain(), 1);
     size_t out = fastpathReplyOutstanding(cc);
     EXPECT_GT(out, 0u);
+    size_t in = fastpathInputMem(cc);
+    EXPECT_EQ(in, strlen("INCR") + strlen("mmc:a") + 2 * sizeof(robj *));
     fastpathLimitsCron();
     size_t acc_full = fastpathMaxmemoryAccounted(cc);
-    EXPECT_EQ(acc_full, acc_base + out); /* estimate == base + outstanding reply bytes */
+    EXPECT_EQ(acc_full, acc_base + out + in); /* estimate == base + outstanding reply bytes + held input */
     EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal + acc_full);
 
-    /* Delivering the reply releases the bytes; the next cron drops the estimate back to the base. */
+    /* Delivering the reply releases the bytes and the arguments; the next cron drops the estimate back to the base. */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);
+    EXPECT_EQ(fastpathInputMem(cc), 0u);
     fastpathLimitsCron();
     EXPECT_EQ(fastpathMaxmemoryAccounted(cc), acc_base);
     EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal + acc_base);
@@ -1814,15 +1826,9 @@ TEST_F(FastpathClientControlTest, ReplyGrowthRebucketsAndUpdatesAggregateDelta) 
     size_t acc_base = fastpathMaxmemoryAccounted(cc);
     int base_bucket = fastpathMaxmemoryBucketOf(cc);
 
-    /* Store then read back a large value so the retained GET reply is far larger than the base. */
+    /* Read back a large value so the retained GET reply is far larger than the base. */
     size_t vlen = 256 * 1024;
-    sds val = fpMakeValue(vlen);
-    sds set = fpMakeSet("mmc:big", val, vlen);
-    fpFeedRequest(c, peer, set, sdslen(set), 1);
-    sdsfree(set);
-    fastpathSubmitPending(1);
-    EXPECT_EQ(fastpathDrain(), 1);
-    EXPECT_EQ(fastpathProcessReturns(1), 1); /* +OK delivered, outstanding back to base */
+    fpStoreValue("mmc:big", vlen);
 
     send(peer, "*2\r\n$3\r\nGET\r\n$7\r\nmmc:big\r\n");
     fpReadUntilInflight(c, 1);
@@ -1833,7 +1839,7 @@ TEST_F(FastpathClientControlTest, ReplyGrowthRebucketsAndUpdatesAggregateDelta) 
 
     fastpathLimitsCron();
     size_t acc_full = fastpathMaxmemoryAccounted(cc);
-    EXPECT_EQ(acc_full, acc_base + out);
+    EXPECT_EQ(acc_full, acc_base + out + fastpathInputMem(cc));
     int grown_bucket = fastpathMaxmemoryBucketOf(cc);
     EXPECT_GT(grown_bucket, base_bucket);                       /* moved up a size class */
     EXPECT_EQ(grown_bucket, fpExpectedBucketIndex(acc_full));
@@ -1841,14 +1847,15 @@ TEST_F(FastpathClientControlTest, ReplyGrowthRebucketsAndUpdatesAggregateDelta) 
 
     /* Deliver the big reply: the estimate and bucket fall back to the base class. */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
+    fpSetNonBlock(peer);
     sds drained = fpDrainInto(peer, sdsempty());
     for (int guard = 0; guard < 100000 && c->fp_out && sdslen(c->fp_out) > 0; guard++) {
         fastpathClientWritable(1, c);
         drained = fpDrainInto(peer, drained);
     }
     sdsfree(drained);
-    sdsfree(val);
     EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);
+    EXPECT_EQ(fastpathInputMem(cc), 0u);
     fastpathLimitsCron();
     EXPECT_EQ(fastpathMaxmemoryBucketOf(cc), base_bucket);
     EXPECT_EQ(fastpathMaxmemoryAccounted(cc), acc_base);
@@ -1936,16 +1943,7 @@ TEST_F(FastpathClientControlTest, LargestBucketEvictionPublishesEvictAndCountsOn
     ClientControl *cc = c->control;
 
     size_t vlen = 256 * 1024;
-    sds val = fpMakeValue(vlen);
-    sds set = fpMakeSet("mmc:ev", val, vlen);
-    sdsfree(val);
-    fpFeedRequest(c, peer, set, sdslen(set), 1);
-    sdsfree(set);
-    fastpathSubmitPending(1);
-    EXPECT_EQ(fastpathDrain(), 1);
-    EXPECT_EQ(fastpathProcessReturns(1), 1); /* +OK delivered */
-    sds tmp = fpDrainInto(peer, sdsempty());  /* clear +OK from the socket */
-    sdsfree(tmp);
+    fpStoreValue("mmc:ev", vlen);
 
     send(peer, "*2\r\n$3\r\nGET\r\n$6\r\nmmc:ev\r\n");
     fpReadUntilInflight(c, 1);
@@ -1997,16 +1995,7 @@ TEST_F(FastpathClientControlTest, TwoClientsEvictTheLargerFirst) {
 
     /* a retains a large reply, b retains nothing, so a lands in a strictly higher bucket. */
     size_t vlen = 256 * 1024;
-    sds val = fpMakeValue(vlen);
-    sds set = fpMakeSet("mmc:la", val, vlen);
-    sdsfree(val);
-    fpFeedRequest(a, pa, set, sdslen(set), 1);
-    sdsfree(set);
-    fastpathSubmitPending(1);
-    EXPECT_EQ(fastpathDrain(), 1);
-    EXPECT_EQ(fastpathProcessReturns(1), 1);
-    sds tmp = fpDrainInto(pa, sdsempty());
-    sdsfree(tmp);
+    fpStoreValue("mmc:la", vlen);
     send(pa, "*2\r\n$3\r\nGET\r\n$6\r\nmmc:la\r\n");
     fpReadUntilInflight(a, 1);
     fastpathSubmitPending(1);
@@ -2058,16 +2047,7 @@ TEST_F(FastpathClientControlTest, TerminalPendingMemPreventsCollateralEviction) 
 
     /* big retains a large reply so it alone exceeds the limit; small retains nothing and stays healthy. */
     size_t vlen = 256 * 1024;
-    sds val = fpMakeValue(vlen);
-    sds set = fpMakeSet("mmc:tp", val, vlen);
-    sdsfree(val);
-    fpFeedRequest(big, pbig, set, sdslen(set), 1);
-    sdsfree(set);
-    fastpathSubmitPending(1);
-    EXPECT_EQ(fastpathDrain(), 1);
-    EXPECT_EQ(fastpathProcessReturns(1), 1); /* +OK delivered */
-    sds tmp = fpDrainInto(pbig, sdsempty());
-    sdsfree(tmp);
+    fpStoreValue("mmc:tp", vlen);
     send(pbig, "*2\r\n$3\r\nGET\r\n$6\r\nmmc:tp\r\n");
     fpReadUntilInflight(big, 1);
     fastpathSubmitPending(1);
@@ -2121,6 +2101,82 @@ TEST_F(FastpathClientControlTest, TerminalPendingMemPreventsCollateralEviction) 
     close(pbig);
     close(psmall);
     freeClient(small);
+    EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal);
+    fpDisableMaxmemory();
+}
+
+/* As on the main path, a command whose arguments put its client over maxmemory-clients does not run: the
+ * client is evicted before execution, counted once, and gets no reply. */
+TEST_F(FastpathClientControlTest, OverLimitCommandIsEvictedBeforeItRuns) {
+    size_t base_normal = server.stat_clients_type_memory[CLIENT_TYPE_NORMAL];
+    fpEnableMaxmemory(150000);
+
+    int peer;
+    client *c = newFastpathClient(&peer);
+    ClientControl *cc = c->control;
+
+    size_t vlen = 256 * 1024;
+    sds val = fpMakeValue(vlen);
+    sds set = fpMakeSet("mmc:argv", val, vlen);
+    sdsfree(val);
+    fpFeedRequest(c, peer, set, sdslen(set), 1);
+    sdsfree(set);
+    fastpathSubmitPending(1);
+
+    long long base_evicted = server.stat_evictedclients;
+    EXPECT_EQ(fastpathDrain(), 1);
+    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);
+    EXPECT_EQ(cc->requests & CC_REQ_EVICT, (uint32_t)CC_REQ_EVICT);
+    robj *key = createStringObject("mmc:argv", 8);
+    EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr); /* the SET never ran */
+    decrRefCount(key);
+
+    EXPECT_EQ(fastpathProcessReturns(1), 1);
+    EXPECT_EQ(cc->lifecycle, FP_CLOSING);
+    EXPECT_TRUE(fpPeerHasNoReply(peer));
+    ASSERT_EQ(c->flag.fastpath, 1u);
+    fastpathHandoffDone(c, 1);
+    EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
+    fastpathWorkerReopen(1);
+    close(peer);
+    EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal);
+    fpDisableMaxmemory();
+}
+
+/* A partial command reaches main in no batch, yet its input counts: once the owner holds more than the
+ * whole limit for one client, main evicts it on its next drain instead of at the next cron pass. */
+TEST_F(FastpathClientControlTest, PartialCommandInputEvictsPromptly) {
+    size_t base_normal = server.stat_clients_type_memory[CLIENT_TYPE_NORMAL];
+    fpEnableMaxmemory(150000);
+    fastpathApplyMaxmemoryClients(1); /* publishes the limit the owner compares against */
+
+    int peer;
+    client *c = newFastpathClient(&peer);
+    ClientControl *cc = c->control;
+
+    /* A SET whose 300000-byte value stops 100000 bytes short. */
+    size_t sent_len = 200000;
+    sds req = sdsnew("*3\r\n$3\r\nSET\r\n$8\r\nmmc:part\r\n$300000\r\n");
+    sds part = fpMakeValue(sent_len);
+    req = sdscatlen(req, part, sdslen(part));
+    sdsfree(part);
+    fpFeedRequest(c, peer, req, sdslen(req), 0);
+    sdsfree(req);
+    EXPECT_EQ(c->fp_inflight, 0u);
+    EXPECT_GE(fastpathInputMem(cc), sent_len);
+
+    long long base_evicted = server.stat_evictedclients;
+    EXPECT_EQ(fastpathDrain(), 0); /* no batch, but the owner's hint is served */
+    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);
+    EXPECT_EQ(cc->requests & CC_REQ_EVICT, (uint32_t)CC_REQ_EVICT);
+
+    fastpathProcessReturns(1);
+    EXPECT_EQ(cc->lifecycle, FP_CLOSING);
+    ASSERT_EQ(c->flag.fastpath, 1u);
+    fastpathHandoffDone(c, 1);
+    EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
+    fastpathWorkerReopen(1);
+    close(peer);
     EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal);
     fpDisableMaxmemory();
 }

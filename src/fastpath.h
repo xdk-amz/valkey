@@ -69,6 +69,7 @@ typedef struct ClientControl {
     /* Consumer cache line: written only by the IO owner. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
     _Atomic(time_t) last_interaction; /* Sole writer the IO owner (main only at attach-init before transfer); unixtime of the last successful fast-path read, acquire-read by main for idle timeout. */
+    _Atomic(size_t) input_mem; /* Sole writer the IO owner (main only at attach-init before transfer): bytes of its private query buffer and of the arguments it holds, parsed or on main; read by main for maxmemory-clients. */
 } ClientControl;
 
 /* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
@@ -154,6 +155,7 @@ void fastpathControlReclaim(client *c);
 /* Reply bytes charged to a control but not yet released (produced - released). Read-only: reports the
  * outstanding external reply memory; it does not enforce COB or maxmemory-clients. */
 size_t fastpathReplyOutstanding(const ClientControl *cc);
+size_t fastpathInputMem(const ClientControl *cc);
 
 /* Acquire-loaded last-interaction unixtime for a control; read-only, main-only, never a connection deref. */
 time_t fastpathControlLastInteraction(const ClientControl *cc);
@@ -190,6 +192,7 @@ size_t fastpathEvictTopFromBucket(int bucket_idx);
  * every call so an in-flight terminal client's not-yet-removed memory is not counted as live pressure and
  * does not trigger collateral eviction of a healthy client. Reads only main-owned bookkeeping. */
 size_t fastpathTerminalPendingMem(void);
+int fastpathServeMemHints(void);
 
 /* Main-only introspection for tests: the total reply-memory estimate currently contributed by fast-path
  * entries to stat_clients_type_memory[CLIENT_TYPE_NORMAL]. Reads only main-owned bookkeeping. */

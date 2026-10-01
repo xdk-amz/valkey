@@ -7407,6 +7407,7 @@ size_t getClientEvictionLimit(void) {
 
 void evictClients(void) {
     if (!server.client_mem_usage_buckets) return;
+    fastpathServeMemHints(); /* input an IO thread just reported for a client over the limit */
     /* Start eviction from topmost bucket (largest clients) */
     int curr_bucket = CLIENT_MEM_USAGE_BUCKETS - 1;
     listIter bucket_iter;

@@ -84,6 +84,7 @@ typedef struct fpThread {
     uint32_t owner_slots_used;
     _Atomic int role; /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
     _Atomic int req_pending; /* set by any request publisher, cleared before the owner scans; a hint that some owned client has a pending CC_REQ_* */
+    _Atomic int mem_hint;    /* set by the IO thread when an owned client alone exceeds maxmemory-clients; main clears it and re-accounts */
     size_t main_clients;   /* main only: clients routed here and not yet taken back */
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
@@ -358,12 +359,22 @@ typedef struct FastpathLimitEntry {
     bool bucketed;                 /* True while bucket_node is linked in fp_mem_buckets; keeps link/unlink idempotent. */
     bool terminal_requested;       /* True once a terminal request was published for this entry, so it happens once. */
     bool terminal_pending_mem;     /* True while accounted_mem is pinned into fp_terminal_pending_mem; set once when terminal turns on while mem_accounted, cleared once at hand-off removal. */
+    bool no_evict;                 /* CLIENT NO-EVICT at attach; it runs only on main, so it holds while the client is IO-owned. */
 } FastpathLimitEntry;
 
 /* Main-only registry of limit entries for currently IO-owned connections; a later COB/maxmemory pass
  * iterates it without dereferencing any client. Needs no lock: only main links, unlinks and walks it.
  * A file-scope list is zero-initialized, which is a valid empty list. */
 static list fp_limit_registry;
+
+/* Client eviction limit, 0 when maxmemory-clients is off; main publishes it so an IO thread can tell
+ * when a client it owns exceeds the limit by itself. */
+static _Atomic size_t fp_evict_limit;
+
+static void fpPublishEvictLimit(void) {
+    size_t limit = server.maxmemory_clients ? getClientEvictionLimit() : 0;
+    atomic_store_explicit(&fp_evict_limit, limit, memory_order_relaxed);
+}
 
 /* Private fast-path size buckets, one list of FastpathLimitEntry per CLIENT_MEM_USAGE_BUCKETS class,
  * kept separate from server.client_mem_usage_buckets so fast-path entries never mix into normal client
@@ -421,9 +432,12 @@ static void fpMemAccountRemove(FastpathLimitEntry *e) {
  * A no-op before base capture, or once terminal so a closing entry's estimate stays frozen (and stays out
  * of any selectable bucket) until hand-off removes it. Main-only; reads only the control's acquire-loaded
  * counters. */
-static void fpMemAccountUpdate(FastpathLimitEntry *e) {
+/* in_floor: argument bytes main knows the client holds though its owner may not have published them yet. */
+static void fpMemAccountUpdateWith(FastpathLimitEntry *e, size_t in_floor) {
     if (e->terminal_requested || !e->base_captured) return;
-    size_t estimate = e->base_usage + fastpathReplyOutstanding(e->control);
+    size_t in = fastpathInputMem(e->control);
+    if (in < in_floor) in = in_floor;
+    size_t estimate = e->base_usage + fastpathReplyOutstanding(e->control) + in;
     size_t prev = e->mem_accounted ? e->accounted_mem : 0;
     server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] -= prev;
     server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] += estimate;
@@ -431,7 +445,7 @@ static void fpMemAccountUpdate(FastpathLimitEntry *e) {
     fp_normal_mem_contribution += estimate;
     e->accounted_mem = estimate;
     e->mem_accounted = true;
-    if (server.maxmemory_clients && server.client_mem_usage_buckets) {
+    if (server.maxmemory_clients && server.client_mem_usage_buckets && !e->no_evict) {
         int idx = fpMemBucketIndex(estimate);
         if (!e->bucketed) {
             listLinkNodeTail(&fp_mem_buckets[idx], &e->bucket_node);
@@ -448,6 +462,10 @@ static void fpMemAccountUpdate(FastpathLimitEntry *e) {
         listUnlinkNode(&fp_mem_buckets[e->bucket_index], &e->bucket_node);
         e->bucketed = false;
     }
+}
+
+static void fpMemAccountUpdate(FastpathLimitEntry *e) {
+    fpMemAccountUpdateWith(e, 0);
 }
 
 /* Common terminal mark for both the maxmemory EVICT and the COB CLOSE paths: flip terminal_requested
@@ -485,8 +503,12 @@ static void fpLimitRegistryInsert(client *c) {
     if (e->reg_state == FP_LIMIT_LINKED) return;
     /* Main still owns the client here: snapshot its base allocation and strip its normal accounting
      * before IO ownership is published, so the estimate has a base and the normal path double-counts
-     * neither the base nor a stale bucket membership. */
-    e->base_usage = getClientMemoryUsage(c, NULL);
+     * neither the base nor a stale bucket membership. The input side is left out of the base: the IO
+     * owner publishes it live. */
+    size_t base = getClientMemoryUsage(c, NULL);
+    size_t input = (c->querybuf ? sdsAllocSize(c->querybuf) : 0) + c->argv_len_sum + sizeof(robj *) * c->argc;
+    e->base_usage = base > input ? base - input : 0;
+    e->no_evict = c->flag.no_evict;
     e->base_captured = true;
     fpRemoveNormalAccounting(c);
     listLinkNodeTail(&fp_limit_registry, &e->reg_node);
@@ -579,8 +601,16 @@ static void fpLimitCheckIdleTimeout(FastpathLimitEntry *e) {
  * COB check and re-accounts the entry's maxmemory-clients estimate in one pass. Rotating head to tail
  * advances the cursor without a saved node a concurrent unlink could dangle. */
 void fastpathLimitsCron(void) {
+    fpPublishEvictLimit(); /* follows maxmemory when the limit is a percentage */
     size_t n = listLength(&fp_limit_registry);
     if (n == 0) return;
+    /* Input that reaches no batch, such as a partial command, is seen within a tick. */
+    if (server.maxmemory_clients) {
+        listIter li;
+        listNode *ln;
+        listRewind(&fp_limit_registry, &li);
+        while ((ln = listNext(&li)) != NULL) fpMemAccountUpdate(listNodeValue(ln));
+    }
     int hz = server.hz > 0 ? server.hz : 1;
     size_t budget = (n + (size_t)hz - 1) / (size_t)hz;
     if (budget > n) budget = n;
@@ -619,6 +649,7 @@ void fastpathApplyMaxmemoryClients(int enabled) {
      * reads the global to decide bucketing, and keeps each entry's stat contribution current either way,
      * so enabling rebuckets accounted entries and disabling only unbuckets them. */
     serverAssert((server.maxmemory_clients != 0) == (enabled != 0));
+    fpPublishEvictLimit();
     listIter li;
     listNode *ln;
     listRewind(&fp_limit_registry, &li);
@@ -674,6 +705,7 @@ int fastpathControlEnsure(client *c) {
     atomic_init(&cc->reply_bytes_produced, (size_t)0);
     atomic_init(&cc->reply_bytes_released, (size_t)0);
     atomic_init(&cc->last_interaction, (time_t)0);
+    atomic_init(&cc->input_mem, (size_t)0);
     cc->name = NULL;
     e->control = cc;
     e->bucketed = false; /* zcalloc already cleared base/accounted/reg state; a fresh entry names no bucket */
@@ -818,6 +850,7 @@ static void fpReplyChargeBatch(cmdBatch *b) {
             size_t produced = atomic_load_explicit(&cc->reply_bytes_produced, memory_order_relaxed);
             atomic_store_explicit(&cc->reply_bytes_produced, produced + bytes, memory_order_release);
             fpLimitHardCheck(cc); /* hard COB enforced once per charged group, before this batch is published back */
+            if (server.maxmemory_clients) fpMemAccountUpdate(cc->limit);
         }
         i = j;
     }
@@ -848,6 +881,36 @@ size_t fastpathReplyOutstanding(const ClientControl *cc) {
     return produced - released;
 }
 
+/* Argument bytes of a parsed command, counted the way getClientMemoryUsage counts them. */
+static inline size_t fpArgvBytes(size_t argv_len_sum, int argc) {
+    return argv_len_sum + sizeof(robj *) * (size_t)argc;
+}
+
+/* IO owner, outside a read: the query buffer is private or NULL here. */
+static size_t fpInputMem(const client *c) {
+    return (c->querybuf ? sdsAllocSize(c->querybuf) : 0) + fpArgvBytes(c->argv_len_sum, c->argc) +
+           c->fp_inflight_argv;
+}
+
+static void fpPublishInput(fpThread *t, client *c) {
+    size_t v = fpInputMem(c);
+    if (v != c->fp_input_published) {
+        c->fp_input_published = v;
+        atomic_store_explicit(&c->control->input_mem, v, memory_order_relaxed);
+    }
+    size_t limit = atomic_load_explicit(&fp_evict_limit, memory_order_relaxed);
+    if (!limit) return;
+    /* A client over the whole limit is evicted whatever the others hold, so main is told now. */
+    const FastpathLimitEntry *e = c->control->limit;
+    int over = !e->no_evict && e->base_usage + fastpathReplyOutstanding(c->control) + v > limit;
+    if (over && !c->fp_mem_hinted) atomic_store_explicit(&t->mem_hint, 1, memory_order_release);
+    c->fp_mem_hinted = (uint8_t)over;
+}
+
+size_t fastpathInputMem(const ClientControl *cc) {
+    return atomic_load_explicit(&cc->input_mem, memory_order_relaxed);
+}
+
 /* IO owner (and main at attach-init) writes the idle stamp with release so main's acquire load sees the latest interaction. */
 static void fpControlSetLastInteraction(ClientControl *cc, time_t t) {
     atomic_store_explicit(&cc->last_interaction, t, memory_order_release);
@@ -876,6 +939,10 @@ int fastpathAttach(client *c) {
     c->io_tid = tid;
     c->flag.fastpath = 1;
     c->fp_inflight = 0;
+    c->fp_inflight_argv = 0;
+    c->fp_input_published = 0;
+    c->fp_mem_hinted = 0;
+    atomic_store_explicit(&c->control->input_mem, (size_t)0, memory_order_relaxed);
     c->fp_held = 0;
     c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
@@ -1073,6 +1140,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->requeued = 0;
     e->woff = c->woff; /* prior causal state in; main executes against it and returns the resulting offset */
     c->fp_inflight++;
+    c->fp_inflight_argv += fpArgvBytes(argv_len_sum, argc);
 }
 
 /* The first unsupported command and all successors remain queued for main. */
@@ -1218,6 +1286,7 @@ static void fpRead(fpThread *t, int tid, client *c) {
         c->read_flags = 0;
     }
     trimClientQueryBuffer(c);
+    fpPublishInput(t, c);
 }
 
 /* Clients turned away by the thread's in-flight cap wait in arrival order. The socket stays
@@ -1388,9 +1457,11 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         int j = i;
         int requeued = 0;
         long long strand_woff = 0;
+        size_t strand_argv = 0;
         struct serverCommand *strand_last = NULL;
         while (j < b->count && b->e[j].handle.control == cc) {
             cmdEntry *e = &b->e[j];
+            strand_argv += fpArgvBytes(e->argv_len_sum, e->argc);
             if (!e->requeued && e->cmd) strand_last = e->cmd;
             if (e->requeued) {
                 requeued++;
@@ -1410,12 +1481,14 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             size_t released = n ? fpSend(t, c, iov, n) : 0;
             fpControlReleaseBytes(cc, released); /* resolved: the handle is current, so release directly */
             c->fp_inflight -= (j - i);
+            c->fp_inflight_argv -= strand_argv;
             c->commands_processed += (j - i) - requeued;
             if (strand_last) c->lastcmd = strand_last; /* CLIENT LIST cmd= */
             if (requeued) {
                 t->rq_gate += requeued; /* main handed these back unexecuted (a gate closed after admission) */
                 fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
             }
+            fpPublishInput(t, c);
         } else {
             /* A current handle always resolves in flight, so c==NULL implies stale: never write a reused control, but still balance a current-but-unresolved strand in release builds. */
             const ClientHandle *h = &b->e[i].handle;
@@ -1489,7 +1562,10 @@ static void fpCancelLeavingInCur(fpThread *t) {
             grp[n++] = b->e[j];
             b->e[j].handle.control = NULL;
         }
-        if (c) c->fp_inflight -= n;
+        if (c) {
+            c->fp_inflight -= n;
+            for (int k = 0; k < n; k++) c->fp_inflight_argv -= fpArgvBytes(grp[k].argv_len_sum, grp[k].argc);
+        }
         if (c && c->control->lifecycle == FP_CLOSING) {
             for (int k = 0; k < n; k++) {
                 for (int a = 0; a < grp[k].argc; a++) decrRefCount(grp[k].argv[a]);
@@ -1643,6 +1719,13 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         e->requeued = 1; /* a global gate closed since admission: main runs it under current eligibility */
         return;
     }
+    if (server.maxmemory_clients && e->handle.control) {
+        /* As on the main path, a client over the limit is evicted before its command runs. */
+        FastpathLimitEntry *limit = e->handle.control->limit;
+        fpMemAccountUpdateWith(limit, fpArgvBytes(e->argv_len_sum, e->argc));
+        evictClients();
+        if (limit->terminal_requested) goto release_argv;
+    }
 
     if (principal->flags & USER_FLAG_RETIRED) {
         /* The IO thread may have tagged this command under the retired rule set after the epoch
@@ -1742,8 +1825,27 @@ static void fpHoldBatch(fpThread *t, cmdBatch *b) {
     t->pending_count++;
 }
 
+/* A thread saw a client alone exceed maxmemory-clients: re-account now, not at the next tick, so the
+ * next eviction pass sees it. Returns 1 when it re-accounted. */
+int fastpathServeMemHints(void) {
+    if (ProcessingEventsWhileBlocked) return 0;
+    int hinted = 0;
+    for (int tid = 1; tid < fp_slots; tid++) {
+        _Atomic int *hint = &fp_threads[tid].mem_hint;
+        if (atomic_load_explicit(hint, memory_order_relaxed) && atomic_exchange_explicit(hint, 0, memory_order_acquire))
+            hinted = 1;
+    }
+    if (!hinted || !server.maxmemory_clients) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(&fp_limit_registry, &li);
+    while ((ln = listNext(&li)) != NULL) fpMemAccountUpdate(listNodeValue(ln));
+    return 1;
+}
+
 int fastpathDrain(void) {
     int total = 0;
+    if (fastpathServeMemHints()) evictClients();
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     /* While a global gate is closed (pause, failover, command filter, throttle) every entry is
      * handed back for the main path to run under current eligibility. */

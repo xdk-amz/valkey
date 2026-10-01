@@ -1531,6 +1531,9 @@ typedef struct client {
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
+    size_t fp_inflight_argv;              /* Fast path: argv bytes of those commands (IO thread only) */
+    size_t fp_input_published;            /* Fast path: input memory last published on the control (IO thread only) */
+    uint8_t fp_mem_hinted;                /* Fast path: main was told this client alone exceeds maxmemory-clients (IO thread only) */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
     uint8_t fp_deferred;                  /* Fast path: waiting in the owning IO thread's deferred FIFO. Not a flag bit: the IO thread writes it while main writes flag. */
     uint32_t fp_owner_slot;               /* Fast path: index in the owning IO thread's private connection table */
@@ -3340,6 +3343,7 @@ char *getClientTypeName(int client_class);
 void flushReplicasOutputBuffers(void);
 void disconnectReplicas(void);
 void evictClients(void);
+size_t getClientEvictionLimit(void);
 int listenToPort(connListener *fds);
 void pauseActions(pause_purpose purpose, mstime_t end, uint32_t actions);
 void unpauseActions(pause_purpose purpose);

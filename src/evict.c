@@ -36,6 +36,7 @@
 #include "dplus.h"
 #include "cluster_migrateslots.h"
 #include "io_threads.h"
+#include "fastpath.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -296,6 +297,8 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
             overhead += dc->last_memory_usage;
         }
     }
+    /* Likewise fast-path clients already evicted or closed whose IO thread has not handed them back. */
+    overhead += fastpathTerminalPendingMem();
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
 
     /* Pending off-main frees count as reclaimed so eviction does not over-evict. */
