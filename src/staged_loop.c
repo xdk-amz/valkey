@@ -12,6 +12,8 @@
 #include "phase_barrier.h"
 #include <sched.h>
 
+extern int ProcessingEventsWhileBlocked; /* networking.c */
+
 static poller *sl_poller = NULL;
 static phaseBarrier sl_barrier;
 static int sl_barrier_ready = 0;
@@ -23,6 +25,8 @@ static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequ
 static int sl_ae_fd = -1;    /* ae's own epoll fd, the single main-affinity entry */
 static int sl_warned = 0;
 static int sl_main_lane = 1; /* main takes a lane in APPLY phases */
+static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
+static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
 
 /* Enrollment: main writes the sequence a newly enrolled worker waits from, then bumps its generation,
  * then sets enrolled, all between phases. A worker adopts the sequence once per generation. */
@@ -177,6 +181,7 @@ static void stagedReconcile(aeEventLoop *el) {
         sl_ae_fd = -1;
         sl_on = 0;
         sl_want = 0;
+        sl_read_client = 0; /* its fd is still readable, so ae serves it on main */
         stagedSetWorkers(0);
         serverLog(LL_NOTICE, "Staged event loop stopped");
         return;
@@ -218,7 +223,7 @@ static void stagedReconcile(aeEventLoop *el) {
 static void collectFDs(aeEventLoop *el) {
     if (el->beforesleep) el->beforesleep(el);
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
-    long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending()) ? 0 : aeUsUntilEarliestTimer(el);
+    long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client) ? 0 : aeUsUntilEarliestTimer(el);
     int n = pollerGetNextBatch(sl_poller, timeout);
     if (n < 0) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
@@ -227,8 +232,19 @@ static void collectFDs(aeEventLoop *el) {
     if (el->aftersleep) el->aftersleep(el, n);
 }
 
+/* Main, at the start of a read phase: hand the waiting read to whichever worker drains first, which
+ * then claims fewer ready fds. */
+static void stagedQueueDeferredRead(void) {
+    if (!sl_read_client) return;
+    client *c = lookupClientByID(sl_read_client);
+    sl_read_client = 0;
+    if (!c || c->io_read_state != CLIENT_IDLE) return;
+    if (ioThreadsSendStagedRead(c) == C_OK && c->io_read_state == CLIENT_PENDING_IO) sl_read_queued = 1;
+}
+
 /* Read: IO threads read and parse ready clients, answer the leading reads, and batch the rest. */
 static void readPhase(void) {
+    stagedQueueDeferredRead();
     if (pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
     stagedRunPhase(STAGED_PHASE_READ);
 }
@@ -236,6 +252,10 @@ static void readPhase(void) {
 /* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
+    if (sl_read_queued) {
+        sl_read_queued = 0;
+        processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
+    }
     fastpathStagedExecute();
     if (ae_ready) aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
 }
@@ -289,6 +309,16 @@ void stagedDrainWorkers(void) {
 
 int stagedApplyReady(void) {
     return sl_on && !sl_depth && sl_workers > 0;
+}
+
+int stagedDeferRead(client *c) {
+    if (!sl_on || sl_depth || !sl_workers || ProcessingEventsWhileBlocked) return 0;
+    if (!c->flag.primary || !c->conn || server.repl_stream_reader) return 0;
+    if (c->flag.blocked || c->flag.unblocked || c->flag.close_asap || c->flag.lua_debug) return 0;
+    if (c->io_read_state != CLIENT_IDLE || c->io_write_state == CLIENT_PENDING_IO) return 0;
+    if (sl_read_client && sl_read_client != c->id) return 0;
+    sl_read_client = c->id;
+    return 1;
 }
 
 int stagedMainTakesLane(void) {
@@ -356,6 +386,10 @@ void stagedNestedIteration(void) {
 void stagedDrainWorkers(void) {
 }
 int stagedApplyReady(void) {
+    return 0;
+}
+int stagedDeferRead(client *c) {
+    UNUSED(c);
     return 0;
 }
 int stagedMainTakesLane(void) {

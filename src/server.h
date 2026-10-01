@@ -3176,6 +3176,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_DPLUS_SPECULATED (1 << 23) /* The IO thread already executed and replied to this read. */
+#define READ_FLAGS_DRAIN (1 << 24)            /* Read the socket repeatedly before parsing. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                     \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \

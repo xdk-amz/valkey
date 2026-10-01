@@ -1587,9 +1587,19 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
     if (io_ready_num <= tid) io_ready_num = tid + 1;
 }
 
+static int sendReadToIOThreads(client *c, int read_flags);
+
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
-    if (stagedLoopActive()) return C_ERR;
+    if (stagedLoopActive()) return stagedDeferRead(c) ? C_OK : C_ERR;
+    return sendReadToIOThreads(c, 0);
+}
+
+int ioThreadsSendStagedRead(client *c) {
+    return sendReadToIOThreads(c, READ_FLAGS_DRAIN);
+}
+
+static int sendReadToIOThreads(client *c, int read_flags) {
     /* Fake/teardown clients may have no connection; never offload those. */
     if (!c->conn) return C_ERR;
     /* If IO thread is still reading, return C_OK so the main thread does not race it. */
@@ -1612,7 +1622,7 @@ int trySendReadToIOThreads(client *c) {
      * During this phase, the main thread writes snapshot data directly via connWrite(). */
     if (c->slot_migration_job && !clusterSlotMigrationShouldInstallWriteHandler(c)) return C_ERR;
 
-    c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    c->read_flags = read_flags | (canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE);
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 

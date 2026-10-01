@@ -48,6 +48,9 @@ void initIOThreads(int prev_threads_num);
 void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
+/* Main, staged loop: queue a read that drains the socket before parsing; C_OK when queued or
+ * when the client is already busy with IO. */
+int ioThreadsSendStagedRead(client *c);
 int trySendWriteToIOThreads(client *c);
 void flushWriteSlab(void);
 /* Partitioned client sockets remain owned by one IO thread. */

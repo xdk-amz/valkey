@@ -22,6 +22,7 @@
 struct aeEventLoop;
 struct poller;
 struct phaseBarrier;
+struct client;
 
 /* Main loop: staged iterations while staged mode is wanted, stock ae iterations otherwise. */
 void stagedMain(struct aeEventLoop *el);
@@ -39,6 +40,9 @@ void stagedStopWorkers(void);
 
 /* Main: staged workers can take an APPLY phase now (staged on, not nested, workers enrolled). */
 int stagedApplyReady(void);
+/* Main: run the primary link's read in the next read phase on a worker, which reads and parses it;
+ * its commands run at the start of that iteration's write phase. 1 when deferred. */
+int stagedDeferRead(struct client *c);
 /* Main: main takes a lane in APPLY phases (it is not pinned onto a worker's CPUs). */
 int stagedMainTakesLane(void);
 /* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
