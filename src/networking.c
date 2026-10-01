@@ -4518,7 +4518,10 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
-        if (processCommandAndResetClient(c) == C_ERR) {
+        if (c->flag.primary && replApplyDefer(c)) {
+            c->flag.pending_command = 0;
+            commandProcessed(c);
+        } else if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
     }
@@ -4532,6 +4535,7 @@ int processPendingCommandAndInputBuffer(client *c) {
     if ((c->querybuf && sdslen(c->querybuf) > 0) || c->cmd_queue.off < c->cmd_queue.len) {
         return processInputBuffer(c);
     }
+    replApplyFlush(c);
     return C_OK;
 }
 
