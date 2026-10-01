@@ -93,7 +93,7 @@ start_server {tags {"fastpath maxmemory-clients external:skip tls:skip"} overrid
 
         set nc [fpmm_client]
         fpmm_wait_fastpath_clients 1
-        $nc select 0 ;# SELECT moves it off the fast path onto the normal main path
+        $nc client tracking on ;# tracking keeps it on the normal main path, unlike a transient SELECT
         assert_equal OK [$nc read]
         fpmm_wait_fastpath_clients 0
 
