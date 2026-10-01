@@ -401,11 +401,13 @@ TEST_F(FastpathClientControlTest, RequestPublishedByAnyoneExecutedOnlyByOwner) {
     fastpathProcessReturns(1);
     EXPECT_EQ(cc->lifecycle, FP_LEAVING);
 
+    /* Nothing is left for main, so the client rejoins the fast path at once. */
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
-    fastpathWorkerReopen(1);
-    close(peer);
-    freeClient(c);
+    EXPECT_EQ(c->flag.fastpath, 1u);
+    EXPECT_EQ(fastpathWorkerOwnedClients(1), 1u);
+    fastpathProcessReturns(1);
+    EXPECT_EQ(cc->lifecycle, FP_ACTIVE);
+    quiesceAndFree(c, peer);
 }
 
 /* Request precedence, idempotence, and coalescing on the control word itself: CLOSE is terminal and

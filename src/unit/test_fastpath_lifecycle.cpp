@@ -166,8 +166,8 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     EXPECT_EQ(fastpathWorkerReopen(1), 0);
 
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(c->flag.fastpath, 0u);
-    EXPECT_EQ(mainBuf(c), ":1\r\n:2\r\n:3\r\n");
+    EXPECT_EQ(c->flag.fastpath, 0u); /* the drained thread admits nothing, so it stays on main */
+    EXPECT_EQ(recv(peer), ":1\r\n:2\r\n:3\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));
     EXPECT_EQ(fastpathWorkerReopen(1), 1);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_OPEN);
@@ -203,7 +203,8 @@ TEST_F(FastpathLifecycleTest, QuiesceWaitsForInflightBatchThenCancelsTheRest) {
     EXPECT_EQ(fastpathDrain(), 0);
 
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(mainBuf(c), ":3\r\n:4\r\n");
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    EXPECT_EQ(recv(peer), ":3\r\n:4\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));
     EXPECT_EQ(fastpathWorkerReopen(1), 1);
     freeHandedOff(c, peer);
