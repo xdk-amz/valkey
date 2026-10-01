@@ -54,7 +54,6 @@
 #include "dplus.h"
 
 #include <limits.h>
-#include <stdalign.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -322,19 +321,27 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
-    /* D+ sharded version array: 256 shards, 8 per cache line = 2KB.
-     * Isolated from the read-hot header fields above (offsetof >= 128).
-     * IO threads read with acquire; main thread bumps with relaxed stores.
-     * Structural mutations (rehash/resize) bump ALL shards + release fence. */
-    alignas(64) dplusVersionArray versions;
+    /* Shard seqlocks for IO-thread speculative readers. Allocated only for a type
+     * with speculative_reads once speculative reads are enabled; NULL otherwise,
+     * in which case no reader walks this table and mutations publish nothing. */
+    dplusVersionArray *versions;
     void *metadata[];
 };
+
+/* Set once by hashtableEnableSpeculativeReads; never cleared. */
+static bool speculative_reads_enabled = false;
 
 /* Forward declarations for dplus version bump helpers (defined below). */
 static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash);
 static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash);
 static inline void dplusBracketAllBegin(hashtable *ht);
 static inline void dplusBracketAllEnd(hashtable *ht);
+
+/* Frees a bucket that a speculative walk may still hold; the free waits for
+ * walk quiescence on a table with versions. */
+static inline void freeReachableBucket(hashtable *ht, bucket *b) {
+    if (!ht->versions || !dplusDeferFreeRaw(b)) zfree(b);
+}
 
 
 struct iter {
@@ -513,32 +520,22 @@ static void swapTables(hashtable *ht) {
 /* Swaps the tables and frees the old table. */
 static void rehashingCompleted(hashtable *ht) {
     if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
+    /* A speculative walk may hold pointers into the old bucket array: the
+     * seqlock validates results, not the walk's memory safety. Drain in-flight
+     * speculation until the free and swap are done. */
+    bool exclusive = ht->tables[0] && ht->versions;
+    if (exclusive) dplusExclusiveEnter();
     if (ht->tables[0]) {
-        /* D+ EXPIRY-RACE FIX: a worker-side speculative walk
-         * (dplusSpeculateBatch → hashtableIncrementalFindInit/Step) may hold
-         * pointers into this bucket array RIGHT NOW — the seqlock versions
-         * validate results, not the walk's memory safety. Drain in-flight
-         * speculation and punt new attempts until the free+swap completes.
-         * Sub-µs when no walk is in flight; bounded by one GET otherwise.
-         * Rehash completion is rare relative to ops — perf-neutral.
-         * Found by the PX 5-10 expiry gauntlet leg: SIGSEGV in
-         * hashtableIncrementalFindStep under mass expiry, BOTH ownership
-         * modes (pre-existing D+ lineage bug). */
-        dplusExclusiveEnter();
         zfree(ht->tables[0]);
         if (ht->type->trackMemUsage) {
             ht->type->trackMemUsage(ht, -sizeof(bucket) * numBuckets(ht->bucket_exp[0]));
         }
-        swapTables(ht);
-        resetTable(ht, 1);
-        ht->rehash_idx = -1;
-        dplusExclusiveLeave();
-        return;
     }
 
     swapTables(ht);
     resetTable(ht, 1);
     ht->rehash_idx = -1;
+    if (exclusive) dplusExclusiveLeave();
 }
 
 /* Reverse bits, adapted to use bswap, from
@@ -632,13 +629,11 @@ static void dismissRehashedBucketsIfNeeded(hashtable *ht) {
  * handle the cleanup of old buckets, such as clearing presence bits. */
 static void rehashStepFinalize(hashtable *ht) {
     size_t idx = ht->rehash_idx;
-    /* Free child bucket. D+ entry-lifetime: defer past walk quiescence —
-     * incremental rehash steps run while walks are in flight (part-1's
-     * drain only covers rehash COMPLETION). */
+    /* Free child bucket. Incremental rehash steps run while walks are in flight. */
     bucket *b = getChildBucket(ht->tables[0] + idx);
     while (b != NULL) {
         bucket *next = getChildBucket(b);
-        if (!dplusDeferFreeRaw(b)) zfree(b);
+        freeReachableBucket(ht, b);
         if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
         ht->child_buckets[0]--;
         b = next;
@@ -1043,10 +1038,7 @@ static void pruneLastBucket(hashtable *ht, bucket *before_last, bucket *last, in
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(before_last, ENTRIES_PER_BUCKET - 1, last, pos_in_last);
     }
-    /* D+ entry-lifetime: a speculative walk may hold this chain bucket —
-     * defer the free past walk quiescence (falls back to zfree when no
-     * walkers can exist). See entry-lifetime-design.md. */
-    if (!dplusDeferFreeRaw(last)) zfree(last);
+    freeReachableBucket(ht, last);
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
     ht->child_buckets[table_index]--;
 }
@@ -1318,24 +1310,46 @@ void dplusVersionArrayInit(dplusVersionArray *va) {
     memset(va, 0, sizeof(*va));
 }
 
-/* S2.2: odd/even bracket wrappers (replace the single-bump wrappers).
- * Begin BEFORE the first mutating store, End AFTER the last. */
+/* Odd/even brackets: Begin before the first mutating store, End after the last.
+ * A table without versions has no concurrent readers and publishes nothing. */
 static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash) {
-    dplusVersionBracketBegin(&ht->versions, DPLUS_SHARD_INDEX(hash));
+    if (ht->versions) dplusVersionBracketBegin(ht->versions, DPLUS_SHARD_INDEX(hash));
 }
 static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash) {
-    dplusVersionBracketEnd(&ht->versions, DPLUS_SHARD_INDEX(hash));
+    if (ht->versions) dplusVersionBracketEnd(ht->versions, DPLUS_SHARD_INDEX(hash));
 }
 static inline void dplusBracketAllBegin(hashtable *ht) {
-    dplusVersionBracketAllBegin(&ht->versions);
+    if (ht->versions) dplusVersionBracketAllBegin(ht->versions);
 }
 static inline void dplusBracketAllEnd(hashtable *ht) {
-    dplusVersionBracketAllEnd(&ht->versions);
+    if (ht->versions) dplusVersionBracketAllEnd(ht->versions);
 }
 
-/* Public accessor for the version array pointer. */
+/* Returns the table's version array, or NULL when the table takes no speculative reads. */
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht) {
-    return &ht->versions;
+    return ht->versions;
+}
+
+static size_t versionsMemUsage(const hashtable *ht) {
+    return ht->versions ? sizeof(dplusVersionArray) : 0;
+}
+
+static void allocVersions(hashtable *ht) {
+    ht->versions = zmalloc_cache_aligned(sizeof(dplusVersionArray));
+    dplusVersionArrayInit(ht->versions);
+}
+
+/* From now on, tables of a type with speculative_reads get versions when created. */
+void hashtableEnableSpeculativeReads(void) {
+    speculative_reads_enabled = true;
+}
+
+/* Gives an existing table versions if its type takes speculative reads. Must run
+ * before any reader can reach the table. */
+void hashtableEnableVersions(hashtable *ht) {
+    if (ht->versions || !ht->type->speculative_reads) return;
+    allocVersions(ht);
+    if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, sizeof(dplusVersionArray));
 }
 
 /* Read-only find: same bucket walk as hashtableFind but does NOT call
@@ -1440,22 +1454,22 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
-    dplusVersionArrayInit(&ht->versions);
+    ht->versions = NULL;
+    if (type->speculative_reads && speculative_reads_enabled) allocVersions(ht);
     resetTable(ht, 0);
     resetTable(ht, 1);
-    if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size);
+    if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size + versionsMemUsage(ht));
     return ht;
 }
 
 /* Deletes all the entries. If a callback is provided, it is called from time
  * to time to indicate progress. */
 void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
-    /* D+ EXPIRY-RACE FIX (same class as rehashingCompleted): this frees both
-     * bucket arrays; a worker speculative walk may hold pointers into them.
-     * Exclusive mode is COUNTER-based, so this nests safely inside
-     * FLUSHALL's existing exclusive window and is safe from the BIO
-     * lazyfree thread concurrently with main. */
-    dplusExclusiveEnter();
+    /* This frees both bucket arrays, which a speculative walk may hold. Exclusive
+     * mode is counter based, so it nests inside FLUSHALL's own window and is safe
+     * from the lazyfree thread concurrently with main. */
+    bool exclusive = ht->versions != NULL;
+    if (exclusive) dplusExclusiveEnter();
     if (hashtableIsRehashing(ht)) {
         /* Pretend rehashing completed. */
         if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
@@ -1498,7 +1512,7 @@ void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
         }
         resetTable(ht, table_index);
     }
-    dplusExclusiveLeave();
+    if (exclusive) dplusExclusiveLeave();
 }
 
 /* Deletes all the entries and frees the table. */
@@ -1507,10 +1521,11 @@ void hashtableRelease(hashtable *ht) {
     hashtableEmpty(ht, NULL);
     /* Call trackMemUsage before zfree, so trackMemUsage can access ht. */
     if (ht->type->trackMemUsage) {
-        size_t alloc_size = sizeof(hashtable);
+        size_t alloc_size = sizeof(hashtable) + versionsMemUsage(ht);
         if (ht->type->getMetadataSize) alloc_size += ht->type->getMetadataSize();
         ht->type->trackMemUsage(ht, -alloc_size);
     }
+    zfree(ht->versions);
     zfree(ht);
 }
 
@@ -1560,7 +1575,7 @@ size_t hashtableMemUsage(const hashtable *ht) {
     size_t num_buckets = numBuckets(ht->bucket_exp[0]) + numBuckets(ht->bucket_exp[1]);
     num_buckets += ht->child_buckets[0] + ht->child_buckets[1];
     size_t metasize = ht->type->getMetadataSize ? ht->type->getMetadataSize() : 0;
-    return sizeof(hashtable) + metasize + sizeof(bucket) * num_buckets;
+    return sizeof(hashtable) + metasize + versionsMemUsage(ht) + sizeof(bucket) * num_buckets;
 }
 
 /* Pauses automatic shrinking. This can be called before deleting a lot of
@@ -1912,10 +1927,9 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
     int pos_in_bucket = p->pos_in_bucket;
     int table_index = p->table_index;
     assert(!isPositionFilled(b, pos_in_bucket));
-    /* S2.2 bracket: hash from entry key (hash bits already set by
-     * hashtableFindPositionForInsert). */
-    const void *key = entryGetKey(ht, entry);
-    uint64_t d_hash = hashKey(ht, key);
+    /* Hash bits are already set by hashtableFindPositionForInsert; the bracket
+     * needs the full hash, which the position does not carry. */
+    uint64_t d_hash = ht->versions ? hashKey(ht, entryGetKey(ht, entry)) : 0;
     dplusBracketShardBegin(ht, d_hash);
     b->presence |= (1 << pos_in_bucket);
     b->entries[pos_in_bucket] = entry;

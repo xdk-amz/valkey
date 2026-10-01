@@ -1219,6 +1219,7 @@ static int createIOThread(int id) {
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
     /* Publish a safe lifecycle state before the new thread can run. */
+    dplusEnableSpeculativeReads();
     dplusReaderWorkerOnline(id);
     io_worker_parked[id] = 1;
     atomic_store_explicit(&io_worker_state[id], IO_WORKER_RUNNING, memory_order_release);

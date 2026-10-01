@@ -96,5 +96,6 @@ void kvstoreHashtableTwoPhasePopDelete(kvstore *kvs, int didx, void *position);
 bool kvstoreHashtablePop(kvstore *kvs, int didx, const void *key, void **popped);
 bool kvstoreHashtableDelete(kvstore *kvs, int didx, const void *key);
 hashtable *kvstoreGetHashtable(kvstore *kvs, int didx);
+hashtable *kvstoreGetHashtableAcquire(kvstore *kvs, int didx);
 
 #endif /* KVSTORE_H */

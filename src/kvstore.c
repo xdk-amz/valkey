@@ -112,6 +112,11 @@ hashtable *kvstoreGetHashtable(kvstore *kvs, int didx) {
     return kvs->hashtables[didx];
 }
 
+/* For a reader on another thread than the owner: sees a new table fully initialized. */
+hashtable *kvstoreGetHashtableAcquire(kvstore *kvs, int didx) {
+    return __atomic_load_n(&kvs->hashtables[didx], __ATOMIC_ACQUIRE);
+}
+
 static hashtable **kvstoreGetHashtableRef(kvstore *kvs, int didx) {
     return &kvs->hashtables[didx];
 }
@@ -193,16 +198,18 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     if (ht) return ht;
 
-    kvs->hashtables[didx] = hashtableCreate(kvs->dtype);
-    kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(kvs->hashtables[didx]);
+    ht = hashtableCreate(kvs->dtype);
+    kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
     metadata->kvs = kvs;
     /* Memory is counted by kvstoreHashtableTrackMemUsage, but when it's invoked
      * by hashtableCreate above, we don't know which hashtable it is for, because
      * the metadata has yet been initialized. Account for the newly created
      * hashtable here instead. */
-    kvs->overhead_hashtable_lut += hashtableMemUsage(kvs->hashtables[didx]);
+    kvs->overhead_hashtable_lut += hashtableMemUsage(ht);
     kvs->allocated_hashtables++;
-    return kvs->hashtables[didx];
+    /* Release pairs with kvstoreGetHashtableAcquire in a speculative reader. */
+    __atomic_store_n(&kvs->hashtables[didx], ht, __ATOMIC_RELEASE);
+    return ht;
 }
 
 /* Called when the hashtable will delete entries, the function will check

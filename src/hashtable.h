@@ -80,6 +80,10 @@ typedef struct {
     size_t (*getMetadataSize)(void);
     /* Flag to disable incremental rehashing */
     unsigned instant_rehashing : 1;
+    /* IO threads may read entries concurrently with the owning thread once
+     * speculative reads are enabled; such tables publish mutations through a
+     * version array and defer bucket frees until readers are quiescent. */
+    unsigned speculative_reads : 1;
 
 } hashtableType;
 
@@ -171,6 +175,8 @@ bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, voi
 struct dplusVersionArray;
 typedef struct dplusVersionArray dplusVersionArray;
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
+void hashtableEnableSpeculativeReads(void);
+void hashtableEnableVersions(hashtable *ht);
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
 /* Iteration & scan */

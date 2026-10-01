@@ -78,6 +78,26 @@ uint64_t dplusStatsSum(size_t field_offset) {
 
 /* --- Component 4: Exclusive mode implementation --- */
 
+/* Speculation reads only the keyspace and never in cluster mode, so only keyspace
+ * tables carry versions, and only once an IO thread can exist. One way: tables
+ * keep their versions when IO threads scale down. Main only, before the first
+ * IO thread starts. */
+void dplusEnableSpeculativeReads(void) {
+    static int enabled = 0;
+    if (enabled || server.cluster_enabled) return;
+    enabled = 1;
+    hashtableEnableSpeculativeReads();
+    if (!server.db) return;
+    for (int i = 0; i < server.dbnum; i++) {
+        serverDb *db = server.db[i];
+        if (!db) continue;
+        for (int didx = 0; didx < kvstoreNumHashtables(db->keys); didx++) {
+            hashtable *ht = kvstoreGetHashtable(db->keys, didx);
+            if (ht) hashtableEnableVersions(ht);
+        }
+    }
+}
+
 /* A slot is published before its thread can read speculative pointers and is
  * excluded only after join, preventing slot-reuse ABA during runtime resize. */
 void dplusReaderWorkerOnline(int tid) {
@@ -560,7 +580,7 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* --- Phase 1: Collect eligible prefix keys into batch --- */
     serverDb *db = c->db;
     int dict_index = 0;
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+    hashtable *ht = kvstoreGetHashtableAcquire(db->keys, dict_index);
     if (!ht) goto out;
 
     dplusVersionArray *va = hashtableGetVersionArray(ht);

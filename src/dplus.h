@@ -76,6 +76,7 @@ extern _Atomic(int) dplus_exclusive_mode;
 
 /* IO-thread lifecycle hooks. A slot is initialized QUIESCENT before thread
  * creation and becomes OFFLINE only after pthread_join completes. */
+void dplusEnableSpeculativeReads(void);
 void dplusReaderWorkerOnline(int tid);
 void dplusReaderWorkerQuiescent(int tid);
 void dplusReaderWorkerOffline(int tid);

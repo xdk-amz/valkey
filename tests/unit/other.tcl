@@ -698,6 +698,12 @@ start_server {tags {"other external:skip"}} {
     test "Server can resize empty dict" {
         # Write and then delete 128 keys, creating an empty dict
         r flushall
+        set dbnum [expr {$::singledb ? 0 : 9}]
+        # The empty dict's fixed overhead, which includes the speculative-read
+        # version array when IO threads are enabled.
+        r set x a
+        r del x
+        set empty [dict get [r memory stats] db.$dbnum overhead.hashtable.main]
         for {set j 1} {$j <= 128} {incr j} {
             r set $j{b} a
         }
@@ -706,9 +712,8 @@ start_server {tags {"other external:skip"}} {
         }
         # The dict containing 128 keys must have expanded,
         # its hash table itself takes a lot more than 400 bytes
-        set dbnum [expr {$::singledb ? 0 : 9}]
         wait_for_condition 100 50 {
-            [dict get [r memory stats] db.$dbnum overhead.hashtable.main] < 400
+            [dict get [r memory stats] db.$dbnum overhead.hashtable.main] < $empty + 400
         } else {
             fail "dict did not resize in time"
         }

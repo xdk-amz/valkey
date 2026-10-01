@@ -710,6 +710,7 @@ hashtableType kvstoreKeysHashtableType = {
     .rehashingCompleted = kvstoreHashtableRehashingCompleted,
     .trackMemUsage = kvstoreHashtableTrackMemUsage,
     .getMetadataSize = kvstoreHashtableMetadataSize,
+    .speculative_reads = 1,
 };
 
 /* Kvstore->expires */
