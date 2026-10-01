@@ -2056,6 +2056,7 @@ struct valkeyServer {
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     int prefetch_ring_stride;                 /* Command ring: prefetch keys of one command in N (1 = every command) */
     int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
+    int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
     int io_batch_inflight;                    /* Fast path: batches in flight per IO thread */
     int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */

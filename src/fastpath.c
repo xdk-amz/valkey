@@ -123,6 +123,26 @@ size_t fastpathPendingBatches(int tid) {
     return (size_t)fp_threads[tid].pending_count;
 }
 
+int fastpathThreadIdle(int tid) {
+    fpThread *t = &fp_threads[tid];
+    if (t->submit.buffer == NULL) return 1;
+    if (spscBacklog(&t->ret) > 0) return 0; /* returns or requests to take */
+    if (atomic_load_explicit(&t->req_pending, memory_order_relaxed)) return 0;
+    if (atomic_load_explicit(&t->role, memory_order_relaxed) == FP_ROLE_QUIESCING) return 0;
+    /* A batch under assembly goes out on a later pass once the ring and the hold allow it; while main
+     * still has batches, the returns wake the thread. */
+    if (t->cur && t->cur->count > 0 && !t->cur_hold && spscBacklog(&t->submit) == 0) return 0;
+    return 1;
+}
+
+int fastpathMainHasWork(void) {
+    for (int tid = 1; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->submit.buffer && spscBacklog(&t->submit) > 0) return 1;
+    }
+    return 0;
+}
+
 static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     cmdBatch *b;
     if (t->nfree > 0) {
@@ -225,6 +245,7 @@ void fastpathWorkerQuiesce(int tid) {
     int expected = FP_ROLE_OPEN;
     atomic_compare_exchange_strong_explicit(&t->role, &expected, FP_ROLE_QUIESCING, memory_order_release,
                                             memory_order_relaxed);
+    ioThreadWake(tid);
 }
 
 /* Drained for main: the thread published DRAINED and main holds no reference or request for it. */
@@ -329,6 +350,7 @@ static void fpRetPublish(fpThread *t, client *c, uintptr_t tag) {
         return;
     }
     spscEnqueue(&t->ret, (void *)((uintptr_t)c | tag), true);
+    ioThreadWake((int)(t - fp_threads));
 }
 
 /* Both addresses are fixed for the life of the connection; a transport they cannot represent is not admitted. */
@@ -805,8 +827,10 @@ void fastpathControlRequest(ClientControl *cc, uint32_t req) {
      * request on its next pass without main walking into the owner's registry. owner_domain/owner_tid
      * are published by the owner with release at attach/handoff; a benign stale read only sets an extra
      * hint, which the scan clears harmlessly. */
-    if (cc->owner_domain == CC_OWNER_IO)
+    if (cc->owner_domain == CC_OWNER_IO) {
         atomic_store_explicit(&fp_threads[cc->owner_tid].req_pending, 1, memory_order_release);
+        ioThreadWake(cc->owner_tid);
+    }
 }
 
 /* Dominant pending request by precedence CLOSE > EVICT > HANDOFF > QUIESCE, EVICT immediate; 0 when no known bit is set, so an unknown future bit is not actioned. */
@@ -1021,6 +1045,7 @@ static void fpSubmit(fpThread *t) {
     if (!b || b->count == 0) return;
     t->cur = NULL;
     spscEnqueue(&t->submit, b, true);
+    ioThreadsWakeMain();
     t->inflight++;
     if (t->inflight > t->inflight_hwm) t->inflight_hwm = t->inflight; /* peak batch-queue depth */
     t->batches++;
@@ -1738,6 +1763,7 @@ int fastpathProcessReturns(int tid) {
                 /* Every referenced byte was sent or copied: main drops the references, still in flight. */
                 b->release = 1;
                 spscEnqueue(&t->submit, b, true);
+                ioThreadsWakeMain();
                 continue;
             }
             fpRecycleBatch(t, b);
@@ -1890,6 +1916,7 @@ release_argv:
 
 /* Overflowed detach requests take ring slots as they free up; the request's position is recorded then. */
 static void fpRetFlushOverflow(fpThread *t) {
+    int published = 0;
     while (listLength(t->ret_overflow) > 0 && spscFreeSlots(&t->ret) > 0) {
         listNode *ln = listFirst(t->ret_overflow);
         client *c = listNodeValue(ln);
@@ -1897,7 +1924,9 @@ static void fpRetFlushOverflow(fpThread *t) {
         spscEnqueue(&t->ret, (void *)((uintptr_t)c | FP_TAG_DETACH), true);
         ClientControl *cc = c->control;
         raxInsert(fp_detaching, (unsigned char *)&cc, sizeof(cc), (void *)t->ret.tail_local, NULL);
+        published = 1;
     }
+    if (published) ioThreadWake((int)(t - fp_threads));
 }
 
 /* Hold a fully executed and charged batch in the thread's main-only durability FIFO instead of returning it;
@@ -1997,7 +2026,7 @@ again:
             if (hold) fpHoldBatch(t, b);
             else spscEnqueue(&t->ret, b, false);
         }
-        spscCommit(&t->ret);
+        if (spscCommit(&t->ret)) ioThreadWake(tid);
     }
     if (deadline && total < enough && getMonotonicUs() < deadline) goto again;
     return total;
@@ -2021,6 +2050,7 @@ void fastpathReleaseDurableReplies(void) {
         t->pending_head = t->pending_tail = NULL;
         t->pending_count = 0;
         spscCommit(&t->ret); /* one publish per thread, matching the drain's release/commit ordering */
+        ioThreadWake(tid);
     }
 }
 

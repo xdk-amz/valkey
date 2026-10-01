@@ -310,3 +310,69 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         close $fd
     }
 }
+
+# CPU time the server process used, in clock ticks, from /proc/<pid>/stat.
+proc server_cpu_ticks {pid} {
+    set f [open /proc/$pid/stat r]
+    set stat [read $f]
+    close $f
+    # Fields after the parenthesized command: state is field 3, utime 14, stime 15.
+    regexp {\) (.*)$} $stat -> rest
+    set fields [split $rest " "]
+    return [expr {[lindex $fields 11] + [lindex $fields 12]}]
+}
+
+if {[file exists /proc/self/stat]} {
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    set pid [srv 0 pid]
+
+    # An idle thread that never blocks costs a core each, which is 2 seconds of CPU per thread here.
+    proc assert_idle_cpu {pid what} {
+        after 500
+        set before [server_cpu_ticks $pid]
+        after 2000
+        set used [expr {[server_cpu_ticks $pid] - $before}]
+        if {$used > 50} {
+            fail "$what: the idle server used $used CPU ticks in 2 seconds"
+        }
+    }
+
+    proc idle_clients {kind} {
+        set clients {}
+        for {set i 0} {$i < 10} {incr i} {
+            # No SELECT first, so the connection stays offloaded.
+            set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+            assert_equal {} [$rd get idle:$kind:$i]
+            lappend clients $rd
+        }
+        return $clients
+    }
+
+    test {Idle IO threads block when no client is connected} {
+        assert_idle_cpu $pid "no clients"
+    }
+
+    test {Idle server blocks with idle fast-path clients connected} {
+        set base [getInfoProperty [r info fastpath] fastpath_clients]
+        set clients [idle_clients fp]
+        wait_for_condition 50 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] >= $base + 10
+        } else {
+            fail "clients did not join the fast path"
+        }
+        assert_idle_cpu $pid "idle fast-path clients"
+        # A command after the idle period is still served.
+        assert_equal {} [[lindex $clients 0] get idle:after]
+        foreach rd $clients { $rd close }
+    }
+
+    test {Idle server blocks with idle partitioned clients connected} {
+        r config set io-threads-fast-path no
+        set clients [idle_clients part]
+        assert_idle_cpu $pid "idle partitioned clients"
+        assert_equal {} [[lindex $clients 0] get idle:after]
+        foreach rd $clients { $rd close }
+        r config set io-threads-fast-path yes
+    }
+}
+}

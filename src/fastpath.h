@@ -141,6 +141,10 @@ void fastpathAdmitReadBegin(int tid);
 void fastpathAdmitReadEnd(int tid);
 /* Main-only introspection for tests: batches this thread holds for the durability barrier, not yet delivered. */
 size_t fastpathPendingBatches(int tid);
+/* IO owner: nothing fast-path work could do now without a socket event or a wake from main. */
+int fastpathThreadIdle(int tid);
+/* Main: whether an IO thread submitted batches main has not drained. */
+int fastpathMainHasWork(void);
 
 /* Build a generation-checked handle for a control-bearing client. */
 ClientHandle fastpathHandleFor(client *c);

@@ -62,6 +62,13 @@ int partitionedClientHold(client *c);
 void ioThreadQueueReadCompletion(client *c);
 void reconcileLazyWrite(client *c);
 int ioThreadEpollFd(int tid);
+/* Main, after publishing work for thread tid: wakes it if it announced sleep. */
+void ioThreadWake(int tid);
+/* IO thread, after publishing results for main: wakes main if it announced sleep. */
+void ioThreadsWakeMain(void);
+/* beforeSleep: whether the event loop must poll without blocking; afterSleep clears the announcement. */
+int ioThreadsMainMustPoll(void);
+void ioThreadsMainAwake(void);
 void partitionedClientRelease(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);

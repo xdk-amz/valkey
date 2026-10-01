@@ -69,6 +69,8 @@ bool mpscEnqueue(mpscQueue *q, void *data, mpscTicket *ticket);
 /* Pops a batch of items from the queue.
  * Stops at the first empty slot. */
 size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs);
+/* Consumer side: whether a producer reserved a slot not yet dequeued (its data may still be landing). */
+bool mpscConsumerHasItem(mpscQueue *q);
 
 /* ==========================================================================
  * SPMC QUEUE (Single-Producer Multi-Consumer)
@@ -98,6 +100,9 @@ void spmcInit(spmcQueue *q, size_t queue_size);
 void spmcFree(spmcQueue *q);
 /* Returns true if the SPMC queue has no items */
 bool spmcIsEmpty(spmcQueue *q);
+/* Consumer side: whether an item is published at the head. May answer true for an item another consumer
+ * is taking at that moment, never false for one already published. */
+bool spmcConsumerHasItem(spmcQueue *q);
 /* Returns an approximate number of items currently in the queue */
 size_t spmcSize(spmcQueue *q);
 /* Pushes an item to the SPMC queue. Returns true on success, false if the queue is full. */
@@ -134,8 +139,8 @@ bool spscIsFull(spscQueue *q);
  * If commit is true, the tail pointer is updated immediately (visible to consumer) else,
  * only local index is updated (batching). */
 void spscEnqueue(spscQueue *q, void *data, bool commit);
-/* Publishes any pending batched enqueues by advancing the shared tail pointer */
-void spscCommit(spscQueue *q);
+/* Publishes any pending batched enqueues by advancing the shared tail pointer; true if it published any */
+bool spscCommit(spscQueue *q);
 
 /* Producer side: number of slots currently free. */
 size_t spscFreeSlots(spscQueue *q);

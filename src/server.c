@@ -2199,17 +2199,18 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         }
     }
 
-    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
-     * connection has pending data). Fast-path batches arrive on rings the
-     * event loop knows nothing about, so main polls while such clients exist. */
-    aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
-
     updateCopyAvoidPressure(current_time);
 
     if (strictOffloadActive()) processDeferredReads();
 
     ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
+
+    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
+     * connection has pending data). Results of offloaded clients arrive on
+     * rings the event loop does not watch, so main polls without blocking
+     * until it has been idle a while; then the IO threads wake it. */
+    aeSetDontWait(server.el, dont_sleep || ioThreadsMainMustPoll());
 
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
@@ -2247,6 +2248,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         }
         /* Set the eventloop start time. */
         server.el_start = getMonotonicUs();
+        ioThreadsMainAwake();
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
