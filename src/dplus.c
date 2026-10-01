@@ -784,8 +784,10 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         /* CRITICAL: clear pending_command — the parse path set it, and without
          * clearing it here the main thread's processPendingCommandAndInputBuffer
          * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
-         * (the removed main-side skip path used to clear this flag). */
-        c->flag.pending_command = 0;
+         * (the removed main-side skip path used to clear this flag). A fast-path
+         * client never has it set, and must not write flag: main writes other
+         * bits of the same word while the IO thread owns the client. */
+        if (c->flag.pending_command) c->flag.pending_command = 0;
         /* Free argv INLINE — do NOT call freeClientArgv() which routes through
          * tryOffloadFreeArgvToIOThreads(). That function increments the non-atomic
          * io_jobs_submitted from the IO thread (data race with main) and enqueues

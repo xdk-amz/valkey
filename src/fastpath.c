@@ -879,7 +879,7 @@ int fastpathAttach(client *c) {
     c->fp_held = 0;
     c->fp_owner_slot = FP_OWNER_SLOT_NONE;
     c->fp_out = NULL;
-    c->flag.fp_deferred = 0;
+    c->fp_deferred = 0;
     listInitNode(&c->fp_defer_node, c);
     /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
      * next writer of these fields. control->lifecycle is the single source of truth for the state. */
@@ -1024,9 +1024,9 @@ static void fpBeginLeave(fpThread *t, client *c, int state, int hold_cur) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
     epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_DEL, c->conn->fd, NULL);
-    if (c->flag.fp_deferred) {
+    if (c->fp_deferred) {
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
-        c->flag.fp_deferred = 0;
+        c->fp_deferred = 0;
     }
     listUnlinkNode(&t->owned, &c->io_owner_node);
     listLinkNodeTail(&t->leaving, &c->io_owner_node);
@@ -1224,8 +1224,8 @@ static void fpRead(fpThread *t, int tid, client *c) {
  * level-triggered readable, but the poll only enqueues it; reads come from the FIFO head as
  * returned batches free capacity, so service order does not follow the kernel's ready list. */
 static void fpDefer(fpThread *t, client *c) {
-    if (c->flag.fp_deferred) return;
-    c->flag.fp_deferred = 1;
+    if (c->fp_deferred) return;
+    c->fp_deferred = 1;
     t->deferrals++;
     listLinkNodeTail(&t->deferred, &c->fp_defer_node);
 }
@@ -1234,7 +1234,7 @@ static void fpServeDeferred(fpThread *t, int tid) {
     while (listLength(&t->deferred) > 0 && t->inflight < server.io_batch_inflight) {
         client *c = listNodeValue(listFirst(&t->deferred));
         listUnlinkNode(&t->deferred, &c->fp_defer_node);
-        c->flag.fp_deferred = 0;
+        c->fp_deferred = 0;
         if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) continue; /* still readable; the poll brings it back */
         fpRead(t, tid, c);
     }
@@ -1243,7 +1243,7 @@ static void fpServeDeferred(fpThread *t, int tid) {
 void fastpathClientReadable(int tid, client *c) {
     fpThread *t = &fp_threads[tid];
     if (c->control->lifecycle != FP_ACTIVE) return;
-    if (c->flag.fp_deferred) return; /* already waiting its turn */
+    if (c->fp_deferred) return; /* already waiting its turn */
     if (c->fp_inflight >= FP_CLIENT_INFLIGHT_MAX) return;
     if (t->inflight >= server.io_batch_inflight || listLength(&t->deferred) > 0) {
         fpDefer(t, c);
