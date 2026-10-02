@@ -47,11 +47,11 @@ static_assert(sizeof(ClientControl) == 3 * CACHE_LINE_SIZE, "identity/control li
 static_assert(offsetof(ClientControl, limit) + sizeof(struct FastpathLimitEntry *) <= CACHE_LINE_SIZE,
               "the limit pointer fits line-0 padding without growing the control");
 
-#define FP_RING_SIZE 1024        /* batches per ring; batches, not commands */
+#define FP_RING_SIZE 1024         /* batches per ring; batches, not commands */
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
-#define FP_FREELIST_IDLE 4 /* batches a thread with nothing in flight keeps pooled */
-#define FP_CLIENT_INFLIGHT_MAX 256 /* commands of one client on main at once */
+#define FP_FREELIST_IDLE 4           /* batches a thread with nothing in flight keeps pooled */
+#define FP_CLIENT_INFLIGHT_MAX 256   /* commands of one client on main at once */
 #define FP_TAG_DETACH ((uintptr_t)1) /* return-ring entry is a client to close, not a batch */
 #define FP_TAG_ATTACH ((uintptr_t)2) /* return-ring entry is a client the IO thread takes ownership of */
 #define FP_TAGS (FP_TAG_DETACH | FP_TAG_ATTACH)
@@ -72,36 +72,36 @@ typedef struct fpThread {
     cmdBatch *cur;    /* batch being assembled */
     cmdBatch *freelist[FP_FREELIST_MAX];
     int nfree;
-    int inflight;     /* batches submitted, not yet returned */
-    int cur_hold;     /* cur holds entries of a client that left behind held commands; cancelled once nothing is in flight */
-    int quiescing;    /* IO thread only: quiesce observed, every owned client marked leaving */
-    list owned;       /* IO thread only: clients this thread reads; registry with leaving */
-    list leaving;     /* IO thread only: clients whose entries must return before hand-off or close */
-    list deferred;    /* IO thread only: readable clients the in-flight cap turned away, oldest first */
-    monotime cron_at; /* IO thread only: last pass of the owner's share of clientsCron */
-    rax *registry;    /* IO thread only: lifecycle membership for owned + leaving clients */
+    int inflight;             /* batches submitted, not yet returned */
+    int cur_hold;             /* cur holds entries of a client that left behind held commands; cancelled once nothing is in flight */
+    int quiescing;            /* IO thread only: quiesce observed, every owned client marked leaving */
+    list owned;               /* IO thread only: clients this thread reads; registry with leaving */
+    list leaving;             /* IO thread only: clients whose entries must return before hand-off or close */
+    list deferred;            /* IO thread only: readable clients the in-flight cap turned away, oldest first */
+    monotime cron_at;         /* IO thread only: last pass of the owner's share of clientsCron */
+    rax *registry;            /* IO thread only: lifecycle membership for owned + leaving clients */
     fpOwnerSlot *owner_slots; /* IO thread only: O(1) handle-to-connection resolution */
     uint32_t owner_slots_len;
     uint32_t owner_slots_cap;
     uint32_t owner_slots_free;
     uint32_t owner_slots_used;
-    _Atomic int role; /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
+    _Atomic int role;        /* FP_ROLE_*: main stores OPEN and QUIESCING, the IO thread stores DRAINED */
     _Atomic int req_pending; /* set by any request publisher, cleared before the owner scans; a hint that some owned client has a pending CC_REQ_* */
     _Atomic int mem_hint;    /* set by the IO thread when an owned client alone exceeds maxmemory-clients; main clears it and re-accounts */
-    size_t main_clients;   /* main only: clients routed here and not yet taken back */
-    size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
-    list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
-    cmdBatch *pending_head; /* main only: FIFO head of batches held for appendfsync-always durability */
-    cmdBatch *pending_tail; /* main only: FIFO tail of the held-batch list */
-    int pending_count;      /* main only: held batches awaiting the post-fsync release */
+    size_t main_clients;     /* main only: clients routed here and not yet taken back */
+    size_t detach_pending;   /* main only: detach requests the IO thread has not consumed */
+    list *ret_overflow;      /* main only: detach requests a full ret ring could not take */
+    cmdBatch *pending_head;  /* main only: FIFO head of batches held for appendfsync-always durability */
+    cmdBatch *pending_tail;  /* main only: FIFO tail of the held-batch list */
+    int pending_count;       /* main only: held batches awaiting the post-fsync release */
     long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals, speculated;
     /* Observability: why a client/command left the fast path, and batch-queue pressure. IO-owner-only,
      * incremented on a decision the owner already makes, so no extra hot-path work. */
-    long long fb_gate;      /* commands that stayed on / returned to main because a dynamic gate was closed at harvest */
+    long long fb_gate;       /* commands that stayed on / returned to main because a dynamic gate was closed at harvest */
     long long fb_ineligible; /* commands not admitted because their command flags are fast-path ineligible */
-    long long fb_error;     /* commands left on main because the read carried a parse/protocol error */
-    long long rq_gate;      /* entries main handed back unexecuted because a gate closed after admission */
-    long long inflight_hwm; /* high-water mark of batches submitted-but-not-returned (queue depth pressure) */
+    long long fb_error;      /* commands left on main because the read carried a parse/protocol error */
+    long long rq_gate;       /* entries main handed back unexecuted because a gate closed after admission */
+    long long inflight_hwm;  /* high-water mark of batches submitted-but-not-returned (queue depth pressure) */
     /* acl-offload: admission-read seqlock. The IO owner makes this odd around the region of a read
      * that dereferences a bound user's rule set (ACL tagging), and even otherwise. Main bumps the
      * ACL epoch, then waits (fastpathAdmissionQuiesce) until this is even or has advanced past the
@@ -112,8 +112,8 @@ typedef struct fpThread {
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
 static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per IO thread */
-static size_t fastpath_clients = 0;                 /* main thread only */
-static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
+static size_t fastpath_clients = 0;                /* main thread only */
+static int fp_slots = 0;                           /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
 static long long fp_retired[12]; /* main thread only: counters of threads since retired */
 
@@ -305,7 +305,7 @@ void fastpathAdmissionQuiesce(void) {
         fpThread *t = &fp_threads[tid];
         if (t->submit.buffer == NULL) continue;
         uint32_t seen = atomic_load_explicit(&t->admit_seq, memory_order_seq_cst);
-        if (!(seen & 1u)) continue; /* not inside an admission read */
+        if (!(seen & 1u)) continue;                                                 /* not inside an admission read */
         while (atomic_load_explicit(&t->admit_seq, memory_order_acquire) == seen) { /* spin: that read is still live */
         }
     }
@@ -434,8 +434,10 @@ static int fpMemBucketIndex(size_t mem) {
     int size_in_bits = 8 * (int)sizeof(mem);
     int clz = mem > 0 ? __builtin_clzl(mem) : size_in_bits;
     int idx = size_in_bits - clz;
-    if (idx > CLIENT_MEM_USAGE_BUCKET_MAX_LOG) idx = CLIENT_MEM_USAGE_BUCKET_MAX_LOG;
-    else if (idx < CLIENT_MEM_USAGE_BUCKET_MIN_LOG) idx = CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
+    if (idx > CLIENT_MEM_USAGE_BUCKET_MAX_LOG)
+        idx = CLIENT_MEM_USAGE_BUCKET_MAX_LOG;
+    else if (idx < CLIENT_MEM_USAGE_BUCKET_MIN_LOG)
+        idx = CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
     return idx - CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
 }
 
@@ -548,7 +550,7 @@ static void fpLimitRegistryInsert(client *c) {
     fpRemoveNormalAccounting(c);
     listLinkNodeTail(&fp_limit_registry, &e->reg_node);
     e->reg_state = FP_LIMIT_LINKED;
-    e->terminal_requested = false; /* fresh IO ownership epoch: no terminal published for this attach yet */
+    e->terminal_requested = false;                            /* fresh IO ownership epoch: no terminal published for this attach yet */
     e->soft_breaching = c->obuf_soft_limit_reached_time != 0; /* import the normal-path soft timer so a breach in progress is not evaded by crossing */
     e->soft_first_breach_time = c->obuf_soft_limit_reached_time;
 }
@@ -559,8 +561,8 @@ static void fpLimitRegistryRemove(client *c) {
     if (!c->control) return;
     FastpathLimitEntry *e = c->control->limit;
     if (!e || e->reg_state != FP_LIMIT_LINKED) return;
-    fpMemAccountRemove(e); /* remove the fast-path aggregate/bucket contribution before normal maintenance resumes */
-    e->base_captured = false; /* the base snapshot belongs to this ownership epoch only */
+    fpMemAccountRemove(e);                                                               /* remove the fast-path aggregate/bucket contribution before normal maintenance resumes */
+    e->base_captured = false;                                                            /* the base snapshot belongs to this ownership epoch only */
     c->obuf_soft_limit_reached_time = e->soft_breaching ? e->soft_first_breach_time : 0; /* hand the soft timer back so breach timing survives the handoff */
     listUnlinkNode(&fp_limit_registry, &e->reg_node);
     e->reg_state = FP_LIMIT_UNLINKED;
@@ -655,7 +657,7 @@ void fastpathLimitsCron(void) {
         listRotateHeadToTail(&fp_limit_registry);
         fpLimitCheckEntry(e);
         fpLimitCheckIdleTimeout(e); /* one idle-timeout check per entry visit, after the COB check so a COB close keeps its reason */
-        fpMemAccountUpdate(e); /* a COB close set terminal_requested, which this skips, so the estimate freezes for hand-off */
+        fpMemAccountUpdate(e);      /* a COB close set terminal_requested, which this skips, so the estimate freezes for hand-off */
     }
 }
 
@@ -672,7 +674,7 @@ size_t fastpathEvictTopFromBucket(int bucket_idx) {
     if (!head) return 0;
     FastpathLimitEntry *e = listNodeValue(head);
     size_t freed = e->accounted_mem; /* the estimate in the NORMAL aggregate; the hand-off removes the same amount */
-    if (fpMarkTerminal(e)) { /* unlinks it from the bucket and pins it pending; a COB-closing entry is not re-published */
+    if (fpMarkTerminal(e)) {         /* unlinks it from the bucket and pins it pending; a COB-closing entry is not re-published */
         server.stat_evictedclients++;
         fastpathControlRequest(e->control, CC_REQ_EVICT);
     }
@@ -802,7 +804,7 @@ void fastpathControlReclaim(client *c) {
     serverAssert(fastpathControlReclaimable(c->control));
     FastpathLimitEntry *e = c->control->limit;
     serverAssert(e && e->reg_state == FP_LIMIT_UNLINKED); /* a still-registered entry means a hand-off did not remove it */
-    zfree(e); /* freed exactly once, with its control */
+    zfree(e);                                             /* freed exactly once, with its control */
     zfree(c->control);
     c->control = NULL;
 }
@@ -824,10 +826,10 @@ void fastpathControlRequest(ClientControl *cc, uint32_t req) {
     uint32_t cur = atomic_load_explicit(&cc->requests, memory_order_relaxed);
     uint32_t next;
     do {
-        if (cur & CC_REQ_CLOSE) return;         /* already closing; nothing outranks it */
+        if (cur & CC_REQ_CLOSE) return; /* already closing; nothing outranks it */
         next = cur | req;
         if (req & CC_REQ_CLOSE) next = CC_REQ_CLOSE; /* drop the bits CLOSE supersedes */
-        if (next == cur) return;                /* idempotent: bit already present */
+        if (next == cur) return;                     /* idempotent: bit already present */
     } while (!atomic_compare_exchange_weak_explicit(&cc->requests, &cur, next, memory_order_release,
                                                     memory_order_relaxed));
     /* Signal the owning IO thread so an idle owner (no traffic, nothing in flight) still observes the
@@ -1021,7 +1023,7 @@ int fastpathAttach(client *c) {
     listInitNode(&c->fp_defer_node, c);
     /* Main publishes IO ownership before the ring entry hands the connection over; the IO thread is the
      * next writer of these fields. control->lifecycle is the single source of truth for the state. */
-    fpLimitRegistryInsert(c); /* register before ownership is published, so a pass never meets an unregistered owned client */
+    fpLimitRegistryInsert(c);                                     /* register before ownership is published, so a pass never meets an unregistered owned client */
     fpControlSetLastInteraction(c->control, c->last_interaction); /* publish the idle stamp from main-owned state before the transfer */
     fpPublishBuffers(c);
     c->control->owner_domain = CC_OWNER_IO;
@@ -1054,10 +1056,10 @@ int fastpathAttach(client *c) {
  * Both are pure reads of a few globals: no locks, allocations, lookups or handshakes on the hot path. */
 static int fpDynamicGate(void) {
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused: main postpones */
-    if (server.failover_state != NO_FAILOVER) return 0;  /* coordinated failover: writes belong on main */
-    if (moduleHasCommandFilters()) return 0;             /* a filter may rewrite/redirect any command */
-    if (throttle_active()) return 0;                     /* main runs the throttle check */
-    if (bgIteration_iterationActive()) return 0;         /* a write may wait for the iterator, as its own client */
+    if (server.failover_state != NO_FAILOVER) return 0;                                 /* coordinated failover: writes belong on main */
+    if (moduleHasCommandFilters()) return 0;                                            /* a filter may rewrite/redirect any command */
+    if (throttle_active()) return 0;                                                    /* main runs the throttle check */
+    if (bgIteration_iterationActive()) return 0;                                        /* a write may wait for the iterator, as its own client */
     if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
         !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS))
         return 0; /* a yielding module postpones commands until it returns */
@@ -1065,7 +1067,7 @@ static int fpDynamicGate(void) {
 }
 
 static int fpCommandAllowed(struct serverCommand *cmd) {
-    if (!cmd) return 0; /* unknown command: the main path replies (and runs the host:/post check) */
+    if (!cmd) return 0;                     /* unknown command: the main path replies (and runs the host:/post check) */
     if (cmd->proc == pingCommand) return 1; /* fast-path clients are never in pubsub mode */
     if (!(cmd->flags & (CMD_WRITE | CMD_READONLY))) return 0;
     if (cmd->flags & (CMD_BLOCKING | CMD_PUBSUB | CMD_ADMIN | CMD_NOSCRIPT | CMD_NO_MULTI | CMD_NO_ASYNC_LOADING |
@@ -1187,14 +1189,14 @@ static void fpExecuteRequests(fpThread *t, client *c) {
     if (reqs == 0) return;
     uint32_t win = fpRequestWinner(reqs);
     if (win == 0) return; /* only unknown future bits set: neither leave the client nor clear them */
-    if (cc->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
+    if (cc->lifecycle == FP_ACTIVE)
+        fpBeginLeave(t, c, (win & CC_REQ_TERMINAL) ? FP_CLOSING : FP_LEAVING, 1);
     else if ((win & CC_REQ_TERMINAL) && cc->lifecycle == FP_LEAVING)
         cc->lifecycle = FP_CLOSING;
     atomic_fetch_and_explicit(&cc->requests, ~win, memory_order_release);
 }
 
-static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
-                          unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
+static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
     e->handle = fastpathHandleFor(c);
     e->argv = argv;
@@ -1240,7 +1242,10 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     if (!leave && c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
         if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
-            if (c->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
+            if (c->read_flags & READ_FLAGS_ERROR_MASK)
+                t->fb_error++;
+            else
+                t->fb_ineligible++;
         } else {
             if (!acl_stop) {
                 aclOffloadTagCommand(c, c->parsed_cmd, c->argv, c->argc, c->db->id, &c->read_flags);
@@ -1275,7 +1280,10 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
         if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
             leave = 1;
-            if (p->read_flags & READ_FLAGS_ERROR_MASK) t->fb_error++; else t->fb_ineligible++;
+            if (p->read_flags & READ_FLAGS_ERROR_MASK)
+                t->fb_error++;
+            else
+                t->fb_ineligible++;
             break;
         }
         if (!acl_stop) {
@@ -1427,8 +1435,10 @@ static int fpFlushOut(fpThread *t, client *c) {
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
             /* Fatal socket: force FP_CLOSING so fpFinishLeaving stops retrying; fpBeginLeave no-ops once past FP_ACTIVE. */
-            if (c->control->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, FP_CLOSING, 0);
-            else c->control->lifecycle = FP_CLOSING;
+            if (c->control->lifecycle == FP_ACTIVE)
+                fpBeginLeave(t, c, FP_CLOSING, 0);
+            else
+                c->control->lifecycle = FP_CLOSING;
             return 0;
         }
         t->net_output_bytes += n;
@@ -1458,8 +1468,10 @@ static size_t fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     if (written < 0) {
         if (errno != EAGAIN && errno != EINTR) {
             /* Fatal write must reach FP_CLOSING even past FP_ACTIVE, so a discarded reply cannot hand off a live connection; fpBeginLeave no-ops once leaving. */
-            if (c->control->lifecycle == FP_ACTIVE) fpBeginLeave(t, c, FP_CLOSING, 0);
-            else c->control->lifecycle = FP_CLOSING;
+            if (c->control->lifecycle == FP_ACTIVE)
+                fpBeginLeave(t, c, FP_CLOSING, 0);
+            else
+                c->control->lifecycle = FP_CLOSING;
             return fpIovLen(iov, iovcnt); /* whole group discarded, released once by the caller */
         }
         written = 0;
@@ -1604,8 +1616,10 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
                 if (e->requeued) continue;
                 char *region = e->reply_big ? e->reply_big : b->arena + e->reply_off;
                 size_t len = e->reply_big ? e->reply_big_len : e->reply_len;
-                if (e->reply_encoded) replyRegionWalk(region, len, fpOutAdd, &out);
-                else fpOutAdd(&out, region, len, 0);
+                if (e->reply_encoded)
+                    replyRegionWalk(region, len, fpOutAdd, &out);
+                else
+                    fpOutAdd(&out, region, len, 0);
             }
             fpOutFlush(&out);
             fpControlReleaseBytes(cc, out.released); /* resolved: the handle is current, so release directly */
@@ -1614,7 +1628,7 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
             c->commands_processed += (j - i) - requeued;
             if (strand_last) c->lastcmd = strand_last; /* CLIENT LIST cmd= */
             if (requeued) {
-                t->rq_gate += requeued; /* main handed these back unexecuted (a gate closed after admission) */
+                t->rq_gate += requeued;                         /* main handed these back unexecuted (a gate closed after admission) */
                 fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
             }
             fpPublishInput(t, c);
@@ -2005,8 +2019,10 @@ static void fpRetFlushOverflow(fpThread *t) {
  * one batch every later batch of the same drain is held behind it, so the owner ring stays per-thread FIFO. */
 static void fpHoldBatch(fpThread *t, cmdBatch *b) {
     b->pending_next = NULL;
-    if (t->pending_tail) t->pending_tail->pending_next = b;
-    else t->pending_head = b;
+    if (t->pending_tail)
+        t->pending_tail->pending_next = b;
+    else
+        t->pending_head = b;
     t->pending_tail = b;
     t->pending_count++;
 }
@@ -2094,8 +2110,10 @@ again:
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
-            if (hold) fpHoldBatch(t, b);
-            else spscEnqueue(&t->ret, b, false);
+            if (hold)
+                fpHoldBatch(t, b);
+            else
+                spscEnqueue(&t->ret, b, false);
         }
         if (spscCommit(&t->ret)) ioThreadWake(tid);
     }
@@ -2132,7 +2150,7 @@ void fastpathRequestDetach(client *c) {
     if (c->flag.fp_detach_sent) return;
     c->flag.fp_detach_sent = 1;
     fastpathControlRequest(c->control, CC_REQ_CLOSE); /* record the terminal request on the control; the ring carries the pointer safely */
-    fastpathControlPin(c, CC_PIN_DETACH); /* a detach record now sits in the ring; hold until the owner consumes it */
+    fastpathControlPin(c, CC_PIN_DETACH);             /* a detach record now sits in the ring; hold until the owner consumes it */
     t->detach_pending++;
     if (!fp_detaching) fp_detaching = raxNew();
     ClientControl *cc = c->control;
@@ -2218,10 +2236,10 @@ void fastpathHandoffDone(client *c, int closing) {
     c->control->owner_domain = CC_OWNER_MAIN;
     c->control->owner_tid = 0;
     c->control->lifecycle = FP_DETACHED;
-    c->control->name = NULL; /* main owns the name again; SETNAME may now replace it */
+    c->control->name = NULL;                                          /* main owns the name again; SETNAME may now replace it */
     c->last_interaction = fastpathControlLastInteraction(c->control); /* acquire the IO owner's stamp back before normal idle-timeout maintenance resumes */
-    fastpathControlUnpin(c, CC_PIN_OWNER); /* IO no longer owns it; drop the ownership pin as main takes over */
-    fpLimitRegistryRemove(c); /* main owns it again; unlink before normal-client maintenance resumes */
+    fastpathControlUnpin(c, CC_PIN_OWNER);                            /* IO no longer owns it; drop the ownership pin as main takes over */
+    fpLimitRegistryRemove(c);                                         /* main owns it again; unlink before normal-client maintenance resumes */
     fastpath_clients--;
     ACLFastpathClientReturned(c);
     /* The IO owner already released this residue's fast-path charge at hand-off; here it only moves bytes. */

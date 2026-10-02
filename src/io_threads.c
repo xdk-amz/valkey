@@ -296,7 +296,7 @@ typedef struct freeSlab {
 } freeSlab;
 
 static freeSlab *cur_free_slab = NULL;       /* accumulating; main-thread only */
-static mstime_t cur_free_slab_ms = 0; /* server.mstime when the current slab was opened */
+static mstime_t cur_free_slab_ms = 0;        /* server.mstime when the current slab was opened */
 static freeSlab **pending_free_slabs = NULL; /* full slabs the ring rejected */
 static size_t pending_free_slabs_len = 0;
 static size_t pending_free_slabs_cap = 0;
@@ -343,13 +343,23 @@ size_t offloadPendingFreeBytes(void) {
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
 /* A fired debug guard means a routed terminal free fell back to main. */
 static _Thread_local int never_free_armed = 0;
-void armNoMainThreadFree(void) { never_free_armed = 1; }
-void disarmNoMainThreadFree(void) { never_free_armed = 0; }
-int noMainThreadFreeArmed(void) { return never_free_armed; }
+void armNoMainThreadFree(void) {
+    never_free_armed = 1;
+}
+void disarmNoMainThreadFree(void) {
+    never_free_armed = 0;
+}
+int noMainThreadFreeArmed(void) {
+    return never_free_armed;
+}
 #else
-void armNoMainThreadFree(void) {}
-void disarmNoMainThreadFree(void) {}
-int noMainThreadFreeArmed(void) { return 0; }
+void armNoMainThreadFree(void) {
+}
+void disarmNoMainThreadFree(void) {
+}
+int noMainThreadFreeArmed(void) {
+    return 0;
+}
 #endif
 
 /* Full private inboxes park whole free slabs for the next beforeSleep pass. */
@@ -394,7 +404,7 @@ static void slabAppendFree(void *ptr, int is_obj) {
 #define SLAB_FLUSH_THRESHOLD 128
 #define SLAB_WRITE ((uintptr_t)1)
 #define SLAB_REARM ((uintptr_t)2)
-#define SLAB_LAZY ((uintptr_t)4)  /* completion needs no response unless something went wrong */
+#define SLAB_LAZY ((uintptr_t)4)   /* completion needs no response unless something went wrong */
 #define SLAB_NOTIFY ((uintptr_t)8) /* set by the IO thread: this entry does need main */
 #define SLAB_TAGS (SLAB_WRITE | SLAB_REARM | SLAB_LAZY | SLAB_NOTIFY)
 typedef struct writeSlab {
@@ -536,9 +546,9 @@ void armPartitionedClientRead(client *c) {
     if (!c->flag.blocked) {
         /* Blocked clients keep reading without parsing so partial commands can complete. */
         if (c->cmd_queue.off < c->cmd_queue.len) return; /* commands still to execute */
-        if (c->flag.pending_command) return;            /* a complete command still in argv */
+        if (c->flag.pending_command) return;             /* a complete command still in argv */
     }
-    if (server.active_io_threads_num <= 1) return;   /* threads mid-scale; clientsCron retries */
+    if (server.active_io_threads_num <= 1) return; /* threads mid-scale; clientsCron retries */
     setClientReadFlagsForOffload(c);
     c->flag.pending_read = 1;
     server.stat_io_reads_pending++;
@@ -692,7 +702,6 @@ void ioThreadQueueReadCompletion(client *c) {
         !isParsingError(c) && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && c->argc > 0) {
         ncmd = 1;
         for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
-
             if (!(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_PARSING_COMPLETED) &&
                 !(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_ERROR_MASK))
                 break;
@@ -722,7 +731,6 @@ static void ringReadEnd(client *c) {
     server.stat_io_reads_pending--;
     server.stat_io_reads_processed++;
     if (c->flag.close_after_reply) {
-
         c->flag.pending_read = 0;
         c->io_read_state = CLIENT_IDLE;
         if (c->flag.protected) return;
@@ -1005,7 +1013,6 @@ void IOThreadsAfterSleep(int numevents) {
     serverAssert(inMainThread());
     /* Always Active Policy */
     if (server.io_threads_always_active) {
-
         if ((numevents > 0 || strictOffloadActive()) && server.active_io_threads_num < io_ready_num) {
             for (int i = server.active_io_threads_num; i < io_ready_num; i++) ioWorkerUnpark(i);
             server.active_io_threads_num = io_ready_num;
@@ -1068,7 +1075,6 @@ void IOThreadsAfterSleep(int numevents) {
     if (avg_q_size > 1 && active < (size_t)io_ready_num) {
         target++;
     } else if (avg_q_size == 0 && (now - last_scale_time > IO_COOLDOWN_MS)) {
-
         size_t min_active = strictOffloadActive() ? 2 : 1;
         if (target > min_active) target--;
     }
@@ -2505,7 +2511,6 @@ static int processOutboxBatch(mpscQueue *outbox) {
             } else if (job_type == JOB_RES_FP_CLOSE || job_type == JOB_RES_FP_HANDOFF) {
                 fastpathHandoffDone((client *)data, job_type == JOB_RES_FP_CLOSE);
             } else if (job_type == JOB_RES_WRITE_SLAB) {
-
                 if (write_count) {
                     handleWriteJobs(write_jobs, write_count);
                     write_count = 0;
@@ -2517,7 +2522,6 @@ static int processOutboxBatch(mpscQueue *outbox) {
                     if (!(e & SLAB_WRITE)) continue;
                     client *wc = (client *)(e & ~SLAB_TAGS);
                     if (e & SLAB_LAZY) {
-
                         if (e & SLAB_NOTIFY) {
                             serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
                             server.stat_io_writes_processed++;

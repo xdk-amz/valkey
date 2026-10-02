@@ -110,7 +110,7 @@ class FastpathAofBarrierTest : public ::testing::Test {
         server.aof_fsync = AOF_FSYNC_NO;
         if (server.aof_buf) sdsfree(server.aof_buf);
         server.aof_buf = sdsempty(); /* nothing written and not yet fsynced */
-        fastpathWorkerReopen(1); /* the previous test drained the thread; bring it back to OPEN */
+        fastpathWorkerReopen(1);     /* the previous test drained the thread; bring it back to OPEN */
     }
 
     /* A connected client admitted to thread 1, its read end non-blocking so an undelivered reply reads as empty. */
@@ -179,9 +179,9 @@ TEST_F(FastpathAofBarrierTest, WriteBatchHeldUntilReleaseUnderAofAlways) {
     EXPECT_EQ(c->fp_inflight, 1u);            /* still charged and pinned while held */
     EXPECT_EQ(recvNow(peer), "");             /* the reply has not reached the socket */
 
-    fastpathReleaseDurableReplies();          /* stands in for the beforeSleep post-fsync release */
+    fastpathReleaseDurableReplies(); /* stands in for the beforeSleep post-fsync release */
     EXPECT_EQ(fastpathPendingBatches(1), 0u);
-    EXPECT_EQ(fastpathProcessReturns(1), 1);  /* now published to the owner ring and delivered */
+    EXPECT_EQ(fastpathProcessReturns(1), 1); /* now published to the owner ring and delivered */
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(recvNow(peer), "+OK\r\n");
 
@@ -326,7 +326,7 @@ TEST_F(FastpathAofBarrierTest, HeldBatchesReleaseInFifoOrder) {
 
     fastpathReleaseDurableReplies();
     EXPECT_EQ(fastpathPendingBatches(1), 0u);
-    EXPECT_EQ(fastpathProcessReturns(1), 2);   /* both batches published in held order */
+    EXPECT_EQ(fastpathProcessReturns(1), 2); /* both batches published in held order */
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(recvNow(peer), "+OK\r\n$3\r\nbar\r\n"); /* write reply first; the later read sees "bar" */
 
@@ -347,13 +347,13 @@ TEST_F(FastpathAofBarrierTest, TerminalRequestWhileHeldDiscardsOnRelease) {
     EXPECT_EQ(fastpathPendingBatches(1), 1u);
     EXPECT_GT(fastpathReplyOutstanding(cc), 0u); /* the reply bytes are charged while held */
 
-    fastpathRequestDetach(c);           /* main asks to terminally close the held client */
-    EXPECT_EQ(fastpathProcessReturns(1), 1);     /* the owner consumes the detach and marks it closing */
+    fastpathRequestDetach(c);                /* main asks to terminally close the held client */
+    EXPECT_EQ(fastpathProcessReturns(1), 1); /* the owner consumes the detach and marks it closing */
     EXPECT_EQ(c->control->lifecycle, FP_CLOSING);
     EXPECT_TRUE(fastpathDetachConsumed(c));
-    EXPECT_EQ(c->fp_inflight, 1u);               /* the held batch still pins it */
+    EXPECT_EQ(c->fp_inflight, 1u); /* the held batch still pins it */
 
-    fastpathReleaseDurableReplies();             /* released to the ring, then discarded on delivery */
+    fastpathReleaseDurableReplies(); /* released to the ring, then discarded on delivery */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
     EXPECT_EQ(c->fp_inflight, 0u);               /* charge cleared without a write */
     EXPECT_EQ(recvNow(peer), "");                /* nothing was written to the closing client */
@@ -377,14 +377,14 @@ TEST_F(FastpathAofBarrierTest, QuiesceBlockedByHeldBatchUntilRelease) {
     EXPECT_EQ(fastpathPendingBatches(1), 1u);
 
     fastpathWorkerQuiesce(1);
-    fastpathProcessReturns(1);            /* the held batch keeps in-flight > 0, so the client cannot hand off */
+    fastpathProcessReturns(1); /* the held batch keeps in-flight > 0, so the client cannot hand off */
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_QUIESCING);
     EXPECT_FALSE(fastpathWorkerDrained(1));
     EXPECT_EQ(c->fp_inflight, 1u);
 
     fastpathReleaseDurableReplies();
     EXPECT_EQ(fastpathPendingBatches(1), 0u);
-    fastpathProcessReturns(1);            /* delivered, in-flight cleared, client handed off, thread drained */
+    fastpathProcessReturns(1); /* delivered, in-flight cleared, client handed off, thread drained */
     EXPECT_EQ(c->fp_inflight, 0u);
     EXPECT_EQ(recvNow(peer), "+OK\r\n");
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_DRAINED);

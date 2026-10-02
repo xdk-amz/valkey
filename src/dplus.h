@@ -89,14 +89,14 @@ void dplusReaderWorkerOffline(int tid);
  * The main thread aggregates (add-and-zero) once per event-loop iteration in
  * beforeSleep — a per-LOOP touch, not per-command. */
 typedef struct dplusThreadStats {
-    long long commands_processed; /* speculated commands consumed on this thread */
-    long long usec;               /* wall time spent executing them (for commandstats) */
-    long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
-    long long owned_net_bytes;    /* bytes written by those completions */
-    long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
-    long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
+    long long commands_processed;     /* speculated commands consumed on this thread */
+    long long usec;                   /* wall time spent executing them (for commandstats) */
+    long long owned_writes;           /* clean owned-local writes completed worker-side (fix #2) */
+    long long owned_net_bytes;        /* bytes written by those completions */
+    long long doorbell_rings;         /* wakeup-pipe bytes actually written (coalescing prototype) */
+    long long doorbell_coalesced;     /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    long long keyspace_hits;      /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long keyspace_hits;          /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -113,10 +113,10 @@ extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
  * If popcount < threshold, skip. Updated per-batch in dplusSpeculateBatch.
  * No shared-line reads (each thread owns its own counter). */
 #define DPLUS_WRITE_TAX_WINDOW 64
-#define DPLUS_WRITE_TAX_THRESHOLD 8  /* Skip if < 8/64 recent batches speculated */
+#define DPLUS_WRITE_TAX_THRESHOLD 8 /* Skip if < 8/64 recent batches speculated */
 
 typedef struct dplusWriteTaxGate {
-    uint64_t history;  /* Shift register: bit=1 means batch was speculated */
+    uint64_t history; /* Shift register: bit=1 means batch was speculated */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusWriteTaxGate;
 
 extern dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS];
@@ -257,8 +257,7 @@ static inline void dplusVersionBumpAll(dplusVersionArray *va) {
 bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
 
 /* Component 2: Speculative find with pre-computed hash (implemented in hashtable.c) */
-bool hashtableFindSpeculative(void *ht, const void *key, void **found, uint64_t hash,
-                              unsigned shard, uint64_t *ver_out);
+bool hashtableFindSpeculative(void *ht, const void *key, void **found, uint64_t hash, unsigned shard, uint64_t *ver_out);
 
 /* Component 2: Hash key accessor (implemented in hashtable.c) */
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
@@ -267,8 +266,8 @@ uint64_t hashtableHashKey(hashtable *ht, const void *key);
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 
 /* Component 4: Exclusive mode helpers (implemented in dplus.c) */
-void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
-void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
+void dplusExclusiveEnter(void); /* Main thread: set exclusive + spin-wait */
+void dplusExclusiveLeave(void); /* Main thread: clear exclusive */
 
 /* ACL/AUTH gate for speculation (main-thread writers; workers read the
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */

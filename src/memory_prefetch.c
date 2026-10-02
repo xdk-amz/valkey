@@ -382,8 +382,7 @@ void processClientsCommandsBatch(void) {
  * key array grown for a wide command is reused (and freed once) rather than
  * allocated and freed per command. getKeysUsingKeySpecs() accumulates onto
  * result->numkeys, so it is reset here before each extraction. */
-static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
-                              getKeysResult *result) {
+static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, getKeysResult *result) {
     result->numkeys = 0;
     int num_keys = getKeysFromCommand(cmd, argv, argc, result);
     int member_idx = cmd->member_arg_index;
@@ -463,8 +462,7 @@ int prefetchBatchEnabled(void) {
     return batch != NULL && batch->max_prefetch_size > 1;
 }
 
-int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
-                            void *result) {
+int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, void *result) {
     if (batch->key_count >= batch->max_prefetch_size) return 0;
     for (int j = 1; j < argc; j++) valkey_prefetch(argv[j]);
     addCommandToBatch(cmd, argv, argc, db, slot, (getKeysResult *)result);

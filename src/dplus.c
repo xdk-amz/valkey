@@ -21,7 +21,7 @@ static _Atomic(long long) dplus_debug_reader_hold_us = 0;
 static _Atomic(long long) dplus_debug_prevalidate_hold_us = 0;
 static _Atomic(int) dplus_debug_prevalidate_bump = 0;
 static _Atomic(uint64_t) dplus_debug_prevalidate_consumed = 0;
-static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
+static char dplus_debug_pv_last_key[32] = ""; /* diagnostic only */
 static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
 static _Atomic(int) dplus_debug_reader_holding = 0;
 static _Atomic(int) dplus_debug_reader_release = 0;
@@ -321,13 +321,13 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
 
 /* Per-key state for the batched prefetch + validate pipeline. */
 typedef struct dplusBatchEntry {
-    void *key_sds;                           /* SDS key string */
-    uint64_t hash;                           /* Pre-computed hash */
-    unsigned shard;                          /* Version shard index */
-    uint64_t v_before;                       /* Version read before find */
+    void *key_sds;                            /* SDS key string */
+    uint64_t hash;                            /* Pre-computed hash */
+    unsigned shard;                           /* Version shard index */
+    uint64_t v_before;                        /* Version read before find */
     hashtableIncrementalFindState find_state; /* Incremental find state */
-    int is_first_cmd;                        /* 1 if this is c->argv, 0 if queue */
-    int queue_idx;                           /* Index in cmd_queue (if !is_first_cmd) */
+    int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
+    int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } dplusBatchEntry;
 
 /* Execute the validate+copy+reply phase for a single prefetched entry.
@@ -593,7 +593,6 @@ int dplusSpeculateBatch(client *c, int tid) {
     if (c->argc == 2 && c->parsed_cmd != NULL &&
         c->parsed_cmd == dplus_get_cmd &&
         (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
-
         /* Write-tax gate: first command IS eligible (GET), so we know the
          * workload can speculate. Check the gate to decide whether recent
          * traffic justifies the prefetch investment. If traffic has been
@@ -712,7 +711,7 @@ int dplusSpeculateBatch(client *c, int tid) {
             queue_pos++;
         }
         if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted — drain */
-        if (head == tail) break; /* nothing in flight and nothing to fill */
+        if (head == tail) break;                      /* nothing in flight and nothing to fill */
 
         /* Sweep: one find step per pending slot (one prefetch each). */
         for (unsigned s = head; s < tail; s++) {
@@ -1424,99 +1423,99 @@ sds dplusInfoString(sds info) {
         punted_replies += dplus_thread_stats[i].punted_replies_written;
     }
     info = sdscatprintf(info,
-        "# Dplus\r\n"
-        "dplus_reclaim_epoch:%llu\r\n"
-        "dplus_epoch_reader_entries:%llu\r\n"
-        "dplus_epoch_reader_retries:%llu\r\n"
-        "dplus_epoch_exclusive_punts:%llu\r\n"
-        "dplus_epoch_pressure_punts:%llu\r\n"
-        "dplus_reclaim_pressure_gate:%d\r\n"
-        "dplus_pressure_activations:%llu\r\n"
-        "dplus_epoch_workers_online:%u\r\n"
-        "dplus_epoch_workers_active:%u\r\n"
-        "dplus_epoch_workers_quiescent:%u\r\n"
-        "dplus_retired_entries:%zu\r\n"
-        "dplus_retired_bytes_lower_bound:%zu\r\n"
-        "dplus_retired_segments:%zu\r\n"
-        "dplus_retired_peak:%zu\r\n"
-        "dplus_reclaimed_entries:%llu\r\n"
-        "dplus_epoch_advances:%llu\r\n"
-        "dplus_epoch_scans:%llu\r\n"
-        "dplus_reclaim_budget_exhaustions:%llu\r\n"
-        "dplus_forced_reclaims:%llu\r\n"
-        "dplus_pressure_forced_drains:%llu\r\n"
-        "dplus_pressure_forced_wait_us:%llu\r\n"
-        "dplus_epoch_debug_reader_holding:%d\r\n"
-        "dplus_epoch_debug_reader_hold_us:%lld\r\n"
-        "dplus_doorbell_rings:%llu\r\n"
-        "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
-        (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
-        (unsigned long long)entries,
-        (unsigned long long)retries,
-        (unsigned long long)epoch_exclusive_punts,
-        (unsigned long long)pressure_punts,
-        atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed),
-        (unsigned long long)dplus_pressure_activations,
-        online,
-        active,
-        quiescent,
-        dplus_retired_entries,
-        dplus_retired_bytes_lower_bound,
-        dplus_retired_segments,
-        dplus_retired_peak,
-        (unsigned long long)dplus_reclaimed_entries,
-        (unsigned long long)dplus_epoch_advances,
-        (unsigned long long)dplus_epoch_scans,
-        (unsigned long long)dplus_reclaim_budget_exhaustions,
-        (unsigned long long)dplus_forced_reclaims,
-        (unsigned long long)dplus_pressure_forced_drains,
-        (unsigned long long)dplus_pressure_forced_wait_us,
-        debug_reader_holding,
-        debug_reader_hold_us,
-        (unsigned long long)doorbell_rings,
-        (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+                        "# Dplus\r\n"
+                        "dplus_reclaim_epoch:%llu\r\n"
+                        "dplus_epoch_reader_entries:%llu\r\n"
+                        "dplus_epoch_reader_retries:%llu\r\n"
+                        "dplus_epoch_exclusive_punts:%llu\r\n"
+                        "dplus_epoch_pressure_punts:%llu\r\n"
+                        "dplus_reclaim_pressure_gate:%d\r\n"
+                        "dplus_pressure_activations:%llu\r\n"
+                        "dplus_epoch_workers_online:%u\r\n"
+                        "dplus_epoch_workers_active:%u\r\n"
+                        "dplus_epoch_workers_quiescent:%u\r\n"
+                        "dplus_retired_entries:%zu\r\n"
+                        "dplus_retired_bytes_lower_bound:%zu\r\n"
+                        "dplus_retired_segments:%zu\r\n"
+                        "dplus_retired_peak:%zu\r\n"
+                        "dplus_reclaimed_entries:%llu\r\n"
+                        "dplus_epoch_advances:%llu\r\n"
+                        "dplus_epoch_scans:%llu\r\n"
+                        "dplus_reclaim_budget_exhaustions:%llu\r\n"
+                        "dplus_forced_reclaims:%llu\r\n"
+                        "dplus_pressure_forced_drains:%llu\r\n"
+                        "dplus_pressure_forced_wait_us:%llu\r\n"
+                        "dplus_epoch_debug_reader_holding:%d\r\n"
+                        "dplus_epoch_debug_reader_hold_us:%lld\r\n"
+                        "dplus_doorbell_rings:%llu\r\n"
+                        "dplus_doorbell_coalesced:%llu\r\n"
+                        "dplus_punted_replies_written:%llu\r\n",
+                        (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
+                        (unsigned long long)entries,
+                        (unsigned long long)retries,
+                        (unsigned long long)epoch_exclusive_punts,
+                        (unsigned long long)pressure_punts,
+                        atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed),
+                        (unsigned long long)dplus_pressure_activations,
+                        online,
+                        active,
+                        quiescent,
+                        dplus_retired_entries,
+                        dplus_retired_bytes_lower_bound,
+                        dplus_retired_segments,
+                        dplus_retired_peak,
+                        (unsigned long long)dplus_reclaimed_entries,
+                        (unsigned long long)dplus_epoch_advances,
+                        (unsigned long long)dplus_epoch_scans,
+                        (unsigned long long)dplus_reclaim_budget_exhaustions,
+                        (unsigned long long)dplus_forced_reclaims,
+                        (unsigned long long)dplus_pressure_forced_drains,
+                        (unsigned long long)dplus_pressure_forced_wait_us,
+                        debug_reader_holding,
+                        debug_reader_hold_us,
+                        (unsigned long long)doorbell_rings,
+                        (unsigned long long)doorbell_coalesced,
+                        (unsigned long long)punted_replies);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
-        "dplus_speculative_attempts:%llu\r\n"
-        "dplus_speculative_hits:%llu\r\n"
-        "dplus_validation_misses:%llu\r\n"
-        "dplus_exclusive_punts:%llu\r\n"
-        "dplus_large_value_punts:%llu\r\n"
-        "dplus_prevalidate_consumed:%llu\r\n"
-        "dplus_pv_last_key:%s\r\n"
-        "dplus_pv_last_client:%llu\r\n"
-        "dplus_bracket_entry_punts:%llu\r\n"
-        "dplus_expired_replies:%llu\r\n"
-        "dplus_intra_batch_write_punts:%llu\r\n"
-        "dplus_miss_punts:%llu\r\n"
-        "dplus_b13_waiting_transitions:%llu\r\n"
-        "dplus_b13_handler_fires:%llu\r\n"
-        "dplus_b13_read_suspends:%llu\r\n"
-        "dplus_b13_rearms:%llu\r\n"
-        "dplus_b13_info_lock_calls:%llu\r\n"
-        "dplus_b13_info_lock_wait_us:%llu\r\n"
-        "dplus_b13_info_lock_hold_us:%llu\r\n",
-        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
-        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
-        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
-        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
-        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
-        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
-        dplus_debug_pv_last_key,
-        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
-        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
-        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
-        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
-        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
-        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
-        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
-        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
+                        "dplus_speculative_attempts:%llu\r\n"
+                        "dplus_speculative_hits:%llu\r\n"
+                        "dplus_validation_misses:%llu\r\n"
+                        "dplus_exclusive_punts:%llu\r\n"
+                        "dplus_large_value_punts:%llu\r\n"
+                        "dplus_prevalidate_consumed:%llu\r\n"
+                        "dplus_pv_last_key:%s\r\n"
+                        "dplus_pv_last_client:%llu\r\n"
+                        "dplus_bracket_entry_punts:%llu\r\n"
+                        "dplus_expired_replies:%llu\r\n"
+                        "dplus_intra_batch_write_punts:%llu\r\n"
+                        "dplus_miss_punts:%llu\r\n"
+                        "dplus_b13_waiting_transitions:%llu\r\n"
+                        "dplus_b13_handler_fires:%llu\r\n"
+                        "dplus_b13_read_suspends:%llu\r\n"
+                        "dplus_b13_rearms:%llu\r\n"
+                        "dplus_b13_info_lock_calls:%llu\r\n"
+                        "dplus_b13_info_lock_wait_us:%llu\r\n"
+                        "dplus_b13_info_lock_hold_us:%llu\r\n",
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
+                        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
+                        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
+                        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
+                        dplus_debug_pv_last_key,
+                        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
+                        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
+                        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
 #endif
     return info;
 }

@@ -647,7 +647,6 @@ static size_t upsertPayloadHeader(char *buf,
                                   int slot,
                                   int track_bytes,
                                   size_t available) {
-
     size_t min_len = (isStrRefPayload(type) ? len : 1);
     if (min_len > available) return 0;
     size_t allowed_len = min(available, len);
@@ -870,7 +869,6 @@ void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
     if (sdsEncodedObject(obj)) {
-
         if (isCopyAvoidPreferred(c, obj)) {
             _addStrRefToBufferOrList(c, obj, RAW_STR_REF);
             if (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1)
@@ -2215,7 +2213,6 @@ void freeClientOriginalArgv(client *c) {
 
 void freeClientArgv(client *c) {
     if ((c->flag.argv_borrowed || c->flag.executor) && !c->original_argv) {
-
         goto clear;
     }
 
@@ -2730,7 +2727,7 @@ int freeClientsInAsyncFreeQueue(void) {
             c->flag.protected_rdb_channel = 0;
         }
 
-        if (c->flag.fastpath) continue; /* freed when its IO thread reports JOB_RES_FP_CLOSE */
+        if (c->flag.fastpath) continue;                                     /* freed when its IO thread reports JOB_RES_FP_CLOSE */
         if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue; /* its IO thread may still meet the pointer */
 
         reconcileLazyWrite(c);
@@ -3525,8 +3522,10 @@ size_t replyRegionTakeRefs(char *buf, size_t len, robj ***refs, uint32_t *nrefs,
             bulkStrRef *str_ref = (bulkStrRef *)ptr;
             for (size_t left = header->payload_len; left > 0; left -= sizeof(bulkStrRef), str_ref++) {
                 size_t str_len = sdslen(str_ref->str);
-                if (header->payload_type == BULK_STR_REF) reply_len += digits10(str_len) + 3 + str_len + 2;
-                else reply_len += str_len;
+                if (header->payload_type == BULK_STR_REF)
+                    reply_len += digits10(str_len) + 3 + str_len + 2;
+                else
+                    reply_len += str_len;
                 if (*nrefs == *cap) {
                     *cap = *cap ? *cap * 2 : 16;
                     *refs = zrealloc(*refs, sizeof(robj *) * *cap);
@@ -4158,7 +4157,6 @@ void unprotectClient(client *c) {
         c->flag.protected = 0;
         if (c->conn) {
             if (c->flag.partitioned) {
-
                 if (!c->flag.pending_command && c->io_read_state == CLIENT_IDLE && !c->flag.pending_read) {
                     if (processPendingCommandAndInputBuffer(c) == C_ERR) return;
                     beforeNextClient(c);
@@ -7642,7 +7640,6 @@ void evictClients(void) {
             break;
         }
     }
-
 }
 
 /* IO threads functions */

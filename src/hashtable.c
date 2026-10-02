@@ -1395,8 +1395,7 @@ bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found) {
 
 /* Speculative find with hash pre-computed and shard version output.
  * For the D+ IO-thread path that already has the hash from key lookup. */
-bool hashtableFindSpeculative(void *ht_ptr, const void *key, void **found,
-                              uint64_t hash, unsigned shard, uint64_t *ver_out) {
+bool hashtableFindSpeculative(void *ht_ptr, const void *key, void **found, uint64_t hash, unsigned shard, uint64_t *ver_out) {
     hashtable *ht = (hashtable *)ht_ptr;
     (void)shard; /* Shard used by caller for version check */
     if (hashtableSize(ht) == 0) return false;

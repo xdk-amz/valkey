@@ -1295,7 +1295,7 @@ static void clientsCron(int clients_this_cycle) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
         if (c->flag.fastpath) continue; /* owned by an IO thread; main touches nothing of it */
-        reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */
+        reconcileLazyWrite(c);          /* a silent client's last write is settled here at the latest */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
         /* The following functions do different service checks on the client.
@@ -4734,7 +4734,6 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         } else if (argc == 5 && p == setCommand && setIsPureExpireForm(argv)) {
             prebuildArgvEntry(argv, 1, 2);
         } else if ((p == msetCommand || p == msetnxCommand) && (argc & 1) == 1) {
-
             for (int j = 1; j + 1 < argc; j += 2) prebuildArgvEntry(argv, j, j + 1);
         }
     }
@@ -7037,9 +7036,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + fp_net_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
                 "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
                 "copy_avoid_mode:%s\r\n",
-                (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE   ? "adaptive"
-                 : server.copy_avoid_mode == COPY_AVOID_MODE_OFF      ? "off"
-                                                                      : "static"),
+                (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE ? "adaptive"
+                 : server.copy_avoid_mode == COPY_AVOID_MODE_OFF    ? "off"
+                                                                    : "static"),
                 "copy_avoid_current_floor:%d\r\n", server.copy_avoid_current_floor,
                 "main_thread_busy_pct:%d\r\n", (int)(server.copy_avoid_busy_ema + 0.5),
                 "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),

@@ -52,26 +52,26 @@
  * observed, and a release is visible before the control is reclaimed. */
 typedef struct ClientControl {
     /* Identity + control cache line: mostly-immutable identity and owner-published fields. */
-    uint64_t client_id;         /* Immutable: the connection's stable client id, set once at init. */
-    uint32_t generation;        /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
-    uint8_t owner_domain;       /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
-    uint8_t owner_tid;          /* Owning IO thread id when owner_domain == CC_OWNER_IO; meaningless for main. */
-    uint8_t lifecycle;          /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
-    uint8_t capa;               /* Main-only, set at attach: the client's CLIENT CAPA bits; CAPA runs only while detached. */
-    _Atomic(uint32_t) requests; /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
-    uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
-    uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
-    uint8_t readonly;           /* Main-only, set at attach: READONLY mode; READONLY/READWRITE run only while detached. */
+    uint64_t client_id;               /* Immutable: the connection's stable client id, set once at init. */
+    uint32_t generation;              /* IO owner bumps on each private-slot assignment to invalidate an earlier ownership epoch. */
+    uint8_t owner_domain;             /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
+    uint8_t owner_tid;                /* Owning IO thread id when owner_domain == CC_OWNER_IO; meaningless for main. */
+    uint8_t lifecycle;                /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
+    uint8_t capa;                     /* Main-only, set at attach: the client's CLIENT CAPA bits; CAPA runs only while detached. */
+    _Atomic(uint32_t) requests;       /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
+    uint32_t pin_refs;                /* Minimal reclamation gate: control is freed only when this reaches zero. */
+    uint32_t pin_bits;                /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
+    uint8_t readonly;                 /* Main-only, set at attach: READONLY mode; READONLY/READWRITE run only while detached. */
     struct FastpathLimitEntry *limit; /* Immutable after fastpathControlEnsure: the connection's one main-owned limit side object. */
-    robj *name;                 /* Main-only, set at attach: the client's CLIENT SETNAME, borrowed; SETNAME runs only while detached. */
+    robj *name;                       /* Main-only, set at attach: the client's CLIENT SETNAME, borrowed; SETNAME runs only while detached. */
 
     /* Producer cache line: written only by main. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_produced; /* Sole writer main: logical reply bytes retained for this client so far; monotonic. */
 
     /* Consumer cache line: written only by the IO owner. */
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
-    _Atomic(time_t) last_interaction; /* Sole writer the IO owner (main only at attach-init before transfer); unixtime of the last successful fast-path read, acquire-read by main for idle timeout. */
-    _Atomic(size_t) input_mem; /* Sole writer the IO owner (main only at attach-init before transfer): bytes of its private query buffer and of the arguments it holds, parsed or on main; read by main for maxmemory-clients. */
+    _Atomic(time_t) last_interaction;                               /* Sole writer the IO owner (main only at attach-init before transfer); unixtime of the last successful fast-path read, acquire-read by main for idle timeout. */
+    _Atomic(size_t) input_mem;                                      /* Sole writer the IO owner (main only at attach-init before transfer): bytes of its private query buffer and of the arguments it holds, parsed or on main; read by main for maxmemory-clients. */
     /* Sole writer the IO owner (main only at attach-init): what CLIENT LIST reports as qbuf, qbuf-free,
      * argv-mem, rbs and rbp, so main never reads the buffers themselves. */
     _Atomic(size_t) qbuf_len;
@@ -99,7 +99,7 @@ typedef struct cmdEntry {
     struct serverCommand *cmd;
     serverDb *db;
     char *reply_big;
-    long long woff; /* Origin client's write offset: prior value in, resulting offset out; the IO owner applies it back before handoff. */
+    long long woff;    /* Origin client's write offset: prior value in, resulting offset out; the IO owner applies it back before handoff. */
     size_t reply_wire; /* Bytes an encoded reply sends; its region holds string references owned by the batch. */
     int argc;
     int argv_len;
@@ -109,7 +109,7 @@ typedef struct cmdEntry {
     uint32_t reply_len;
     uint32_t reply_big_len;
     uint8_t resp;
-    uint8_t requeued;     /* Main did not execute it; the IO thread hands it back for the main path. */
+    uint8_t requeued; /* Main did not execute it; the IO thread hands it back for the main path. */
     uint8_t reply_encoded;
     CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
 } cmdEntry;
@@ -125,7 +125,7 @@ typedef struct cmdBatch {
     robj **refs;                   /* Strings encoded replies point at; main takes and drops these references. */
     uint32_t nrefs;
     uint32_t refs_cap;
-    uint8_t release;               /* Delivered and sent back so main can drop refs; it carries no commands. */
+    uint8_t release; /* Delivered and sent back so main can drop refs; it carries no commands. */
     cmdEntry e[IO_BATCH_MAX];
 } cmdBatch;
 

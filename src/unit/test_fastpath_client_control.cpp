@@ -301,11 +301,13 @@ int fpExpectedBucketIndex(size_t mem) {
     int bits = 8 * (int)sizeof(mem);
     int clz = mem > 0 ? __builtin_clzl(mem) : bits;
     int idx = bits - clz;
-    if (idx > CLIENT_MEM_USAGE_BUCKET_MAX_LOG) idx = CLIENT_MEM_USAGE_BUCKET_MAX_LOG;
-    else if (idx < CLIENT_MEM_USAGE_BUCKET_MIN_LOG) idx = CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
+    if (idx > CLIENT_MEM_USAGE_BUCKET_MAX_LOG)
+        idx = CLIENT_MEM_USAGE_BUCKET_MAX_LOG;
+    else if (idx < CLIENT_MEM_USAGE_BUCKET_MIN_LOG)
+        idx = CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
     return idx - CLIENT_MEM_USAGE_BUCKET_MIN_LOG;
 }
-}  // namespace
+} // namespace
 
 /* Layout and alignment: the same facts the source static_asserts pin, checked at runtime so the file
  * documents the ABI the entries and the two reply counters depend on. */
@@ -596,8 +598,8 @@ TEST_F(FastpathClientControlTest, ControlReclaimedOnlyAfterGatesClearAndNullIsSa
     fastpathWorkerQuiesce(1);
     fastpathProcessReturns(1);
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(cc->pin_refs, 0u);                  /* ownership pin dropped as main took the client back */
-    EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);  /* no charged replies outstanding */
+    EXPECT_EQ(cc->pin_refs, 0u);                 /* ownership pin dropped as main took the client back */
+    EXPECT_EQ(fastpathReplyOutstanding(cc), 0u); /* no charged replies outstanding */
     EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
     fastpathWorkerReopen(1);
     close(peer);
@@ -828,7 +830,7 @@ TEST_F(FastpathClientControlTest, FatalDeliveryToAlreadyLeavingClientUpgradesToC
     EXPECT_EQ(fastpathDrain(), 1);
     EXPECT_GT(cc->reply_bytes_produced, 0u);
 
-    fastpathProcessReturns(1); /* fpSend delivers the reply and fails fatally while already FP_LEAVING */
+    fastpathProcessReturns(1);                    /* fpSend delivers the reply and fails fatally while already FP_LEAVING */
     EXPECT_EQ(c->control->lifecycle, FP_CLOSING); /* upgraded past FP_LEAVING, never handed off alive */
     EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);  /* discarded group released exactly once */
     EXPECT_EQ(cc->reply_bytes_produced, cc->reply_bytes_released);
@@ -1101,9 +1103,9 @@ TEST_F(FastpathClientControlTest, EvictAfterChargedBatchReturnedDiscardsReplyBef
     fastpathControlRequest(cc, CC_REQ_EVICT);
 
     EXPECT_EQ(fastpathProcessReturns(1), 1);
-    EXPECT_EQ(c->control->lifecycle, FP_CLOSING);  /* evicted before delivery, never handed off alive */
-    EXPECT_TRUE(fpPeerHasNoReply(peer));           /* the discarded reply never reached the peer */
-    EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);   /* batch bytes released exactly once on discard */
+    EXPECT_EQ(c->control->lifecycle, FP_CLOSING); /* evicted before delivery, never handed off alive */
+    EXPECT_TRUE(fpPeerHasNoReply(peer));          /* the discarded reply never reached the peer */
+    EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);  /* batch bytes released exactly once on discard */
     EXPECT_EQ(cc->reply_bytes_produced, cc->reply_bytes_released);
 
     ASSERT_EQ(c->flag.fastpath, 1u);
@@ -1268,9 +1270,9 @@ TEST_F(FastpathClientControlTest, EvictSurvivesUnconsumedAttachWhileBatchProcess
 
     /* One owner pass: batchA delivers first, then the attach is consumed; the EVICT must survive. */
     EXPECT_EQ(fastpathProcessReturns(1), 2);
-    EXPECT_EQ(recv(pa), ":1\r\n");                 /* cA, with no request, delivered normally */
-    EXPECT_EQ(b->control->lifecycle, FP_CLOSING);  /* the EVICT survived the attach/batch ordering */
-    EXPECT_EQ(fastpathReplyOutstanding(cb), 0u);   /* the freshly attached client owed no replies */
+    EXPECT_EQ(recv(pa), ":1\r\n");                /* cA, with no request, delivered normally */
+    EXPECT_EQ(b->control->lifecycle, FP_CLOSING); /* the EVICT survived the attach/batch ordering */
+    EXPECT_EQ(fastpathReplyOutstanding(cb), 0u);  /* the freshly attached client owed no replies */
     EXPECT_EQ(fastpathReplyOutstanding(ca), 0u);
 
     ASSERT_EQ(b->flag.fastpath, 1u);
@@ -1292,8 +1294,8 @@ TEST_F(FastpathClientControlTest, NoPendingRequestPreservesNormalDelivery) {
     fastpathSubmitPending(1);
     EXPECT_EQ(fastpathDrain(), 1);
     EXPECT_EQ(fastpathProcessReturns(1), 1);
-    EXPECT_EQ(recv(peer), ":1\r\n");              /* delivered normally, nothing discarded */
-    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE);  /* no request: the client stays active */
+    EXPECT_EQ(recv(peer), ":1\r\n");             /* delivered normally, nothing discarded */
+    EXPECT_EQ(c->control->lifecycle, FP_ACTIVE); /* no request: the client stays active */
     EXPECT_EQ(fastpathReplyOutstanding(cc), 0u);
     EXPECT_EQ(cc->reply_bytes_produced, cc->reply_bytes_released);
 
@@ -1842,9 +1844,9 @@ TEST_F(FastpathClientControlTest, ReplyGrowthRebucketsAndUpdatesAggregateDelta) 
     size_t acc_full = fastpathMaxmemoryAccounted(cc);
     EXPECT_EQ(acc_full, acc_base + out + fastpathInputMem(cc));
     int grown_bucket = fastpathMaxmemoryBucketOf(cc);
-    EXPECT_GT(grown_bucket, base_bucket);                       /* moved up a size class */
+    EXPECT_GT(grown_bucket, base_bucket); /* moved up a size class */
     EXPECT_EQ(grown_bucket, fpExpectedBucketIndex(acc_full));
-    EXPECT_EQ(fastpathMaxmemoryBucketCount(grown_bucket), 1u);  /* the one entry now lives in the higher bucket */
+    EXPECT_EQ(fastpathMaxmemoryBucketCount(grown_bucket), 1u); /* the one entry now lives in the higher bucket */
 
     /* Deliver the big reply: the estimate and bucket fall back to the base class. */
     EXPECT_EQ(fastpathProcessReturns(1), 1);
@@ -1958,10 +1960,10 @@ TEST_F(FastpathClientControlTest, LargestBucketEvictionPublishesEvictAndCountsOn
 
     long long base_evicted = server.stat_evictedclients;
     evictClients();
-    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);       /* counted exactly once */
+    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);        /* counted exactly once */
     EXPECT_EQ(cc->requests & CC_REQ_EVICT, (uint32_t)CC_REQ_EVICT); /* immediate terminal request published */
-    EXPECT_EQ(fastpathMaxmemoryBucketOf(cc), -1);                  /* unlinked from its bucket */
-    EXPECT_EQ(fastpathEvictionMaxBucket(), -1);                    /* nothing left to reselect */
+    EXPECT_EQ(fastpathMaxmemoryBucketOf(cc), -1);                   /* unlinked from its bucket */
+    EXPECT_EQ(fastpathEvictionMaxBucket(), -1);                     /* nothing left to reselect */
 
     /* A second pass finds the still-accounted but terminal entry unbucketed: no second eviction. */
     evictClients();
@@ -2009,9 +2011,9 @@ TEST_F(FastpathClientControlTest, TwoClientsEvictTheLargerFirst) {
 
     long long base_evicted = server.stat_evictedclients;
     evictClients();
-    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);            /* only one eviction */
-    EXPECT_EQ(ca->requests & CC_REQ_EVICT, (uint32_t)CC_REQ_EVICT);     /* the larger client */
-    EXPECT_EQ(cb->requests & CC_REQ_EVICT, 0u);                         /* the smaller one untouched */
+    EXPECT_EQ(server.stat_evictedclients, base_evicted + 1);        /* only one eviction */
+    EXPECT_EQ(ca->requests & CC_REQ_EVICT, (uint32_t)CC_REQ_EVICT); /* the larger client */
+    EXPECT_EQ(cb->requests & CC_REQ_EVICT, 0u);                     /* the smaller one untouched */
     EXPECT_EQ(fastpathMaxmemoryBucketOf(ca), -1);
     EXPECT_GE(fastpathMaxmemoryBucketOf(cb), 0);
 
@@ -2204,8 +2206,8 @@ TEST_F(FastpathClientControlTest, StaleNormalBucketNodeQuarantinedNotFreed) {
 
     long long base_evicted = server.stat_evictedclients;
     evictClients();
-    EXPECT_EQ(c->mem_usage_bucket, nullptr);            /* quarantined out of the normal bucket */
-    EXPECT_EQ(c->flag.fastpath, 1u);                    /* never freed: still IO-owned */
+    EXPECT_EQ(c->mem_usage_bucket, nullptr);             /* quarantined out of the normal bucket */
+    EXPECT_EQ(c->flag.fastpath, 1u);                     /* never freed: still IO-owned */
     EXPECT_EQ(server.stat_evictedclients, base_evicted); /* the fast-path client was not evicted here */
 
     /* Undo the forged accounting so teardown balances. */

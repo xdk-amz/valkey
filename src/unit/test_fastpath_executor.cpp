@@ -303,7 +303,7 @@ TEST_F(FastpathExecutorTest, OffloadedWritePropagatesWoffToOriginClient) {
     fastpathSubmitPending(1);
     EXPECT_EQ(fastpathDrain(), 1);
     EXPECT_EQ(fastpathProcessReturns(1), 1);
-    EXPECT_EQ(c->woff, 0);                              /* read did not propagate */
+    EXPECT_EQ(c->woff, 0);                             /* read did not propagate */
     EXPECT_EQ(server.primary_repl_offset, off_before); /* and did not advance the global offset */
 
     /* A SET propagates: primary_repl_offset advances (even with no backlog/replicas) and the IO
@@ -442,9 +442,9 @@ TEST_F(FastpathExecutorTest, FailoverGateRequeuesAdmittedWrite) {
     server.failover_state = FAILOVER_IN_PROGRESS; /* gate closes after admission, before execution */
     EXPECT_EQ(fastpathDrain(), 1);
     EXPECT_EQ(fastpathProcessReturns(1), 1);
-    EXPECT_EQ(server.primary_repl_offset, off_before);       /* requeued: nothing executed on main here */
-    EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr);    /* the write did not run under the closed gate */
-    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);            /* and the client was handed off to main */
+    EXPECT_EQ(server.primary_repl_offset, off_before);    /* requeued: nothing executed on main here */
+    EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr); /* the write did not run under the closed gate */
+    EXPECT_EQ(c->control->lifecycle, FP_LEAVING);         /* and the client was handed off to main */
 
     server.failover_state = NO_FAILOVER;
     decrRefCount(key);
