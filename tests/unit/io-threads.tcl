@@ -459,3 +459,32 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
         $rd close
     }
 }
+
+# One IO thread: the commands below reach main through one ring, in arrival order.
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2}} {
+    test {A client unblocked before its in-flight read completes runs its commands once} {
+        r client pause 100000 write
+        set b [valkey_deferring_client]
+        $b set unblocked:k1 v1
+        wait_for_blocked_clients_count 1
+        set u [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, U unpauses and B sends more, so one ring drain unblocks B and then
+        # completes B's read, before main resumes B.
+        $s debug sleep 0.5
+        after 100
+        $u client unpause
+        after 20
+        $b set unblocked:k2 v2
+        assert_equal OK [$s read]
+        assert_equal OK [$u read]
+        assert_equal OK [$b read]
+        assert_equal OK [$b read]
+        assert_equal v1 [r get unblocked:k1]
+        assert_equal v2 [r get unblocked:k2]
+        assert_equal PONG [r ping]
+        $b close
+        $u close
+        $s close
+    }
+}

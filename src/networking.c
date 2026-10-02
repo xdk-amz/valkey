@@ -4672,11 +4672,12 @@ int processCommandAndResetClient(client *c) {
  * the client. Returns C_ERR if the client is no longer valid after executing
  * the command, and C_OK for all other cases. */
 int processPendingCommandAndInputBuffer(client *c) {
-    /* Blocked and throttled clients are resumed via processUnblockedClients(); skip them here
-     * to avoid re-entering processCommand() while pending_command is intentionally left set.
-     * A throttled command was already checked, so processCommand() would run it now and again
-     * when the throttler releases it. */
-    if (c->flag.blocked || c->flag.throttled) return C_OK;
+    /* Blocked, throttled and just-unblocked clients are resumed via processUnblockedClients(); skip them
+     * here to avoid re-entering processCommand() while pending_command is intentionally left set. A read
+     * that completes before processUnblockedClients() reaches an unblocked client must not run it early,
+     * and a throttled command was already checked, so processCommand() would run it now and again when
+     * the throttler releases it. */
+    if (c->flag.blocked || c->flag.unblocked || c->flag.throttled) return C_OK;
 
     /* Notice, this code is also called from 'processUnblockedClients'.
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
