@@ -77,6 +77,7 @@ typedef struct fpThread {
     list owned;       /* IO thread only: clients this thread reads; registry with leaving */
     list leaving;     /* IO thread only: clients whose entries must return before hand-off or close */
     list deferred;    /* IO thread only: readable clients the in-flight cap turned away, oldest first */
+    monotime cron_at; /* IO thread only: last pass of the owner's share of clientsCron */
     rax *registry;    /* IO thread only: lifecycle membership for owned + leaving clients */
     fpOwnerSlot *owner_slots; /* IO thread only: O(1) handle-to-connection resolution */
     uint32_t owner_slots_len;
@@ -739,6 +740,11 @@ int fastpathControlEnsure(client *c) {
     atomic_init(&cc->reply_bytes_released, (size_t)0);
     atomic_init(&cc->last_interaction, (time_t)0);
     atomic_init(&cc->input_mem, (size_t)0);
+    atomic_init(&cc->qbuf_len, (size_t)0);
+    atomic_init(&cc->qbuf_free, (size_t)0);
+    atomic_init(&cc->argv_mem, (size_t)0);
+    atomic_init(&cc->rbuf_size, (size_t)0);
+    atomic_init(&cc->rbuf_peak, (size_t)0);
     cc->name = NULL;
     e->control = cc;
     e->bucketed = false; /* zcalloc already cleared base/accounted/reg state; a fresh entry names no bucket */
@@ -929,7 +935,26 @@ static size_t fpInputMem(const client *c) {
            c->fp_inflight_argv;
 }
 
+/* Owner of the client (main before the transfer, then the IO thread): the buffer sizes CLIENT LIST shows. */
+static void fpPublishBuffers(client *c) {
+    ClientControl *cc = c->control;
+    atomic_store_explicit(&cc->qbuf_len, c->querybuf ? sdslen(c->querybuf) : 0, memory_order_relaxed);
+    atomic_store_explicit(&cc->qbuf_free, c->querybuf ? sdsavail(c->querybuf) : 0, memory_order_relaxed);
+    atomic_store_explicit(&cc->argv_mem, c->argv_len_sum, memory_order_relaxed);
+    atomic_store_explicit(&cc->rbuf_size, c->buf_usable_size, memory_order_relaxed);
+    atomic_store_explicit(&cc->rbuf_peak, c->buf_peak, memory_order_relaxed);
+}
+
+void fastpathClientBuffers(const ClientControl *cc, fastpathBufferInfo *info) {
+    info->qbuf = atomic_load_explicit(&cc->qbuf_len, memory_order_relaxed);
+    info->qbuf_free = atomic_load_explicit(&cc->qbuf_free, memory_order_relaxed);
+    info->argv_mem = atomic_load_explicit(&cc->argv_mem, memory_order_relaxed);
+    info->rbs = atomic_load_explicit(&cc->rbuf_size, memory_order_relaxed);
+    info->rbp = atomic_load_explicit(&cc->rbuf_peak, memory_order_relaxed);
+}
+
 static void fpPublishInput(fpThread *t, client *c) {
+    fpPublishBuffers(c);
     size_t v = fpInputMem(c);
     if (v != c->fp_input_published) {
         c->fp_input_published = v;
@@ -997,6 +1022,7 @@ int fastpathAttach(client *c) {
      * next writer of these fields. control->lifecycle is the single source of truth for the state. */
     fpLimitRegistryInsert(c); /* register before ownership is published, so a pass never meets an unregistered owned client */
     fpControlSetLastInteraction(c->control, c->last_interaction); /* publish the idle stamp from main-owned state before the transfer */
+    fpPublishBuffers(c);
     c->control->owner_domain = CC_OWNER_IO;
     c->control->owner_tid = (uint8_t)tid;
     c->control->lifecycle = FP_ACTIVE;
@@ -1729,6 +1755,27 @@ static void fpTakeClient(fpThread *t, client *c) {
     if (epoll_ctl(ioThreadEpollFd(c->io_tid), EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) fpBeginLeave(t, c, FP_LEAVING, 0);
 }
 
+#define FP_CRON_PERIOD_US 100000
+
+/* clientsCron skips IO-owned clients, so their owner applies its buffer policies: a share of the clients
+ * every pass, each about once a second, paused like serverCron by DEBUG PAUSE-CRON. */
+static void fpOwnerCron(fpThread *t) {
+    monotime now = getMonotonicUs();
+    if (now - t->cron_at < FP_CRON_PERIOD_US) return;
+    t->cron_at = now;
+    if (server.pause_cron) return;
+    mstime_t now_ms = mstime();
+    for (size_t n = listLength(&t->owned) / 10 + 1; n > 0 && listLength(&t->owned) > 0; n--) {
+        client *c = listNodeValue(listFirst(&t->owned));
+        listRotateHeadToTail(&t->owned);
+        if (c->control->lifecycle != FP_ACTIVE) continue;
+        time_t last = atomic_load_explicit(&c->control->last_interaction, memory_order_relaxed);
+        clientResizeQueryBuffer(c, server.unixtime - last);
+        clientsCronResizeOutputBuffer(c, now_ms);
+        fpPublishInput(t, c);
+    }
+}
+
 int fastpathProcessReturns(int tid) {
     fpThread *t = &fp_threads[tid];
     if (t->ret.buffer == NULL) return 0;
@@ -1780,6 +1827,7 @@ int fastpathProcessReturns(int tid) {
     if (t->cur_hold && t->inflight == 0) fpCancelLeavingInCur(t);
     fpFinishLeaving(t);
     fpServeDeferred(t, tid);
+    fpOwnerCron(t);
     if (t->inflight == 0 && !t->cur && t->nfree > FP_FREELIST_IDLE) fpTrimFreelist(t);
     return total;
 }

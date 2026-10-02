@@ -5328,8 +5328,21 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 
     /* Compute the total memory consumed by this client. */
     size_t obufmem;
-    size_t total_mem = client->flag.fastpath && client->control ? fastpathClientMemory(client->control, &obufmem)
-                                                                : getClientMemoryUsage(client, &obufmem);
+    int io_owned = client->flag.fastpath && client->control;
+    size_t total_mem = io_owned ? fastpathClientMemory(client->control, &obufmem)
+                                : getClientMemoryUsage(client, &obufmem);
+    fastpathBufferInfo bufs;
+    time_t last_interaction = client->last_interaction;
+    if (io_owned) {
+        fastpathClientBuffers(client->control, &bufs);
+        last_interaction = fastpathControlLastInteraction(client->control);
+    } else {
+        bufs.qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
+        bufs.qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
+        bufs.argv_mem = client->argv_len_sum;
+        bufs.rbs = client->buf_usable_size;
+        bufs.rbp = client->buf_peak;
+    }
 
     size_t used_blocks_of_repl_buf = 0;
     if (client->repl_data && client->repl_data->ref_repl_buf_node) {
@@ -5346,7 +5359,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
             " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char *)objectGetVal(client->name) : ""),
             " age=%I", (long long)(commandTimeSnapshot() / 1000 - client->ctime),
-            " idle=%I", (long long)(server.unixtime - client->last_interaction),
+            " idle=%I", (long long)(server.unixtime - last_interaction),
             " flags=%s", flags,
             " capa=%s", capa,
             " db=%i", client->db->id,
@@ -5355,12 +5368,12 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
-            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
-            " argv-mem=%U", (unsigned long long)client->argv_len_sum,
+            " qbuf=%U", (unsigned long long)bufs.qbuf,
+            " qbuf-free=%U", (unsigned long long)bufs.qbuf_free,
+            " argv-mem=%U", (unsigned long long)bufs.argv_mem,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
-            " rbs=%U", (unsigned long long)client->buf_usable_size,
-            " rbp=%U", (unsigned long long)client->buf_peak,
+            " rbs=%U", (unsigned long long)bufs.rbs,
+            " rbp=%U", (unsigned long long)bufs.rbp,
             " obl=%U", (unsigned long long)client->bufpos,
             " oll=%U", (unsigned long long)listLength(client->reply) + used_blocks_of_repl_buf,
             " omem=%U", (unsigned long long)obufmem, /* should not include client->buf since we want to see 0 for static clients. */

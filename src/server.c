@@ -981,10 +981,14 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
+    return clientResizeQueryBuffer(c, server.unixtime - c->last_interaction);
+}
+
+/* The policy itself, for whichever thread owns the client's query buffer. */
+int clientResizeQueryBuffer(client *c, time_t idletime) {
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
-    time_t idletime = server.unixtime - c->last_interaction;
 
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
@@ -1046,10 +1050,10 @@ int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms) {
 
     if (buffer_target_shrink_size >= PROTO_REPLY_MIN_BYTES && c->buf_peak < buffer_target_shrink_size) {
         new_buffer_size = max(PROTO_REPLY_MIN_BYTES, c->buf_peak + 1);
-        server.stat_reply_buffer_shrinks++;
+        __atomic_fetch_add(&server.stat_reply_buffer_shrinks, 1, __ATOMIC_RELAXED);
     } else if (buffer_target_expand_size < PROTO_REPLY_CHUNK_BYTES * 2 && c->buf_peak == c->buf_usable_size) {
         new_buffer_size = min(PROTO_REPLY_CHUNK_BYTES, buffer_target_expand_size);
-        server.stat_reply_buffer_expands++;
+        __atomic_fetch_add(&server.stat_reply_buffer_expands, 1, __ATOMIC_RELAXED);
     }
 
     serverAssertWithInfo(c, NULL, (!new_buffer_size) || (new_buffer_size >= (size_t)c->bufpos));
@@ -3072,12 +3076,12 @@ void resetServerStats(void) {
     server.stat_acl_offload_quiesce_max_us = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
-    server.stat_reply_buffer_shrinks = 0;
+    __atomic_store_n(&server.stat_reply_buffer_shrinks, 0, __ATOMIC_RELAXED);
     server.stat_cluster_threaded_reads_processed = 0;
     server.stat_cluster_threaded_writes_processed = 0;
     server.stat_cluster_threaded_accepts_processed = 0;
     server.stat_cluster_io_main_thread_fallbacks = 0;
-    server.stat_reply_buffer_expands = 0;
+    __atomic_store_n(&server.stat_reply_buffer_expands, 0, __ATOMIC_RELAXED);
     memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
     server.el_cmd_cnt_max = 0;
     server.priority_el_cmd_cnt_max = 0;
@@ -7100,8 +7104,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
                 "client_idle_timeout_disconnections:%lld\r\n", server.stat_client_idle_timeout_disconnections,
-                "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
-                "reply_buffer_expands:%lld\r\n", server.stat_reply_buffer_expands,
+                "reply_buffer_shrinks:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_shrinks, __ATOMIC_RELAXED),
+                "reply_buffer_expands:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_expands, __ATOMIC_RELAXED),
                 "eventloop_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].cnt,
                 "eventloop_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].sum,
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,

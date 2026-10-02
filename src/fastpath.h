@@ -70,6 +70,13 @@ typedef struct ClientControl {
     _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) reply_bytes_released; /* Sole writer the IO owner: logical reply bytes reclaimed/discarded; monotonic. outstanding = produced - released. */
     _Atomic(time_t) last_interaction; /* Sole writer the IO owner (main only at attach-init before transfer); unixtime of the last successful fast-path read, acquire-read by main for idle timeout. */
     _Atomic(size_t) input_mem; /* Sole writer the IO owner (main only at attach-init before transfer): bytes of its private query buffer and of the arguments it holds, parsed or on main; read by main for maxmemory-clients. */
+    /* Sole writer the IO owner (main only at attach-init): what CLIENT LIST reports as qbuf, qbuf-free,
+     * argv-mem, rbs and rbp, so main never reads the buffers themselves. */
+    _Atomic(size_t) qbuf_len;
+    _Atomic(size_t) qbuf_free;
+    _Atomic(size_t) argv_mem;
+    _Atomic(size_t) rbuf_size;
+    _Atomic(size_t) rbuf_peak;
 } ClientControl;
 
 /* Compact reference to shared control plus an owner-private connection-table slot. Main uses only
@@ -167,6 +174,11 @@ void fastpathControlReclaim(client *c);
 size_t fastpathReplyOutstanding(const ClientControl *cc);
 size_t fastpathInputMem(const ClientControl *cc);
 size_t fastpathClientMemory(const ClientControl *cc, size_t *output_mem);
+/* Main: CLIENT LIST buffer fields of an IO-owned client, as its owner last published them. */
+typedef struct fastpathBufferInfo {
+    size_t qbuf, qbuf_free, argv_mem, rbs, rbp;
+} fastpathBufferInfo;
+void fastpathClientBuffers(const ClientControl *cc, fastpathBufferInfo *info);
 
 /* Acquire-loaded last-interaction unixtime for a control; read-only, main-only, never a connection deref. */
 time_t fastpathControlLastInteraction(const ClientControl *cc);

@@ -3397,6 +3397,8 @@ void resetSharedQueryBuf(client *c);
 int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
 void releaseReplyReferences(client *c);
+int clientResizeQueryBuffer(client *c, time_t idletime);
+int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms);
 typedef void replySegmentFn(void *ctx, const char *p, size_t len, int transient);
 size_t replyRegionTakeRefs(char *buf, size_t len, robj ***refs, uint32_t *nrefs, uint32_t *cap);
 void replyReleaseRefs(robj **refs, uint32_t n);
