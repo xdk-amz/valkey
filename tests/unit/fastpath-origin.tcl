@@ -270,6 +270,25 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         fp_wait_fastpath_clients 0
     }
 
+    test {Fast path: an empty multibulk does not stall or break the commands around it} {
+        set a [fp_client]
+        fp_wait_fastpath_clients 1
+        r del fp:empty
+        # A count below one is an empty command: it is skipped and the commands after it still run,
+        # whether it leads the read or follows another command, and whatever protocol comes next.
+        $a write "*-10\r\n*0\r\n*2\r\n\$4\r\nincr\r\n\$8\r\nfp:empty\r\n*-1\r\nincr fp:empty\r\n"
+        $a flush
+        wait_for_condition 50 100 {
+            [r get fp:empty] eq 2
+        } else {
+            fail "commands around an empty multibulk did not run: [r get fp:empty]"
+        }
+        assert_equal 1 [$a read]
+        assert_equal 2 [$a read]
+        $a close
+        fp_wait_fastpath_clients 0
+    }
+
     test {Fast path: MONITOR names the origin peer} {
         set m [valkey_deferring_client]
         $m monitor

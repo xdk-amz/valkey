@@ -1265,6 +1265,12 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
 
     while (!leave && q->off < q->len) {
         parsedCommand *p = &q->cmds[q->off];
+        if (p->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
+            /* An empty command ends the queued run: skip it, as main does, and parse on from a fresh request type. */
+            q->off++;
+            c->reqtype = 0;
+            continue;
+        }
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
         if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
@@ -1356,6 +1362,11 @@ static void fpRead(fpThread *t, int tid, client *c) {
         size_t pos = c->qb_pos;
         parseInputBuffer(c);
         int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
+        if (c->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
+            /* A multibulk count below one is an empty command: skip it and parse on, as main does. */
+            c->reqtype = 0;
+            completed = 1;
+        }
         prepareCommandQueue(c);
         aclOffloadBeginRead(c); /* snapshot the ACL epoch these commands are tagged under */
         fpSpeculate(t, tid, c);
