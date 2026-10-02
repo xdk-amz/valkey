@@ -1297,6 +1297,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             c->net_input_bytes_curr_cmd = p->input_bytes, c->parsed_cmd = p->cmd, c->slot = p->slot;
             c->read_flags |= p->read_flags;
         }
+        if (q->off == q->len) q->off = q->len = 0; /* a consumed queue must read as empty to the parser */
         fpBeginLeave(t, c, FP_LEAVING, 0);
         return;
     }

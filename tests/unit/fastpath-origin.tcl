@@ -289,6 +289,25 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         fp_wait_fastpath_clients 0
     }
 
+    test {Fast path: a pipeline that hands its last queued command to main keeps parsing} {
+        set a [fp_client]
+        fp_wait_fastpath_clients 1
+        # SET and GET run on the fast path; CLIENT ID, the last queued command, sends the client
+        # to main, which then parses the inline PING left in the buffer.
+        $a write "*3\r\n\$3\r\nset\r\n\$7\r\nfp:pipe\r\n\$1\r\nv\r\n*2\r\n\$3\r\nget\r\n\$7\r\nfp:pipe\r\n*2\r\n\$6\r\nclient\r\n\$2\r\nid\r\nPING\r\n"
+        $a flush
+        assert_equal OK [$a read]
+        assert_equal v [$a read]
+        assert_morethan [$a read] 0
+        assert_equal PONG [$a read]
+        # Back on the fast path, the next read starts from an empty command queue.
+        fp_wait_fastpath_clients 1
+        $a ping
+        assert_equal PONG [$a read]
+        $a close
+        fp_wait_fastpath_clients 0
+    }
+
     test {Fast path: MONITOR names the origin peer} {
         set m [valkey_deferring_client]
         $m monitor
