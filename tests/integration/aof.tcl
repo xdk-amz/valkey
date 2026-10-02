@@ -273,8 +273,11 @@ tags {"aof external:skip logreqres:skip"} {
         test {GETEX should not append to AOF} {
             set aof [get_last_incr_aof_path r]
             r set foo bar
+            # Unless appendfsync is always, IO threads can deliver a reply before the AOF buffer is written.
+            wait_for_condition 50 100 {[s aof_buffer_length] == 0} else { fail "AOF buffer was not written" }
             set before [file size $aof]
             r getex foo
+            wait_for_condition 50 100 {[s aof_buffer_length] == 0} else { fail "AOF buffer was not written" }
             set after [file size $aof]
             assert_equal $before $after
         }
