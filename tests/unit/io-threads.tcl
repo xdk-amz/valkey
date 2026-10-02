@@ -488,3 +488,69 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
         $s close
     }
 }
+
+# Reads one reply line from a deferring client, or "" when none arrives within ms milliseconds.
+proc read_line_within {rd ms} {
+    set fd [$rd channel]
+    fconfigure $fd -blocking 0
+    set line ""
+    set deadline [expr {[clock milliseconds] + $ms}]
+    while {[clock milliseconds] < $deadline} {
+        set line [gets $fd]
+        if {$line ne ""} break
+        after 10
+    }
+    fconfigure $fd -blocking 1
+    return $line
+}
+
+# Ends a busy script from a fresh connection, which main still serves while the script runs.
+proc kill_busy_script {} {
+    set k [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+    catch {$k script kill}
+    $k close
+}
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2 io-threads-fast-path no lua-time-limit 10}} {
+    test {A command read behind a busy script is answered while the script runs} {
+        set a [valkey_deferring_client]
+        set b [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, A starts a script that never ends and B's PING is read right behind it.
+        $s debug sleep 0.5
+        after 100
+        $a eval {while true do end} 0
+        after 20
+        $b ping
+        assert_equal OK [$s read]
+        set reply [read_line_within $b 3000]
+        kill_busy_script
+        assert_match {-BUSY*} $reply
+        catch {$a read}
+        $a close
+        $b close
+        $s close
+    }
+}
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2 lua-time-limit 10}} {
+    test {A SCRIPT KILL handed to main behind a busy script ends the script} {
+        set a [valkey_deferring_client]
+        set b [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, A's EVAL and then B's SCRIPT KILL leave the fast path for main.
+        $s debug sleep 0.5
+        after 100
+        $a eval {while true do end} 0
+        after 20
+        $b script kill
+        assert_equal OK [$s read]
+        set reply [read_line_within $a 3000]
+        if {$reply eq ""} kill_busy_script
+        assert_match {*killed by user*} $reply
+        assert_equal OK [$b read]
+        $a close
+        $b close
+        $s close
+    }
+}

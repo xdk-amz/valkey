@@ -2226,6 +2226,9 @@ int fastpathTryReadmit(client *c) {
     return 0;
 }
 
+/* Ids of clients main took back from the fast path whose pending input has not run yet. */
+static list *fp_resume = NULL;
+
 void fastpathHandoffDone(client *c, int closing) {
     fpThread *t = &fp_threads[c->io_tid];
     serverAssert(t->main_clients > 0);
@@ -2268,9 +2271,27 @@ void fastpathHandoffDone(client *c, int closing) {
         return;
     }
     c->flag.fp_readmit = 1; /* the command that sent it to main does not keep it there */
-    if (processPendingCommandAndInputBuffer(c) != C_OK) return;
-    if (c->flag.fp_readmit && fastpathTryReadmit(c)) return;
-    beforeNextClient(c);
+    if (!fp_resume) fp_resume = listCreate();
+    listAddNodeTail(fp_resume, (void *)(uintptr_t)c->id);
+}
+
+/* See header. Clients come off the list one at a time, so a command that becomes a busy script leaves
+ * the rest to the script's event processing, which calls this again. */
+int fastpathResumeHandedOff(void) {
+    int resumed = 0;
+    while (fp_resume && listLength(fp_resume) > 0) {
+        listNode *ln = listFirst(fp_resume);
+        uint64_t id = (uint64_t)(uintptr_t)listNodeValue(ln);
+        listDelNode(fp_resume, ln);
+        client *c = lookupClientByID(id);
+        if (!c || !c->conn) continue; /* freed since its hand-off */
+        if (c->flag.fastpath) continue; /* main already ran its input and it rejoined; the IO thread owns it */
+        resumed++;
+        if (processPendingCommandAndInputBuffer(c) != C_OK) continue;
+        if (c->flag.fp_readmit && fastpathTryReadmit(c)) continue;
+        beforeNextClient(c);
+    }
+    return resumed;
 }
 
 static long long fp_net_in_base = 0, fp_net_out_base = 0;

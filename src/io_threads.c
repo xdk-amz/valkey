@@ -819,11 +819,34 @@ static void ringCoalesce(void) {
     } while (getMonotonicUs() < deadline);
 }
 
+/* Entries taken off a command ring and not yet run. A command run from here can start a busy script,
+ * whose event processing must still serve the entries behind it, so they are kept here, off the stack. */
+static uintptr_t ring_taken[RING_BATCH];
+static size_t ring_taken_pos = 0, ring_taken_len = 0;
+
+static int ringRunTaken(void) {
+    int ran = 0;
+    while (ring_taken_pos < ring_taken_len) {
+        uintptr_t e = ring_taken[ring_taken_pos++];
+        client *c = (client *)(e & ~RING_TAGS);
+        c->ring_seen = 0;
+        if (e & RING_CMD) {
+            ringExecuteOne(c);
+        } else {
+            ringReadEnd(c);
+        }
+        ran++;
+    }
+    ring_taken_pos = ring_taken_len = 0;
+    return ran;
+}
+
 /* Drains one thread's ring up to RING_BATCH entries; returns how many it executed. */
 static int processCommandRingOne(int t, int use_prefetch) {
-    uintptr_t ents[RING_BATCH];
+    int ran = ringRunTaken(); /* entries a busy command left behind run before newer ones */
+    uintptr_t *ents = ring_taken;
     spscQueue *q = &io_cmd_ring[t];
-    if (q->buffer == NULL) return 0;
+    if (q->buffer == NULL) return ran;
     size_t n = 0;
     if (use_prefetch) {
         /* Prefetch client state before extracting keys from each chunk. */
@@ -844,18 +867,12 @@ static int processCommandRingOne(int t, int use_prefetch) {
     } else {
         n = spscDequeueBatch(q, (void **)ents, RING_BATCH);
     }
-    if (n == 0) return 0;
-    for (size_t i = 0; i < n; i++) {
-        client *c = (client *)(ents[i] & ~RING_TAGS);
-        c->ring_seen = 0;
-        if (ents[i] & RING_CMD) {
-            ringExecuteOne(c);
-        } else {
-            ringReadEnd(c);
-        }
-    }
+    if (n == 0) return ran;
+    ring_taken_pos = 0;
+    ring_taken_len = n;
+    ran += ringRunTaken();
     processClientsCommandsBatch();
-    return (int)n;
+    return ran;
 }
 
 static int processCommandRing(void) {
@@ -2565,6 +2582,7 @@ int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
     int fp_processed = fastpathDrain();
+    fp_processed += fastpathResumeHandedOff(); /* clients a busy command left waiting come first */
 
     if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) {
         if (fp_processed) main_io_work_at = getMonotonicUs();
@@ -2586,6 +2604,7 @@ int processIOThreadsResponses(void) {
         total_processed += processed;
         if (processed == 0) break;
     }
+    total_processed += fastpathResumeHandedOff();
     flushWriteSlab();
     if (total_processed) main_io_work_at = getMonotonicUs();
     return total_processed;

@@ -136,6 +136,9 @@ int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
+/* Runs the pending input of clients main took back, in hand-off order; returns how many it resumed.
+ * Called after each drain of IO responses, including from a busy script's event processing. */
+int fastpathResumeHandedOff(void);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
 void fastpathNetBytes(long long *in, long long *out);
