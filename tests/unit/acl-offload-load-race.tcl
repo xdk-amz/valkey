@@ -60,6 +60,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         # the role-holder pipelines commands from a raw fast-path-ish conn
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         $c aclcheck.auth.module.user.with.role modu1 hr
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # now DROP the role via ACL LOAD (file no longer defines role hr) while commands are in flight
         alr_write_aclfile $aclfile { {user default on nopass ~* &* +@all} }
@@ -77,6 +78,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         r acl load
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         $c aclcheck.auth.module.user.with.role modu2 hr
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # redefine role hr with different rules -> LOAD creates a NEW hr object; survivor must remap to it
         alr_write_aclfile $aclfile {
@@ -101,6 +103,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         # module user holds BOTH roles in one assignment (role= replaces the set with the named list)
         $c aclcheck.auth.module.user.with.role modu3 hr,hr2
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # drop hr but keep hr2 -> survivor's multi-role list must lose exactly one node, atomically
         alr_write_aclfile $aclfile {
