@@ -376,3 +376,33 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
     }
 }
 }
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {io-threads 4 io-threads-fast-path no}} {
+    proc ping_rounds {rd n} {
+        for {set p 0} {$p < $n} {incr p} {
+            $rd ping
+            $rd flush
+            assert_equal PONG [$rd read]
+        }
+    }
+
+    # The resumed command runs while main holds the socket, and SCRIPT DEBUG moves the client off its IO
+    # thread; main then writes the reply itself.
+    test {A paused client whose resumed command leaves its IO thread gets its reply} {
+        set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        ping_rounds $rd 1
+        set start [clock milliseconds]
+        r client pause 300 all
+        $rd script debug yes
+        $rd flush
+        set fd [$rd channel]
+        fconfigure $fd -blocking 0
+        wait_for_condition 100 20 {
+            [string match "+OK*" [gets $fd]]
+        } else {
+            fail "SCRIPT DEBUG reply never arrived after the pause ended"
+        }
+        assert_morethan_equal [expr {[clock milliseconds] - $start}] 250
+        $rd close
+    }
+}

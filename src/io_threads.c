@@ -590,6 +590,7 @@ void unpartitionClient(client *c) {
     waitPartitionPass(tid);
     while (c->io_read_state == CLIENT_ARMING_IO || c->io_read_state == CLIENT_PENDING_IO)
         atomic_thread_fence(memory_order_acquire);
+    if (c->io_read_state == CLIENT_HELD_IO) c->io_read_state = CLIENT_IDLE; /* a command run under main's hold */
     if (c->flag.pending_read && c->io_read_state == CLIENT_IDLE) {
         c->flag.pending_read = 0;
         server.stat_io_reads_pending--;
