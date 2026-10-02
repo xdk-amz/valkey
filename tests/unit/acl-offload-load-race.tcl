@@ -28,6 +28,13 @@ proc alr_write_aclfile {path lines} {
     close $fd
 }
 proc alr_offload_hits {} { getInfoProperty [r info stats] acl_offload_hits }
+# ACL LOAD disconnects clients of users the file does not define, module users included. A read after the
+# disconnect would reconnect and wait forever, so reading stops at the first error.
+proc alr_read_until_closed {c n} {
+    for {set i 0} {$i < $n} {incr i} {
+        if {[catch {$c read}]} break
+    }
+}
 
 set server_path [tmpdir "acl-offload-load-race"]
 # The server aborts startup if aclfile is missing; seed it before start_server.
@@ -57,7 +64,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         # now DROP the role via ACL LOAD (file no longer defines role hr) while commands are in flight
         alr_write_aclfile $aclfile { {user default on nopass ~* &* +@all} }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping] ;# survivor roles-list remap (drop) did not crash/UAF
         catch {$c close}; catch {$rd close}
     }
@@ -77,7 +84,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
             {role hr ~h:* ~extra:* +@read +set}
         }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping]
         # the surviving module user still holds the (remapped) role -- read its ACL string via the module
         assert_match "*role=*hr*" [r aclcheck.get.module.user.acl]
@@ -101,7 +108,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
             {role hr2 ~h2:* +@read +set}
         }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping]
         set acl [r aclcheck.get.module.user.acl]
         assert_match "*hr2*" $acl   ;# retained
