@@ -2284,7 +2284,7 @@ int fastpathResumeHandedOff(void) {
         uint64_t id = (uint64_t)(uintptr_t)listNodeValue(ln);
         listDelNode(fp_resume, ln);
         client *c = lookupClientByID(id);
-        if (!c || !c->conn) continue; /* freed since its hand-off */
+        if (!c || !c->conn) continue;   /* freed since its hand-off */
         if (c->flag.fastpath) continue; /* main already ran its input and it rejoined; the IO thread owns it */
         resumed++;
         if (processPendingCommandAndInputBuffer(c) != C_OK) continue;
