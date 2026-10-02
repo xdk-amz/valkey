@@ -7,6 +7,7 @@
 #include "throttle.h"
 #include "module.h"
 #include "dplus.h"
+#include "bgiteration.h"
 #ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
 #else
@@ -328,7 +329,7 @@ static int fpSessionEligible(client *c) {
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
     if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
     if (server.cluster_enabled) return 0;
-    if (!fpDynamicGate()) return 0; /* pause, failover, command filter or throttle active: stay on main */
+    if (!fpDynamicGate()) return 0; /* a global gate is closed: stay on main */
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
     if (c->flag.close_asap || c->flag.close_after_reply || c->flag.close_after_command) return 0;
@@ -1041,18 +1042,23 @@ int fastpathAttach(client *c) {
  *       so the IO thread checks it once at admission.
  *   fpDynamicGate()    - DYNAMIC, global server state that a command's flags cannot express and that
  *       main can change at any time (module command filters, active throttlers, an in-progress
- *       failover, a client pause). Read lock-free from both the IO thread (admission) and main
- *       (execution). The execute-time check is the authoritative one: if a gate closes after a
- *       command was admitted, the executor requeues it to main rather than running it under stale
- *       eligibility, so ACL/MONITOR/module/throttle/failover invariants are always upheld by the
- *       main path. Reading a gate the moment it flips is a benign race: a missed close is caught at
- *       execution, and a missed open only defers a command to main (conservative, never wrong).
+ *       failover, a client pause, a forkless iteration, a yielding module). Read lock-free from both
+ *       the IO thread (admission) and main (execution). The execute-time check is the authoritative
+ *       one: if a gate closes after a command was admitted, the executor requeues it to main rather
+ *       than running it under stale eligibility, so ACL/MONITOR/module/throttle/failover invariants
+ *       are always upheld by the main path. Reading a gate the moment it flips is a benign race: a
+ *       missed close is caught at execution, and a missed open only defers a command to main
+ *       (conservative, never wrong).
  * Both are pure reads of a few globals: no locks, allocations, lookups or handshakes on the hot path. */
 static int fpDynamicGate(void) {
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused: main postpones */
     if (server.failover_state != NO_FAILOVER) return 0;  /* coordinated failover: writes belong on main */
     if (moduleHasCommandFilters()) return 0;             /* a filter may rewrite/redirect any command */
     if (throttle_active()) return 0;                     /* main runs the throttle check */
+    if (bgIteration_iterationActive()) return 0;         /* a write may wait for the iterator, as its own client */
+    if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
+        !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS))
+        return 0; /* a yielding module postpones commands until it returns */
     return 1;
 }
 
@@ -2010,8 +2016,8 @@ int fastpathDrain(void) {
     int total = 0;
     if (fastpathServeMemHints()) evictClients();
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
-    /* While a global gate is closed (pause, failover, command filter, throttle) every entry is
-     * handed back for the main path to run under current eligibility. */
+    /* While a global gate is closed every entry is handed back for the main path to run under current
+     * eligibility. */
     int gated = !fpDynamicGate();
     int aof_always = (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
                      server.aof_fsync == AOF_FSYNC_ALWAYS;

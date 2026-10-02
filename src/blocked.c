@@ -109,6 +109,7 @@ void freeClientBlockingState(client *c) {
 void blockClient(client *c, int btype) {
     /* Replicated clients should never be blocked unless pause or module */
     serverAssert(!(isReplicatedClient(c) && btype != BLOCKED_MODULE && btype != BLOCKED_POSTPONE));
+    serverAssert(!c->flag.executor); /* its argv and replies belong to a batch entry, not to a waiting client */
 
     initClientBlockingState(c);
 

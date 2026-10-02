@@ -599,6 +599,52 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     } {} {needs:debug}
 }
 
+start_server {tags {"external:skip"} overrides {forkless-infrastructure-enabled yes save "" io-threads 4}} {
+    # Writes to keys the iterator has not passed wait for it, which a fast-path command cannot do on
+    # the executor that runs it for the client. A pipelining client then waits with commands queued.
+    test "fast-path client writes during forkless bgsave" {
+        set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        for {set i 0} {$i < 100} {incr i} { $rd set key$i v$i }
+        wait_for_condition 50 100 {
+            [getInfoProperty [r info fastpath] fastpath_clients] >= 1
+        } else {
+            fail "client never joined the fast path"
+        }
+        r config set rdb-key-save-delay 10000
+        r config set bgsave-default-method forkless
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave did not start"
+        }
+        for {set i 0} {$i < 50} {incr i} {
+            assert_equal [string length v${i}x] [$rd append key$i x]
+        }
+        set pipe [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        for {set i 50} {$i < 100} {incr i} { $pipe append key$i x }
+        $pipe flush
+        after 50
+        for {set i 50} {$i < 100} {incr i} { $pipe append key$i y }
+        $pipe flush
+        for {set i 50} {$i < 100} {incr i} {
+            assert_equal [string length v${i}x] [$pipe read]
+        }
+        for {set i 50} {$i < 100} {incr i} {
+            assert_equal [string length v${i}xy] [$pipe read]
+        }
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_status] ok
+        for {set i 0} {$i < 100} {incr i} {
+            set expected [expr {$i < 50 ? "v${i}x" : "v${i}xy"}]
+            assert_equal $expected [$rd get key$i]
+        }
+        $pipe close
+        $rd close
+    }
+}
+
 start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     test "modify new keys during forkless bgsave" {
         
