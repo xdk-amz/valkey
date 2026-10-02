@@ -490,7 +490,8 @@ static int clientIsPartitionable(client *c) {
 static void setClientReadFlagsForOffload(client *c) {
     /* A blocked command stays in argv and re-executes after unblock with its parse-time slot outcome. */
     int keep = c->flag.pending_command ? c->read_flags & (READ_FLAGS_NO_KEYS | READ_FLAGS_CROSSSLOT) : 0;
-    c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    /* Commands still queued are parsed again only after they ran. */
+    c->read_flags = canParseCommand(c) && c->cmd_queue.len == 0 ? 0 : READ_FLAGS_DONT_PARSE;
     c->read_flags |= keep;
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
@@ -634,6 +635,7 @@ int partitionedClientHold(client *c) {
 
 void partitionedClientRelease(client *c) {
     if (!c->flag.partitioned || c->io_read_state != CLIENT_HELD_IO) return;
+    setClientReadFlagsForOffload(c); /* commands run under the hold may have blocked it or queued more */
     __atomic_store_n(&c->io_read_state, CLIENT_IDLE, __ATOMIC_RELEASE);
     struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
     if (io_epfd[c->io_tid] > 0 && c->conn) epoll_ctl(io_epfd[c->io_tid], EPOLL_CTL_MOD, c->conn->fd, &ev);
