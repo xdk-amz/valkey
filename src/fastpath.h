@@ -57,9 +57,11 @@ typedef struct ClientControl {
     uint8_t owner_domain;       /* CC_OWNER_MAIN/CC_OWNER_IO: current owning domain (published by the owner). */
     uint8_t owner_tid;          /* Owning IO thread id when owner_domain == CC_OWNER_IO; meaningless for main. */
     uint8_t lifecycle;          /* Single source of truth: FP_ACTIVE/LEAVING/CLOSING/DETACHED. */
+    uint8_t capa;               /* Main-only, set at attach: the client's CLIENT CAPA bits; CAPA runs only while detached. */
     _Atomic(uint32_t) requests; /* CC_REQ_* bitmask; any authorized caller sets, only the owner clears on execution. */
     uint32_t pin_refs;          /* Minimal reclamation gate: control is freed only when this reaches zero. */
     uint32_t pin_bits;          /* Main-only: which CC_PIN_* lifecycle pins are currently held, so each stays idempotent. */
+    uint8_t readonly;           /* Main-only, set at attach: READONLY mode; READONLY/READWRITE run only while detached. */
     struct FastpathLimitEntry *limit; /* Immutable after fastpathControlEnsure: the connection's one main-owned limit side object. */
     robj *name;                 /* Main-only, set at attach: the client's CLIENT SETNAME, borrowed; SETNAME runs only while detached. */
 

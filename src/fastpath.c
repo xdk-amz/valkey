@@ -1028,6 +1028,8 @@ int fastpathAttach(client *c) {
     c->control->owner_tid = (uint8_t)tid;
     c->control->lifecycle = FP_ACTIVE;
     c->control->name = c->name;
+    c->control->capa = (uint8_t)c->capa;
+    c->control->readonly = c->flag.readonly;
     fastpathControlPin(c, CC_PIN_OWNER); /* IO now owns the connection; hold until handoff returns it to main */
     listInitNode(&c->io_owner_node, c);
     fastpath_clients++;
@@ -1899,6 +1901,9 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->resp = e->resp;
     ec->origin = &e->origin;
     ec->name = e->handle.control ? e->handle.control->name : NULL; /* SLOWLOG, COMMANDLOG and ACL LOG name the origin */
+    /* A replica redirects or serves the origin's commands by its CLIENT CAPA and READONLY mode. */
+    ec->capa = e->handle.control ? e->handle.control->capa : 0;
+    ec->flag.readonly = e->handle.control ? e->handle.control->readonly : 0;
     ec->buf = b->arena + b->arena_used;
     ec->buf_usable_size = b->arena_cap - b->arena_used;
     ec->bufpos = 0;
