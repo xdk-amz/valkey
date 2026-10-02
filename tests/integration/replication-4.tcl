@@ -293,3 +293,45 @@ start_server {tags {"repl external:skip"}} {
         }
     }
 }
+
+start_server {tags {"repl external:skip"}} {
+    start_server {overrides {io-threads 2 io-threads-always-active yes}} {
+        set primary [srv -1 client]
+        set primary_host [srv -1 host]
+        set primary_port [srv -1 port]
+        set replica [srv 0 client]
+
+        test {Replica IO threads drain the primary link} {
+            $replica replicaof $primary_host $primary_port
+            wait_for_sync $replica
+
+            # Stop the replica during a pipelined burst so the stream backs up in its socket
+            # and its IO-thread reads find more than one buffer of data.
+            set n 20000
+            set val [string repeat x 100]
+            set buf {}
+            for {set i 0} {$i < $n} {incr i} {
+                append buf [format_command set key:$i $val]
+            }
+            pause_process [srv 0 pid]
+            set rd [valkey_deferring_client -1]
+            $rd write $buf
+            $rd flush
+            for {set i 0} {$i < $n} {incr i} {
+                assert_equal OK [$rd read]
+            }
+            $rd close
+            resume_process [srv 0 pid]
+
+            wait_for_condition 500 100 {
+                [status $primary master_repl_offset] eq [status $replica master_repl_offset]
+            } else {
+                fail "Replica did not reach the primary's offset"
+            }
+            assert_equal [$primary debug digest] [$replica debug digest]
+            assert_equal $n [$replica dbsize]
+            assert_morethan [status $replica io_threaded_primary_drain_jobs] 0
+            assert_morethan [status $replica io_threaded_primary_drain_bytes] 0
+        }
+    }
+}

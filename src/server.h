@@ -2165,6 +2165,8 @@ struct valkeyServer {
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
+    long long stat_io_primary_drain_jobs;              /* IO-thread reads that drained the primary link */
+    long long stat_io_primary_drain_bytes;             /* Bytes read by those drained reads */
     long long stat_strict_deferred_reads;              /* Strict offload: client reads deferred off main to the retry FIFO */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
@@ -3221,6 +3223,7 @@ void dictVanillaFree(void *val);
                                                  Only ALLOW is recorded; a denial leaves the bit clear and \
                                                  main runs the stock check to produce the exact error. */
 #define READ_FLAGS_DPLUS_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
+#define READ_FLAGS_DRAIN (1 << 26)            /* Read the socket repeatedly before parsing. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                        \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \

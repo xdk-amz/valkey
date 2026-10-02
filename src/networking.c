@@ -4332,6 +4332,8 @@ void parseMultibulkBuffer(client *c) {
     /* Try parsing pipelined commands. */
     cmdQueue *queue = &c->cmd_queue;
     serverAssert(queue->len == 0);
+    /* A drained primary read parses everything it read, so main does not parse the rest. */
+    uint16_t max_grow = (c->read_flags & READ_FLAGS_DRAIN) ? 8192 : 512;
     while ((flag & READ_FLAGS_PARSING_COMPLETED) &&
            sdslen(c->querybuf) > c->qb_pos &&
            c->querybuf[c->qb_pos] == '*') {
@@ -4340,7 +4342,7 @@ void parseMultibulkBuffer(client *c) {
         if (queue->len == queue->cap) {
             if (queue->cap == 0) {
                 queue->cap = COMMAND_QUEUE_MIN_CAPACITY;
-            } else if (queue->cap <= 512) {
+            } else if (queue->cap <= max_grow) {
                 queue->cap *= 2;
             } else {
                 break; /* Limit the length of the command queue. */
@@ -7484,6 +7486,11 @@ int processDeferredReads(void) {
 int processClientIOReadsDone(client *c) {
     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
 
+    if (c->read_flags & READ_FLAGS_DRAIN) {
+        server.stat_io_primary_drain_jobs++;
+        if (c->nread > 0) server.stat_io_primary_drain_bytes += c->nread;
+    }
+
     if (ProcessingEventsWhileBlocked) {
         /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
          * In this case, there may be some clients left in the batch waiting to be processed. */
@@ -7650,7 +7657,20 @@ void ioThreadReadQueryFromClient(client *c) {
     serverAssert(c->io_read_state == CLIENT_PENDING_IO);
 
     /* Read */
-    readToQueryBuf(c);
+    if (c->read_flags & READ_FLAGS_DRAIN) {
+        /* As main reads a primary link: several reads per event, parsed together. A later read's
+         * EOF or error is seen by the next read. */
+        ssize_t total = 0;
+        for (int i = 0; i < REPL_MAX_READS_PER_IO_EVENT; i++) {
+            int full = readToQueryBuf(c);
+            if (c->nread <= 0) break;
+            total += c->nread;
+            if (!full || c->flag.close_asap) break;
+        }
+        if (total > 0) c->nread = total;
+    } else {
+        readToQueryBuf(c);
+    }
 
     if (c->flag.close_asap) {
         goto done;
