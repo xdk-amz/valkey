@@ -1036,6 +1036,7 @@ typedef struct blockingState {
                            * is > timeout then the operation timed out. */
     int unblock_on_nokey; /* Whether to unblock the client when at least one of the keys
                              is deleted or does not exist anymore */
+    int wait_write;       /* BLOCKED_POSTPONE: resumes once main processes its in-flight write */
     union {
         listNode *client_waiting_acks_list_node; /* list node in server.clients_waiting_acks list. */
         listNode *postponed_list_node;           /* list node in server.postponed_clients */
@@ -2232,6 +2233,7 @@ struct valkeyServer {
     clientBufferLimitsConfig client_obuf_limits[CLIENT_TYPE_OBUF_COUNT];
     int extended_redis_compat;                 /* True if extended Redis OSS compatibility is enabled */
     int pause_cron;                            /* Don't run cron tasks (debug) */
+    int debug_io_write_done_delay_us;          /* IO threads sleep this long between writing a reply and reporting it (debug) */
     int dict_resizing;                         /* Whether to allow main dict and expired dict to be resized (debug) */
     int latency_tracking_enabled;              /* 1 if extended latency tracking is enabled, 0 otherwise. */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
@@ -3396,6 +3398,8 @@ int isParsingError(client *c);
 void resetSharedQueryBuf(client *c);
 int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
+int settleClientWrite(client *c);
+void debugIOWriteDoneDelay(void);
 void releaseReplyReferences(client *c);
 int clientResizeQueryBuffer(client *c, time_t idletime);
 int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms);

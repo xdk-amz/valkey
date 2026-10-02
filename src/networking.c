@@ -3950,6 +3950,7 @@ void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
     c->io_write_state = CLIENT_IDLE;
+    if (c->flag.blocked && c->bstate->btype == BLOCKED_POSTPONE && c->bstate->wait_write) unblockClient(c, 1);
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
     if (c->flag.close_asap) return;
@@ -3983,6 +3984,19 @@ void processClientIOWriteDone(client *c) {
         /* Try again in the next eventloop */
         putClientInPendingWriteQueue(c);
     }
+}
+
+/* Main: wait out an offloaded write of the client's earlier replies, so the reply buffers show only what
+ * is still unsent although the client may have received those replies. Returns 0 when that write's
+ * completion is still on its way to main: the client is postponed and re-runs its command once main
+ * has processed it. */
+int settleClientWrite(client *c) {
+    waitForClientIO(c);
+    reconcileLazyWrite(c);
+    if (c->io_write_state == CLIENT_IDLE || c->flag.deny_blocking) return 1;
+    blockPostponeClient(c);
+    c->bstate->wait_write = 1;
+    return 0;
 }
 
 /* This function is called just before entering the event loop, in the hope
@@ -7705,10 +7719,17 @@ int ioThreadWriteClientNoSignal(client *c, int publish) {
         }
     }
     if (publish) {
+        debugIOWriteDoneDelay();
         atomic_thread_fence(memory_order_release);
         c->io_write_state = CLIENT_COMPLETED_IO;
     }
     return needs_main;
+}
+
+/* DEBUG IO-WRITE-DONE-DELAY: the reply is on the socket, the write is not reported done yet. */
+void debugIOWriteDoneDelay(void) {
+    int delay_us = __atomic_load_n(&server.debug_io_write_done_delay_us, __ATOMIC_RELAXED);
+    if (delay_us) usleep(delay_us);
 }
 
 void ioThreadWriteToClient(client *c) {

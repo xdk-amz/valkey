@@ -86,6 +86,7 @@ void initClientBlockingState(client *c) {
     c->bstate->btype = BLOCKED_NONE;
     c->bstate->timeout = 0;
     c->bstate->unblock_on_nokey = 0;
+    c->bstate->wait_write = 0;
     c->bstate->keys = dictCreate(&objectKeyHeapPointerValueDictType);
     c->bstate->numreplicas = 0;
     c->bstate->numlocal = 0;
@@ -188,6 +189,7 @@ void processUnblockedClients(void) {
         /* Hold a partitioned client's socket until any landed read drains after unblock. */
         if (!c->flag.blocked) {
             if (c->io_read_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_COMPLETED_IO) continue;
+            partitionedClientWaitArm(c); /* no read follows an arm while the client waits for its reply */
             if (!partitionedClientHold(c)) continue;
             /* If we have a queued command, execute it now. */
             int rc = processPendingCommandAndInputBuffer(c);
@@ -243,6 +245,7 @@ void unblockClient(client *c, int queue_for_reprocessing) {
         serverAssert(c->bstate->postponed_list_node);
         listDelNode(server.postponed_clients, c->bstate->postponed_list_node);
         c->bstate->postponed_list_node = NULL;
+        c->bstate->wait_write = 0;
         break;
     case BLOCKED_SHUTDOWN:
         /* No special cleanup. */

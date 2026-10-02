@@ -58,6 +58,7 @@ void unpartitionClient(client *c);
 void unpartitionAllClients(void);
 void partitionedClientDetach(client *c);
 void armPartitionedClientRead(client *c);
+void partitionedClientWaitArm(client *c);
 int partitionedClientHold(client *c);
 void ioThreadQueueReadCompletion(client *c);
 void reconcileLazyWrite(client *c);

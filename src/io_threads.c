@@ -617,6 +617,13 @@ void unpartitionAllClients(void) {
     for (int tid = 1; tid < io_worker_hwm; tid++) unpartitionWorkerClients(tid);
 }
 
+/* A re-arm still staged for the IO thread lands before main tries to hold the socket. */
+void partitionedClientWaitArm(client *c) {
+    if (!c->flag.partitioned || c->io_read_state != CLIENT_ARMING_IO) return;
+    flushWriteSlab();
+    while (c->io_read_state == CLIENT_ARMING_IO) atomic_thread_fence(memory_order_acquire);
+}
+
 /* Holding the socket prevents clientsCron from racing reads; release restores consumed readiness. */
 int partitionedClientHold(client *c) {
     if (!c->flag.partitioned || !c->flag.pending_read) return 1; /* main already owns it */
@@ -1172,6 +1179,7 @@ static void ioThreadWriteSlab(writeSlab *slab) {
             c->io_read_state = CLIENT_IDLE;
         }
         if (e & SLAB_WRITE) {
+            debugIOWriteDoneDelay();
             atomic_thread_fence(memory_order_release);
             c->io_write_state = CLIENT_COMPLETED_IO;
             if (needs_main) {

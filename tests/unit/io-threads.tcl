@@ -377,13 +377,66 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
 }
 }
 
-start_server {config "minimal.conf" tags {"external:skip"} overrides {io-threads 4 io-threads-fast-path no}} {
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 4 io-threads-fast-path no}} {
+    # A client may send its next command as soon as it reads a reply whose IO thread has not reported the
+    # write yet; that reply is not pending output. The race needs a writer thread other than the one reading
+    # the client, and a varying number of PINGs moves the writer between threads. A large reply is reported
+    # through main, which the next command must wait for.
     proc ping_rounds {rd n} {
         for {set p 0} {$p < $n} {incr p} {
             $rd ping
             $rd flush
             assert_equal PONG [$rd read]
         }
+    }
+    proc set_large_value {} {
+        set c [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        $c set big [string repeat x 100000]
+        $c close
+    }
+    proc large_reply_round {rd} {
+        $rd get big
+        $rd flush
+        assert_equal 100000 [string length [$rd read]]
+    }
+
+    # The replica would fall back to SYNC and never send acknowledgements. The filter makes PSYNC fail on
+    # its next check, so no replica is created.
+    test {PSYNC does not count a delivered handshake reply as pending output} {
+        set_large_value
+        r debug io-write-done-delay 50000
+        for {set i 0} {$i < 24} {incr i} {
+            set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+            ping_rounds $rd [expr {$i % 3}]
+            $rd replconf rdb-filter-only ""
+            $rd flush
+            assert_equal OK [$rd read]
+            if {$i % 2} { large_reply_round $rd }
+            $rd psync ? -1
+            $rd flush
+            catch {$rd read} err
+            $rd close
+            assert_match {*Filtered replica requires EOF capability*} $err
+        }
+        r debug io-write-done-delay 0
+        assert_equal PONG [r ping]
+    }
+
+    test {SCRIPT DEBUG does not count a delivered reply as pending output} {
+        set_large_value
+        r debug io-write-done-delay 50000
+        for {set i 0} {$i < 24} {incr i} {
+            set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+            ping_rounds $rd [expr {1 + $i % 3}]
+            if {$i % 2} { large_reply_round $rd }
+            $rd script debug yes
+            $rd flush
+            catch {$rd read} reply
+            $rd close
+            assert_equal OK $reply
+        }
+        r debug io-write-done-delay 0
+        assert_equal PONG [r ping]
     }
 
     # The resumed command runs while main holds the socket, and SCRIPT DEBUG moves the client off its IO
