@@ -47,6 +47,34 @@ start_server {tags {"fastpath obuf-limits external:skip tls:skip"} overrides {io
         r config set client-output-buffer-limit "normal 0 0 0"
     }
 
+    test {Fast path COB: a reply that outgrows the hard limit stops mid-run} {
+        r config set client-output-buffer-limit "normal 1mb 0 0"
+        r config set commandlog-reply-larger-than 102400
+        r commandlog reset large-reply
+        r hset cob:hash f v
+        set base [fpol_disconnections]
+        set a [fpol_client]
+        fpol_wait_fastpath_clients 1
+
+        # The whole reply would be about 35 MB; the command must stop near the 1 MB limit instead.
+        $a hrandfield cob:hash -5000000
+        $a flush
+        catch {$a read} e
+        assert_match {*I/O error*} $e
+        wait_for_condition 100 50 {
+            [fpol_disconnections] == $base + 1
+        } else {
+            fail "hard-limit disconnection was not counted: [r info stats]"
+        }
+        set entry [lindex [r commandlog get 1 large-reply] 0]
+        assert_equal hrandfield [string tolower [lindex $entry 3 0]]
+        assert_range [lindex $entry 2] 1000000 4000000
+        $a close
+        fpol_wait_fastpath_clients 0
+        r config set client-output-buffer-limit "normal 0 0 0"
+        r config set commandlog-reply-larger-than 1048576
+    }
+
     test {Fast path COB: a client under the limit is untouched and stays on the fast path} {
         r config set client-output-buffer-limit "normal 100kb 0 0"
         set base [fpol_disconnections]

@@ -7158,8 +7158,8 @@ int checkClientOutputBufferLimits(client *c) {
  *
  * Returns 1 if client was (flagged) closed. */
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
-    if (c->flag.fake) return 0;     /* It is unsafe to free fake clients. */
-    if (c->flag.executor) return 0; /* replies return to the IO thread with the batch */
+    if (c->flag.fake) return 0; /* It is unsafe to free fake clients. */
+    if (c->flag.executor) return fastpathExecutorOutputLimitReached(c);
     if (c->flag.fastpath) return 0; /* IO-owned: COB is enforced through the fast-path control registry, not the client */
     serverAssert(c->conn);
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));

@@ -1903,6 +1903,20 @@ static int fpControlDetaching(ClientControl *cc) {
            raxFind(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL);
 }
 
+static ClientControl *fp_exec_control = NULL; /* main only: origin of the command the executor is running */
+
+/* The executor builds a fast-path client's reply on main, so the client's hard output limit applies while
+ * the reply grows, as on the main path: a long-running reply stops mid-run and the client is closed. */
+int fastpathExecutorOutputLimitReached(client *ec) {
+    ClientControl *cc = fp_exec_control;
+    if (!cc || !cc->limit || ec->flag.close_asap) return ec->flag.close_asap;
+    size_t hard = server.client_obuf_limits[FP_LIMIT_CLASS].hard_limit_bytes;
+    if (hard == 0 || fastpathReplyOutstanding(cc) + getClientOutputBufferMemoryUsage(ec) < hard) return 0;
+    ec->flag.close_asap = 1; /* commands that build long replies stop at this flag */
+    fpLimitRequestTerminalClose(cc->limit);
+    return 1;
+}
+
 /* The executor borrows argv and writes replies into the batch arena. */
 static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     char *saved_buf = ec->buf;
@@ -1910,6 +1924,8 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     user *principal = e->origin.principal;
 
     if (fpControlDetaching(e->handle.control)) goto release_argv; /* no reply: the IO thread is closing it */
+    if (e->handle.control && e->handle.control->limit && e->handle.control->limit->terminal_requested)
+        goto release_argv; /* closing for a limit: as on the main path, its later commands do not run */
     if (!fpDynamicGate()) {
         e->requeued = 1; /* a global gate closed since admission: main runs it under current eligibility */
         return;
@@ -1956,8 +1972,11 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->flag.pending_command = 1;
 
     ec->woff = e->woff; /* execute against the origin's prior causal state, not another client's */
+    fp_exec_control = e->handle.control;
     processCommandAndResetClient(ec);
-    e->woff = ec->woff; /* call() advanced it iff this command propagated; otherwise it stays the prior value */
+    fp_exec_control = NULL;
+    ec->flag.close_asap = 0; /* set only by the origin's output limit; the origin is already closing */
+    e->woff = ec->woff;      /* call() advanced it iff this command propagated; otherwise it stays the prior value */
 
     e->reply_off = (uint32_t)b->arena_used;
     e->reply_len = (uint32_t)ec->bufpos;

@@ -132,6 +132,7 @@ typedef struct cmdBatch {
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
 int fastpathTryReadmit(client *c);
+int fastpathExecutorOutputLimitReached(client *ec);
 int fastpathDrain(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
