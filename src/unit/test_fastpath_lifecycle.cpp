@@ -11,6 +11,7 @@
 #include "generated_wrappers.hpp"
 
 #include <cstring>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -120,7 +121,10 @@ class FastpathLifecycleTest : public ::testing::Test {
         EXPECT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
     }
 
+    /* Waits up to 5 s, so a missing reply fails the test instead of hanging it. */
     static std::string recv(int peer) {
+        struct pollfd pfd = {peer, POLLIN, 0};
+        if (poll(&pfd, 1, 5000) != 1) return std::string();
         char buf[4096];
         ssize_t n = read(peer, buf, sizeof(buf));
         return n > 0 ? std::string(buf, n) : std::string();
@@ -166,6 +170,7 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     EXPECT_EQ(fastpathWorkerReopen(1), 0);
 
     fastpathHandoffDone(c, 0);
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
     EXPECT_EQ(c->flag.fastpath, 0u); /* the drained thread admits nothing, so it stays on main */
     EXPECT_EQ(recv(peer), ":1\r\n:2\r\n:3\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));
@@ -203,6 +208,7 @@ TEST_F(FastpathLifecycleTest, QuiesceWaitsForInflightBatchThenCancelsTheRest) {
     EXPECT_EQ(fastpathDrain(), 0);
 
     fastpathHandoffDone(c, 0);
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
     EXPECT_EQ(c->flag.fastpath, 0u);
     EXPECT_EQ(recv(peer), ":3\r\n:4\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));

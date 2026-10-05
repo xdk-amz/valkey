@@ -412,8 +412,11 @@ TEST_F(FastpathClientControlTest, RequestPublishedByAnyoneExecutedOnlyByOwner) {
     fastpathProcessReturns(1);
     EXPECT_EQ(cc->lifecycle, FP_LEAVING);
 
-    /* Nothing is left for main, so the client rejoins the fast path at once. */
+    /* The hand-off leaves the client's input to main's resume pass. Nothing is left for main, so that
+     * pass puts it straight back on the fast path. */
     fastpathHandoffDone(c, 0);
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
     EXPECT_EQ(c->flag.fastpath, 1u);
     EXPECT_EQ(fastpathWorkerOwnedClients(1), 1u);
     fastpathProcessReturns(1);
@@ -2236,6 +2239,7 @@ TEST_F(FastpathClientControlTest, HandoffRemovesContributionAndNormalReaddHasNoD
     fastpathHandoffDone(c, 0);
     EXPECT_EQ(c->flag.fastpath, 0u);
     EXPECT_EQ(fastpathMaxmemoryBucketOf(cc), -1);
+    EXPECT_EQ(fastpathResumeHandedOff(), 1); /* main's resume pass accounts it as a normal client */
     EXPECT_NE(c->mem_usage_bucket, nullptr);
     EXPECT_GT(c->last_memory_usage, 0u);
     EXPECT_EQ(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], base_normal + c->last_memory_usage);
