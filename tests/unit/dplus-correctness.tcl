@@ -68,6 +68,10 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
     }
     after 20 ;# a 1ms probe arm expires harmlessly if set
 
+    # The P1 checks assert exact version deltas, and a resize of the keyspace table brackets every
+    # shard. The cron resizes the table once the P1 keys fill it, so resizing stays off while they run.
+    r debug dict-resizing 0
+
     test {P1-BRACKET-SET-INSERT: fresh SET brackets its shard (+even, +2 min)} {
         r set p1:a v1
         set v [shard_version r p1:a]
@@ -154,6 +158,8 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         set v1 [shard_version r p1:j]
         assert {$v1 % 2 == 0 && $v1 >= $v0 + 4} ;# del bracket + insert bracket
     }
+
+    r debug dict-resizing 1
 
     if {$::dplus_instrumented} {
     test {P2-PUNT-INJECTED-BRACKET: version change inside the copy-validate window forces punt} {
