@@ -282,6 +282,33 @@ TEST_F(FastpathLifecycleTest, DetachIsConsumedBeforeMainMayFree) {
     freeHandedOff(c, peer);
 }
 
+static client *dequeue_probe_client = NULL;
+static int dequeue_probe_consumed = -1;
+
+static void probeDetachAfterDequeue(int tid) {
+    (void)tid;
+    if (dequeue_probe_consumed == -1) dequeue_probe_consumed = fastpathDetachConsumed(dequeue_probe_client);
+}
+
+/* The thread dequeues a batch of records before it handles them, so a close request that is dequeued
+ * but not yet handled must not let main free the client. */
+TEST_F(FastpathLifecycleTest, DetachIsNotConsumedBetweenDequeueAndHandling) {
+    int peer;
+    client *c = newFastpathClient(&peer);
+    fastpathProcessReturns(1);
+    fastpathRequestDetach(c);
+    dequeue_probe_client = c;
+    dequeue_probe_consumed = -1;
+    testOnlyFastpathAfterDequeue(probeDetachAfterDequeue);
+    fastpathProcessReturns(1); /* owned: closes, hands back FP_CLOSE */
+    testOnlyFastpathAfterDequeue(NULL);
+    EXPECT_EQ(dequeue_probe_consumed, 0);
+    EXPECT_EQ(c->control->lifecycle, FP_CLOSING);
+    EXPECT_TRUE(fastpathDetachConsumed(c));
+    fastpathHandoffDone(c, 1); /* frees it */
+    close(peer);
+}
+
 /* Destroying a thread that still owns a client is a precondition failure. */
 TEST_F(FastpathLifecycleTest, FreeThreadRequiresEmptyRegistry) {
     fastpathInitThread(2);

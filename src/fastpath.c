@@ -108,6 +108,9 @@ typedef struct fpThread {
      * odd value it saw, proving no reader still holds a pre-mutation selectors pointer. One relaxed
      * store on each side of the tag; no lock, no allocation. */
     _Atomic uint32_t admit_seq;
+    /* Return-ring position the IO owner has finished handling. The ring's head moves when a batch is
+     * dequeued, before its records are handled, so a detached client may be freed only once this passes it. */
+    _Atomic size_t ret_done;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
@@ -1814,13 +1817,22 @@ static void fpOwnerCron(fpThread *t) {
     }
 }
 
+static void (*fp_test_after_dequeue)(int tid) = NULL;
+
+/* Unit tests observe main's view between a batch's dequeue and the handling of its records. */
+void testOnlyFastpathAfterDequeue(void (*cb)(int tid)) {
+    fp_test_after_dequeue = cb;
+}
+
 int fastpathProcessReturns(int tid) {
     fpThread *t = &fp_threads[tid];
     if (t->ret.buffer == NULL) return 0;
     void *items[16];
     int total = 0;
     size_t n;
+    size_t done = atomic_load_explicit(&t->ret.head, memory_order_relaxed);
     while ((n = spscDequeueBatch(&t->ret, items, 16)) > 0) {
+        if (fp_test_after_dequeue) fp_test_after_dequeue(tid);
         for (size_t i = 0; i < n; i++) {
             uintptr_t v = (uintptr_t)items[i];
             if (v & FP_TAGS) {
@@ -1854,6 +1866,8 @@ int fastpathProcessReturns(int tid) {
             fpRecycleBatch(t, b);
             t->inflight--;
         }
+        done += n;
+        atomic_store_explicit(&t->ret_done, done, memory_order_release);
         total += (int)n;
     }
     if (atomic_load_explicit(&t->role, memory_order_acquire) == FP_ROLE_QUIESCING) {
@@ -2171,7 +2185,7 @@ int fastpathDetachConsumed(client *c) {
     ClientControl *cc = c->control;
     if (!raxFind(fp_detaching, (unsigned char *)&cc, sizeof(cc), &pos) || pos == NULL) return 0;
     fpThread *t = &fp_threads[c->io_tid];
-    if (atomic_load_explicit(&t->ret.head, memory_order_acquire) < (size_t)pos) return 0;
+    if (atomic_load_explicit(&t->ret_done, memory_order_acquire) < (size_t)pos) return 0;
     raxRemove(fp_detaching, (unsigned char *)&cc, sizeof(cc), NULL);
     t->detach_pending--;
     c->flag.fp_detach_sent = 0;

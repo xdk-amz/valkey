@@ -153,6 +153,7 @@ void fastpathAdmissionQuiesce(void);
 void fastpathAdmitReadBegin(void);
 void fastpathAdmitReadEnd(void);
 uint32_t testOnlyFastpathAdmitSeq(int tid);
+void testOnlyFastpathAfterDequeue(void (*cb)(int tid));
 /* Main-only introspection for tests: batches this thread holds for the durability barrier, not yet delivered. */
 size_t fastpathPendingBatches(int tid);
 /* IO owner: nothing fast-path work could do now without a socket event or a wake from main. */
