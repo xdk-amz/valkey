@@ -626,11 +626,35 @@ hashtableType objectHashtableType = {
     .entryDestructor = dictObjectDestructor,
 };
 
+/* Matching metadata sizes permit hashtable type swaps without reallocating the table. */
+static size_t setHashtableTypeMetadataSize(void) {
+    return sizeof(setVolatileIndex);
+}
+
+static void setHashtableTypeDestructor(void *entry) {
+    smemberFree(entry);
+}
+
 /* Set hashtable type. Items are SDS strings */
 hashtableType setHashtableType = {
     .hashFunction = sdsHashConfigurableSeed,
     .keyCompare = dictSdsKeyCompare,
-    .entryDestructor = dictSdsDestructor};
+    .entryDestructor = setHashtableTypeDestructor,
+    .getMetadataSize = setHashtableTypeMetadataSize,
+};
+
+static bool setVolatileHashtableTypeValidate(hashtable *ht, void *entry) {
+    UNUSED(ht);
+    return getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE || !smemberIsExpired(entry);
+}
+
+hashtableType setWithVolatileMembersHashtableType = {
+    .hashFunction = sdsHashConfigurableSeed,
+    .keyCompare = dictSdsKeyCompare,
+    .entryDestructor = setHashtableTypeDestructor,
+    .getMetadataSize = setHashtableTypeMetadataSize,
+    .validateEntry = setVolatileHashtableTypeValidate,
+};
 
 /* Zset hashtable callbacks for fbtree backend.
  * Stored entries are packed [8B score][element]. Lookup keys are plain sds
@@ -2323,6 +2347,7 @@ void createSharedObjects(void) {
     shared.rpop = createSharedString("RPOP");
     shared.lpop = createSharedString("LPOP");
     shared.lpush = createSharedString("LPUSH");
+    shared.rpush = createSharedString("RPUSH");
     shared.rpoplpush = createSharedString("RPOPLPUSH");
     shared.lmove = createSharedString("LMOVE");
     shared.blmove = createSharedString("BLMOVE");
@@ -2335,7 +2360,10 @@ void createSharedObjects(void) {
     shared.hdel = createSharedString("HDEL");
     shared.hpexpireat = createSharedString("HPEXPIREAT");
     shared.hpersist = createSharedString("HPERSIST");
+    shared.spexpireat = createSharedString("SPEXPIREAT");
+    shared.spersist = createSharedString("SPERSIST");
     shared.srem = createSharedString("SREM");
+    shared.sadd = createSharedString("SADD");
     shared.xgroup = createSharedString("XGROUP");
     shared.xclaim = createSharedString("XCLAIM");
     shared.xdel = createSharedString("XDEL");
@@ -2373,6 +2401,7 @@ void createSharedObjects(void) {
     shared.special_equals = createSharedString("=");
     shared.redacted = createSharedString("(redacted)");
     shared.fields = createSharedString("FIELDS");
+    shared.members = createSharedString("MEMBERS");
     shared.finish = createSharedString("FINISH");
     shared.state = createSharedString("STATE");
     shared.success = createSharedString("SUCCESS");
@@ -2924,6 +2953,7 @@ void resetServerStats(void) {
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredfields = 0;
+    server.stat_expiredsetmembers = 0;
     server.stat_expired_keys_stale_perc = 0;
     server.stat_expired_keys_with_vola_stale_perc = 0;
     server.stat_expired_time_cap_reached_count = 0;
@@ -3777,7 +3807,7 @@ bool clientSupportStandAloneRedirect(client *c) {
     return !server.cluster_enabled && server.primary_host && c->capa & CLIENT_CAPA_REDIRECT;
 }
 
-static int shouldPropagate(int target) {
+int shouldPropagate(int target) {
     if (!server.replication_allowed || target == PROPAGATE_NONE || server.loading) return 0;
 
     if (target & PROPAGATE_AOF) {
@@ -6867,6 +6897,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "sync_partial_err:%lld\r\n", server.stat_sync_partial_err,
                 "expired_keys:%lld\r\n", server.stat_expiredkeys,
                 "expired_fields:%lld\r\n", server.stat_expiredfields,
+                "expired_set_members:%lld\r\n", server.stat_expiredsetmembers,
                 "expired_stale_perc:%.2f\r\n", server.stat_expired_keys_stale_perc * 100,
                 "expired_keys_with_volatile_items_stale_perc:%.2f\r\n", server.stat_expired_keys_with_vola_stale_perc * 100,
                 "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
@@ -8252,6 +8283,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
  * HGET specific command extended options - PERSIST
  * HSET specific command extended options - NX/XX/FXX/FNX
  * DELEX specific command extended options - IFEQ/IFNE
+ * SADDEX specific command extended options - NX/XX/MXX/MNX
  * INCREX specific command extended options - BYINT/BYFLOAT
  * Common command extended options - EX/EXAT/PX/PXAT/KEEPTTL
  *
@@ -8278,13 +8310,15 @@ int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_
         if ((opt[0] == 'n' || opt[0] == 'N') &&
             (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
             !(*flags & (ARGS_SET_CONDITIONAL & ~ARGS_SET_NX)) && /* Repeated NX allowed */
-            (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET || command_type == COMMAND_INCREX))
+            (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET || command_type == COMMAND_INCREX ||
+             command_type == COMMAND_SADDEX))
         {
             *flags |= ARGS_SET_NX;
         } else if ((opt[0] == 'x' || opt[0] == 'X') &&
                    (opt[1] == 'x' || opt[1] == 'X') && opt[2] == '\0' &&
                    !(*flags & (ARGS_SET_CONDITIONAL & ~ARGS_SET_XX)) && /* Repeated XX allowed */
-                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET || command_type == COMMAND_INCREX))
+                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET || command_type == COMMAND_INCREX ||
+                    command_type == COMMAND_SADDEX))
         {
             *flags |= ARGS_SET_XX;
         } else if ((opt[0] == 'f' || opt[0] == 'F') &&
@@ -8297,6 +8331,18 @@ int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_
                    (opt[1] == 'x' || opt[1] == 'X') &&
                    (opt[2] == 'x' || opt[2] == 'X') && opt[3] == '\0' &&
                    !(*flags & ARGS_SET_FNX || *flags & ARGS_SET_IFEQ) && (command_type == COMMAND_HSET))
+        {
+            *flags |= ARGS_SET_FXX;
+        } else if ((opt[0] == 'm' || opt[0] == 'M') &&
+                   (opt[1] == 'n' || opt[1] == 'N') &&
+                   (opt[2] == 'x' || opt[2] == 'X') && opt[3] == '\0' &&
+                   !(*flags & ARGS_SET_FXX) && (command_type == COMMAND_SADDEX))
+        {
+            *flags |= ARGS_SET_FNX;
+        } else if ((opt[0] == 'm' || opt[0] == 'M') &&
+                   (opt[1] == 'x' || opt[1] == 'X') &&
+                   (opt[2] == 'x' || opt[2] == 'X') && opt[3] == '\0' &&
+                   !(*flags & ARGS_SET_FNX) && (command_type == COMMAND_SADDEX))
         {
             *flags |= ARGS_SET_FXX;
         } else if ((opt[0] == 'i' || opt[0] == 'I') &&
@@ -8328,7 +8374,8 @@ int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_
         } else if (!strcasecmp(opt, "KEEPTTL") && !(*flags & ARGS_PERSIST) &&
                    !(*flags & ARGS_EX) && !(*flags & ARGS_EXAT) &&
                    !(*flags & ARGS_PX) && !(*flags & ARGS_PXAT) &&
-                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET))
+                   (command_type == COMMAND_SET || command_type == COMMAND_HSET || command_type == COMMAND_MSET ||
+                    command_type == COMMAND_SADDEX))
         {
             *flags |= ARGS_KEEPTTL;
         } else if (!strcasecmp(opt,"PERSIST") && (command_type == COMMAND_GET || command_type == COMMAND_HGET) &&
