@@ -8,6 +8,7 @@
 
 /* Ensure assert() is never compiled out, even in Release builds. */
 #undef NDEBUG
+#include <algorithm>
 #include <cassert>
 #include <climits>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 extern "C" {
 #include "allocator_defrag.h"
@@ -236,10 +238,10 @@ TEST_F(VsetTest, TestVsetGetSize) {
  * encoding: NONE, SINGLE, VECTOR, and RAX (both a single time-bucket and
  * multiple time-buckets).
  *
- * Note on RAX: the estimate is the timestamp of the earliest time-bucket
- * (the entry's expiry rounded up to a bucket-interval boundary), not the
- * exact entry expiry. raxSeek("^") already positions the iterator on the
- * smallest key and populates it.key, so the RAX case reads the earliest
+ * Note on RAX: the estimate is the start of the earliest time-bucket's window
+ * (the bucket key rounds the entry's expiry up to a bucket-interval boundary),
+ * not the exact entry expiry. raxSeek("^") already positions the iterator on
+ * the smallest key and populates it.key, so the RAX case reads the earliest
  * bucket directly.
  *
  * A top-level HT bucket is intentionally not tested: vsetAddEntry() always
@@ -295,10 +297,10 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
 
     /* --- VSET_BUCKET_RAX, single time-bucket: > 127 entries with the same
      * expiry force a vector -> RAX conversion (one HT sub-bucket). The
-     * estimate is the earliest bucket's timestamp: the bucket key rounds the
-     * expiry up to a bucket-interval boundary, so it lies in
-     * [expiry, expiry + BUCKET_MAX]. With the raxNext() bug it instead reads
-     * an unpopulated key (typically 0), which fails the lower bound. --- */
+     * estimate is the start of the earliest bucket's window: the bucket key
+     * rounds the expiry up to a bucket-interval boundary, so the window start
+     * lies in (expiry - BUCKET_MAX, expiry]. With the raxNext() bug it instead
+     * reads an unpopulated key (typically 0), which fails the lower bound. --- */
     {
         vset set;
         vsetInit(&set);
@@ -312,8 +314,8 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
             ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries[i]));
         }
         long long est = vsetEstimatedEarliestExpiry(&set, mockGetExpiry);
-        ASSERT_GE(est, expiry);
-        ASSERT_LE(est, expiry + BUCKET_MAX);
+        ASSERT_GT(est, expiry - BUCKET_MAX);
+        ASSERT_LE(est, expiry);
         vsetRelease(&set);
         for (int i = 0; i < n; i++) mockFreeEntry(entries[i]);
     }
@@ -347,8 +349,8 @@ TEST_F(VsetTest, TestVsetEstimatedEarliestExpiry) {
         }
         long long est = vsetEstimatedEarliestExpiry(&set, mockGetExpiry);
         /* Must reflect the early bucket, not the late one. */
-        ASSERT_GE(est, early);
-        ASSERT_LE(est, early + BUCKET_MAX);
+        ASSERT_GT(est, early - BUCKET_MAX);
+        ASSERT_LE(est, early);
         ASSERT_LT(est, late);
         vsetRelease(&set);
         for (int i = 0; i < idx; i++) mockFreeEntry(entries[i]);
@@ -734,6 +736,158 @@ TEST_F(VsetTest, TestVsetLargeExpiryBucketOverflow) {
     for (int i = 0; i < total_entries; i++) mockFreeEntry(entries[i]);
 }
 
+#define RAX_BASE_ENTRIES 128
+
+/* The base entries share one bucket and overflow the vector limit, forcing a RAX. */
+static void makeRaxBase(vset *set, mock_entry **base) {
+    vsetInit(set);
+    for (size_t i = 0; i < RAX_BASE_ENTRIES; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "rax_base_%zu", i);
+        base[i] = mockCreateEntry(key, 80);
+        ASSERT_TRUE(vsetAddEntry(set, mockGetExpiry, base[i]));
+    }
+}
+
+TEST_F(VsetTest, TestVsetHasHidden) {
+    /* Expiration is strict: a deadline equal to the time is live. */
+    {
+        vset set;
+        vsetInit(&set);
+        mock_entry *entry = mockCreateEntry("single", 50);
+        ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entry));
+        ASSERT_FALSE(vsetHasHidden(&set, mockGetExpiry, 50));
+        ASSERT_TRUE(vsetHasHidden(&set, mockGetExpiry, 51));
+        vsetRelease(&set);
+        mockFreeEntry(entry);
+    }
+
+    /* A top-level vector is kept sorted, whatever the insertion order, so its
+     * earliest entry decides. */
+    {
+        vset set;
+        vsetInit(&set);
+        mock_entry *entries[] = {
+            mockCreateEntry("vector_a", 300),
+            mockCreateEntry("vector_b", 120),
+            mockCreateEntry("vector_c", 200),
+        };
+        const size_t count = sizeof(entries) / sizeof(entries[0]);
+        for (size_t i = 0; i < count; i++) ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries[i]));
+        ASSERT_FALSE(vsetHasHidden(&set, mockGetExpiry, 120));
+        ASSERT_TRUE(vsetHasHidden(&set, mockGetExpiry, 121));
+        vsetRelease(&set);
+        for (size_t i = 0; i < count; i++) mockFreeEntry(entries[i]);
+    }
+
+    /* A RAX answers from its earliest bucket: by the entries while the bucket's
+     * window is open, by the bucket's key once it has closed. */
+    {
+        vset set;
+        mock_entry *base[RAX_BASE_ENTRIES];
+        makeRaxBase(&set, base);
+        mock_entry *later = mockCreateEntry("later_window", 20000);
+        ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, later));
+        ASSERT_FALSE(vsetHasHidden(&set, mockGetExpiry, 80));
+        ASSERT_TRUE(vsetHasHidden(&set, mockGetExpiry, 81));
+        ASSERT_TRUE(vsetHasHidden(&set, mockGetExpiry, 19000));
+        vsetRelease(&set);
+        for (size_t i = 0; i < RAX_BASE_ENTRIES; i++) mockFreeEntry(base[i]);
+        mockFreeEntry(later);
+    }
+}
+
+/* An expiry drawn to exercise every encoding: spread deadlines (vector
+ * buckets), a few shared deadlines (hashtable buckets), deadlines packed into
+ * one window, and the LLONG_MAX bucket. */
+static long long liveTestExpiry(int style, long long base) {
+    switch (style) {
+    case 0: return base + rand() % 200000;
+    case 1: return base + (long long)(rand() % 6) * 20000;
+    case 2: return base + rand() % 40;
+    default: return rand() % 8 == 0 ? LLONG_MAX - rand() % 3 : base + rand() % 30000;
+    }
+}
+
+/* The live census, the bounded collection and both hidden checks agree with a
+ * brute-force scan at every time that matters: each entry's own expiry and its
+ * neighbours, and the edges of the windows the RAX files it under. A time of
+ * LLONG_MAX is never a command time, so it is not probed. */
+TEST_F(VsetTest, TestVsetLiveEntriesMatchBruteForce) {
+    srand(12345);
+    for (int round = 0; round < 48; round++) {
+        int style = round % 4;
+        int n = round < 8 ? round * 23 : 100 + rand() % 2500;
+        long long base = 1000000 + rand() % 100000;
+        vset set;
+        vsetInit(&set);
+        std::vector<mock_entry *> entries;
+        for (int i = 0; i < n; i++) {
+            char key[32];
+            snprintf(key, sizeof(key), "live_%d_%d", round, i);
+            entries.push_back(mockCreateEntry(key, liveTestExpiry(style, base)));
+            ASSERT_TRUE(vsetAddEntry(&set, mockGetExpiry, entries.back()));
+        }
+        /* Removals and expiry changes reshape the buckets the walks read. */
+        for (int k = 0; k < n / 3 && !entries.empty(); k++) {
+            size_t i = rand() % entries.size();
+            if (rand() % 2) {
+                ASSERT_TRUE(vsetRemoveEntry(&set, mockGetExpiry, entries[i]));
+                mockFreeEntry(entries[i]);
+                entries[i] = entries.back();
+                entries.pop_back();
+            } else {
+                mock_entry *old = entries[i];
+                long long old_expiry = mockGetExpiry(old);
+                entries[i] = mockEntryUpdate(old, liveTestExpiry(style, base));
+                ASSERT_TRUE(vsetUpdateEntry(&set, mockGetExpiry, old, entries[i], old_expiry, mockGetExpiry(entries[i])));
+            }
+        }
+
+        std::vector<long long> probes = {0, base - 1, base, LLONG_MAX - 1};
+        for (size_t i = 0; i < entries.size(); i += 1 + entries.size() / 64) {
+            long long e = mockGetExpiry(entries[i]);
+            if (e >= LLONG_MAX - 16) continue;
+            long long min_window = e & ~15LL, max_window = e & ~8191LL;
+            for (long long t : {e - 1, e, e + 1, min_window, min_window + 16, max_window + 8191, max_window + 8192,
+                                max_window + 8193})
+                probes.push_back(t);
+        }
+
+        std::vector<void *> out(entries.size() + 1);
+        for (long long now : probes) {
+            std::vector<void *> live;
+            bool hidden = false;
+            for (mock_entry *m : entries) {
+                if (mockGetExpiry(m) < now)
+                    hidden = true;
+                else
+                    live.push_back(m);
+            }
+            std::sort(live.begin(), live.end());
+            ASSERT_EQ(vsetCountLive(&set, mockGetExpiry, now), live.size()) << "round " << round << " now " << now;
+            ASSERT_EQ(vsetHasHidden(&set, mockGetExpiry, now), hidden) << "round " << round << " now " << now;
+            if (hidden) {
+                ASSERT_TRUE(vsetMayHaveHidden(&set, mockGetExpiry, now)) << "round " << round << " now " << now;
+            }
+
+            size_t got = vsetCollectLive(&set, mockGetExpiry, now, live.size(), out.data());
+            ASSERT_EQ(got, live.size()) << "round " << round << " now " << now;
+            std::vector<void *> collected(out.begin(), out.begin() + got);
+            std::sort(collected.begin(), collected.end());
+            ASSERT_EQ(collected, live) << "round " << round << " now " << now;
+            /* One fewer than the live entries is not enough room. */
+            if (!live.empty()) {
+                ASSERT_EQ(vsetCollectLive(&set, mockGetExpiry, now, live.size() - 1, out.data()), live.size())
+                    << "round " << round << " now " << now;
+            }
+        }
+
+        vsetRelease(&set);
+        for (mock_entry *m : entries) mockFreeEntry(m);
+    }
+}
+
 TEST_F(VsetTest, TestVsetDefrag) {
     srand(time(nullptr));
 
@@ -809,15 +963,15 @@ TEST_F(VsetTest, TestVsetMemUsage) {
 
     /* NONE: memory usage should be 0 */
     vsetInit(&set);
-    ASSERT_EQ(vsetMemUsage(&set), 0u);
+    ASSERT_EQ(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     /* SINGLE: memory usage should be 0 (entry pointer stored inline) */
     insert_mock_entry_with_expiry(&set, 100);
-    ASSERT_EQ(vsetMemUsage(&set), 0u);
+    ASSERT_EQ(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     /* VECTOR: second entry forces SINGLE → VECTOR, memory now non-zero */
     insert_mock_entry_with_expiry(&set, 200);
-    ASSERT_GT(vsetMemUsage(&set), 0u);
+    ASSERT_GT(vsetMemUsage(&set, SIZE_MAX), 0u);
 
     vsetRelease(&set);
 
@@ -828,20 +982,37 @@ TEST_F(VsetTest, TestVsetMemUsage) {
     for (int i = 0; i < 200; i++) {
         insert_mock_entry_with_expiry(&set, 1000LL);
     }
-    size_t mem_one_bucket = vsetMemUsage(&set);
+    size_t mem_one_bucket = vsetMemUsage(&set, SIZE_MAX);
     ASSERT_GT(mem_one_bucket, 0u);
     vsetRelease(&set);
 
-    /* RAX with multiple buckets: spread entries across many time windows
-     * so the RAX holds several distinct time buckets. */
+    /* Two equally sized HT buckets: without scaling by the bucket count, a
+     * one-bucket sample reports only one of them. */
     vsetInit(&set);
     for (int i = 0; i < 200; i++) {
-        long long expiry = 1000LL + i * 10000LL;
-        insert_mock_entry_with_expiry(&set, expiry);
+        insert_mock_entry_with_expiry(&set, 1000LL);
     }
-    size_t mem_multi_bucket = vsetMemUsage(&set);
-    ASSERT_GT(mem_multi_bucket, 0u);
+    for (int i = 0; i < 200; i++) {
+        insert_mock_entry_with_expiry(&set, 100000LL);
+    }
+    ASSERT_GT(vsetMemUsage(&set, SIZE_MAX), 0u);
+    /* Both buckets are accounted for, not averaged into one. */
+    ASSERT_GT(vsetMemUsage(&set, 1), mem_one_bucket + mem_one_bucket / 2);
+    vsetRelease(&set);
+
+    /* RAX with heterogeneous buckets: one HT bucket followed by ten SINGLE
+     * buckets, which hold their entry inline and so cost nothing. Scaling the
+     * sampled HT bucket by eleven must overshoot the full walk. */
+    vsetInit(&set);
+    for (int i = 0; i < 200; i++) {
+        insert_mock_entry_with_expiry(&set, 1000LL);
+    }
+    for (int i = 1; i <= 10; i++) {
+        insert_mock_entry_with_expiry(&set, 1000LL + i * 10000LL);
+    }
+    size_t mem_multi_bucket = vsetMemUsage(&set, SIZE_MAX);
     ASSERT_GT(mem_multi_bucket, mem_one_bucket);
+    ASSERT_GT(vsetMemUsage(&set, 1), mem_multi_bucket);
 
     vsetRelease(&set);
 }

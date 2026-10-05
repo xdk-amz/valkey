@@ -1651,31 +1651,37 @@ static inline size_t vsetBucketMemUsage_HASHTABLE(vsetBucket *bucket) {
     return hashtableMemUsage(ht);
 }
 
-static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket) {
+/* Sums the memory of at most 'sample_size' time buckets and scales the result by
+ * the number of buckets, so a caller that samples k entries of the object does
+ * not pay a walk over every bucket. */
+static inline size_t vsetBucketMemUsage_RAX(vsetBucket *bucket, size_t sample_size) {
     rax *r = vsetBucketRax(bucket);
     size_t total_mem = raxAllocSize(r);
+    size_t sampled_mem = 0, samples = 0;
     raxIterator it;
     raxStart(&it, r);
     assert(raxSeek(&it, "^", NULL, 0));
-    while (raxNext(&it)) {
+    while (samples < sample_size && raxNext(&it)) {
         switch (vsetBucketType(it.data)) {
         case VSET_BUCKET_NONE:
-            total_mem += vsetBucketMemUsage_NONE(it.data);
+            sampled_mem += vsetBucketMemUsage_NONE(it.data);
             break;
         case VSET_BUCKET_SINGLE:
-            total_mem += vsetBucketMemUsage_SINGLE(it.data);
+            sampled_mem += vsetBucketMemUsage_SINGLE(it.data);
             break;
         case VSET_BUCKET_VECTOR:
-            total_mem += vsetBucketMemUsage_VECTOR(it.data);
+            sampled_mem += vsetBucketMemUsage_VECTOR(it.data);
             break;
         case VSET_BUCKET_HT:
-            total_mem += vsetBucketMemUsage_HASHTABLE(it.data);
+            sampled_mem += vsetBucketMemUsage_HASHTABLE(it.data);
             break;
         default:
             panic("Unknown bucket type encountered in vsetBucketMemUsage_HASHTABLE");
         }
+        samples++;
     }
     raxStop(&it);
+    total_mem += (size_t)((double)sampled_mem / samples * raxSize(r));
     return total_mem;
 }
 
@@ -2092,11 +2098,12 @@ size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc 
  *     set: Pointer to the volatile set (vset *) to inspect.
  *     getExpiry: Callback function used to extract the expiration time from a set entry.
  *
- * Returns the earliest expiration time based on the structure of the volatile set.
- * This is an *approximate* value:
- *   - For bucketed types (e.g., radix tree, vector), it returns the expiry of the first bucket or entry,
- *     which may not be the actual earliest expiring item.
- *   - For single-entry sets, it returns the expiry of the sole item.
+ * Returns a lower bound on the earliest expiration time in the set, so a caller
+ * that must not miss an already expired entry can rely on it:
+ *   - For a radix tree it returns the start of the earliest time window. The
+ *     bucket key is the deadline rounded UP to the end of its window, so an
+ *     entry filed under it expires anywhere inside that window.
+ *   - For vector and single-entry buckets it returns the exact expiry.
  *   - For VSET_BUCKET_NONE, it returns -1 to indicate there is no data.
  *
  * Supported bucket types:
@@ -2128,7 +2135,7 @@ long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) {
          * RAX-encoded set is never empty, so the first advance always succeeds. */
         raxSeek(&it, "^", NULL, 0);
         assert(raxNext(&it));
-        expiry = decodeExpiryKey(it.key);
+        expiry = decodeExpiryKey(it.key) - VOLATILESET_BUCKET_INTERVAL_MAX;
         raxStop(&it);
         break;
     }
@@ -2196,7 +2203,7 @@ bool vsetNext(vsetIterator *iter, void **entryptr) {
     return ret == 1;
 }
 
-size_t vsetMemUsage(vset *set) {
+size_t vsetMemUsage(vset *set, size_t sample_size) {
     int bucket_type = vsetBucketType(*set);
     switch (bucket_type) {
     case VSET_BUCKET_NONE:
@@ -2208,7 +2215,7 @@ size_t vsetMemUsage(vset *set) {
     case VSET_BUCKET_HT:
         panic("Unsupported hashtable bucket type for vset");
     case VSET_BUCKET_RAX:
-        return vsetBucketMemUsage_RAX(*set);
+        return vsetBucketMemUsage_RAX(*set, sample_size);
     default:
         panic("Unknown set type encountered in vsetMemUsage");
     }
@@ -2236,6 +2243,8 @@ static inline size_t vsetBucketSize_HASHTABLE(vsetBucket *bucket) {
     return hashtableSize(ht);
 }
 
+static inline size_t vsetBucketSize(vsetBucket *bucket);
+
 static inline size_t vsetBucketSize_RAX(vsetBucket *bucket) {
     rax *r = vsetBucketRax(bucket);
     size_t numele = 0;
@@ -2243,22 +2252,7 @@ static inline size_t vsetBucketSize_RAX(vsetBucket *bucket) {
     raxStart(&it, r);
     assert(raxSeek(&it, "^", NULL, 0));
     while (raxNext(&it)) {
-        switch (vsetBucketType(it.data)) {
-        case VSET_BUCKET_NONE:
-            numele += vsetBucketSize_NONE(it.data);
-            break;
-        case VSET_BUCKET_SINGLE:
-            numele += vsetBucketSize_SINGLE(it.data);
-            break;
-        case VSET_BUCKET_VECTOR:
-            numele += vsetBucketSize_VECTOR(it.data);
-            break;
-        case VSET_BUCKET_HT:
-            numele += vsetBucketSize_HASHTABLE(it.data);
-            break;
-        default:
-            panic("Unknown bucket type encountered in vsetBucketSize_RAX");
-        }
+        numele += vsetBucketSize(it.data);
     }
     raxStop(&it);
     return numele;
@@ -2281,6 +2275,254 @@ size_t vsetSize(vset *set) {
         panic("Unknown set type encountered in vsetSize");
     }
     return 0;
+}
+
+/* Expiration is strict: a deadline equal to command time remains live. */
+static inline bool vsetEntryIsHidden(long long expiry, mstime_t now) {
+    return expiry < now;
+}
+
+static inline size_t vsetBucketSize(vsetBucket *bucket) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return vsetBucketSize_NONE(bucket);
+    case VSET_BUCKET_SINGLE:
+        return vsetBucketSize_SINGLE(bucket);
+    case VSET_BUCKET_VECTOR:
+        return vsetBucketSize_VECTOR(bucket);
+    case VSET_BUCKET_HT:
+        return vsetBucketSize_HASHTABLE(bucket);
+    default:
+        panic("Unknown bucket type encountered in vsetBucketSize");
+    }
+    return 0;
+}
+
+/* Live entries at a point in time.
+ *
+ * Two properties of the RAX encoding let a bucket be classified by its key
+ * instead of by its entries:
+ *
+ *   1. findBucket() files an entry under a key no later than get_max_bucket_ts()
+ *      of its expiry, and splitting or re-aligning a bucket only lowers keys, so
+ *      every entry of the bucket keyed 'ts' expires in
+ *      [ts - VOLATILESET_BUCKET_INTERVAL_MAX, ts) (at 'ts' itself in the bucket
+ *      keyed LLONG_MAX, which no 'now' reaches).
+ *   2. An entry is filed under the smallest key above its expiry, and splits,
+ *      re-alignment and removals keep it there, so no entry of a bucket expires
+ *      before the key of the bucket preceding it.
+ *
+ * So at 'now' a bucket keyed at or below 'now' is wholly hidden, a bucket whose
+ * window starts at or after 'now' is wholly live, and at most one bucket holds
+ * entries of both kinds. A top-level vector is kept sorted, so its live entries
+ * are a suffix. */
+
+static bool vsetBucketHasHidden(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return false;
+    case VSET_BUCKET_SINGLE:
+        return vsetEntryIsHidden(getExpiry(vsetBucketSingle(bucket)), now);
+    case VSET_BUCKET_VECTOR: {
+        /* RAX vector buckets are append-ordered, so any entry may be the earliest. */
+        pVector *pv = vsetBucketVector(bucket);
+        for (uint32_t i = 0; i < pvLen(pv); i++) {
+            if (vsetEntryIsHidden(getExpiry(pvGet(pv, i)), now)) return true;
+        }
+        return false;
+    }
+    case VSET_BUCKET_HT: {
+        hashtableIterator it;
+        void *entry;
+        bool hidden = false;
+        hashtableInitIterator(&it, vsetBucketHashtable(bucket), 0);
+        while (!hidden && hashtableNext(&it, &entry)) hidden = vsetEntryIsHidden(getExpiry(entry), now);
+        hashtableCleanupIterator(&it);
+        return hidden;
+    }
+    default:
+        panic("Unknown bucket type encountered in vsetBucketHasHidden");
+    }
+    return false;
+}
+
+/* 1 when an entry is hidden at 'now', 0 when none is. Every entry after the
+ * earliest bucket is live once that bucket's key is above 'now', so at most the
+ * earliest bucket is read; a hashtable bucket is read only when 'read_hashtable'
+ * is set, -1 standing for the answer it would have given. */
+static int vsetHiddenAt(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, bool read_hashtable) {
+    vsetBucket *bucket = *set;
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+        return vsetEntryIsHidden(getExpiry(vsetBucketSingle(bucket)), now);
+    case VSET_BUCKET_VECTOR:
+        return vsetEntryIsHidden(getExpiry(pvGet(vsetBucketVector(bucket), 0)), now);
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        raxIterator it;
+        raxStart(&it, vsetBucketRax(bucket));
+        assert(raxSeek(&it, "^", NULL, 0));
+        assert(raxNext(&it));
+        long long ts = decodeExpiryKey(it.key);
+        vsetBucket *earliest = it.data;
+        raxStop(&it);
+        if (ts <= now) return 1;
+        if (ts - VOLATILESET_BUCKET_INTERVAL_MAX >= now) return 0;
+        if (vsetBucketType(earliest) == VSET_BUCKET_HT && !read_hashtable) return -1;
+        return vsetBucketHasHidden(earliest, getExpiry, now);
+    }
+    default:
+        panic("Unknown set type encountered in vsetHiddenAt");
+    }
+    return 0;
+}
+
+bool vsetHasHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) {
+    return vsetHiddenAt(set, getExpiry, now, true) == 1;
+}
+
+bool vsetMayHaveHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) {
+    return vsetHiddenAt(set, getExpiry, now, false) != 0;
+}
+
+/* Appends the live entries of 'bucket' to the 'held' already in 'out', or only
+ * counts them when 'out' is NULL. 'check' is false for a bucket already known
+ * to be wholly live, whose entries are then not read. Returns the new total, or
+ * cap + 1 once more than 'cap' entries are live. */
+static size_t
+vsetBucketTakeLive(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now, bool check, void **out, size_t held, size_t cap) {
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_SINGLE: {
+        void *entry = vsetBucketSingle(bucket);
+        if (check && vsetEntryIsHidden(getExpiry(entry), now)) return held;
+        if (out) {
+            if (held == cap) return cap + 1;
+            out[held] = entry;
+        }
+        return held + 1;
+    }
+    case VSET_BUCKET_VECTOR: {
+        pVector *pv = vsetBucketVector(bucket);
+        uint32_t len = pvLen(pv);
+        if (!check) {
+            if (out) {
+                if (cap - held < len) return cap + 1;
+                memcpy(out + held, pv->data, len * sizeof(void *));
+            }
+            return held + len;
+        }
+        for (uint32_t i = 0; i < len; i++) {
+            void *entry = pvGet(pv, i);
+            if (vsetEntryIsHidden(getExpiry(entry), now)) continue;
+            if (out) {
+                if (held == cap) return cap + 1;
+                out[held] = entry;
+            }
+            held++;
+        }
+        return held;
+    }
+    case VSET_BUCKET_HT: {
+        hashtable *ht = vsetBucketHashtable(bucket);
+        if (!check) {
+            if (!out) return held + hashtableSize(ht);
+            if (cap - held < hashtableSize(ht)) return cap + 1;
+        }
+        hashtableIterator it;
+        void *entry;
+        hashtableInitIterator(&it, ht, 0);
+        while (hashtableNext(&it, &entry)) {
+            if (check && vsetEntryIsHidden(getExpiry(entry), now)) continue;
+            if (out) {
+                if (held == cap) {
+                    held = cap + 1;
+                    break;
+                }
+                out[held] = entry;
+            }
+            held++;
+        }
+        hashtableCleanupIterator(&it);
+        return held;
+    }
+    default:
+        panic("Unknown bucket type encountered in vsetBucketTakeLive");
+    }
+    return held;
+}
+
+/* The live entries newest bucket first, stopping at the first bucket whose key
+ * proves it (and every earlier one) wholly hidden. A bucket is read only when
+ * its window holds 'now', which is true of at most one. */
+static size_t vsetScanLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, void **out, size_t cap) {
+    vsetBucket *bucket = *set;
+    switch (vsetBucketType(bucket)) {
+    case VSET_BUCKET_NONE:
+        return 0;
+    case VSET_BUCKET_SINGLE:
+        return vsetBucketTakeLive(bucket, getExpiry, now, true, out, 0, cap);
+    case VSET_BUCKET_VECTOR: {
+        /* Sorted, so a binary search finds where the live suffix starts. */
+        pVector *pv = vsetBucketVector(bucket);
+        uint32_t lo = 0, hi = pvLen(pv);
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (vsetEntryIsHidden(getExpiry(pvGet(pv, mid)), now))
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        size_t live = pvLen(pv) - lo;
+        if (out) {
+            if (live > cap) return cap + 1;
+            memcpy(out, pv->data + lo, live * sizeof(void *));
+        }
+        return live;
+    }
+    case VSET_BUCKET_HT:
+        panic("Unsupported hashtable bucket type for vset");
+    case VSET_BUCKET_RAX: {
+        size_t live = 0;
+        raxIterator it;
+        raxStart(&it, vsetBucketRax(bucket));
+        assert(raxSeek(&it, "$", NULL, 0));
+        bool more = raxPrev(&it);
+        while (more && live <= cap) {
+            long long ts = decodeExpiryKey(it.key);
+            if (ts <= now) break;
+            vsetBucket *current = it.data;
+            bool wholly_live = ts - VOLATILESET_BUCKET_INTERVAL_MAX >= now, advanced = false;
+            if (!wholly_live) {
+                /* The preceding bucket's key bounds this bucket's entries from below. */
+                more = raxPrev(&it);
+                advanced = true;
+                wholly_live = more && decodeExpiryKey(it.key) >= now;
+            }
+            if (wholly_live && out == NULL)
+                live += vsetBucketSize(current);
+            else
+                live = vsetBucketTakeLive(current, getExpiry, now, !wholly_live, out, live, cap);
+            if (!advanced && live <= cap) more = raxPrev(&it);
+        }
+        raxStop(&it);
+        return live;
+    }
+    default:
+        panic("Unknown set type encountered in vsetScanLive");
+    }
+    return 0;
+}
+
+size_t vsetCountLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) {
+    return vsetScanLive(set, getExpiry, now, NULL, SIZE_MAX);
+}
+
+size_t vsetCollectLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t cap, void **out) {
+    assert(out && cap < SIZE_MAX);
+    return vsetScanLive(set, getExpiry, now, out, cap);
 }
 
 /* Initializes a volatile set iterator.

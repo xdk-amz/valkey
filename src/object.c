@@ -715,7 +715,10 @@ void freeListObject(robj *o) {
 
 void freeSetObject(robj *o) {
     switch (objectGetEncoding(o)) {
-    case OBJ_ENCODING_HASHTABLE: hashtableRelease((hashtable *)objectGetVal(o)); break;
+    case OBJ_ENCODING_HASHTABLE:
+        setTypeFreeVolatileSet(o);
+        hashtableRelease((hashtable *)objectGetVal(o));
+        break;
     case OBJ_ENCODING_INTSET:
     case OBJ_ENCODING_LISTPACK: zfree(objectGetVal(o)); break;
     default: serverPanic("Unknown set encoding type");
@@ -1361,18 +1364,19 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
     } else if (objectGetType(o) == OBJ_SET) {
         if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
             hashtable *ht = objectGetVal(o);
+            vset *volatile_members = hashtableMetadata(ht);
             asize += hashtableMemUsage(ht);
 
             hashtableIterator iter;
-            hashtableInitIterator(&iter, ht, 0);
+            hashtableInitIterator(&iter, ht, HASHTABLE_ITER_SKIP_VALIDATION);
             void *next;
             while (hashtableNext(&iter, &next) && samples < sample_size) {
-                sds element = next;
-                elesize += sdsAllocSize(element);
+                elesize += smemberMemUsage(next);
                 samples++;
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
+            if (vsetIsValid(volatile_members)) asize += vsetMemUsage(volatile_members, sample_size);
         } else if (objectGetEncoding(o) == OBJ_ENCODING_INTSET) {
             asize += zmalloc_size(objectGetVal(o));
         } else if (objectGetEncoding(o) == OBJ_ENCODING_LISTPACK) {
@@ -1418,7 +1422,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             }
             hashtableCleanupIterator(&iter);
             if (samples) asize += (double)elesize / samples * hashtableSize(ht);
-            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields);
+            if (vsetIsValid(volatile_fields)) asize += vsetMemUsage(volatile_fields, sample_size);
         } else {
             serverPanic("Unknown hash encoding");
         }

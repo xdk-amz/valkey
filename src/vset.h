@@ -49,13 +49,24 @@
  *     is provided and matches the old entry expiration time.
  *
  * Expiry Retrieval/Removal:
- *     long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) - will return an estimation to the lowest expiry time of
+ *     long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry) - will return a lower bound on the lowest expiry time of
  *     the entries which currently exists in the set. Because of the semi-sorted ordering this implementation is using, the returned value MIGHT not be the 'real' minimum
- *     but rather some value which is the maximum among a group of entries which are all close or equal to the 'real' minimum.
+ *     but rather the start of the time window holding a group of entries which are all close or equal to the 'real' minimum, so a caller that must not miss an
+ *     already expired entry can rely on it.
  *
  *     size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx) - can be used
  *     in order to remove up to max_count entries from the vset. The removed entries will all satisfy the condition that their expiration time is smaller than the provided now.
  *     Note that there are no guarantees about the order to the entries.
+ *
+ * Live entries at a given time (an entry expiring before 'now' is hidden, one expiring at or after it is live):
+ *     bool vsetHasHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) - whether any entry is hidden. Reads at most the earliest bucket.
+ *     bool vsetMayHaveHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) - like vsetHasHidden, but answers true instead of reading a
+ *     hashtable bucket, so it never reads more than one vector of entries.
+ *     size_t vsetCountLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now) - the exact number of live entries. Buckets whose key proves
+ *     them wholly live or wholly hidden are counted without reading an entry, so only one bucket is read.
+ *     size_t vsetCollectLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t cap, void **out) - stores the live entries in 'out'
+ *     when there are at most 'cap' of them and returns their number; returns cap + 1, leaving 'out' unspecified, as soon as more are live.
+ *     It walks the newest buckets first, so a set with many live entries is recognised after reading about 'cap' of them.
  *
  * Utilities:
  *     bool vsetIsEmpty(vset *set) - used in order to check if a given set has any entries.
@@ -90,8 +101,12 @@ void vsetClear(vset *set);
 void vsetRelease(vset *set);
 bool vsetIsValid(vset *set);
 long long vsetEstimatedEarliestExpiry(vset *set, vsetGetExpiryFunc getExpiry);
+bool vsetHasHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now);
+bool vsetMayHaveHidden(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now);
+size_t vsetCountLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now);
+size_t vsetCollectLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, size_t cap, void **out);
 size_t vsetRemoveExpired(vset *set, vsetGetExpiryFunc getExpiry, vsetExpiryFunc expiryFunc, mstime_t now, size_t max_count, void *ctx);
-size_t vsetMemUsage(vset *set);
+size_t vsetMemUsage(vset *set, size_t sample_size);
 size_t vsetScanDefrag(vset *set, size_t cursor, void *(*defragfn)(void *));
 
 #endif
