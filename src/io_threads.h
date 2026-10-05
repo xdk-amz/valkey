@@ -71,6 +71,7 @@ void ioThreadsWakeMain(void);
 int ioThreadsMainMustPoll(void);
 void ioThreadsMainAwake(void);
 void partitionedClientRelease(client *c);
+int partitionedClientHoldReads(client *c);
 int tryOffloadFreeObjToIOThreads(robj *o);
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 int tryOffloadFreePtrToIOThreads(void *ptr);

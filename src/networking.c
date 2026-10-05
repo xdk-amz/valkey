@@ -5297,6 +5297,7 @@ int isClientConnIpV6(client *c) {
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
+    int held_reads = !server.crashed && partitionedClientHoldReads(client);
     char flags[32], events[3], capa[9], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
@@ -5403,6 +5404,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " tot-net-in=%U", client->net_input_bytes,
             " tot-net-out=%U", client->net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
+    if (held_reads) partitionedClientRelease(client);
     return ret;
 }
 

@@ -1303,17 +1303,21 @@ static void clientsCron(int clients_this_cycle) {
          * terminated. */
         if (clientsCronHandleTimeout(c, now)) continue;
         if (clientsCronTcpIsClosing(c)) continue;
-        /* Hold armed sockets while clientsCron mutates read-side buffers. */
         if (c->flag.partitioned) {
+            /* An armed read can start as soon as the hold is released, so every check that reads the query
+             * buffer or the parsed arguments runs under it; none of them frees the client. A client whose
+             * read is starting is checked on a later pass. */
+            if (!partitionedClientHold(c)) continue;
+            clientsCronResizeQueryBuffer(c);
+            clientsCronResizeOutputBuffer(c, now);
+            clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot);
+            if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+            partitionedClientRelease(c);
+            if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
             armPartitionedClientRead(c);
-            if (partitionedClientHold(c)) {
-                int terminated = clientsCronResizeQueryBuffer(c);
-                partitionedClientRelease(c);
-                if (terminated) continue;
-            }
-        } else if (clientsCronResizeQueryBuffer(c)) {
             continue;
         }
+        if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
 

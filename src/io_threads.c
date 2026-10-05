@@ -651,6 +651,23 @@ void partitionedClientRelease(client *c) {
     if (io_epfd[c->io_tid] > 0 && c->conn) epoll_ctl(io_epfd[c->io_tid], EPOLL_CTL_MOD, c->conn->fd, &ev);
 }
 
+/* An armed partitioned client's IO thread starts a read whenever data arrives, so main reads its query
+ * buffer and parsed arguments only after this: a read in flight has finished, and no new one can start
+ * until partitionedClientRelease. Returns 1 if main took the hold. */
+int partitionedClientHoldReads(client *c) {
+    if (!c->flag.partitioned) return 0;
+    partitionedClientWaitArm(c);
+    for (;;) {
+        if (!c->flag.pending_read) return 0; /* not armed: no read can start */
+        uint8_t expected = CLIENT_IDLE;
+        if (__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_HELD_IO, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            return 1;
+        if (expected != CLIENT_PENDING_IO) return 0; /* completed, held or closing: no read starts */
+        while (c->io_read_state == CLIENT_PENDING_IO) atomic_thread_fence(memory_order_acquire);
+    }
+}
+
 /* One-shot readiness keeps a partitioned client idle until main rearms it. With a timeout the thread
  * sleeps here, after announcing it; main's wakes arrive as the wake fd. */
 static int ioThreadPollPartitionWait(int id, int timeout_ms) {
