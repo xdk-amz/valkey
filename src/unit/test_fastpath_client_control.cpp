@@ -424,6 +424,28 @@ TEST_F(FastpathClientControlTest, RequestPublishedByAnyoneExecutedOnlyByOwner) {
     quiesceAndFree(c, peer);
 }
 
+/* A read main deferred while it owned the client is dropped when the client rejoins the fast path, so
+ * main never dispatches a second reader for a connection its IO owner is reading. */
+TEST_F(FastpathClientControlTest, ReadmitDropsReadDeferredOnMain) {
+    int peer;
+    client *c = newFastpathClient(&peer);
+    ClientControl *cc = c->control;
+    fastpathControlRequest(cc, CC_REQ_HANDOFF);
+    fastpathProcessReturns(1);
+    ASSERT_EQ(cc->lifecycle, FP_LEAVING);
+    fastpathHandoffDone(c, 0);
+    ASSERT_EQ(c->flag.fastpath, 0u);
+
+    c->flag.pending_read_deferred = 1;
+    listLinkNodeTail(server.clients_pending_read, &c->clients_pending_read_node);
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
+    EXPECT_EQ(c->flag.fastpath, 1u);
+    EXPECT_EQ(c->flag.pending_read_deferred, 0u);
+    EXPECT_EQ(listLength(server.clients_pending_read), 0u);
+    fastpathProcessReturns(1);
+    quiesceAndFree(c, peer);
+}
+
 /* Request precedence, idempotence, and coalescing on the control word itself: CLOSE is terminal and
  * supersedes the rest, and setting a bit already present does not change the word. */
 TEST_F(FastpathClientControlTest, RequestPrecedenceAndIdempotence) {

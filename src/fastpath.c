@@ -2192,6 +2192,11 @@ static int fpReadmit(client *c) {
         c->flag.pending_write = 0;
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
     }
+    if (c->flag.pending_read_deferred) {
+        /* The IO owner reads the socket itself; a deferred read dispatched later would parse it on a second thread. */
+        c->flag.pending_read_deferred = 0;
+        listUnlinkNode(server.clients_pending_read, &c->clients_pending_read_node);
+    }
     trimClientQueryBuffer(c);
     connSetReadHandler(c->conn, NULL);
     if (fastpathAttach(c) == C_OK) return 1;
