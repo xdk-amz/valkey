@@ -89,6 +89,7 @@ void testOnlyFreeIOThreadQueues(void);
 void testOnlyFillIOThreadInbox(void);
 size_t testOnlyGetClusterIOPendingResponses(void);
 void testOnlySetIOThreadReady(int tid, int epfd);
+void testOnlySetCurTid(int tid);
 void trySendPollJobToIOThreads(void);
 int trySendAcceptToIOThreads(connection *conn);
 struct clusterLink;

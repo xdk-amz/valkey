@@ -1809,6 +1809,11 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
     if (io_ready_num <= tid) io_ready_num = tid + 1;
 }
 
+/* Unit tests run IO-thread code on their own threads; this makes the calling thread IO thread tid. */
+void testOnlySetCurTid(int tid) {
+    thread_id = tid;
+}
+
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     /* Fake/teardown clients may have no connection; never offload those. */

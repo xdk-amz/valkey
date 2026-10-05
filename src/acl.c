@@ -811,7 +811,7 @@ void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int
      * exit from here on goes through fastpathAdmitReadEnd. */
     int errpos = 0;
     int ok = 0;
-    fastpathAdmitReadBegin(c->cur_tid);
+    fastpathAdmitReadBegin();
     /* StoreLoad barrier. fastpathAdmitReadBegin published admit_seq odd with a seq_cst store; this
      * seq_cst fence prevents the epoch snapshot, the roles-list header read and the rule-set loads
      * below from being reordered BEFORE that publish on a weak-memory arch (an acquire fence would
@@ -831,7 +831,7 @@ void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int
     if (roles == NULL || listLength(roles) == 0) {
         ok = ACLCheckAllUserCommandPerm(u, cmd, argv, argc, dbid, &errpos) == ACL_OK;
     }
-    fastpathAdmitReadEnd(c->cur_tid);
+    fastpathAdmitReadEnd();
     if (ok) *read_flags |= READ_FLAGS_ACL_ALLOWED;
 }
 

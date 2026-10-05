@@ -148,9 +148,11 @@ void fastpathResetNetStats(void);
  * has left any admission-time ACL rule-set read it may have been inside, so main may then
  * mutate or free that rule-set memory. Cheap when idle; on the rare ACL-mutation path only. */
 void fastpathAdmissionQuiesce(void);
-/* IO-thread side: mark entry/exit of the admission region that dereferences a user's rule set. */
-void fastpathAdmitReadBegin(int tid);
-void fastpathAdmitReadEnd(int tid);
+/* IO-thread side: mark entry/exit of the admission region that dereferences a user's rule set,
+ * on the calling thread's own admission slot. */
+void fastpathAdmitReadBegin(void);
+void fastpathAdmitReadEnd(void);
+uint32_t testOnlyFastpathAdmitSeq(int tid);
 /* Main-only introspection for tests: batches this thread holds for the durability barrier, not yet delivered. */
 size_t fastpathPendingBatches(int tid);
 /* IO owner: nothing fast-path work could do now without a socket event or a wake from main. */

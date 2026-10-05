@@ -276,16 +276,20 @@ int fastpathWorkerReopen(int tid) {
  * subsequent rule-set loads are also ordered after main's epoch bump, so the worker re-snapshots
  * the new epoch and reads the new (swapped) lists. A plain release store would let those loads hoist
  * above the odd publish, so seq_cst is required here, not release. */
-void fastpathAdmitReadBegin(int tid) {
-    fpThread *t = &fp_threads[tid];
+void fastpathAdmitReadBegin(void) {
+    fpThread *t = &fp_threads[getCurTid()]; /* admit_seq has one writer: the reading thread itself */
     atomic_store_explicit(&t->admit_seq, atomic_load_explicit(&t->admit_seq, memory_order_relaxed) + 1,
                           memory_order_seq_cst);
 }
 
-void fastpathAdmitReadEnd(int tid) {
-    fpThread *t = &fp_threads[tid];
+void fastpathAdmitReadEnd(void) {
+    fpThread *t = &fp_threads[getCurTid()];
     atomic_store_explicit(&t->admit_seq, atomic_load_explicit(&t->admit_seq, memory_order_relaxed) + 1,
                           memory_order_release);
+}
+
+uint32_t testOnlyFastpathAdmitSeq(int tid) {
+    return atomic_load_explicit(&fp_threads[tid].admit_seq, memory_order_acquire);
 }
 
 /* Main-thread side: return once no worker still holds a rule-set pointer from before the caller's
