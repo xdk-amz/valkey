@@ -16,7 +16,7 @@
 # Run under ThreadSanitizer to prove the survivor remap is data-race-free (build both the server and
 # the module instrumented, and extend the timeout to absorb TSan's slowdown):
 #   make -j SANITIZER=thread && make -C tests/modules SANITIZER=thread
-#   ./runtest --single unit/acl-offload-load-race --timeout 2400
+#   ./runtest-moduleapi --single unit/moduleapi/acl-offload-load-race --timeout 2400
 # The role-holder's admission still reads u->roles (the offload-eligibility check) while ACL LOAD
 # swaps it, so a regression to in-place mutation surfaces here as a TSan report on u->roles.
 
