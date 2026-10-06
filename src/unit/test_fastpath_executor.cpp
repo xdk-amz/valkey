@@ -108,6 +108,24 @@ class FastpathExecutorTest : public ::testing::Test {
         ssize_t n = read(fd, buf, sizeof(buf));
         return n > 0 ? std::string(buf, n) : std::string();
     }
+
+    /* Whole pages from the allocator: mprotect() can make them unreachable and zmalloc_size() works on them. */
+    static void *allocPages(size_t pagesz, size_t len) {
+        void *p = NULL;
+#ifdef USE_JEMALLOC
+        return je_posix_memalign(&p, pagesz, len) == 0 ? p : NULL;
+#else
+        return posix_memalign(&p, pagesz, len) == 0 ? p : NULL;
+#endif
+    }
+
+    static void freePages(void *p) {
+#ifdef USE_JEMALLOC
+        je_free(p);
+#else
+        free(p);
+#endif
+    }
 };
 
 TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
@@ -116,11 +134,12 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
     conn->state = CONN_STATE_CONNECTED;
 
-    /* The client lives alone in its own pages so it can be unmapped while its batch runs. */
+    /* The client gets pages of its own so they can be made unreachable while its batch runs. They come
+     * from the allocator because attaching sizes the client with zmalloc_size(). */
     size_t pagesz = sysconf(_SC_PAGESIZE);
     size_t maplen = (sizeof(client) + pagesz - 1) / pagesz * pagesz;
-    client *c = static_cast<client *>(mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    ASSERT_NE(c, MAP_FAILED);
+    client *c = static_cast<client *>(allocPages(pagesz, maplen));
+    ASSERT_NE(c, nullptr);
     client *tmp = createClient(NULL);
     memcpy(c, tmp, sizeof(client));
     zfree(tmp);
@@ -162,18 +181,21 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
     EXPECT_NE(lookupKeyRead(server.db[0], key), nullptr);
     decrRefCount(key);
 
-    /* Quiesce so the thread hands the client back and unregisters it (no freeClient on mmap'd pages);
-     * main completes the hand-off, then reclaim its separately allocated control so nothing is owned. */
+    /* Quiesce so the thread hands the client back and unregisters it; main completes the hand-off,
+     * then reclaim its separately allocated control so nothing is owned. */
     fastpathWorkerQuiesce(1);
     fastpathProcessReturns(1);
     fastpathHandoffDone(c, 0); /* main takes the client back: drops the owner pin and the routed count */
     EXPECT_EQ(fastpathWorkerOwnedClients(1), 0u);
     fastpathControlReclaim(c);
 
+    /* Move the client back into a zmalloc block and free it like any other. */
+    client *h = static_cast<client *>(zmalloc(sizeof(client)));
+    memcpy(h, c, sizeof(client));
+    connSetPrivateData(conn, h);
+    freePages(c);
+    freeClient(h);
     close(sv[1]);
-    close(sv[0]);
-    conn->fd = -1;
-    munmap(c, maplen);
 }
 
 /* A retired user struct is kept until the last fast-path client naming it hands off,
@@ -255,9 +277,8 @@ TEST_F(FastpathExecutorTest, ClientInfoOfFastpathClientComesFromAdmissionPeer) {
     ASSERT_EQ(modulePopulateClientInfoStructure(&ci, c, 1), VALKEYMODULE_OK);
     EXPECT_STRNE(ci.addr, "192.0.2.77");
 
+    freeClient(c);
     close(sv[1]);
-    close(sv[0]);
-    conn->fd = -1;
 }
 
 /* An offloaded write advances the global replication offset on main; the IO owner must copy that
