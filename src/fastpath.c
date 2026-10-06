@@ -2213,6 +2213,12 @@ int fastpathDetachConsumed(client *c) {
     return 1;
 }
 
+/* Under appendfsync always a reply may not leave while the AOF buffer still holds writes. */
+static int fpAofHoldsReplies(void) {
+    return (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
+           server.aof_fsync == AOF_FSYNC_ALWAYS && sdslen(server.aof_buf) > 0;
+}
+
 /* A client that left to authenticate returns once main has nothing further to do for it;
  * any other unsupported command keeps it on the main path, as before. */
 static int fpQuiescent(client *c) {
@@ -2261,6 +2267,9 @@ int fastpathTryReadmit(client *c) {
         if (!fpIneligibleTransient(c)) c->flag.fp_readmit = 0;
         return 0;
     }
+    /* Readmission writes pending replies at once, so under appendfsync always it waits until beforeSleep has
+     * made the writes they follow durable. */
+    if (clientHasPendingReplies(c) && fpAofHoldsReplies()) return 0;
     c->flag.fp_readmit = 0;
     int was_partitioned = c->flag.partitioned;
     if (was_partitioned) unpartitionClient(c);
