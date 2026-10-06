@@ -246,6 +246,23 @@ start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-thre
         ao_default_allow {~foo:* +@read +set}
     }
 
+    test {acl-offload: DELROLE right after DELUSER of its last holder, whose fast-path client is still closing} {
+        r acl setrole erole "~e:*" +@read +set
+        r acl setuser eholder on nopass "~e:*" +@read +set role=erole
+        set rd [ao_client]; $rd auth eholder ""; assert_equal OK [$rd read]
+        $rd set e:1 v; assert_equal OK [$rd read]
+        # One EXEC runs both commands, so the deleted holder's fast-path client cannot finish closing between them.
+        r multi
+        r acl deluser eholder
+        r acl delrole erole
+        catch {r exec} res
+        assert_equal {1 1} $res
+        catch {$rd close}
+        assert_equal {} [r acl getrole erole]
+        assert_equal PONG [r ping]
+        ao_default_allow {~foo:* +@read +set}
+    }
+
     test {acl-offload: counters exposed in INFO stats} {
         set stats [r info stats]
         assert_match "*acl_offload_hits:*" $stats

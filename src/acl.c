@@ -3407,6 +3407,44 @@ static int ACLLoadConfiguredRoles(void) {
     return C_OK;
 }
 
+/* A retired user is gone from Users and holds no roles, though it still names them until its last
+ * fast-path client returns. */
+static int ACLRoleHasLiveMember(user *r) {
+    int live = 0;
+    dictIterator *di = dictGetIterator(r->members);
+    dictEntry *de;
+    while (!live && (de = dictNext(di))) {
+        user *u = dictGetVal(de);
+        if (!(u->flags & USER_FLAG_RETIRED)) live = 1;
+    }
+    dictReleaseIterator(di);
+    return live;
+}
+
+/* Drop a role being deleted from the retired users that still name it. Their fast-path clients may read
+ * their roles lists, so each list is replaced and published, never edited in place. */
+static void ACLRoleDropRetiredMembers(user *r) {
+    while (dictSize(r->members) > 0) {
+        dictIterator *di = dictGetIterator(r->members);
+        user *u = dictGetVal(dictNext(di));
+        dictReleaseIterator(di);
+        serverAssert(u->flags & USER_FLAG_RETIRED);
+        list *old_list = atomic_load_explicit(&u->roles, memory_order_relaxed);
+        list *new_list = listCreate();
+        listIter li;
+        listNode *ln;
+        listRewind(old_list, &li);
+        while ((ln = listNext(&li))) {
+            if (listNodeValue(ln) != r) listAddNodeTail(new_list, listNodeValue(ln));
+        }
+        atomic_store_explicit(&u->roles, new_list, memory_order_release);
+        aclOffloadBumpEpoch();
+        aclOffloadQuiesce();
+        listRelease(old_list);
+        dictDelete(r->members, u);
+    }
+}
+
 /* Move role memberships of users not replaced by ACL LOAD, i.e. module users, to
  * the new role of the same name, or drop them if it is gone. Called after the old
  * users are freed, so only such survivors are left on the old member lists. */
@@ -4598,7 +4636,7 @@ void aclCommand(client *c) {
         for (int j = 2; j < c->argc; j++) {
             sds rolename = objectGetVal(c->argv[j]);
             user *r = ACLGetRoleByName(rolename, sdslen(rolename));
-            if (r && dictSize(r->members) > 0) {
+            if (r && ACLRoleHasLiveMember(r)) {
                 addReplyErrorFormat(c, "Role '%s' is assigned to one or more users. Remove it from them first.",
                                     rolename);
                 return;
@@ -4610,6 +4648,7 @@ void aclCommand(client *c) {
             sds rolename = objectGetVal(c->argv[j]);
             user *r;
             if (raxRemove(Roles, (unsigned char *)rolename, sdslen(rolename), (void **)&r)) {
+                ACLRoleDropRetiredMembers(r);
                 ACLFreeUser(r);
                 deleted++;
             }
