@@ -178,11 +178,13 @@ start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io
         }
         $probe close
 
-        # The callback blocks the client that runs the command.
+        # The callback blocks the client that runs the command, and the command runs once.
         r module load $testmodule
         set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         $rd hset fp f v
         assert_equal 1 [$rd read]
+        $rd ping
+        assert_equal PONG [$rd read]
         assert_equal {{event hset key fp}} [r b_keyspace.events]
         $rd close
     }

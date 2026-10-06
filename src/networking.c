@@ -7543,7 +7543,9 @@ int processClientIOReadsDone(client *c) {
         }
     }
 
-    if (c->argc > 0) {
+    /* A blocked client's argv is the command that blocked it, and its block type already chose whether
+     * that command runs again on unblock. Partitioned clients finish reads while blocked. */
+    if (c->argc > 0 && !c->flag.blocked) {
         c->flag.pending_command = 1;
     }
 
