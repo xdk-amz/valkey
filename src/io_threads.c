@@ -675,6 +675,19 @@ int partitionedClientHoldReads(client *c) {
     }
 }
 
+/* Claims a readable partitioned client's read for the calling IO thread. An IO thread rearming the client
+ * registers its socket again before it stores IDLE, so the readiness can arrive while the client is still
+ * arming; the one-shot event does not repeat, so the claim waits for the rearm instead of dropping it. */
+int partitionedClientClaimRead(client *c) {
+    uint8_t expected = CLIENT_IDLE;
+    while (!__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_PENDING_IO, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+        if (expected != CLIENT_ARMING_IO) return 0;
+        expected = CLIENT_IDLE;
+    }
+    return 1;
+}
+
 /* One-shot readiness keeps a partitioned client idle until main rearms it. With a timeout the thread
  * sleeps here, after announcing it; main's wakes arrive as the wake fd. */
 static int ioThreadPollPartitionWait(int id, int timeout_ms) {
@@ -701,10 +714,7 @@ static int ioThreadPollPartitionWait(int id, int timeout_ms) {
             processed++;
             continue;
         }
-        uint8_t expected = CLIENT_IDLE;
-        if (!__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_PENDING_IO, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            continue;
+        if (!partitionedClientClaimRead(c)) continue;
         ioThreadReadQueryFromClient(c);
         processed++;
     }
