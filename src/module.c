@@ -11762,6 +11762,10 @@ int moduleHasCommandFilters(void) {
     return moduleCommandFilters != NULL && listLength(moduleCommandFilters) > 0;
 }
 
+int moduleHasKeyspaceSubscribers(void) {
+    return moduleKeyspaceSubscribers != NULL && listLength(moduleKeyspaceSubscribers) > 0;
+}
+
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 

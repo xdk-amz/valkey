@@ -187,6 +187,7 @@ void moduleInitModulesSystem(void);
 void moduleInitModulesSystemLast(void);
 void modulesCron(void);
 int moduleHasCommandFilters(void);
+int moduleHasKeyspaceSubscribers(void);
 int moduleLoad(const char *path, void **argv, int argc, int is_loadex, const char **errmsg);
 int moduleLoadStatic(const char *path, void **argv, int argc, int is_loadex);
 int moduleUnload(sds name, const char **errmsg);

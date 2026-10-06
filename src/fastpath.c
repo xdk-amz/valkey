@@ -1065,6 +1065,7 @@ static int fpDynamicGate(void) {
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused: main postpones */
     if (server.failover_state != NO_FAILOVER) return 0;                                 /* coordinated failover: writes belong on main */
     if (moduleHasCommandFilters()) return 0;                                            /* a filter may rewrite/redirect any command */
+    if (moduleHasKeyspaceSubscribers()) return 0;                                       /* the callback runs as the command's client and may block it */
     if (throttle_active()) return 0;                                                    /* main runs the throttle check */
     if (bgIteration_iterationActive()) return 0;                                        /* a write may wait for the iterator, as its own client */
     if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
