@@ -222,14 +222,17 @@ void dplusRecomputeSpecAclOk(client *c) {
             /* Synthetic argv: the helper only needs cmd identity + dbid for
              * the command/db checks; the ALLKEYS-or-%R~* requirement is what
              * actually gates key access, so a placeholder key can only cause
-             * a (safe) conservative punt, never a false allow. */
-            robj *argv[2];
-            argv[0] = createStringObject("get", 3);
-            argv[1] = createStringObject("k", 1);
-            int dbid = c->db ? c->db->id : 0;
-            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
-            decrRefCount(argv[0]);
-            decrRefCount(argv[1]);
+             * a (safe) conservative punt, never a false allow. A sentinel has no
+             * GET and never speculates. */
+            if (get_cmd) {
+                robj *argv[2];
+                argv[0] = createStringObject("get", 3);
+                argv[1] = createStringObject("k", 1);
+                int dbid = c->db ? c->db->id : 0;
+                if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
+                decrRefCount(argv[0]);
+                decrRefCount(argv[1]);
+            }
         }
     }
     atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
