@@ -26,3 +26,22 @@ start_server {tags {"modules"}} {
         assert_equal {OK} [r module unload eventloop]
     }
 }
+
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+    r module load $testmodule
+    r client setname control ;# named clients stay on the main path
+
+    test "Module eventloop iteration for a client read by IO threads" {
+        set rr [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] == 1
+        } else {
+            fail "a fresh client did not join the fast path"
+        }
+        # Each call asserts that no command runs between the loop's before-sleep and after-sleep events.
+        for {set i 0} {$i < 200} {incr i} {
+            $rr test.iteration
+        }
+        $rr close
+    }
+}

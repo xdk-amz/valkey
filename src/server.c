@@ -2154,8 +2154,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;
 
-    /* Try to process more IO reads that are ready to be processed. */
-    if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
+    /* Try to process more IO reads that are ready to be processed. Not when a module listens to the
+     * event loop: its before-sleep event has fired, and no command runs until its after-sleep event. */
+    if (server.aof_fsync != AOF_FSYNC_ALWAYS && !moduleHasServerEventListener(VALKEYMODULE_EVENT_EVENTLOOP)) {
         int io_responses_after = processIOThreadsResponses();
         if (io_responses_after > 0) {
             server.el_iteration_active = true;

@@ -13276,6 +13276,19 @@ void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
     }
 }
 
+/* Returns 1 if a module listens to server event 'eid'. */
+int moduleHasServerEventListener(uint64_t eid) {
+    if (ValkeyModule_EventListeners == NULL) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(ValkeyModule_EventListeners, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleEventListener *el = ln->value;
+        if (el->event.id == eid) return 1;
+    }
+    return 0;
+}
+
 /* Remove all the listeners for this module: this is used before unloading
  * a module. */
 void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
