@@ -31,6 +31,7 @@ static inline void cpuRelax(void) {
 #include <poll.h>
 #ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #else
 #include "fastpath_no_epoll.h"
@@ -641,6 +642,12 @@ int partitionedClientHold(client *c) {
     uint8_t expected = CLIENT_IDLE;
     return __atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_HELD_IO, 0,
                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+/* Returns 1 if the client's socket holds input its IO thread has not read yet. */
+int partitionedClientInputWaiting(client *c) {
+    int pending = 0;
+    return c->conn && ioctl(c->conn->fd, FIONREAD, &pending) == 0 && pending > 0;
 }
 
 void partitionedClientRelease(client *c) {

@@ -1306,7 +1306,9 @@ static void clientsCron(int clients_this_cycle) {
         if (c->flag.partitioned) {
             /* An armed read can start as soon as the hold is released, so every check that reads the query
              * buffer or the parsed arguments runs under it; none of them frees the client. A client whose
-             * read is starting is checked on a later pass. */
+             * read is starting is checked on a later pass, and so is one whose input is waiting: holding it
+             * makes its IO thread pass over the readiness and read it after clients whose input came later. */
+            if (c->flag.pending_read && partitionedClientInputWaiting(c)) continue;
             if (!partitionedClientHold(c)) continue;
             clientsCronResizeQueryBuffer(c);
             clientsCronResizeOutputBuffer(c, now);
