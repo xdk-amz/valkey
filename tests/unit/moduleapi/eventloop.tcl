@@ -27,8 +27,9 @@ start_server {tags {"modules"}} {
     }
 }
 
-start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
-    r module load $testmodule
+# Loaded at startup: a MODULE LOAD that IO-thread timing runs after the before-sleep event gives the new
+# listener an unmatched after-sleep event, which this module counts.
+start_server [list tags {"modules external:skip tls:skip"} overrides [list io-threads 2 io-batch-hold-us 10000 loadmodule $testmodule]] {
     r client setname control ;# named clients stay on the main path
 
     test "Module eventloop iteration for a client read by IO threads" {
