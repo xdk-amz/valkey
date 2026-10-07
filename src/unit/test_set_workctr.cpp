@@ -178,7 +178,7 @@ TEST_F(SetWorkCounterTest, addExistingLiveMemberIsOneLookup) {
     decrRefCount(o);
 }
 
-TEST_F(SetWorkCounterTest, replacingExpiredMemberIsOneProbeOnePopOneInsert) {
+TEST_F(SetWorkCounterTest, replacingExpiredMemberIsOneProbeAndAnInPlaceRewrite) {
     robj *o = makeHashtableSet(100);
     ASSERT_EQ(setExpiry(o, "m0", NOW + 100000), EXPIRATION_MODIFICATION_SUCCESSFUL);
     ASSERT_EQ(setExpiry(o, "m7", NOW + 1000), EXPIRATION_MODIFICATION_SUCCESSFUL);
@@ -188,13 +188,14 @@ TEST_F(SetWorkCounterTest, replacingExpiredMemberIsOneProbeOnePopOneInsert) {
     wcReset();
     ASSERT_EQ(addWithExpiry(o, "m7", EXPIRY_NONE, KEEP_TTL, &replaced), 1);
     EXPECT_TRUE(replaced);
-    /* Legitimate: the expired physical entry is popped and unindexed once. */
-    EXPECT_EQ(wc.ht_pops, 1);
+    /* Legitimate: the expired physical entry is rewritten in place without its
+     * TTL and unindexed once; nothing is popped or inserted. */
+    EXPECT_EQ(wc.ht_pops, 0);
     EXPECT_EQ(IDX(vset_removes), 1);
     EXPECT_EQ(wc.set_members_reclaimed, 1);
-    EXPECT_EQ(wc.ht_inserts, 1);
+    EXPECT_EQ(wc.ht_inserts, 0);
     /* Not legitimate: probing the same member a third time. */
-    EXPECT_LE(wc.ht_lookups, 2) << "validating probe + non-validating pop + insert probe is one lookup too many";
+    EXPECT_LE(wc.ht_lookups, 2) << "a third probe of the same member is one lookup too many";
     EXPECT_EQ(setTypeSize(o), 100u);
     decrRefCount(o);
 }

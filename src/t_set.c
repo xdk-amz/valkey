@@ -1026,8 +1026,12 @@ typedef struct {
  * most one vector of the expiry index, or walks a listpack. */
 static bool setTypeMayHideMembers(robj *o) {
     if (!setTypeHasVolatileMembers(o) || getExpirationPolicyWithFlags(0) == POLICY_IGNORE_EXPIRE) return false;
-    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE)
-        return vsetMayHaveHidden(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc, commandTimeSnapshot());
+    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+        WC_INDEX_BEGIN();
+        bool may = vsetMayHaveHidden(setTypeGetVolatileSet(o), smemberGetExpiryVsetFunc, commandTimeSnapshot());
+        WC_INDEX_END();
+        return may;
+    }
     return setTypeHasExpiredMembers(o);
 }
 
@@ -1056,7 +1060,10 @@ static long setTypeCollectLiveIndexed(robj *set, smember **out, size_t cap) {
     if (!vsetIsValid(&idx->index)) return -1;
     debugServerAssert(idx->volatile_count == vsetSize(&idx->index));
     if (idx->volatile_count != setTypeSize(set)) return -1;
+    WC_INC(set_census_calls);
+    WC_INDEX_BEGIN();
     size_t live = vsetCollectLive(&idx->index, smemberGetExpiryVsetFunc, commandTimeSnapshot(), cap, (void **)out);
+    WC_INDEX_END();
     return live > cap ? -1 : (long)live;
 }
 
@@ -1067,7 +1074,11 @@ static unsigned long setTypeLiveCount(robj *set) {
     if (!vsetIsValid(&idx->index)) return setTypeSize(set);
     debugServerAssert(idx->volatile_count == vsetSize(&idx->index));
     unsigned long persistent = setTypeSize(set) - idx->volatile_count;
-    return persistent + vsetCountLive(&idx->index, smemberGetExpiryVsetFunc, commandTimeSnapshot());
+    WC_INC(set_census_calls);
+    WC_INDEX_BEGIN();
+    size_t indexed_live = vsetCountLive(&idx->index, smemberGetExpiryVsetFunc, commandTimeSnapshot());
+    WC_INDEX_END();
+    return persistent + indexed_live;
 }
 
 /* Draw a live member of a hashtable set, or NULL once the budget is spent. */
@@ -1127,12 +1138,15 @@ static void setTypePickLiveByRank(robj *set, unsigned long live, unsigned int n,
     serverAssert(set->encoding == OBJ_ENCODING_HASHTABLE && live > 0 && n <= SET_RANK_WALK_MAX);
     for (unsigned int i = 0; i < n; i++) draws[i] = (setRankDraw){.rank = (unsigned long)rand() % live, .draw = i};
     qsort(draws, n, sizeof(draws[0]), setRankDrawCompare);
+    WC_INC(set_persistent_scans);
+    WC_ADD(set_rank_selects, n);
     hashtableIterator iter;
     hashtableInitIterator(&iter, objectGetVal(set), 0);
     unsigned long seen = 0;
     unsigned int resolved = 0;
     void *next;
     while (resolved < n && hashtableNext(&iter, &next)) {
+        WC_INC(set_iter_next);
         while (resolved < n && draws[resolved].rank == seen) out[draws[resolved++].draw] = next;
         seen++;
     }
@@ -1731,9 +1745,11 @@ static unsigned long spopLiveSample(client *c,
     if (count > live) count = live;
     unsigned long popped = 0, seen = 0;
     hashtableIterator iter;
+    WC_INC(set_persistent_scans);
     hashtableInitIterator(&iter, objectGetVal(set), HASHTABLE_ITER_SAFE);
     void *next;
     while (popped < count && hashtableNext(&iter, &next)) {
+        WC_INC(set_iter_next);
         if ((unsigned long)rand() % (live - seen++) >= count - popped) continue;
         spopHashtableMember(c, set, next, propargv, propindex, batchsize);
         popped++;
@@ -2203,9 +2219,11 @@ static void srandmemberReplyLiveSample(client *c, robj *set, unsigned long live,
     addReplyArrayLen(c, count);
     unsigned long seen = 0;
     hashtableIterator iter;
+    WC_INC(set_persistent_scans);
     hashtableInitIterator(&iter, objectGetVal(set), 0);
     void *next;
     while (count && hashtableNext(&iter, &next)) {
+        WC_INC(set_iter_next);
         if ((unsigned long)rand() % (live - seen++) >= count) continue;
         addReplyBulkCBuffer(c, next, sdslen(next));
         count--;
