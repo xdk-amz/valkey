@@ -2487,6 +2487,7 @@ vsetBucketTakeLive(vsetBucket *bucket, vsetGetExpiryFunc getExpiry, mstime_t now
  * proves it (and every earlier one) wholly hidden. A bucket is read only when
  * its window holds 'now', which is true of at most one. */
 static size_t vsetScanLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now, void **out, size_t cap) {
+    WC_INC(vset_census_calls);
     vsetBucket *bucket = *set;
     switch (vsetBucketType(bucket)) {
     case VSET_BUCKET_NONE:
@@ -2535,10 +2536,12 @@ static size_t vsetScanLive(vset *set, vsetGetExpiryFunc getExpiry, mstime_t now,
                 advanced = true;
                 wholly_live = more && decodeExpiryKey(it.key) >= now;
             }
-            if (wholly_live && out == NULL)
+            if (wholly_live && out == NULL) {
+                WC_INC(vset_bucket_skips);
                 live += vsetBucketSize(current);
-            else
+            } else {
                 live = vsetBucketTakeLive(current, getExpiry, now, !wholly_live, out, live, cap);
+            }
             if (!advanced && live <= cap) more = raxPrev(&it);
         }
         raxStop(&it);

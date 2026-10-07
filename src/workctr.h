@@ -71,24 +71,22 @@
     X(lp_blob_bytes_copied, "bytes copied by whole-listpack duplication/merge (lpDup, lpMerge)")                 \
     /* ---- expiry index (vset) ---- */                                                                            \
     X(vset_adds, "vsetAddEntry")                                                                                   \
-    X(vset_removes, "vsetRemoveEntry")                                                                             \
+    X(vset_removes, "vset entry removals (vsetRemoveEntry, vsetUpdateEntry dropping one)")                         \
     X(vset_updates, "vsetUpdateEntry")                                                                             \
     X(vset_expire_calls, "vsetRemoveExpired calls")                                                                \
-    X(vset_census_calls, "vsetCountHidden calls (exact hidden/total partition from the index)")                     \
-    X(vset_select_calls, "vsetSelectLive calls (rank/select over the live indexed entries)")                        \
-    X(vset_bucket_visits, "vset buckets visited (expire scan, iteration, mem usage, defrag, census, select)")       \
-    X(vset_bucket_skips, "vset buckets whose whole size was skipped in O(1) by census/select")                     \
-    X(vset_entry_visits, "vset entries visited (expire scan, iteration, census, select)")                           \
+    X(vset_census_calls, "vsetCountLive / vsetCollectLive calls (live entries from the index)")                    \
+    X(vset_bucket_visits, "vset buckets visited (expire scan, iteration, mem usage, defrag, live walks)")          \
+    X(vset_bucket_skips, "vset buckets vsetCountLive counted by size, reading no entry")                           \
+    X(vset_entry_visits, "vset entries visited (expire scan, iteration, live walks)")                              \
     /* ---- set type layer ---- */                                                                                 \
     X(set_random_calls, "setTypeRandomElement calls")                                                              \
     X(set_random_expired_seen, "random picks rejected because the member was expired")                             \
-    X(set_probe_batches, "hashtableFairRandomEntry batches spent rejection-sampling a live/persistent member")      \
-    X(set_census_calls, "setTypeLiveCensus calls (exact live/hidden/live_ttl partition)")                           \
-    X(set_census_entries, "members examined by a census (listpack walk only; a hashtable reads the index)")         \
-    X(set_rank_selects, "draws answered by rank/select over the live members")                                     \
-    X(set_persistent_scans, "member walks looking for the index-th member without a TTL")                           \
-    X(set_reservoir_passes, "full-iteration reservoir passes (random live element, SPOP/SRANDMEMBER volatile)")    \
-    X(set_iter_next, "setTypeNext returning a member")                                                             \
+    X(set_census_calls, "exact live counts and index collections (setTypeLiveCount, ...Indexed)")                  \
+    X(set_census_entries, "members examined by a census (a hashtable census reads the index)")                     \
+    X(set_rank_selects, "draws resolved by a member rank walk")                                                    \
+    X(set_persistent_scans, "member walks to ranks among the counted live members (early exit)")                   \
+    X(set_reservoir_passes, "full passes that collect or sample the live members (SPOP/SRANDMEMBER)")              \
+    X(set_iter_next, "members returned by setTypeNext or a member walk")                                           \
     X(list_iter_next, "listTypeNext returning an entry")                                                            \
     X(hash_iter_next, "hashTypeNext returning a field")                                                             \
     X(set_lp_skipped_expired, "listpack members skipped by setTypeNext as expired")                                \

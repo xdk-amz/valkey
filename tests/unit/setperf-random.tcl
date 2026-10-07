@@ -690,14 +690,15 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
 }
 
 # ---------------------------------------------------------------------------
-# Census / rank-select contracts.
+# Index-answered contracts.
 #
-# A hidden-dense set is answered from the volatile index, not from a pass over
-# the members: one census reports the exact live/hidden partition from the
-# bucket keys, and a uniform rank is carried to a member by the index's
-# rank/select. So SRANDMEMBER and SPOP must visit no members at all on such a
-# set, must allocate by the request rather than by the population, and must cost
-# the same at 10,000 members as at 1,000,000.
+# A hidden-dense set whose members all carry a TTL is answered from the
+# volatile index, not from a pass over the members: a walk of the newest
+# buckets collects the few live members, the bucket keys proving most buckets
+# wholly live or wholly hidden without reading an entry, and the reply is drawn
+# from that collection. So SRANDMEMBER and SPOP must visit no members at all on
+# such a set, must allocate by the request rather than by the population, and
+# must cost the same at 10,000 members as at 1,000,000.
 #
 # This holds only where the index can see the live members, i.e. where they
 # carry a TTL (wc_fixture_hidden_ttl). The `mostly_expired` fixture, whose live
@@ -774,11 +775,11 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
                     wc_assert_eq "persistent-member walks" [wc_get $d set_persistent_scans] 0 \
                         "every live member carries a TTL, so no walk for an untimed member is needed (n=$n)" $cmd $key "round=$i"
                     wc_assert_eq "member-iterator visits" [wc_get $d set_iter_next] 0 \
-                        "a census plus rank/select reads no member (n=$n)" $cmd $key "round=$i"
+                        "an index answer reads no member (n=$n)" $cmd $key "round=$i"
                     wc_assert_le "census member examinations" [wc_get $d set_census_entries] 0 \
                         "a hashtable census reads the index, never the members (n=$n)" $cmd $key "round=$i"
                     wc_assert_ge "census taken" [wc_get $d set_census_calls] 1 \
-                        "the exact partition must come from a census, not from sampling (n=$n)" $cmd $key "round=$i"
+                        "the live members must come from the index, not from sampling (n=$n)" $cmd $key "round=$i"
 
                     # Auxiliary storage is the request, not the population.
                     wc_assert_le "largest single allocation (bytes)" [wc_get $d mem_max_alloc] 16384 \
@@ -972,9 +973,12 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
             wc_assert_ge "adjacent repeats ($tag)" $repeats 1 \
                 "draws with replacement over $live_keep members must sometimes repeat" \
                 "srandmember key -$draws" $key
-            # One reply is one population read at most, whatever the encoding.
-            wc_assert_le "full-iteration reservoir passes ($tag)" [wc_get $d set_reservoir_passes] 0 \
-                "a negative count must not reservoir-sample" "srandmember key -$draws" $key
+            # One reply is one population read at most, whatever the encoding:
+            # none when every live member carries a TTL (the index names them),
+            # one collecting pass when they carry none and the index cannot.
+            set max_passes [expr {$fixture eq "hidden_ttl" ? 0 : 1}]
+            wc_assert_le "full-iteration reservoir passes ($tag)" [wc_get $d set_reservoir_passes] $max_passes \
+                "a negative count reads the population at most once" "srandmember key -$draws" $key
             wc_assert_eq "members reclaimed ($tag)" [wc_get $d set_members_reclaimed] 0 \
                 "SRANDMEMBER must not reclaim" "srandmember key -$draws" $key
             wc_assert_eq "physical members after the read ($tag)" [dict get [wc_setinfo $key] physical] $n \

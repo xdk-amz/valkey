@@ -97,8 +97,8 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
             "sadd ins:add:none <$ins_k absent members>" ins:add:none
     }
 
-    # SADDEX reaches the same insertion through setTypeSetExpiryInternal (one
-    # hashtableFindRef) instead of setTypeIsMember; the slot probe and the
+    # SADDEX reaches the same insertion through setTypeAddWithExpiry (one
+    # hashtableFindPositionForInsert) instead of setTypeIsMember; the slot probe and the
     # insert-position request are the same two operations. EX 1000 keeps the new
     # members out of the fixture's far-future expiry bucket, so the expiry index
     # stays a sparse vector and adds no lookup of its own.
@@ -116,7 +116,8 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
                 wc_fixture $key $ins_n $ttl
                 set inscmda($ttl) [subst -nocommands $ins_tpl]
                 set insda($ttl) [wc_measure "r $inscmda($ttl)"]
-                assert_equal $::wc_last_reply $ins_k
+                # SADDEX replies 1 once every member is set, as HSETEX does.
+                assert_equal $::wc_last_reply 1
                 assert_equal [r scard $key] [expr {$ins_n + $ins_k}]
                 set ins_first [lindex $ins_absent 0]
                 assert_equal [r sismember $key $ins_first] 1
@@ -152,7 +153,7 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
             set ins_live [wc_fixture $key $ins_n $ttl]
             set ins_targets [lrange $ins_live 300 [expr {300 + $ins_k - 1}]]
             set insda($ttl) [wc_measure "r saddex $key MXX EX 1000 MEMBERS $ins_k $ins_targets"]
-            assert_equal $::wc_last_reply 0
+            assert_equal $::wc_last_reply 1
             assert_equal [r scard $key] $ins_n
             foreach ins_t [lrange $ins_targets 0 4] {
                 assert_morethan [lindex [r sttl $key members 1 $ins_t] 0] 0
@@ -244,7 +245,8 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
             set ins_targets [wc_members $ins_k short $ins_live_keep]
             set inscmd1 [subst -nocommands $ins_tpl]
             set insd1 [wc_measure "r $inscmd1"]
-            assert_equal $::wc_last_reply $ins_k
+            # SADD counts the replaced members as added; SADDEX replies 1.
+            assert_equal $::wc_last_reply [expr {[string match SADDEX* $ins_label] ? 1 : $ins_k}]
             wc_record $::cur_test $ins_label \
                 [dict create n $ins_n ttl mostly_expired enc hashtable k $ins_k] $insd1
             # Correctness: the members are live again with the requested TTL.
@@ -383,7 +385,7 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
                 set key "ins:lpx:$ttl"
                 wc_fixture $key $n $ttl
                 set insda($ttl) [wc_measure "r saddex $key EX 1000 MEMBERS $ins_lp_k $ins_lp_add"]
-                assert_equal $::wc_last_reply $ins_lp_k
+                assert_equal $::wc_last_reply 1
                 foreach ins_m $ins_lp_add {
                     assert_equal [r sismember $key $ins_m] 1
                     assert_morethan [lindex [r sttl $key members 1 $ins_m] 0] 0

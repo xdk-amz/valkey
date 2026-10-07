@@ -298,6 +298,39 @@ use-after-free. The store suite (propagation volume, replica and AOF content
 equality) is clean, and the `MEMORY USAGE` accounting floor for
 expired-but-unreclaimed members -- a failure on da37a1d -- now passes.
 
+## Selection on this head
+
+`SPOP` and `SRANDMEMBER` on a set that may hide a member take up to three
+steps, each only when the one before cannot finish the request; a set that
+provably hides nothing takes the parent's paths.
+
+1. Index answer. When every member of a hashtable set carries a TTL (the set
+   keeps a count of its indexed members), a walk of the expiry index's newest
+   buckets collects the live members if at most min(512, size / 2) are live.
+   A bucket's key proves it wholly live or wholly hidden, so at most one bucket
+   is read, and an all-hidden set is usually recognised from one key. Counted
+   as `set_census_calls`, with the index walk in `vset_census_calls` and the
+   index account's `vset_*_visits`.
+2. Draws. The parent's sampler, rejecting a hidden pick, within a budget of
+   min(32 + 8 x request, 32 + size / 128) rejected picks
+   (`set_random_expired_seen`).
+3. One pass that knows the exact live count (the index's live entries plus the
+   members without a TTL): a rank walk for up to 64 draws with replacement
+   (`set_persistent_scans`, `set_rank_selects`), selection sampling for distinct
+   members, which `SPOP` pops in place (`set_persistent_scans`), or one
+   collecting pass for more draws with replacement (`set_reservoir_passes`).
+   Members these walks return count as `set_iter_next`.
+
+One contract changed: "SRANDMEMBER -k on a hidden-dense hashtable draws
+independently and uniformly" allows one collecting pass on the `persistent`
+fixture (40 live members without a TTL among 9,960 hidden), which the index
+cannot name, as its own comment allows; the `future_ttl` fixture still allows
+none.
+
+Result on this head: all 133 contracts pass with seeds 12345 and 7, as does
+setperf-random with SETPERF_EXTENDED=1 (1,000,000 members); gtest
+`SetWorkCounterTest` 9 / 9.
+
 ## Recorded run against da37a1d (instrumented build, seed 12345)
 
 | Suite | pass | fail (all contract violations, no harness errors) |
