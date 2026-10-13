@@ -216,3 +216,52 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         r config set busy-reply-threshold 5000
     }
 }
+
+# Thread id of the server thread named $name, or "" when there is none.
+proc sl_thread_tid {pid name} {
+    foreach dir [glob -nocomplain /proc/$pid/task/*] {
+        if {[catch {open $dir/comm} f]} continue
+        set comm [string trim [read $f]]
+        close $f
+        if {$comm eq $name} { return [file tail $dir] }
+    }
+    return ""
+}
+
+# CPU list a thread may run on, as taskset prints it ("pid N's current affinity list: 0-7").
+proc sl_affinity {tid} {
+    return [lindex [exec taskset -pc $tid] end]
+}
+
+if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}]} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
+    test {Staged loop: main and an IO thread pinned to its CPU sleep at the barrier instead of spinning} {
+        set pid [srv 0 pid]
+        set io1 [sl_thread_tid $pid io_thd_1]
+        assert {$io1 ne ""}
+        set main_cpus [sl_affinity $pid]
+        set io1_cpus [sl_affinity $io1]
+        set cpu [lindex [split [lindex [split $main_cpus ,] 0] -] 0]
+        set loglines [count_log_lines 0]
+        exec taskset -pc $cpu $pid
+        exec taskset -pc $cpu $io1
+        wait_for_log_messages 0 {"*1 IO thread is pinned to main's CPU*sleep at the barrier*"} $loglines 100 50
+        # Fast-path reads and writes still complete, in order, while neither spins.
+        set fd [sl_socket]
+        set payload ""
+        set expect {}
+        for {set i 0} {$i < 200} {incr i} {
+            append payload [sl_resp set sl:pin:$i v$i] [sl_resp get sl:pin:$i]
+            lappend expect {+OK} v$i
+        }
+        puts -nonewline $fd $payload
+        flush $fd
+        assert_equal $expect [sl_read_replies $fd 400]
+        close $fd
+        set loglines [count_log_lines 0]
+        exec taskset -pc $io1_cpus $io1
+        exec taskset -pc $main_cpus $pid
+        wait_for_log_messages 0 {"*no IO thread is pinned to main's CPU*"} $loglines 100 50
+    }
+}
+}

@@ -45,6 +45,9 @@ int stagedApplyReady(void);
 int stagedDeferRead(struct client *c);
 /* Main: main takes a lane in APPLY phases (it is not pinned onto a worker's CPUs). */
 int stagedMainTakesLane(void);
+/* IO thread tid: spin before sleeping at the barrier. 0 while it is pinned to main's one CPU,
+ * where spinning would hold the CPU main needs. */
+int stagedWorkerSpins(int tid);
 /* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
 void stagedRunApplyPhase(int with_workers);
 

@@ -1151,7 +1151,7 @@ static int ioThreadDrainInboxes(long id, void **batch_jobs) {
 static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
     phaseBarrier *b = stagedBarrier();
     for (;;) {
-        int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen);
+        int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
         if (phase == PHASE_BARRIER_EXIT) return;
         monotime start = getMonotonicUs();
         ioThreadDrainInboxes(id, batch_jobs);

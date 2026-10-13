@@ -5,9 +5,9 @@
  *
  * Main opens a phase for workers [0, n) and waits until each of them reports done. A worker
  * blocks until a phase that includes its index opens, runs it, and reports done. Waiters spin
- * briefly and then sleep on a condition variable, so a worker and main sharing one CPU cannot
- * livelock. Workers outside the participant count park until the count grows or the barrier
- * shuts down. */
+ * briefly, unless the caller says not to, and then sleep on a condition variable, so a worker and
+ * main sharing one CPU cannot livelock. Workers outside the participant count park until the count
+ * grows or the barrier shuts down. */
 
 #include <pthread.h>
 #ifndef __cplusplus
@@ -47,16 +47,18 @@ int phaseBarrierSetParticipants(phaseBarrier *b, int nparticipants);
 int phaseBarrierOpen(phaseBarrier *b, int phase_id);
 
 /* Main. Block until every participant of the open phase has called phaseBarrierDone. Stores
- * made by participants before phaseBarrierDone are visible to main on return. */
-void phaseBarrierWaitAllDone(phaseBarrier *b);
+ * made by participants before phaseBarrierDone are visible to main on return. spin 0 sleeps at
+ * once, for a main that shares its CPU with a participant. */
+void phaseBarrierWaitAllDone(phaseBarrier *b, int spin);
 
 /* Main. Wake every worker; each subsequent phaseBarrierAwaitPhase returns PHASE_BARRIER_EXIT.
  * Call only after phaseBarrierWaitAllDone for any open phase. */
 void phaseBarrierShutdown(phaseBarrier *b);
 
 /* Worker. Block until a phase newer than *last_seen opens with worker_id among its participants
- * and return its id, or return PHASE_BARRIER_EXIT after shutdown. *last_seen starts at 0. */
-int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen);
+ * and return its id, or return PHASE_BARRIER_EXIT after shutdown. *last_seen starts at 0. spin 0
+ * sleeps at once, for a worker that shares its CPU with main. */
+int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin);
 
 /* Worker. Report the phase returned by phaseBarrierAwaitPhase complete. Not called on exit. */
 void phaseBarrierDone(phaseBarrier *b);

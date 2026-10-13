@@ -28,11 +28,20 @@ static int sl_main_lane = 1; /* main takes a lane in APPLY phases */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
 
+/* Main and the workers pinned to main's one CPU sleep at the barrier instead of spinning. Pinning
+ * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
+#define STAGED_PINNING_READ_US 1000000
+static int sl_main_spins = 1;     /* no enrolled worker is pinned to main's CPU */
+static int sl_pinned_workers = 0; /* enrolled workers pinned to main's one CPU, as last read */
+static int sl_pinned_cpu = -1;    /* main's one CPU, as last read; -1 when main may run on several */
+static monotime sl_pinning_read = 0;
+
 /* Enrollment: main writes the sequence a newly enrolled worker waits from, then bumps its generation,
  * then sets enrolled, all between phases. A worker adopts the sequence once per generation. */
 static _Atomic int sl_enrolled[IO_THREADS_MAX_NUM];
 static _Atomic uint32_t sl_gen[IO_THREADS_MAX_NUM];
 static uint64_t sl_enroll_seq[IO_THREADS_MAX_NUM];
+static _Atomic int sl_on_main_cpu[IO_THREADS_MAX_NUM]; /* worker is pinned to main's one CPU */
 
 int stagedLoopActive(void) {
     return sl_on || sl_want;
@@ -65,7 +74,7 @@ static void stagedRunPhase(int phase) {
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
-    phaseBarrierWaitAllDone(&sl_barrier);
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
 }
 
 /* Main-affinity handler. Never called: main checks whether ae's fd fired and runs ae itself. */
@@ -146,6 +155,40 @@ static int stagedMainSharesWorkerCpu(void) {
     return 0;
 }
 
+/* Main: a worker pinned to the one CPU main is pinned to only takes turns with main, so neither
+ * of them spins at the barrier, where a spinning waiter holds the CPU the other needs. */
+static void stagedReadCpuPinning(void) {
+    cpu_set_t mine;
+    CPU_ZERO(&mine);
+    int cpu = -1;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(mine), &mine) == 0 && CPU_COUNT(&mine) == 1) {
+        for (int i = 0; i < CPU_SETSIZE && cpu < 0; i++)
+            if (CPU_ISSET(i, &mine)) cpu = i;
+    }
+    int pinned = 0;
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
+        int on = 0;
+        if (cpu >= 0 && tid <= sl_workers) {
+            cpu_set_t one;
+            CPU_ZERO(&one);
+            on = ioThreadGetAffinity(tid, &one, sizeof(one)) == 0 && CPU_EQUAL(&one, &mine);
+        }
+        atomic_store_explicit(&sl_on_main_cpu[tid], on, memory_order_relaxed);
+        pinned += on;
+    }
+    if (sl_workers > 0 && (pinned != sl_pinned_workers || (pinned && cpu != sl_pinned_cpu))) {
+        if (pinned)
+            serverLog(LL_NOTICE, "Staged event loop: %d IO thread%s pinned to main's CPU %d; they and main sleep at the barrier instead of spinning",
+                      pinned, pinned == 1 ? " is" : "s are", cpu);
+        else
+            serverLog(LL_NOTICE, "Staged event loop: no IO thread is pinned to main's CPU; the barrier spins again");
+    }
+    sl_pinned_workers = pinned;
+    sl_pinned_cpu = cpu;
+    sl_main_spins = pinned == 0;
+    sl_pinning_read = getMonotonicUs();
+}
+
 /* Main, between phases: enroll IO threads 1..want. Leavers pass one SYNC phase so none is left
  * waiting on the barrier; newcomers wait from the current sequence. */
 static void stagedSetWorkers(int want) {
@@ -167,6 +210,7 @@ static void stagedSetWorkers(int want) {
         stagedPlaceEpollThread();
     }
     sl_main_lane = !stagedMainSharesWorkerCpu();
+    stagedReadCpuPinning();
 }
 
 /* Main, at the iteration boundary: follow the configuration and the live IO thread count. */
@@ -216,6 +260,7 @@ static void stagedReconcile(aeEventLoop *el) {
         fastpathStagedAdoptClients();
         serverLog(LL_NOTICE, "Staged event loop started with %d IO threads", sl_workers);
     }
+    if (getMonotonicUs() - sl_pinning_read >= STAGED_PINNING_READ_US) stagedReadCpuPinning();
 }
 
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
@@ -325,6 +370,10 @@ int stagedMainTakesLane(void) {
     return sl_main_lane;
 }
 
+int stagedWorkerSpins(int tid) {
+    return !atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed);
+}
+
 void stagedRunApplyPhase(int with_workers) {
     if (!with_workers) {
         replApplyRunLane(0);
@@ -334,7 +383,7 @@ void stagedRunApplyPhase(int with_workers) {
     serverAssert(rc == 0);
     sl_opens++;
     if (sl_main_lane) replApplyRunLane(0);
-    phaseBarrierWaitAllDone(&sl_barrier);
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
 }
 
 void stagedStopWorkers(void) {
@@ -393,6 +442,10 @@ int stagedDeferRead(client *c) {
     return 0;
 }
 int stagedMainTakesLane(void) {
+    return 1;
+}
+int stagedWorkerSpins(int tid) {
+    UNUSED(tid);
     return 1;
 }
 void stagedRunApplyPhase(int with_workers) {

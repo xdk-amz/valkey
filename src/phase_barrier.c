@@ -81,8 +81,8 @@ int phaseBarrierOpen(phaseBarrier *b, int phase_id) {
     return 0;
 }
 
-void phaseBarrierWaitAllDone(phaseBarrier *b) {
-    for (int i = 0; i < PHASE_BARRIER_SPIN; i++) {
+void phaseBarrierWaitAllDone(phaseBarrier *b, int spin) {
+    for (int i = 0, n = spin ? PHASE_BARRIER_SPIN : 0; i < n; i++) {
         if (atomic_load_explicit(&b->pending, memory_order_acquire) == 0) return;
         phaseBarrierRelax();
     }
@@ -112,9 +112,9 @@ static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int
     return 1;
 }
 
-int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen) {
+int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin) {
     int phase;
-    for (int i = 0; i < PHASE_BARRIER_SPIN; i++) {
+    for (int i = 0, n = spin ? PHASE_BARRIER_SPIN : 0; i < n; i++) {
         if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
         uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
         if (takePhase(st, worker_id, last_seen, &phase)) return phase;

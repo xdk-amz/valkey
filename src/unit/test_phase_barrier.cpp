@@ -25,12 +25,14 @@ struct Harness {
     int payload = 0;              /* written by main only between phases */
     std::vector<int> result;      /* result[w] written by worker w only inside a phase */
     std::vector<int> ran;         /* phases each worker ran, read by main only between phases */
+    std::vector<int> spin;        /* spin[w]: worker w spins before sleeping; set before start */
+    int main_spin = 1;            /* main spins before sleeping */
     std::atomic<int> in_phase{0}; /* workers currently inside a phase */
     std::atomic<int> errors{0};
     std::vector<std::thread> threads;
 
     explicit Harness(int nworkers, int nparticipants) :
-        result(nworkers, -1), ran(nworkers, 0) {
+        result(nworkers, -1), ran(nworkers, 0), spin(nworkers, 1) {
         EXPECT_EQ(phaseBarrierInit(&b, nparticipants), 0);
     }
 
@@ -39,7 +41,7 @@ struct Harness {
             threads.emplace_back([this, w] {
                 uint64_t seen = 0;
                 for (;;) {
-                    int ph = phaseBarrierAwaitPhase(&b, w, &seen);
+                    int ph = phaseBarrierAwaitPhase(&b, w, &seen, spin[w]);
                     if (ph == PHASE_BARRIER_EXIT) return;
                     in_phase.fetch_add(1, std::memory_order_relaxed);
                     if (ph != (payload & PHASE_BARRIER_MAX_ID)) errors.fetch_add(1);
@@ -63,7 +65,7 @@ struct Harness {
     void runPhase(int k, int n, int nworkers) {
         payload = k;
         ASSERT_EQ(phaseBarrierOpen(&b, k & PHASE_BARRIER_MAX_ID), 0);
-        phaseBarrierWaitAllDone(&b);
+        phaseBarrierWaitAllDone(&b, main_spin);
         ASSERT_EQ(in_phase.load(), 0) << "WaitAllDone returned while a worker was in phase " << k;
         for (int w = 0; w < nworkers; w++) {
             if (w < n)
@@ -100,19 +102,20 @@ TEST(PhaseBarrierTest, RejectsMisuse) {
     EXPECT_EQ(phaseBarrierOpen(&b, 4), -1);
     EXPECT_EQ(phaseBarrierSetParticipants(&b, 2), -1);
     uint64_t seen = 0;
-    EXPECT_EQ(phaseBarrierAwaitPhase(&b, 0, &seen), 3);
+    EXPECT_EQ(phaseBarrierAwaitPhase(&b, 0, &seen, 1), 3);
     phaseBarrierDone(&b);
-    phaseBarrierWaitAllDone(&b);
+    phaseBarrierWaitAllDone(&b, 1);
     EXPECT_EQ(phaseBarrierSetParticipants(&b, 0), 0);
     ASSERT_EQ(phaseBarrierOpen(&b, 5), 0);
-    phaseBarrierWaitAllDone(&b); /* zero participants: complete at once */
+    phaseBarrierWaitAllDone(&b, 0); /* zero participants: complete at once */
     phaseBarrierShutdown(&b);
     EXPECT_EQ(phaseBarrierOpen(&b, 6), -1);
-    EXPECT_EQ(phaseBarrierAwaitPhase(&b, 0, &seen), PHASE_BARRIER_EXIT);
+    EXPECT_EQ(phaseBarrierAwaitPhase(&b, 0, &seen, 0), PHASE_BARRIER_EXIT);
     phaseBarrierDestroy(&b);
 }
 
-TEST(PhaseBarrierTest, SingleCoreNoLivelock) {
+/* Main and one worker take turns on a single CPU for many phases. */
+static void runOnOneCpu(int main_spin, int worker_spin) {
     cpu_set_t orig, one;
     ASSERT_EQ(pthread_getaffinity_np(pthread_self(), sizeof(orig), &orig), 0);
     int cpu = -1;
@@ -129,11 +132,13 @@ TEST(PhaseBarrierTest, SingleCoreNoLivelock) {
 
     const int phases = 20000;
     Harness h(1, 1);
+    h.main_spin = main_spin;
+    h.spin[0] = worker_spin;
     h.start(1); /* the worker inherits the single-CPU mask */
     auto t0 = std::chrono::steady_clock::now();
     for (int k = 1; k <= phases; k++) {
         h.runPhase(k, 1, 1);
-        if (HasFatalFailure()) break;
+        if (::testing::Test::HasFatalFailure()) break;
     }
     auto elapsed = std::chrono::steady_clock::now() - t0;
     h.stop();
@@ -143,10 +148,42 @@ TEST(PhaseBarrierTest, SingleCoreNoLivelock) {
     EXPECT_LT(elapsed, std::chrono::seconds(30));
 }
 
+TEST(PhaseBarrierTest, SingleCoreNoLivelock) {
+    runOnOneCpu(1, 1);
+}
+
+TEST(PhaseBarrierTest, SingleCoreWithoutSpinning) {
+    runOnOneCpu(0, 0);
+}
+
 TEST(PhaseBarrierTest, ParticipantCountChanges) {
     const int nworkers = 8;
     const int counts[] = {8, 3, 0, 5, 1, 8, 2};
     Harness h(nworkers, nworkers);
+    h.start(nworkers);
+    int k = 0;
+    for (int rep = 0; rep < 200; rep++) {
+        for (int n : counts) {
+            ASSERT_EQ(phaseBarrierSetParticipants(&h.b, n), 0);
+            for (int i = 0; i < 5; i++) {
+                h.runPhase(++k, n, nworkers);
+                if (HasFatalFailure()) {
+                    h.stop();
+                    return;
+                }
+            }
+        }
+    }
+    h.stop();
+    EXPECT_EQ(h.errors.load(), 0);
+}
+
+TEST(PhaseBarrierTest, SomeWaitersSleepAtOnce) {
+    const int nworkers = 8;
+    const int counts[] = {8, 3, 0, 5, 1, 8, 2};
+    Harness h(nworkers, nworkers);
+    h.main_spin = 0;
+    for (int w = 0; w < nworkers; w += 2) h.spin[w] = 0;
     h.start(nworkers);
     int k = 0;
     for (int rep = 0; rep < 200; rep++) {
