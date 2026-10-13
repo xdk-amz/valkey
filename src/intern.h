@@ -40,6 +40,23 @@ static inline sds internAdmit(sds s) {
 
 void internInit(void);
 
+/* RDB loading. While every write is being probed, the loader reads a candidate
+ * string into the scratch buffer instead of a fresh allocation, so a string that
+ * is already shared costs no allocation:
+ *
+ *   if (internLoadReady(len)) {
+ *       char *buf = internLoadScratch(len);
+ *       ... read len bytes into buf ...
+ *       sds s = internAdmitLoaded(len);  // owned by the caller
+ *   }
+ *
+ * The returned sds is either shared or a fresh private or singleton copy. A
+ * later internAdmit() of it is a no-op. Main thread only. */
+#define INTERN_LOAD_MAX (64 * 1024)
+int internLoadReady(size_t len);
+char *internLoadScratch(size_t len);
+sds internAdmitLoaded(size_t len);
+
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */
 void internDeferBegin(void);

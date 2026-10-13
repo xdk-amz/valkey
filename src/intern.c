@@ -178,6 +178,26 @@ static hashtableType internIndexType = {
 };
 
 /*-----------------------------------------------------------------------------
+ * Hot cache: a direct-mapped array of indexed strings keyed by a fingerprint of
+ * the length and the first and last 8 bytes. A hit skips the full hash. A slot
+ * only ever points at a string that is in the index; the slot is cleared when
+ * that string leaves the index.
+ *----------------------------------------------------------------------------*/
+
+#define HOT_BITS 12
+static sds hot[1 << HOT_BITS];
+
+static inline size_t hotSlot(const char *p, size_t len) {
+    return mix(rd64((const unsigned char *)p) ^ K1 ^ len, rd64((const unsigned char *)p + len - 8) ^ K2) >>
+           (64 - HOT_BITS);
+}
+
+static inline void hotForget(sds s) {
+    size_t i = hotSlot(s, sdslen(s));
+    if (hot[i] == s) hot[i] = NULL;
+}
+
+/*-----------------------------------------------------------------------------
  * Probation: a set-associative table of singletons waiting for a second holder.
  *----------------------------------------------------------------------------*/
 
@@ -294,51 +314,79 @@ static sds newShareable(const char *buf, size_t len) {
     return s;
 }
 
+static inline sds shareIndexed(sds found, sds s) {
+    internHdrOf(found)->refcount++;
+    st.refs++;
+    st.saved_bytes += internSize(found);
+    st.hits++;
+    if (s) sdsfree(s);
+    observe(1);
+    return found;
+}
+
+/* The string internAdmitBuf() last returned as a private copy. It was already
+ * offered, so internAdmit() of the same pointer returns at once. A stale value
+ * after that string is freed can only make one later call return early. */
+static const char *offered_last;
+
+/* Promotes a probation singleton equal to buf[0..len) to the index, or returns
+ * NULL. */
+static sds promote(uint64_t h, const char *buf, size_t len, size_t hi) {
+    if (!prob_count) return NULL;
+    sds cand = probTake(h, buf, len);
+    if (!cand) return NULL;
+    internHdr *ch = internHdrOf(cand);
+    ch->where = INTERN_IN_INDEX;
+    ch->refcount++;
+    memo_key = cand;
+    memo_hash = h;
+    serverAssert(hashtableAdd(intern_index, cand));
+    memo_key = NULL;
+    size_t sz = internSize(cand);
+    st.refs += ch->refcount;
+    st.shared_bytes += sz;
+    st.saved_bytes += (size_t)(ch->refcount - 1) * sz;
+    st.promotions++;
+    hot[hi] = cand;
+    observe(1);
+    return cand;
+}
+
+/* Looks `key` (an sds with the same content as buf) up in the index. */
+static sds indexFind(sds key, uint64_t h) {
+    sds found = NULL;
+    if (hashtableSize(intern_index) == 0) return NULL;
+    memo_key = key;
+    memo_hash = h;
+    hashtableFind(intern_index, key, (void **)&found);
+    memo_key = NULL;
+    return found;
+}
+
 sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
+    if (s == offered_last) {
+        offered_last = NULL;
+        return s;
+    }
     if (sdsIsShared(s)) return s;
     size_t len = sdslen(s);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
-
-    uint64_t h = internHash(s, len);
     st.sampled++;
 
-    sds found = NULL;
-    if (hashtableSize(intern_index)) {
-        memo_key = s;
-        memo_hash = h;
-        hashtableFind(intern_index, s, (void **)&found);
-        memo_key = NULL;
-    }
-    if (found) {
-        internHdrOf(found)->refcount++;
-        st.refs++;
-        st.saved_bytes += internSize(found);
-        st.hits++;
-        sdsfree(s);
-        observe(1);
-        return found;
-    }
+    size_t hi = hotSlot(s, len);
+    sds c = hot[hi];
+    if (c && sdslen(c) == len && memcmp(c, s, len) == 0) return shareIndexed(c, s);
 
-    if (prob_count) {
-        sds cand = probTake(h, s, len);
-        if (cand) {
-            internHdr *ch = internHdrOf(cand);
-            ch->where = INTERN_IN_INDEX;
-            ch->refcount++;
-            memo_key = cand;
-            memo_hash = h;
-            serverAssert(hashtableAdd(intern_index, cand));
-            memo_key = NULL;
-            size_t sz = internSize(cand);
-            st.refs += ch->refcount;
-            st.shared_bytes += sz;
-            st.saved_bytes += (size_t)(ch->refcount - 1) * sz;
-            st.promotions++;
-            sdsfree(s);
-            observe(1);
-            return cand;
-        }
+    uint64_t h = internHash(s, len);
+    sds found = indexFind(s, h);
+    if (found) {
+        hot[hi] = found;
+        return shareIndexed(found, s);
+    }
+    if ((found = promote(h, s, len, hi)) != NULL) {
+        sdsfree(s);
+        return found;
     }
 
     observe(0);
@@ -347,6 +395,47 @@ sds internAdmitSlow(sds s) {
     sdsfree(s);
     probInsert(h, sh);
     return sh;
+}
+
+/* Scratch sds the loader reads candidate strings into. Its length is set to the
+ * string being offered so it can be used as an index key. */
+static sds load_scratch;
+
+char *internLoadScratch(size_t len) {
+    if (load_scratch == NULL) load_scratch = sdsnewlen(SDS_NOINIT, INTERN_LOAD_MAX);
+    sdssetlen(load_scratch, len);
+    return load_scratch;
+}
+
+sds internAdmitLoaded(size_t len) {
+    sds buf = load_scratch;
+    serverAssert(buf && sdslen(buf) == len);
+    st.sampled++;
+    size_t hi = hotSlot(buf, len);
+    sds c = hot[hi];
+    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0) return shareIndexed(c, NULL);
+
+    uint64_t h = internHash(buf, len);
+    sds found = indexFind(buf, h);
+    if (found) {
+        hot[hi] = found;
+        return shareIndexed(found, NULL);
+    }
+    if ((found = promote(h, buf, len, hi)) != NULL) return found;
+
+    observe(0);
+    if ((((h ^ intern_salt) >> 56) & intern_sel_mask) != 0) {
+        sds s = sdsnewlen(buf, len);
+        offered_last = s;
+        return s;
+    }
+    sds sh = newShareable(buf, len);
+    probInsert(h, sh);
+    return sh;
+}
+
+int internLoadReady(size_t len) {
+    return intern_level == 0 && len >= INTERN_MIN_LEN && len <= INTERN_LOAD_MAX && onServerMainThread();
 }
 
 /*-----------------------------------------------------------------------------
@@ -366,6 +455,7 @@ static void releaseOnMain(sds s, uint32_t n) {
     h->refcount -= n;
     if (h->refcount) return;
     if (h->where == INTERN_IN_INDEX) {
+        hotForget(s);
         serverAssert(hashtableDelete(intern_index, s));
     } else if (h->where == INTERN_IN_PROBATION) {
         probRemove(s);
@@ -510,6 +600,8 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     uint8_t where = ((internHdr *)np)->where;
     if (where == INTERN_IN_INDEX) {
         serverAssert(hashtableReplaceReallocatedEntry(intern_index, s, ns));
+        size_t i = hotSlot(ns, sdslen(ns));
+        if (hot[i] == s) hot[i] = ns;
     } else if (where == INTERN_IN_PROBATION) {
         probSlot *set = probSet(internHash(ns, sdslen(ns)));
         int w;

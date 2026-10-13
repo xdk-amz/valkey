@@ -310,8 +310,8 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
         return 0;
     }
     robj *val = *valref;
-    dbInternValue(val);
     val = objectSetKeyAndExpire(val, key, -1);
+    dbInternValue(val);
     kvstoreHashtableInsertAtPosition(db->keys, dict_index, val, &pos);
     initObjectLRUOrLFU(val);
 
@@ -447,10 +447,6 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     int keyfound = 0;
 
-    /* Values stored through setKey are not modified in place afterwards, unlike
-     * objects some commands create with dbAdd and then write into. */
-    dbInternValue(*valref);
-
     if (flags & SETKEY_ALREADY_EXIST)
         keyfound = 1;
     else if (flags & SETKEY_ADD_OR_UPDATE)
@@ -465,6 +461,10 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else {
         dbSetValue(db, key, valref, 1, NULL);
     }
+    /* Offered after insertion, once the value has its final encoding. Values
+     * stored through setKey are not modified in place afterwards, unlike
+     * objects some commands create with dbAdd and then write into. */
+    dbInternValue(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
@@ -1759,8 +1759,8 @@ void copyCommand(client *c) {
         dbDelete(dst, newkey);
     }
 
-    dbInternValue(newobj);
     dbAdd(dst, newkey, &newobj);
+    dbInternValue(newobj);
     if (expire != -1) newobj = setExpire(c, dst, newkey, expire);
 
     /* OK! key copied */

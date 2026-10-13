@@ -296,8 +296,8 @@ void restoreCommand(client *c) {
     }
 
     /* Create the key and set the TTL if any */
-    dbInternValue(obj);
     dbAdd(c->db, key, &obj);
+    dbInternValue(obj);
     if (ttl) {
         obj = setExpire(c, c->db, key, ttl);
         if (!absttl) {

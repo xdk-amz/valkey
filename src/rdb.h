@@ -172,6 +172,7 @@ enum RdbType {
 #define RDB_LOAD_ENC (1 << 0)
 #define RDB_LOAD_PLAIN (1 << 1)
 #define RDB_LOAD_SDS (1 << 2)
+#define RDB_LOAD_INTERN (1 << 3) /* a keyspace value: offer it to the intern table */
 
 /* flags on the purpose of rdb save or load */
 #define RDBFLAGS_NONE 0                 /* No special RDB loading or saving. */

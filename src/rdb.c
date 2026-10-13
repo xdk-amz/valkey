@@ -489,6 +489,7 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     uint64_t len, clen;
     unsigned char *c = NULL;
     char *val = NULL;
+    int intern = 0;
 
     if ((clen = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
     if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
@@ -499,8 +500,11 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     }
 
     /* Allocate our target according to the uncompressed size. */
+    intern = (flags & RDB_LOAD_INTERN) && !plain && (sds || !stringObjectWouldEmbed(len)) && internLoadReady(len);
     if (plain) {
         val = ztrymalloc(len);
+    } else if (intern) {
+        val = internLoadScratch(len);
     } else {
         val = sdstrynewlen(SDS_NOINIT, len);
     }
@@ -520,6 +524,7 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     }
     zfree(c);
 
+    if (intern) val = internAdmitLoaded(len);
     if (plain || sds) {
         return val;
     } else {
@@ -529,7 +534,7 @@ err:
     zfree(c);
     if (plain)
         zfree(val);
-    else
+    else if (!intern)
         sdsfree(val);
     return NULL;
 }
@@ -632,6 +637,14 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         case RDB_ENC_LZF: return rdbLoadLzfStringObject(rdb, flags, lenptr);
         default: rdbReportCorruptRDB("Unknown RDB string encoding type %llu", len); return NULL;
         }
+    }
+
+    if ((flags & RDB_LOAD_INTERN) && !plain && (sds || !stringObjectWouldEmbed(len)) && internLoadReady(len)) {
+        char *buf = internLoadScratch(len);
+        if (len && rioRead(rdb, buf, len) == 0) return NULL;
+        if (lenptr) *lenptr = len;
+        char *loaded = internAdmitLoaded(len);
+        return sds ? (void *)loaded : (void *)createObject(OBJ_STRING, loaded);
     }
 
     if (plain || sds) {
@@ -2157,7 +2170,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
 
     if (rdbtype == RDB_TYPE_STRING) {
         /* Read string value */
-        if ((o = rdbLoadEncodedStringObject(rdb)) == NULL) return NULL;
+        if ((o = rdbGenericLoadStringObject(rdb, RDB_LOAD_ENC | RDB_LOAD_INTERN, NULL)) == NULL) return NULL;
         o = tryObjectEncodingEx(o, 0);
     } else if (rdbtype == RDB_TYPE_LIST) {
         /* Read list value */
@@ -2205,8 +2218,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
         for (i = 0; i < len; i++) {
             long long llval;
             sds sdsele;
+            int eflags = RDB_LOAD_SDS | (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE ? RDB_LOAD_INTERN : 0);
 
-            if ((sdsele = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
+            if ((sdsele = rdbGenericLoadStringObject(rdb, eflags, NULL)) == NULL) {
                 decrRefCount(o);
                 return NULL;
             }
@@ -2513,7 +2527,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                 decrRefCount(o);
                 return NULL;
             }
-            if ((value = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
+            if ((value = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS | RDB_LOAD_INTERN, NULL)) == NULL) {
                 sdsfree(field);
                 decrRefCount(o);
                 return NULL;

@@ -376,6 +376,11 @@ static bool shouldEmbedStringObject(size_t val_len, const_sds key, long long exp
     return size <= 128;
 }
 
+/* True if a string of this length is created embedded when it has no key. */
+bool stringObjectWouldEmbed(size_t len) {
+    return shouldEmbedStringObject(len, NULL, EXPIRY_NONE);
+}
+
 /* Create a string object with EMBSTR encoding if it is small, otherwise RAW encoding */
 robj *createStringObject(const char *ptr, size_t len) {
     if (shouldEmbedStringObject(len, NULL, EXPIRY_NONE))
