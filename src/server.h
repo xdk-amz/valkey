@@ -4005,6 +4005,7 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
     (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE | LOOKUP_NOHOTKEYS) /* Avoid any effects from fetching the key */
 
 void dbAdd(serverDb *db, robj *key, robj **valref);
+void dbInternValue(robj *val);
 int dbAddRDBLoad(serverDb *db, sds key, robj **valref);
 void dbReplaceValue(serverDb *db, robj *key, robj **valref);
 

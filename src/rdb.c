@@ -34,6 +34,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "lzf.h" /* LZF compression library */
 #include "zipmap.h"
@@ -2262,6 +2263,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             /* This will also be called when the set was just converted
              * to a regular hash table encoded set. */
             if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
+                sdsele = internAdmit(sdsele);
                 if (!hashtableAdd((hashtable *)objectGetVal(o), sdsele)) {
                     rdbReportCorruptRDB("Duplicate set members detected");
                     decrRefCount(o);

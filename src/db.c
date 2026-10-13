@@ -59,8 +59,8 @@ static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
 /* Offers an out-of-line string value to the intern table before it is stored.
  * Only an unshared object is changed, so no other reference sees its value
- * pointer move. */
-static inline void dbInternValue(robj *val) {
+ * pointer move. The caller must not modify the value in place afterwards. */
+void dbInternValue(robj *val) {
     if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
         objectSetVal(val, internAdmit(objectGetVal(val)));
     }
@@ -234,7 +234,6 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
 
     /* Not existing. Convert val to valkey object and insert. */
     robj *val = *valref;
-    dbInternValue(val);
     val = objectSetKeyAndExpire(val, objectGetVal(key), -1);
     /* Track hash object if it has volatile fields (for active expiry).
      * For example, this is needed when a hash is moved to a new DB (e.g. MOVE). */
@@ -348,9 +347,6 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * The program is aborted if the key was not already present. */
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
     robj *val = *valref;
-    /* dbReplaceValue (overwrite == 0) installs values the caller is about to
-     * modify in place, such as the private copy made by dbUnshareStringValue. */
-    if (overwrite) dbInternValue(val);
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
         oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
@@ -450,6 +446,10 @@ void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
  * in a context where there is no clear client performing the operation. */
 void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     int keyfound = 0;
+
+    /* Values stored through setKey are not modified in place afterwards, unlike
+     * objects some commands create with dbAdd and then write into. */
+    dbInternValue(*valref);
 
     if (flags & SETKEY_ALREADY_EXIST)
         keyfound = 1;
@@ -1759,6 +1759,7 @@ void copyCommand(client *c) {
         dbDelete(dst, newkey);
     }
 
+    dbInternValue(newobj);
     dbAdd(dst, newkey, &newobj);
     if (expire != -1) newobj = setExpire(c, dst, newkey, expire);
 
