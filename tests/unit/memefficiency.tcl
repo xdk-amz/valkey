@@ -363,7 +363,7 @@ run_solo {defrag} {
                 set k 0
                 set f 0
                 for {set j 0} {$j < $n} {incr j} {
-                    $rd hset k$k f$f $val
+                    $rd hset k$k f$f $val$f
                     lassign [next_exp_kf $k $f] k f
                     if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
                 }

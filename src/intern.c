@@ -73,11 +73,13 @@ static inline size_t internSize(const_sds s) {
 /*-----------------------------------------------------------------------------
  * Hashing. A seeded multiply-mix hash over the whole string up to
  * INTERN_HASH_FULL_MAX bytes, and over the head, tail and eight interior windows
- * of longer strings. Equality is always confirmed with memcmp.
+ * of longer strings. Equality is always confirmed with memcmp. The multiplier
+ * constants are derived from the random seed at startup: with public constants
+ * a block equal to a constant zeroes the product, which lets a client build
+ * colliding strings without knowing the seed.
  *----------------------------------------------------------------------------*/
 
-static const uint64_t K0 = 0xa0761d6478bd642full, K1 = 0xe7037ed1a0b428dbull, K2 = 0x8ebc6af09c88c6e3ull,
-                      K3 = 0x589965cc75374cc3ull;
+static uint64_t K0, K1, K2, K3;
 
 static inline uint64_t mix(uint64_t a, uint64_t b) {
     __uint128_t r = (__uint128_t)a * b;
@@ -493,13 +495,54 @@ static void releaseHook(sds s) {
 }
 
 /*-----------------------------------------------------------------------------
+ * Defrag. A string with one holder can move: the caller updates the holder and
+ * this updates the table slot. A string with more holders stays in place, since
+ * the other holders cannot be found. A pending off-main release would make the
+ * count higher than the holders, never lower, so a count of 1 is exact.
+ *----------------------------------------------------------------------------*/
+
+sds internDefragShared(sds s, void *(*defragfn)(void *)) {
+    internHdr *h = internHdrOf(s);
+    if (h->refcount != 1) return NULL;
+    void *np = defragfn(h);
+    if (np == NULL) return NULL;
+    sds ns = (char *)np + ((char *)s - (char *)h);
+    uint8_t where = ((internHdr *)np)->where;
+    if (where == INTERN_IN_INDEX) {
+        serverAssert(hashtableReplaceReallocatedEntry(intern_index, s, ns));
+    } else if (where == INTERN_IN_PROBATION) {
+        probSlot *set = probSet(internHash(ns, sdslen(ns)));
+        int w;
+        for (w = 0; w < PROB_WAYS; w++) {
+            if (set[w].s == s) break;
+        }
+        serverAssert(w < PROB_WAYS);
+        set[w].s = ns;
+    }
+    return ns;
+}
+
+/*-----------------------------------------------------------------------------
  * Init and introspection.
  *----------------------------------------------------------------------------*/
 
+/* splitmix64 step, used to expand the seed into the hash secrets. */
+static uint64_t nextSecret(uint64_t *x) {
+    uint64_t z = (*x += 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return (z ^ (z >> 31)) | 1;
+}
+
 void internInit(void) {
     uint8_t *seed = hashtableGetHashFunctionSeed();
-    memcpy(&intern_seed, seed, sizeof(intern_seed));
-    intern_seed ^= 0x9e3779b97f4a7c15ull;
+    uint64_t x;
+    memcpy(&x, seed, sizeof(x));
+    K0 = nextSecret(&x);
+    K1 = nextSecret(&x);
+    K2 = nextSecret(&x);
+    K3 = nextSecret(&x);
+    memcpy(&intern_seed, seed + 8, sizeof(intern_seed));
     intern_salt = mix(intern_seed, K2);
     intern_index = hashtableCreate(&internIndexType);
     prob_nsets = PROB_MIN_SETS;
@@ -515,6 +558,12 @@ size_t internSharedAllocSize(const_sds s) {
 
 uint32_t internSharedRefcount(const_sds s) {
     return internHdrOf(s)->refcount;
+}
+
+size_t internSdsMemUsage(const_sds s) {
+    if (!sdsIsShared(s)) return sdsAllocSize(s);
+    internHdr *h = internHdrOf(s);
+    return zmalloc_size(h) / (h->refcount ? h->refcount : 1);
 }
 
 void internGetInfo(internInfo *info) {

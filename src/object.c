@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "serverassert.h"
 #include "functions.h"
@@ -1339,7 +1340,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
 
     if (objectGetType(o) == OBJ_STRING) {
         if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
-            asize += sdsAllocSize(objectGetVal(o));
+            asize += internSdsMemUsage(objectGetVal(o));
         } else if (objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetEncoding(o) != OBJ_ENCODING_EMBSTR) {
             serverPanic("Unknown string encoding");
         }
@@ -1368,7 +1369,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             void *next;
             while (hashtableNext(&iter, &next) && samples < sample_size) {
                 sds element = next;
-                elesize += sdsAllocSize(element);
+                elesize += internSdsMemUsage(element);
                 samples++;
             }
             hashtableCleanupIterator(&iter);

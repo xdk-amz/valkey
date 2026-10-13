@@ -509,7 +509,7 @@ size_t entryMemUsage(entry *entry) {
     if (entryHasStringRef(entry)) {
         mem += zmalloc_usable_size(entryGetStringRefRef(entry));
     } else {
-        mem += sdsAllocSize((sds)entryGetValue(entry, NULL));
+        mem += internSdsMemUsage((sds)entryGetValue(entry, NULL));
     }
     return mem;
 }

@@ -48,9 +48,18 @@ void internDeferPublish(void);
 /* Applies releases queued by other threads. Main thread only. */
 size_t internDrainDeferred(void);
 
+/* Moves a shareable string with a single holder using `defragfn`, keeping the
+ * table consistent. Returns the new sds, or NULL if it did not move. The caller
+ * updates the holder. */
+sds internDefragShared(sds s, void *(*defragfn)(void *));
+
 /* Allocation size of a shareable string, including its prefix. */
 size_t internSharedAllocSize(const_sds s);
 uint32_t internSharedRefcount(const_sds s);
+
+/* Memory attributed to one holder of `s`: the full allocation for a private
+ * string, an equal share of the allocation for a shared one. */
+size_t internSdsMemUsage(const_sds s);
 
 typedef struct internInfo {
     size_t shared;        /* strings in the index */
