@@ -61,6 +61,7 @@
 
 #include "eval.h"
 #include "bgiteration.h"
+#include "intern.h"
 
 #include "trace/trace_commands.h"
 
@@ -1973,6 +1974,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* We should handle pending reads clients ASAP after event loop. */
     int io_responses = processIOThreadsResponses();
+
+    internDrainDeferred();
     if (io_responses > 0) server.el_iteration_active = true;
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
@@ -3084,6 +3087,7 @@ void initServer(void) {
     server.slot_migration_pipe_read = -1;
     server.slot_migration_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
+    internInit();
     server.current_client = NULL;
     server.errors = raxNew();
     server.execution_nesting = 0;
@@ -6726,6 +6730,22 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "active_defrag_running:%d\r\n", server.active_defrag_cpu_percent,
                 "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
                 "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
+        internInfo ii;
+        internGetInfo(&ii);
+        info = sdscatprintf(info,
+                            "intern_strings:%zu\r\n"
+                            "intern_refs:%zu\r\n"
+                            "intern_bytes:%zu\r\n"
+                            "intern_saved_bytes:%zu\r\n"
+                            "intern_table_bytes:%zu\r\n"
+                            "intern_singletons:%zu\r\n"
+                            "intern_hits:%zu\r\n"
+                            "intern_promotions:%zu\r\n"
+                            "intern_sampled:%zu\r\n"
+                            "intern_deferred:%zu\r\n"
+                            "intern_level:%d\r\n",
+                            ii.shared, ii.refs, ii.shared_bytes, ii.saved_bytes, ii.table_bytes, ii.singletons,
+                            ii.hits, ii.promotions, ii.sampled, ii.deferred, ii.level);
         freeMemoryOverheadData(mh);
     }
 

@@ -44,6 +44,7 @@
 #include "forkless.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
+#include "intern.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -55,6 +56,15 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
+
+/* Offers an out-of-line string value to the intern table before it is stored.
+ * Only an unshared object is changed, so no other reference sees its value
+ * pointer move. */
+static inline void dbInternValue(robj *val) {
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
+        objectSetVal(val, internAdmit(objectGetVal(val)));
+    }
+}
 
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -224,6 +234,7 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
 
     /* Not existing. Convert val to valkey object and insert. */
     robj *val = *valref;
+    dbInternValue(val);
     val = objectSetKeyAndExpire(val, objectGetVal(key), -1);
     /* Track hash object if it has volatile fields (for active expiry).
      * For example, this is needed when a hash is moved to a new DB (e.g. MOVE). */
@@ -300,6 +311,7 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
         return 0;
     }
     robj *val = *valref;
+    dbInternValue(val);
     val = objectSetKeyAndExpire(val, key, -1);
     kvstoreHashtableInsertAtPosition(db->keys, dict_index, val, &pos);
     initObjectLRUOrLFU(val);
@@ -336,6 +348,9 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * The program is aborted if the key was not already present. */
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
     robj *val = *valref;
+    /* dbReplaceValue (overwrite == 0) installs values the caller is about to
+     * modify in place, such as the private copy made by dbUnshareStringValue. */
+    if (overwrite) dbInternValue(val);
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
         oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
@@ -607,7 +622,7 @@ int dbDelete(serverDb *db, robj *key) {
  */
 robj *dbUnshareStringValue(serverDb *db, robj *key, robj *o) {
     serverAssert(objectGetType(o) == OBJ_STRING);
-    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
+    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW || sdsIsShared(objectGetVal(o))) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(objectGetVal(decoded), sdslen(objectGetVal(decoded)));
         decrRefCount(decoded);

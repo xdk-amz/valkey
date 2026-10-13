@@ -201,6 +201,8 @@ void *activeDefragAlloc(void *ptr) {
  * When it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
 sds activeDefragSds(sds sdsptr) {
+    /* Other holders point at a shared string, so it must stay where it is. */
+    if (sdsIsShared(sdsptr)) return NULL;
     void *ptr = sdsAllocPtr(sdsptr);
     void *newptr = activeDefragAlloc(ptr);
     if (newptr) {

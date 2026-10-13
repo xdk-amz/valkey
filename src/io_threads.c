@@ -1039,6 +1039,9 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
+    /* Releasing a shared value is a reference count decrement on the main thread. */
+    if (sdsIsShared(objectGetVal(obj))) return C_ERR;
+
     void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
     if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) return C_ERR;
     io_jobs_submitted++;

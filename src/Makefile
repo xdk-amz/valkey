@@ -545,6 +545,7 @@ ENGINE_SERVER_OBJ = \
     debug.o \
     defrag.o \
     entry.o \
+    intern.o \
     eval.o \
     evict.o \
     expire.o \

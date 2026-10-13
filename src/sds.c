@@ -190,9 +190,16 @@ sds sdsdup(const_sds s) {
     return sdsnewlen(s, sdslen(s));
 }
 
+/* Releases one reference of a shared string. Installed by the server. */
+void (*sdsSharedReleaseHook)(sds s) = NULL;
+
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
+    if (sdsIsShared(s)) {
+        sdsSharedReleaseHook(s);
+        return;
+    }
     s_free_with_size(sdsAllocPtr(s), sdsAllocSize(s));
 }
 
@@ -254,6 +261,7 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
 
     /* Return ASAP if there is enough space left. */
     if (avail >= addlen) return s;
+    assert(!sdsIsShared(s));
 
     len = sdslen(s);
     sh = (char *)s - sdsHdrSize(oldtype);
@@ -340,6 +348,7 @@ sds sdsResize(sds s, size_t size, int would_regrow) {
 
     /* Return ASAP if the size is already good. */
     if (sdsalloc(s) == size) return s;
+    assert(!sdsIsShared(s));
 
     /* Truncate len if needed. */
     if (size < len) len = size;
