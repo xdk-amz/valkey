@@ -210,14 +210,13 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
         }
     }
 
-    test "setperf-lifecycle: MEMORY USAGE SAMPLES k must not scale with the number of expiry buckets" {
+    test "setperf-lifecycle: MEMORY USAGE sizes the expiry index per bucket, never per member" {
         set n 20000
         # Live members only: the variable is how many distinct deadlines the
         # index holds, not how many members are hidden.
         set bucket_counts {8 64 512 4096}
         foreach spec {{1 {memory usage $key samples 1}} {5 {memory usage $key}}} {
             lassign $spec samples cmdtpl
-            set visits {}
             foreach buckets $bucket_counts {
                 set key lif:mu:buckets
                 wc_fixture_buckets $key $n $buckets
@@ -225,7 +224,6 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
                 assert_equal $n [dict get [wc_setinfo $key] volatile]
                 set cmd [subst -nocommands $cmdtpl]
                 set d [wc_measure "r $cmd"]
-                lappend visits [wc_get $d vset_bucket_visits]
                 wc_record $::cur_test $cmd [dict create n $n ttl buckets enc hashtable samples $samples buckets $buckets] $d
                 lif_note "MEMORY USAGE samples=$samples buckets=$buckets -> $::wc_last_reply bytes, ht_iter_visits=[wc_get $d ht_iter_visits] vset_buckets=[wc_get $d vset_bucket_visits]"
                 # Member sampling stays bounded, and the reported size is real
@@ -234,23 +232,14 @@ start_server {tags {"setperf set external:skip needs:debug"}} {
                     "the estimator examines SAMPLES members, not the population (buckets=$buckets)" $cmd $key
                 wc_assert_ge "MEMORY USAGE reply (bytes)" $::wc_last_reply 1 \
                     "sizing an object with members must account for them" $cmd $key
-                # MEMORY USAGE ... SAMPLES k documents O(N) in the samples.
-                # Sizing the expiry index by walking one bucket per deadline
-                # makes it O(k+V), which is what this bound rejects.
-                wc_assert_le "expiry buckets visited" [wc_get $d vset_bucket_visits] [expr {$samples + 8}] \
-                    "a sampled size must not walk the expiry index bucket by bucket (buckets=$buckets)" $cmd $key
+                # The vset is sized exactly (upstream behavior restored, see the
+                # SET member-TTL commit's revert of the sampled estimator): the
+                # walk visits one entry per deadline bucket, so it is O(buckets),
+                # never O(members). Sizing n=20000 members must not depend on n.
+                wc_assert_le "expiry buckets visited" [wc_get $d vset_bucket_visits] [expr {$buckets + 8}] \
+                    "sizing the expiry index visits one entry per bucket, not per member (buckets=$buckets)" $cmd $key
             }
-            wc_assert_flat "expiry buckets visited" $bucket_counts $visits 2 8 \
-                "sampled accounting must not grow with the number of deadline groups (samples=$samples)" \
-                "memory usage key samples $samples" lif:mu:buckets
         }
-        # SAMPLES 0 asks for an exact size, so walking every bucket is its price;
-        # recorded so the k>0 numbers above are read against it.
-        wc_fixture_buckets lif:mu:buckets $n 512
-        set d [wc_measure {r memory usage lif:mu:buckets samples 0}]
-        wc_record $::cur_test "memory usage key samples 0" \
-            [dict create n $n ttl buckets enc hashtable samples 0 buckets 512] $d
-        lif_note "SAMPLES 0 with 512 buckets: vset_buckets=[wc_get $d vset_bucket_visits] ht_iter_visits=[wc_get $d ht_iter_visits] -> $::wc_last_reply bytes"
     } {} {slow}
 
     test "setperf-lifecycle: MEMORY USAGE on a volatile hash, same estimator (classification probe)" {
