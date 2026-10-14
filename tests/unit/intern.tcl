@@ -77,8 +77,8 @@ start_server {tags {"intern"}} {
     test {MEMORY USAGE charges a share of a shared value} {
         r flushall
         set v [string repeat u 1000]
-        for {set i 0} {$i < 100} {incr i} {r set k$i $v}
-        assert_lessthan [r memory usage k50] 600
+        for {set i 0} {$i < 1000} {incr i} {r set k$i $v}
+        assert_lessthan [r memory usage k999] 600
     }
 
     test {valkey-check-rdb reads an RDB written from shared values} {

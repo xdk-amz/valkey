@@ -459,7 +459,7 @@ static inline int selectSingleton(uint64_t h, size_t len, size_t priv_size) {
 }
 
 static void setLevel(int level) {
-    intern_level = level;
+    __atomic_store_n(&intern_level, level, __ATOMIC_RELAXED);
     intern_load_ready = (level == 0);
     intern_gate.period = 1u << level;
     if (intern_gate.tick > intern_gate.period) intern_gate.tick = intern_gate.period;
@@ -607,17 +607,6 @@ __attribute__((cold, noinline)) static sds makeSingleton(sds s, size_t len, uint
     sdsfree(s);
     probInsert(h, sh);
     return sh;
-}
-
-/* Scales with the sampling level so the overall rate stays one write in
- * INTERN_IO_PERIOD: the main gate already picked one in 2^level. */
-static uint32_t io_tick = 1;
-
-int internIOGateDue(void) {
-    if (--io_tick) return 0;
-    uint32_t period = INTERN_IO_PERIOD >> intern_level;
-    io_tick = period ? period : 1;
-    return 1;
 }
 
 sds internAdmitSlow(sds s) {
@@ -936,34 +925,72 @@ size_t internDrainDeferred(void) {
 
 #define INTERN_PENDING_MAX 4096
 
+/* Arguments an IO thread selected for admission, with the hash and length it
+ * computed, so the main thread can admit them without reading their bytes. */
+typedef struct internSelected {
+    robj *o;
+    uint64_t hash;
+    size_t len;
+} internSelected;
+
 struct internPending {
-    uint32_t n, cap;
-    robj *o[];
+    uint32_t n, cap;   /* shared arguments waiting for their references */
+    uint32_t ns, scap; /* arguments selected for admission */
+    uint32_t hits;     /* sampled arguments that were shared */
+    robj **o;
+    internSelected *sel;
 };
 
-static robj *parseArgIO(internPending **pp, const char *buf, size_t len) {
+static internPending *pendingGet(internPending **pp) {
+    if (*pp == NULL) *pp = zcalloc(sizeof(internPending));
+    return *pp;
+}
+
+/* Makes room for one more entry in an array of `cap` entries holding `n`. */
+static int pendingGrow(void **arr, uint32_t n, uint32_t *cap, size_t entry) {
+    if (n < *cap) return 1;
+    uint32_t ncap = *cap ? *cap * 2 : 16;
+    if (ncap > INTERN_PENDING_MAX) return 0;
+    *arr = zrealloc(*arr, ncap * entry);
+    *cap = ncap;
+    return 1;
+}
+
+/* Each IO thread selects one eligible argument in 2^level, the main sampling
+ * level, but no more than one in INTERN_IO_MIN_PERIOD. */
+static __thread uint32_t io_sel_tick = 1;
+
+static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int argi) {
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return NULL;
+    /* The command name and, usually, the key come first; values follow. */
+    int sampled = 0;
+    if (argi >= 2 && --io_sel_tick == 0) {
+        uint32_t period = 1u << __atomic_load_n(&intern_level, __ATOMIC_RELAXED);
+        io_sel_tick = period > INTERN_IO_MIN_PERIOD ? period : INTERN_IO_MIN_PERIOD;
+        sampled = 1;
+    }
     uint64_t m = hotMix(buf, len);
     hotSlotEntry *e = &hot[m >> (64 - HOT_BITS)];
     sds c = __atomic_load_n(&e->s, __ATOMIC_ACQUIRE);
-    if (c == NULL || __atomic_load_n(&e->tag, __ATOMIC_RELAXED) != m) return NULL;
-    if (sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
-    internPending *p = *pp;
-    if (p == NULL || p->n == p->cap) {
-        uint32_t cap = p ? p->cap * 2 : 16;
-        if (cap > INTERN_PENDING_MAX) return NULL;
-        p = zrealloc(p, sizeof(*p) + cap * sizeof(robj *));
-        if (*pp == NULL) p->n = 0;
-        p->cap = cap;
-        *pp = p;
+    if (c && __atomic_load_n(&e->tag, __ATOMIC_RELAXED) == m && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+        internPending *p = pendingGet(pp);
+        if (!pendingGrow((void **)&p->o, p->n, &p->cap, sizeof(robj *))) return NULL;
+        robj *o = createObject(OBJ_STRING, c);
+        p->o[p->n++] = o;
+        /* A sampled hit, so the sampling level sees what parse-time sharing found. */
+        p->hits += sampled;
+        return o;
     }
-    robj *o = createObject(OBJ_STRING, c);
-    p->o[p->n++] = o;
+    if (!sampled) return NULL;
+    internPending *p = pendingGet(pp);
+    if (!pendingGrow((void **)&p->sel, p->ns, &p->scap, sizeof(internSelected))) return NULL;
+    robj *o = createStringObject(buf, len);
+    p->sel[p->ns++] = (internSelected){o, internHash(buf, len), len};
     return o;
 }
 
-robj *internParseArg(internPending **pending, const char *buf, size_t len) {
-    if (!intern_is_main) return parseArgIO(pending, buf, len);
+robj *internParseArg(internPending **pending, const char *buf, size_t len, int argi) {
+    if (!intern_is_main) return parseArgIO(pending, buf, len, argi);
     if (len > INTERN_MAX_LEN) return NULL;
     sds c = hotFind(buf, len);
     if (!c) return NULL;
@@ -978,8 +1005,37 @@ robj *internParseArg(internPending **pending, const char *buf, size_t len) {
 }
 
 void internFreePending(internPending *pending) {
-    if (pending) serverAssert(pending->n == 0);
+    if (pending == NULL) return;
+    serverAssert(pending->n == 0 && pending->ns == 0);
+    zfree(pending->o);
+    zfree(pending->sel);
     zfree(pending);
+}
+
+/* True for commands that store a value argument itself rather than a copy of
+ * it. Other commands copy their arguments, so sharing those on an IO thread
+ * would only add reference work on the main thread. */
+int internIOShares(const char *name, size_t len) {
+    static const char *cmds[] = {"set", "setex", "psetex", "setnx", "getset", "mset", "msetnx"};
+    if (len < 3 || len > 6) return 0;
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        if (strlen(cmds[i]) == len && strncasecmp(cmds[i], name, len) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Admits a private argument an IO thread selected, using the hash and length
+ * it computed. Returns the sds the argument must hold. The bytes are read only
+ * on a table hit or to copy a new singleton. */
+static sds admitSelected(sds s, size_t len, uint64_t h) {
+    st.sampled++;
+    if (unlikely(filterMayHave(h))) {
+        sds r = admitFromTables(s, len, h);
+        if (r) return r;
+    }
+    observe(0);
+    if (unlikely(selectSingleton(h, len, privateSize(len)))) return makeSingleton(s, len, h);
+    return s;
 }
 
 /* Takes the reference an IO thread left for the main thread. The string may
@@ -1027,6 +1083,14 @@ void internReadCollected(internPending *pending, uint32_t *epoch) {
     if (pending && pending->n) {
         for (uint32_t i = 0; i < pending->n; i++) takePendingRef(pending->o[i]);
         pending->n = 0;
+        for (; pending->hits; pending->hits--) observe(1);
+    }
+    if (pending && pending->ns) {
+        for (uint32_t i = 0; i < pending->ns; i++) {
+            internSelected *e = &pending->sel[i];
+            objectSetVal(e->o, admitSelected(objectGetVal(e->o), e->len, e->hash));
+        }
+        pending->ns = 0;
     }
     if (*epoch) {
         serverAssert(read_inflight[*epoch - 1] > 0);

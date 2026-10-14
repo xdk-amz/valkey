@@ -4304,8 +4304,9 @@ static int parseMultibulk(client *c,
                  * lookups, so their arguments are never shared. */
                 if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
                     const char *name = objectGetVal((*argv)[0]);
-                    if (name[0] != 'z' && name[0] != 'Z')
-                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen);
+                    if (intern_is_main ? (name[0] != 'z' && name[0] != 'Z')
+                                       : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
+                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, *argc);
                 }
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;

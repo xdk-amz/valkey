@@ -100,12 +100,10 @@ static inline sds internAdmitDue(sds s) {
     return internAdmitSlow(s);
 }
 
-/* For a write internGateDue() selected whose value an IO thread parsed: its
- * bytes are not in this thread's cache, so such values are offered at a fixed
- * rate, one in INTERN_IO_PERIOD, whatever the sampling level. IO threads share
- * repeats of values already in the hot cache; this finds new ones. */
-#define INTERN_IO_PERIOD 64
-int internIOGateDue(void);
+/* An IO thread selects eligible arguments for admission at the main sampling
+ * rate, but at most one in INTERN_IO_MIN_PERIOD, and hashes them, since the
+ * main thread does not have their bytes in cache. See internParseArg(). */
+#define INTERN_IO_MIN_PERIOD 8
 
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. */
@@ -157,20 +155,23 @@ sds internDupSds(const_sds s);
 /* Request parsing. A bulk argument equal to a hot shared string becomes a
  * string object that points at it, so the argument costs no allocation or copy.
  * Returns NULL otherwise. The argument must be long enough that it would not be
- * embedded.
+ * embedded; `argi` is its position in the command.
  *
  * On the main thread, which parses only while every write is being probed, the
  * object holds a reference. On an IO thread the object is recorded in *pending
- * without one; the main thread takes the references when it collects the read
- * with internReadCollected(). */
+ * without one, and an argument after the key may be selected, hashed and
+ * recorded instead; the main thread takes the references and admits the
+ * selected arguments when it collects the read with internReadCollected(). */
 struct serverObject;
 typedef struct internPending internPending;
-struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len);
+struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len, int argi);
 extern __thread int intern_is_main;
 static inline int internParseReady(void) {
     return intern_is_main ? intern_load_ready : 1;
 }
 void internFreePending(internPending *pending);
+/* IO threads share and select only arguments of these commands. */
+int internIOShares(const char *name, size_t len);
 
 /* Read jobs. An IO thread reads hot shared strings while it parses, and holds
  * unreferenced ones until the read is collected, so a shared string that dies
