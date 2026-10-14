@@ -1092,6 +1092,14 @@ void internReadCollected(internPending *pending, uint32_t *epoch) {
         }
         pending->ns = 0;
     }
+    /* A long pipeline grows the arrays; do not keep them for an idle client. */
+    if (pending && (pending->cap > 64 || pending->scap > 64)) {
+        zfree(pending->o);
+        zfree(pending->sel);
+        pending->o = NULL;
+        pending->sel = NULL;
+        pending->cap = pending->scap = 0;
+    }
     if (*epoch) {
         serverAssert(read_inflight[*epoch - 1] > 0);
         read_inflight[*epoch - 1]--;
