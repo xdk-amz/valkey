@@ -410,6 +410,8 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->cur_tid = 0;
+    c->intern_pending = NULL;
+    c->intern_read_epoch = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -2477,6 +2479,7 @@ int freeClient(client *c) {
     if (c->lib_ver) decrRefCount(c->lib_ver);
     freeClientMultiState(c);
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
+    internFreePending(c->intern_pending);
     sdsfree(c->peerid);
     sdsfree(c->sockname);
     zfree(c);
@@ -4302,7 +4305,7 @@ static int parseMultibulk(client *c,
                 if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
                     const char *name = objectGetVal((*argv)[0]);
                     if (name[0] != 'z' && name[0] != 'Z')
-                        arg = internParseArg(c->querybuf + c->qb_pos, c->bulklen);
+                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen);
                 }
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
@@ -7067,6 +7070,7 @@ int processClientIOReadsDone(client *c) {
 
     c->flag.pending_read = 0;
     c->io_read_state = CLIENT_IDLE;
+    internReadCollected(c->intern_pending, &c->intern_read_epoch);
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return 0;

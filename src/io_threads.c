@@ -709,6 +709,7 @@ int trySendReadToIOThreads(client *c) {
     io_jobs_submitted++;
     server.stat_io_reads_pending++;
     c->flag.pending_read = 1;
+    internReadDispatched(&c->intern_read_epoch);
     return C_OK;
 }
 

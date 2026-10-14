@@ -100,6 +100,13 @@ static inline sds internAdmitDue(sds s) {
     return internAdmitSlow(s);
 }
 
+/* For a write internGateDue() selected whose value an IO thread parsed: its
+ * bytes are not in this thread's cache, so such values are offered at a fixed
+ * rate, one in INTERN_IO_PERIOD, whatever the sampling level. IO threads share
+ * repeats of values already in the hot cache; this finds new ones. */
+#define INTERN_IO_PERIOD 64
+int internIOGateDue(void);
+
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. */
 void internInit(void);
@@ -147,17 +154,32 @@ sds internNewFrom(const char *buf, size_t len);
  * bytes are in cache. Main thread only. */
 sds internDupSds(const_sds s);
 
-/* Request parsing. While every write is being probed, a bulk argument equal to
- * a hot shared string becomes a string object that holds a reference on it, so
- * the argument costs no allocation or copy. Returns NULL otherwise, or when not
- * called on the main thread. The argument must be long enough that it would not
- * be embedded. */
+/* Request parsing. A bulk argument equal to a hot shared string becomes a
+ * string object that points at it, so the argument costs no allocation or copy.
+ * Returns NULL otherwise. The argument must be long enough that it would not be
+ * embedded.
+ *
+ * On the main thread, which parses only while every write is being probed, the
+ * object holds a reference. On an IO thread the object is recorded in *pending
+ * without one; the main thread takes the references when it collects the read
+ * with internReadCollected(). */
 struct serverObject;
-struct serverObject *internParseArg(const char *buf, size_t len);
+typedef struct internPending internPending;
+struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len);
 extern __thread int intern_is_main;
 static inline int internParseReady(void) {
-    return intern_is_main && intern_load_ready;
+    return intern_is_main ? intern_load_ready : 1;
 }
+void internFreePending(internPending *pending);
+
+/* Read jobs. An IO thread reads hot shared strings while it parses, and holds
+ * unreferenced ones until the read is collected, so a shared string that dies
+ * while reads are in flight is freed only once every read dispatched before
+ * its death is collected. The main thread reports each read job it dispatches
+ * and collects, and calls internEpochTick() once per event loop iteration. */
+void internReadDispatched(uint32_t *epoch);
+void internReadCollected(internPending *pending, uint32_t *epoch);
+void internEpochTick(void);
 
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */

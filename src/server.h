@@ -1512,6 +1512,10 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    /* Arguments an IO thread parsed as shared strings; the main thread takes
+     * their references when it collects the read. */
+    struct internPending *intern_pending;
+    uint32_t intern_read_epoch; /* epoch of the read job in flight, plus one; 0 if none */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif

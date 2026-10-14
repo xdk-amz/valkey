@@ -172,3 +172,32 @@ start_server {tags {"intern repl external:skip"}} {
         } {} {needs:debug}
     }
 }
+
+start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+    proc intern_stat {field} {
+        set info [r info memory]
+        if {[regexp "\r\n$field:(\[0-9\]+)" $info -> v]} {return $v}
+        return 0
+    }
+
+    test {Values parsed by IO threads are shared} {
+        r flushall
+        set v [string repeat w 300]
+        for {set i 0} {$i < 3000} {incr i} {r set k$i $v}
+        assert_morethan [s io_threaded_reads_processed] 1000
+        assert_morethan [intern_stat intern_refs] 2500
+        for {set i 0} {$i < 3000} {incr i 97} {assert_equal $v [r get k$i]}
+    }
+
+    test {Values shared by IO threads are released on overwrite and flush} {
+        set w [string repeat z 300]
+        for {set i 0} {$i < 3000} {incr i} {r set k$i $w}
+        for {set i 0} {$i < 3000} {incr i 89} {assert_equal $w [r get k$i]}
+        r flushall
+        wait_for_condition 50 100 {
+            [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
+        } else {
+            fail "intern references not released"
+        }
+    }
+}
