@@ -26,6 +26,9 @@ typedef struct internHdr {
 #define INTERN_IN_INDEX 1
 #define INTERN_IN_PROBATION 2
 
+/* A string at this many references is not shared further. */
+#define INTERN_REFS_MAX (UINT32_MAX - 1)
+
 #define INTERN_MAX_LEN (512 * 1024)
 #define INTERN_HASH_FULL_MAX 512
 
@@ -383,12 +386,14 @@ static sds promote(uint64_t h, const char *buf, size_t len, size_t hi) {
     sds cand = probTake(h, buf, len);
     if (!cand) return NULL;
     internHdr *ch = internHdrOf(cand);
-    ch->where = INTERN_IN_INDEX;
     ch->refcount++;
     memo_key = cand;
     memo_hash = h;
-    serverAssert(hashtableAdd(intern_index, cand));
+    int added = hashtableAdd(intern_index, cand);
     memo_key = NULL;
+    /* An equal string already in the index has reached INTERN_REFS_MAX. */
+    if (!added) return cand;
+    ch->where = INTERN_IN_INDEX;
     size_t sz = internSize(cand);
     st.refs += ch->refcount;
     st.shared_bytes += sz;
@@ -427,6 +432,7 @@ sds internAdmitSlow(sds s) {
     size_t hi = hotSlot(s, len);
     sds c = hot[hi];
     if (c && sdslen(c) == len && memcmp(c, s, len) == 0) {
+        if (internHdrOf(c)->refcount >= INTERN_REFS_MAX) return s;
         st.hot_hits++;
         return shareIndexed(c, s);
     }
@@ -434,6 +440,7 @@ sds internAdmitSlow(sds s) {
     uint64_t h = internHash(s, len);
     sds found = indexFind(s, len, h);
     if (found) {
+        if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
         hot[hi] = found;
         return shareIndexed(found, s);
     }
@@ -481,14 +488,14 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     st.sampled++;
     size_t hi = hotSlot(buf, len);
     sds c = hot[hi];
-    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0 && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
         st.hot_hits++;
         return shareIndexed(c, NULL);
     }
 
     uint64_t h = internHash(buf, len);
     sds found = indexFind(buf, len, h);
-    if (found) {
+    if (found && internHdrOf(found)->refcount < INTERN_REFS_MAX) {
         hot[hi] = found;
         return shareIndexed(found, NULL);
     }
@@ -646,13 +653,14 @@ size_t internDrainDeferred(void) {
 }
 
 /* Set on the main thread at init; a forked child inherits it for its only thread. */
-static __thread int intern_is_main;
+__thread int intern_is_main;
 
 robj *internParseArg(const char *buf, size_t len) {
-    if (!intern_is_main || len > INTERN_MAX_LEN) return NULL;
+    if (len > INTERN_MAX_LEN) return NULL;
     sds c = hot[hotSlot(buf, len)];
     if (!c || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
     internHdr *h = internHdrOf(c);
+    if (h->refcount >= INTERN_REFS_MAX) return NULL;
     h->refcount++;
     st.refs++;
     st.saved_bytes += h->size;
