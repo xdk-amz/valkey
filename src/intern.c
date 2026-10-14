@@ -32,7 +32,7 @@ typedef struct internHdr {
 #define INTERN_MAX_LEN (512 * 1024)
 #define INTERN_HASH_FULL_MAX 512
 
-#define INTERN_LEVEL_MAX 4
+#define INTERN_LEVEL_MAX 6
 #define INTERN_LEVEL_START 0
 #define INTERN_WINDOW 64
 
@@ -42,6 +42,7 @@ typedef struct internHdr {
 
 internGate intern_gate = {1, 1};
 int intern_load_ready = 0;
+const char *intern_offered;
 
 /* Set on the main thread at init; a forked child inherits it for its only thread. */
 __thread int intern_is_main;
@@ -262,16 +263,17 @@ static void probInsert(uint64_t h, sds s) {
     internHdrOf(s)->where = INTERN_IN_PROBATION;
 }
 
-static void probRemove(sds s) {
+static probSlot *probFind(sds s) {
     probSlot *set = probSet(internHash(s, sdslen(s)));
     for (int w = 0; w < PROB_WAYS; w++) {
-        if (set[w].s == s) {
-            set[w].s = NULL;
-            prob_count--;
-            return;
-        }
+        if (set[w].s == s) return &set[w];
     }
     serverPanic("intern: probation entry not found");
+}
+
+static void probRemove(sds s) {
+    probFind(s)->s = NULL;
+    prob_count--;
 }
 
 static void probResize(size_t nsets) {
@@ -313,17 +315,40 @@ static uint32_t win_created, win_promoted;
 /* About one missed value per INTERN_SEL_FLOOR writes becomes a singleton
  * whatever its hash, so a value that starts repeating is found even while
  * selection has backed off. Its first repeat after that promotes it. A sampled
- * miss stands for intern_gate.period writes, so the countdown steps by that. */
-#define INTERN_SEL_FLOOR 16
+ * miss stands for intern_gate.period writes, so the countdown steps by that.
+ * The floor only picks values whose shareable copy fits the allocation size
+ * class of the private copy, so a singleton that never repeats costs no memory. */
+#define INTERN_SEL_FLOOR 1024
 static uint32_t sel_floor_tick = INTERN_SEL_FLOOR;
 
-static inline int selectSingleton(uint64_t h) {
+static inline size_t allocClass(size_t size) {
+#if defined(USE_JEMALLOC)
+    return je_nallocx(size, 0);
+#else
+    return (size + 15) & ~(size_t)15;
+#endif
+}
+
+static inline size_t shareableSize(size_t len) {
+    char type = sdsReqType(len);
+    if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+    return sizeof(internHdr) + sdsHdrSize(type) + len + 1;
+}
+
+/* True if a shareable copy of a len-byte string is no bigger than a private
+ * allocation of priv_size bytes. */
+static inline int shareableFits(size_t len, size_t priv_size) {
+    return allocClass(shareableSize(len)) <= allocClass(priv_size);
+}
+
+static inline int selectSingleton(uint64_t h, size_t len, size_t priv_size) {
     uint32_t step = intern_gate.period;
     if (sel_floor_tick <= step) {
         sel_floor_tick = INTERN_SEL_FLOOR;
-        return 1;
+        if (shareableFits(len, priv_size)) return 1;
+    } else {
+        sel_floor_tick -= step;
     }
-    sel_floor_tick -= step;
     return (((h ^ intern_salt) >> 56) & intern_sel_mask) == 0;
 }
 
@@ -337,6 +362,14 @@ static void setLevel(int level) {
 static void setSelLevel(int level) {
     intern_sel_level = level;
     intern_sel_mask = (1ull << level) - 1;
+}
+
+void internResetSampling(void) {
+    setLevel(INTERN_LEVEL_START);
+    setSelLevel(INTERN_LEVEL_START);
+    win_sel = win_benefit = win_evict = win_created = win_promoted = 0;
+    sel_floor_tick = INTERN_SEL_FLOOR;
+    intern_gate.tick = intern_gate.period;
 }
 
 static void observe(int benefit) {
@@ -394,10 +427,10 @@ static inline sds shareIndexed(sds found, sds s) {
     return found;
 }
 
-/* The string internAdmitLoaded() last returned as a private copy. It was already
- * offered, so internAdmit() of the same pointer returns at once. A stale value
- * after that string is freed can only make one later call return early. */
-static const char *offered_last;
+/* Allocation size of a private copy of a len-byte string made by sdsnewlen(). */
+static inline size_t privateSize(size_t len) {
+    return sdsHdrSize(sdsReqType(len)) + len + 1;
+}
 
 /* Promotes a probation singleton equal to buf[0..len) to the index, or returns
  * NULL. */
@@ -440,11 +473,6 @@ static sds indexFind(const char *buf, size_t len, uint64_t h) {
 
 sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
-    if (s == offered_last) {
-        offered_last = NULL;
-        return s;
-    }
-    if (sdsIsShared(s)) return s;
     size_t len = sdslen(s);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
     st.sampled++;
@@ -470,7 +498,7 @@ sds internAdmitSlow(sds s) {
     }
 
     observe(0);
-    if (!selectSingleton(h)) return s;
+    if (!selectSingleton(h, len, sdsAllocSize(s))) return s;
     win_created++;
     sds sh = newShareable(s, len);
     sdsfree(s);
@@ -498,7 +526,9 @@ sds internAdmitLoaded(size_t len) {
 sds internNewFrom(const char *buf, size_t len) {
     if (--intern_gate.tick || len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
         if (intern_gate.tick == 0) intern_gate.tick = intern_gate.period;
-        return sdsnewlen(buf, len);
+        sds s = sdsnewlen(buf, len);
+        intern_offered = s;
+        return s;
     }
     intern_gate.tick = intern_gate.period;
     return internAdmitBufSlow(buf, len);
@@ -520,7 +550,7 @@ sds internDupSds(const_sds s) {
     }
     sds d = internNewFrom(s, sdslen(s));
     /* Already offered; a later internAdmit() of it returns at once. */
-    if (!sdsIsShared(d)) offered_last = d;
+    if (!sdsIsShared(d)) intern_offered = d;
     return d;
 }
 
@@ -542,9 +572,9 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     if ((found = promote(h, buf, len, hi)) != NULL) return found;
 
     observe(0);
-    if (!selectSingleton(h)) {
+    if (!selectSingleton(h, len, privateSize(len))) {
         sds s = sdsnewlen(buf, len);
-        offered_last = s;
+        intern_offered = s;
         return s;
     }
     win_created++;
@@ -641,6 +671,30 @@ void internDeferBegin(void) {
     defer_map.open = 1;
 }
 
+/* Releases an IO thread made since its last flush, one entry per string. */
+#define DEFER_RUN_MAX 32
+typedef struct deferRun {
+    deferEntry e[DEFER_RUN_MAX];
+    int n;
+    int coalesce;
+} deferRun;
+
+static __thread deferRun defer_run;
+
+void internDeferCoalesce(void) {
+    defer_run.coalesce = 1;
+}
+
+void internDeferFlush(void) {
+    deferRun *r = &defer_run;
+    if (r->n == 0) return;
+    deferMsg *msg = zmalloc(sizeof(deferMsg) + r->n * sizeof(deferEntry));
+    msg->count = r->n;
+    memcpy(msg->e, r->e, r->n * sizeof(deferEntry));
+    r->n = 0;
+    deferPush(msg);
+}
+
 void internDeferPublish(void) {
     deferMap *m = &defer_map;
     m->open = 0;
@@ -659,6 +713,20 @@ void internDeferPublish(void) {
 static void deferRecord(sds s) {
     deferMap *m = &defer_map;
     if (!m->open) {
+        deferRun *r = &defer_run;
+        if (r->coalesce) {
+            for (int i = r->n - 1; i >= 0; i--) {
+                if (r->e[i].s == s) {
+                    r->e[i].n++;
+                    return;
+                }
+            }
+            if (r->n == DEFER_RUN_MAX) internDeferFlush();
+            r->e[r->n].s = s;
+            r->e[r->n].n = 1;
+            r->n++;
+            return;
+        }
         deferMsg *msg = zmalloc(sizeof(deferMsg) + sizeof(deferEntry));
         msg->count = 1;
         msg->e[0].s = s;
@@ -737,13 +805,7 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
         size_t i = hotSlot(ns, sdslen(ns));
         if (hot[i] == s) hot[i] = ns;
     } else if (where == INTERN_IN_PROBATION) {
-        probSlot *set = probSet(internHash(ns, sdslen(ns)));
-        int w;
-        for (w = 0; w < PROB_WAYS; w++) {
-            if (set[w].s == s) break;
-        }
-        serverAssert(w < PROB_WAYS);
-        set[w].s = ns;
+        probFind(s)->s = ns;
     }
     return ns;
 }

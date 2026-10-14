@@ -27,6 +27,10 @@ typedef struct internGate {
 
 extern internGate intern_gate;
 
+/* The private string internNewFrom(), internDupSds() or the loader last
+ * returned. It was already offered, so internAdmit() of it returns at once. */
+extern const char *intern_offered;
+
 sds internAdmitSlow(sds s);
 
 /* Offers a freshly owned string that is about to be stored in the keyspace.
@@ -34,12 +38,21 @@ sds internAdmitSlow(sds s);
  * is `s` itself or a shareable string that carries one reference for the
  * holder. Main thread only. */
 static inline sds internAdmit(sds s) {
+    if (s == intern_offered) {
+        intern_offered = NULL;
+        return s;
+    }
     if (sdsIsShared(s)) return s;
     if (--intern_gate.tick) return s;
     return internAdmitSlow(s);
 }
 
 void internInit(void);
+
+/* Probes every write again. Called when the whole dataset is replaced, since
+ * what was learned about the old data does not apply to the new. Main thread
+ * only. */
+void internResetSampling(void);
 
 /* RDB loading. While every write is being probed, the loader reads a candidate
  * string into the scratch buffer instead of a fresh allocation, so a string that
@@ -90,6 +103,12 @@ static inline int internParseReady(void) {
  * releases are coalesced into one message for the main thread. */
 void internDeferBegin(void);
 void internDeferPublish(void);
+
+/* IO threads: consecutive releases of the same string are counted and sent as
+ * one entry. internDeferFlush() sends what is pending; call it after each batch
+ * of jobs and before waiting for work. */
+void internDeferCoalesce(void);
+void internDeferFlush(void);
 
 /* Applies releases queued by other threads. Main thread only. */
 size_t internDrainDeferred(void);

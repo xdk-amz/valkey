@@ -13,6 +13,7 @@
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
+#include "intern.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -311,6 +312,7 @@ void cleanupThreadResources(void *dummy) {
 
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
+    internDeferFlush();
 
     /* Release response lists left when the flush stops early. */
     for (int i = 0; i < JOB_PRIORITY_COUNT; i++) {
@@ -371,6 +373,7 @@ static void *IOThreadMain(void *myid) {
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
     thread_id = (int)id;
+    internDeferCoalesce();
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
@@ -421,6 +424,7 @@ static void *IOThreadMain(void *myid) {
         }
 
         if (processed) {
+            internDeferFlush();
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
         }
 
@@ -1001,12 +1005,6 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
             /* Set argv[j] to NULL to avoid double free */
             argv[j] = NULL;
         } else {
-            /* A shared value is released here, where reference counts are kept. */
-            if (argv[j]->type == OBJ_STRING && argv[j]->encoding == OBJ_ENCODING_RAW &&
-                sdsIsShared(objectGetVal(argv[j]))) {
-                sdsfree(objectGetVal(argv[j]));
-                objectSetVal(argv[j], NULL);
-            }
             last_arg_to_free = j;
         }
     }
@@ -1045,18 +1043,8 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    /* A shared value is released here, on main, where reference counts are
-     * kept; the IO thread then frees an object with no value. */
-    sds val = objectGetVal(obj);
-    int shared = sdsIsShared(val);
-
     void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
-    if (shared) objectSetVal(obj, NULL);
-    if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) {
-        if (shared) objectSetVal(obj, val);
-        return C_ERR;
-    }
-    if (shared) sdsfree(val);
+    if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) return C_ERR;
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;

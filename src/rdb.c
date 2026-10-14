@@ -3385,6 +3385,7 @@ void startLoading(size_t size, int rdbflags, int async) {
     server.loading_rdb_used_mem = 0;
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
+    internResetSampling();
     blockingOperationStarts();
 
     /* Cleanup slot migrations (we need a clean state for the incoming load) */

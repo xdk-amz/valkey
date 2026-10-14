@@ -594,7 +594,7 @@ run_solo {defrag} {
                 $rd client reply off
                 set val [string repeat A 512]
                 for {set j 0} {$j < $n_keys} {incr j} {
-                    $rd set k$j $val
+                    $rd set k$j $val$j
                     if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
                 }
                 # Many RESP3 tracking clients read every key, registering their

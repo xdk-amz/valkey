@@ -463,8 +463,10 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     }
     /* Offered after insertion, once the value has its final encoding. Values
      * stored through setKey are not modified in place afterwards, unlike
-     * objects some commands create with dbAdd and then write into. */
-    dbInternValue(*valref);
+     * objects some commands create with dbAdd and then write into. An argument
+     * an IO thread parsed is not offered: its bytes are not in this thread's
+     * cache, and storing it otherwise never reads them. */
+    if (c == NULL || c->cur_tid == 0 || server.active_io_threads_num <= 1) dbInternValue(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
@@ -733,6 +735,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     }
 
     if (dbnum == -1) flushReplicaKeysWithExpireList(async);
+
+    /* The data that sampling learned from is gone. */
+    if (dbnum == -1) internResetSampling();
 
     if (with_functions) {
         serverAssert(dbnum == -1);
