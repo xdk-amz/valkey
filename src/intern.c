@@ -474,9 +474,7 @@ sds internNewFrom(const char *buf, size_t len) {
         return sdsnewlen(buf, len);
     }
     intern_gate.tick = intern_gate.period;
-    sds s = internAdmitBufSlow(buf, len);
-    if (s == offered_last) offered_last = NULL;
-    return s;
+    return internAdmitBufSlow(buf, len);
 }
 
 static sds internAdmitBufSlow(const char *buf, size_t len) {
@@ -647,8 +645,24 @@ size_t internDrainDeferred(void) {
     return applied;
 }
 
+/* Set on the main thread at init; a forked child inherits it for its only thread. */
+static __thread int intern_is_main;
+
+robj *internParseArg(const char *buf, size_t len) {
+    if (!intern_is_main || len > INTERN_MAX_LEN) return NULL;
+    sds c = hot[hotSlot(buf, len)];
+    if (!c || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
+    internHdr *h = internHdrOf(c);
+    h->refcount++;
+    st.refs++;
+    st.saved_bytes += h->size;
+    st.hits++;
+    st.hot_hits++;
+    return createObject(OBJ_STRING, c);
+}
+
 static void releaseHook(sds s) {
-    if (onServerMainThread()) {
+    if (intern_is_main) {
         releaseOnMain(s, 1);
     } else {
         deferRecord(s);
@@ -713,6 +727,7 @@ void internInit(void) {
     setLevel(INTERN_LEVEL_START);
     setSelLevel(INTERN_LEVEL_START);
     intern_gate.tick = intern_gate.period;
+    intern_is_main = 1;
     sdsSharedReleaseHook = releaseHook;
 }
 

@@ -3156,6 +3156,11 @@ static ValkeyModuleString *moduleAssertUnsharedString(ValkeyModuleString *str) {
         /* Convert the string from integer to raw encoding. */
         objectSetVal(str, sdsfromlonglong((long)objectGetVal(str)));
         str->encoding = OBJ_ENCODING_RAW;
+    } else if (str->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(str))) {
+        /* A shared string is immutable; modify a private copy. */
+        sds shared = objectGetVal(str);
+        objectSetVal(str, sdsdup(shared));
+        sdsfree(shared);
     }
     return str;
 }

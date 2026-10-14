@@ -69,6 +69,17 @@ sds internAdmitLoaded(size_t len);
  * without allocating on a hit. Main thread only. */
 sds internNewFrom(const char *buf, size_t len);
 
+/* Request parsing. While every write is being probed, a bulk argument equal to
+ * a hot shared string becomes a string object that holds a reference on it, so
+ * the argument costs no allocation or copy. Returns NULL otherwise, or when not
+ * called on the main thread. The argument must be long enough that it would not
+ * be embedded. */
+struct serverObject;
+struct serverObject *internParseArg(const char *buf, size_t len);
+static inline int internParseReady(void) {
+    return intern_load_ready;
+}
+
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */
 void internDeferBegin(void);

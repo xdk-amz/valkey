@@ -1001,6 +1001,12 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
             /* Set argv[j] to NULL to avoid double free */
             argv[j] = NULL;
         } else {
+            /* A shared value is released here, where reference counts are kept. */
+            if (argv[j]->type == OBJ_STRING && argv[j]->encoding == OBJ_ENCODING_RAW &&
+                sdsIsShared(objectGetVal(argv[j]))) {
+                sdsfree(objectGetVal(argv[j]));
+                objectSetVal(argv[j], NULL);
+            }
             last_arg_to_free = j;
         }
     }
@@ -1039,11 +1045,18 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
 
-    /* Releasing a shared value is a reference count decrement on the main thread. */
-    if (sdsIsShared(objectGetVal(obj))) return C_ERR;
+    /* A shared value is released here, on main, where reference counts are
+     * kept; the IO thread then frees an object with no value. */
+    sds val = objectGetVal(obj);
+    int shared = sdsIsShared(val);
 
     void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
-    if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) return C_ERR;
+    if (shared) objectSetVal(obj, NULL);
+    if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) {
+        if (shared) objectSetVal(obj, val);
+        return C_ERR;
+    }
+    if (shared) sdsfree(val);
     io_jobs_submitted++;
     server.stat_io_freed_objects++;
     return C_OK;

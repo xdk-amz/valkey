@@ -40,6 +40,7 @@
 #include "util.h"
 #include "vset.h"
 #include "server.h"
+#include "intern.h"
 #include "zmalloc.h"
 #include <math.h>
 #include <string.h>
@@ -571,6 +572,9 @@ int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool 
         if (flags & HASH_SET_TAKE_VALUE) {
             v = value;
             value = NULL;
+        } else if (sdslen(value) >= 64) {
+            /* Likely stored by pointer: share an existing copy when there is one. */
+            v = internNewFrom(value, sdslen(value));
         } else {
             v = sdsdup(value);
         }

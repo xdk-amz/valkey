@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "intern.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -4295,7 +4296,10 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                robj *arg = NULL;
+                if (internParseReady() && !stringObjectWouldEmbed(c->bulklen))
+                    arg = internParseArg(c->querybuf + c->qb_pos, c->bulklen);
+                (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
