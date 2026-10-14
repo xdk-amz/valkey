@@ -211,16 +211,39 @@ static hashtableType internIndexType = {
  *----------------------------------------------------------------------------*/
 
 #define HOT_BITS 12
-static sds hot[1 << HOT_BITS];
+typedef struct hotSlotEntry {
+    uint64_t tag; /* full mix of len + edge bytes; a mismatch skips the memcmp */
+    sds s;
+} hotSlotEntry;
+
+static hotSlotEntry hot[1 << HOT_BITS];
+
+static inline uint64_t hotMix(const char *p, size_t len) {
+    return mix(rd64((const unsigned char *)p) ^ K1 ^ len, rd64((const unsigned char *)p + len - 8) ^ K2);
+}
 
 static inline size_t hotSlot(const char *p, size_t len) {
-    return mix(rd64((const unsigned char *)p) ^ K1 ^ len, rd64((const unsigned char *)p + len - 8) ^ K2) >>
-           (64 - HOT_BITS);
+    return hotMix(p, len) >> (64 - HOT_BITS);
+}
+
+static inline void hotStore(const char *p, size_t len, sds s) {
+    uint64_t m = hotMix(p, len);
+    hot[m >> (64 - HOT_BITS)] = (hotSlotEntry){m, s};
 }
 
 static inline void hotForget(sds s) {
     size_t i = hotSlot(s, sdslen(s));
-    if (hot[i] == s) hot[i] = NULL;
+    if (hot[i].s == s) hot[i].s = NULL;
+}
+
+/* Returns the hot string equal to buf[0..len) or NULL. A fingerprint mismatch
+ * returns without the memcmp, so a value the cache has not seen is cheap. */
+static inline sds hotFind(const char *buf, size_t len) {
+    uint64_t m = hotMix(buf, len);
+    hotSlotEntry *e = &hot[m >> (64 - HOT_BITS)];
+    sds c = e->s;
+    if (!c || e->tag != m || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
+    return c;
 }
 
 /*-----------------------------------------------------------------------------
@@ -434,7 +457,7 @@ static inline size_t privateSize(size_t len) {
 
 /* Promotes a probation singleton equal to buf[0..len) to the index, or returns
  * NULL. */
-static sds promote(uint64_t h, const char *buf, size_t len, size_t hi) {
+static sds promote(uint64_t h, const char *buf, size_t len) {
     if (!prob_count) return NULL;
     sds cand = probTake(h, buf, len);
     if (!cand) return NULL;
@@ -453,7 +476,7 @@ static sds promote(uint64_t h, const char *buf, size_t len, size_t hi) {
     st.saved_bytes += (size_t)(ch->refcount - 1) * sz;
     st.promotions++;
     win_promoted++;
-    hot[hi] = cand;
+    hotStore(buf, len, cand);
     observe(1);
     return cand;
 }
@@ -477,9 +500,8 @@ sds internAdmitSlow(sds s) {
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
     st.sampled++;
 
-    size_t hi = hotSlot(s, len);
-    sds c = hot[hi];
-    if (c && sdslen(c) == len && memcmp(c, s, len) == 0) {
+    sds c = hotFind(s, len);
+    if (c) {
         if (internHdrOf(c)->refcount >= INTERN_REFS_MAX) return s;
         st.hot_hits++;
         return shareIndexed(c, s);
@@ -489,10 +511,10 @@ sds internAdmitSlow(sds s) {
     sds found = indexFind(s, len, h);
     if (found) {
         if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
-        hot[hi] = found;
+        hotStore(s, len, found);
         return shareIndexed(found, s);
     }
-    if ((found = promote(h, s, len, hi)) != NULL) {
+    if ((found = promote(h, s, len)) != NULL) {
         sdsfree(s);
         return found;
     }
@@ -556,9 +578,8 @@ sds internDupSds(const_sds s) {
 
 static sds internAdmitBufSlow(const char *buf, size_t len) {
     st.sampled++;
-    size_t hi = hotSlot(buf, len);
-    sds c = hot[hi];
-    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0 && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
+    sds c = hotFind(buf, len);
+    if (c && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
         st.hot_hits++;
         return shareIndexed(c, NULL);
     }
@@ -566,10 +587,10 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     uint64_t h = internHash(buf, len);
     sds found = indexFind(buf, len, h);
     if (found && internHdrOf(found)->refcount < INTERN_REFS_MAX) {
-        hot[hi] = found;
+        hotStore(buf, len, found);
         return shareIndexed(found, NULL);
     }
-    if ((found = promote(h, buf, len, hi)) != NULL) return found;
+    if ((found = promote(h, buf, len)) != NULL) return found;
 
     observe(0);
     if (!selectSingleton(h, len, privateSize(len))) {
@@ -763,8 +784,8 @@ size_t internDrainDeferred(void) {
 
 robj *internParseArg(const char *buf, size_t len) {
     if (len > INTERN_MAX_LEN) return NULL;
-    sds c = hot[hotSlot(buf, len)];
-    if (!c || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
+    sds c = hotFind(buf, len);
+    if (!c) return NULL;
     internHdr *h = internHdrOf(c);
     if (h->refcount >= INTERN_REFS_MAX) return NULL;
     h->refcount++;
@@ -803,7 +824,7 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     if (where == INTERN_IN_INDEX) {
         serverAssert(hashtableReplaceReallocatedEntry(intern_index, s, ns));
         size_t i = hotSlot(ns, sdslen(ns));
-        if (hot[i] == s) hot[i] = ns;
+        if (hot[i].s == s) hot[i].s = ns;
     } else if (where == INTERN_IN_PROBATION) {
         probFind(s)->s = ns;
     }
