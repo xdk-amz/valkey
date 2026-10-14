@@ -134,19 +134,19 @@ uint32_t internSharedRefcount(const_sds s);
 size_t internSdsMemUsage(const_sds s);
 
 typedef struct internInfo {
-    size_t shared;        /* strings in the index */
-    size_t singletons;    /* strings in probation */
-    size_t refs;          /* references held on indexed strings */
-    size_t shared_bytes;  /* allocation bytes of indexed strings */
-    size_t saved_bytes;   /* bytes not allocated thanks to sharing */
-    size_t table_bytes;   /* index and probation table memory */
-    size_t hits;          /* writes that took a reference on an indexed string */
-    size_t hot_hits;      /* hits found through the hot cache */
-    size_t promotions;    /* singletons that gained a second holder */
-    size_t sampled;       /* writes that were hashed */
-    size_t deferred;      /* releases applied from other threads */
-    int level;            /* sampling level, 0 = every write */
-    int sel_level;        /* singleton selection level, 0 = every missed value */
+    size_t shared;       /* strings in the index */
+    size_t singletons;   /* strings in probation */
+    size_t refs;         /* references held on indexed strings */
+    size_t shared_bytes; /* allocation bytes of indexed strings */
+    size_t saved_bytes;  /* bytes not allocated thanks to sharing */
+    size_t table_bytes;  /* index and probation table memory */
+    size_t hits;         /* writes that took a reference on an indexed string */
+    size_t hot_hits;     /* hits found through the hot cache */
+    size_t promotions;   /* singletons that gained a second holder */
+    size_t sampled;      /* writes that were hashed */
+    size_t deferred;     /* releases applied from other threads */
+    int level;           /* sampling level, 0 = every write */
+    int sel_level;       /* singleton selection level, 0 = every missed value */
 } internInfo;
 
 void internGetInfo(internInfo *info);
