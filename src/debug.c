@@ -419,12 +419,12 @@ static void debugAddReplyWorkCounters(client *c, const workCounters *snap, const
     addReplyMapLen(c, 2 * n + 1);
     addReplyBulkCString(c, "generation");
     addReplyLongLong(c, wcGeneration());
-#define WC_REPLY(name, desc)         \
+#define WC_REPLY(name, desc)       \
     addReplyBulkCString(c, #name); \
     addReplyLongLong(c, snap->name);
     WC_COUNTERS(WC_REPLY)
 #undef WC_REPLY
-#define WC_REPLY_IDX(name, desc)           \
+#define WC_REPLY_IDX(name, desc)          \
     addReplyBulkCString(c, "idx_" #name); \
     addReplyLongLong(c, idx->name);
     WC_COUNTERS(WC_REPLY_IDX)
