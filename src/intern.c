@@ -361,9 +361,10 @@ static void probInsert(uint64_t h, sds s) {
     internHdrOf(s)->where = INTERN_IN_PROBATION;
 }
 
-/* Returns the probation slot holding `s`, or NULL if it was evicted. */
-static probSlot *probFind(sds s) {
-    probSlot *set = probSet(internHash(s, sdslen(s)));
+/* Returns the probation slot holding `s`, or NULL if it was evicted. The slot is
+ * found by the hash of `content`, which has the bytes of `s`. */
+static probSlot *probFind(const_sds content, sds s) {
+    probSlot *set = probSet(internHash(content, sdslen(content)));
     for (int w = 0; w < PROB_WAYS; w++) {
         if (set[w].s == s) return &set[w];
     }
@@ -371,7 +372,7 @@ static probSlot *probFind(sds s) {
 }
 
 static void probRemove(sds s) {
-    probSlot *slot = probFind(s);
+    probSlot *slot = probFind(s, s);
     if (slot == NULL) return;
     slot->s = NULL;
     prob_count--;
@@ -922,7 +923,8 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
         size_t i = hotSlot(ns, sdslen(ns));
         if (hot[i].s == s) hot[i].s = ns;
     } else if (where == INTERN_IN_PROBATION) {
-        probSlot *slot = probFind(s);
+        /* The old copy is freed; hash the moved one. */
+        probSlot *slot = probFind(ns, s);
         if (slot) slot->s = ns;
     }
     return ns;
