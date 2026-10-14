@@ -536,16 +536,24 @@ static sds internAdmitBufSlow(const char *buf, size_t len);
 /* Scratch sds the loader reads candidate strings into. Its length is set to the
  * string being offered so it can be used as an index key. */
 static sds load_scratch;
+int intern_load_busy;
 
 char *internLoadScratch(size_t len) {
+    serverAssert(!intern_load_busy);
     if (load_scratch == NULL) load_scratch = sdsnewlen(SDS_NOINIT, INTERN_LOAD_MAX);
     sdssetlen(load_scratch, len);
+    intern_load_busy = 1;
     return load_scratch;
 }
 
 sds internAdmitLoaded(size_t len) {
-    serverAssert(load_scratch && sdslen(load_scratch) == len);
+    serverAssert(intern_load_busy && load_scratch && sdslen(load_scratch) == len);
+    intern_load_busy = 0;
     return internAdmitBufSlow(load_scratch, len);
+}
+
+void internLoadAbort(void) {
+    intern_load_busy = 0;
 }
 
 sds internNewFrom(const char *buf, size_t len) {

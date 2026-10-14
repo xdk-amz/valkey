@@ -99,3 +99,76 @@ start_server {tags {"intern"}} {
         assert_match {*RDB looks OK*} $result
     } {} {external:skip}
 }
+
+start_server {tags {"intern repl external:skip"}} {
+    set replica [srv 0 client]
+    start_server {} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+
+        test {RESTORE served during an async load does not disturb the load} {
+            $master config set repl-diskless-sync yes
+            $master config set repl-diskless-sync-delay 0
+            $master config set save ""
+            $master config set rdbcompression no
+            $replica config set repl-diskless-load swapdb
+            $replica config set dual-channel-replication-enabled no
+            $replica config set replica-read-only no
+            $replica config set save ""
+            $replica replicaof $master_host $master_port
+            wait_for_condition 100 100 {
+                [s -1 master_link_status] eq "up"
+            } else {
+                fail "Replica did not sync"
+            }
+
+            # Each value read spans several event-processing chunks on the replica.
+            set v [randstring 3000 3000 alpha]
+            for {set i 0} {$i < 4000} {incr i} {$master set k$i $v}
+            $master set probe [randstring 2500 2500 alpha]
+            set payload [$master dump probe]
+            $master del probe
+            wait_for_ofs_sync $master $replica
+
+            $replica config set loading-process-events-interval-bytes 1024
+            $replica config set key-load-delay 100
+            set sync_full [s 0 sync_full]
+            # Overflow the backlog so the reconnect is a full sync with the same replid.
+            $master multi
+            $master client kill type replica
+            $master config set repl-backlog-size 16384
+            for {set i 0} {$i < 10} {incr i} {$master set fill$i [string repeat A 16384]}
+            $master exec
+            wait_for_condition 100 100 {
+                [s 0 sync_full] > $sync_full
+            } else {
+                fail "Replica did not start a full sync"
+            }
+            wait_for_condition 100 50 {
+                [s -1 async_loading] eq 1
+            } else {
+                fail "Replica did not start async loading"
+            }
+
+            set restored 0
+            while {[s -1 async_loading] eq 1} {
+                $replica restore r$restored 0 $payload
+                incr restored
+            }
+            assert_morethan $restored 10
+
+            $replica config set key-load-delay 0
+            wait_for_condition 100 100 {
+                [s -1 master_link_status] eq "up"
+            } else {
+                fail "Replica did not finish the sync"
+            }
+            wait_for_ofs_sync $master $replica
+            # A RESTORE that lands after the swap stays on the replica.
+            foreach k [$replica keys r*] {$replica del $k}
+            assert_equal [$master debug digest] [$replica debug digest]
+            assert_equal $v [$replica get k3999]
+        } {} {needs:debug}
+    }
+}

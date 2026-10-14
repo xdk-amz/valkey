@@ -535,7 +535,9 @@ err:
     zfree(c);
     if (plain)
         zfree(val);
-    else if (!intern)
+    else if (intern)
+        internLoadAbort();
+    else
         sdsfree(val);
     return NULL;
 }
@@ -643,7 +645,10 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
     if ((flags & RDB_LOAD_INTERN) && intern_load_ready && !plain && internLoadReady(len) &&
         (sds || !stringObjectWouldEmbed(len))) {
         char *buf = internLoadScratch(len);
-        if (len && rioRead(rdb, buf, len) == 0) return NULL;
+        if (len && rioRead(rdb, buf, len) == 0) {
+            internLoadAbort();
+            return NULL;
+        }
         if (lenptr) *lenptr = len;
         char *loaded = internAdmitLoaded(len);
         return sds ? (void *)loaded : (void *)createObject(OBJ_STRING, loaded);

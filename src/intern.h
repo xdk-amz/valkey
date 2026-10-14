@@ -70,14 +70,19 @@ void internResetSampling(void);
  * later internAdmit() of it is a no-op. Main thread only. */
 #define INTERN_LOAD_MAX (64 * 1024)
 extern int intern_load_ready;
+/* Set while a loader holds the scratch buffer. Reading can process events, and
+ * a command run there (RESTORE during an async load) must not reuse it. */
+extern int intern_load_busy;
 #define INTERN_MIN_LEN 16
 /* The loader holds exclusive access to the keyspace (main thread, or a module
  * thread that holds the GIL), so no thread check is needed here. */
 static inline int internLoadReady(size_t len) {
-    return intern_load_ready && len >= INTERN_MIN_LEN && len <= INTERN_LOAD_MAX;
+    return intern_load_ready && !intern_load_busy && len >= INTERN_MIN_LEN && len <= INTERN_LOAD_MAX;
 }
 char *internLoadScratch(size_t len);
 sds internAdmitLoaded(size_t len);
+/* Releases the scratch buffer when a read into it fails. */
+void internLoadAbort(void);
 
 /* Returns a new sds holding buf[0..len) to store in the keyspace, sharing an
  * existing copy when there is one, like internAdmit(sdsnewlen(buf, len)) but
