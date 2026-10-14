@@ -47,6 +47,27 @@ static inline sds internAdmit(sds s) {
     return internAdmitSlow(s);
 }
 
+/* Counts one write for a caller that checks the gate before looking at its
+ * value. Returns non-zero for one write in every sampling period; the caller
+ * then offers that write's value with internAdmitDue(), or skips it if the
+ * value is not eligible. */
+static inline int internGateDue(void) {
+    if (--intern_gate.tick) return 0;
+    intern_gate.tick = intern_gate.period;
+    return 1;
+}
+
+/* Offers the value of a write that internGateDue() selected. Same contract as
+ * internAdmit(). */
+static inline sds internAdmitDue(sds s) {
+    if (s == intern_offered) {
+        intern_offered = NULL;
+        return s;
+    }
+    if (sdsIsShared(s)) return s;
+    return internAdmitSlow(s);
+}
+
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. */
 void internInit(void);
@@ -103,7 +124,7 @@ struct serverObject;
 struct serverObject *internParseArg(const char *buf, size_t len);
 extern __thread int intern_is_main;
 static inline int internParseReady(void) {
-    return intern_is_main && intern_load_ready;
+    return intern_load_ready && intern_is_main;
 }
 
 /* Bio jobs that free keyspace data run between these two calls, so their

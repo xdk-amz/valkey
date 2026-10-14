@@ -66,6 +66,13 @@ void dbInternValue(robj *val) {
     }
 }
 
+/* Same as dbInternValue() for a write that internGateDue() selected. */
+static void dbInternDueValue(robj *val) {
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
+        objectSetVal(val, internAdmitDue(objectGetVal(val)));
+    }
+}
+
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
  * found in the specified DB. This function implements the functionality of
@@ -465,8 +472,10 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
      * stored through setKey are not modified in place afterwards, unlike
      * objects some commands create with dbAdd and then write into. An argument
      * an IO thread parsed is not offered: its bytes are not in this thread's
-     * cache, and storing it otherwise never reads them. */
-    if (c == NULL || c->cur_tid == 0 || server.active_io_threads_num <= 1) dbInternValue(*valref);
+     * cache, and storing it otherwise never reads them. A write that is not due
+     * for sampling only counts down the gate. */
+    if (internGateDue() && (c == NULL || c->cur_tid == 0 || server.active_io_threads_num <= 1))
+        dbInternDueValue(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
