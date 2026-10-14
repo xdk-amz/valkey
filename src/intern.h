@@ -124,7 +124,7 @@ struct serverObject;
 struct serverObject *internParseArg(const char *buf, size_t len);
 extern __thread int intern_is_main;
 static inline int internParseReady(void) {
-    return intern_load_ready && intern_is_main;
+    return intern_is_main && intern_load_ready;
 }
 
 /* Bio jobs that free keyspace data run between these two calls, so their
