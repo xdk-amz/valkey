@@ -80,4 +80,22 @@ start_server {tags {"intern"}} {
         for {set i 0} {$i < 100} {incr i} {r set k$i $v}
         assert_lessthan [r memory usage k50] 600
     }
+
+    test {valkey-check-rdb reads an RDB written from shared values} {
+        r flushall
+        # One value compresses on save and one does not, so both string load paths run.
+        set z [string repeat c 300]
+        set p [randstring 300 300 alpha]
+        for {set i 0} {$i < 500} {incr i} {
+            r set z$i $z
+            r set p$i $p
+            r hset h$i a $p
+            r sadd s$i $p "$p$i"
+        }
+        assert_morethan [intern_stat intern_refs] 1000
+        r save
+        set dump [file join [lindex [r config get dir] 1] dump.rdb]
+        catch {exec $::VALKEY_CHECK_RDB_BIN $dump} result
+        assert_match {*RDB looks OK*} $result
+    } {} {external:skip}
 }

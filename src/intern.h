@@ -47,6 +47,8 @@ static inline sds internAdmit(sds s) {
     return internAdmitSlow(s);
 }
 
+/* Until this runs, admission returns its input and loading stays plain. The
+ * check tools load data without it. */
 void internInit(void);
 
 /* Probes every write again. Called when the whole dataset is replaced, since

@@ -388,6 +388,8 @@ static void setSelLevel(int level) {
 }
 
 void internResetSampling(void) {
+    /* The check tools load without internInit(); loading must stay plain. */
+    if (intern_index == NULL) return;
     setLevel(INTERN_LEVEL_START);
     setSelLevel(INTERN_LEVEL_START);
     win_sel = win_benefit = win_evict = win_created = win_promoted = 0;
@@ -496,6 +498,7 @@ static sds indexFind(const char *buf, size_t len, uint64_t h) {
 
 sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
+    if (intern_index == NULL) return s;
     size_t len = sdslen(s);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
     st.sampled++;
@@ -577,6 +580,7 @@ sds internDupSds(const_sds s) {
 }
 
 static sds internAdmitBufSlow(const char *buf, size_t len) {
+    if (intern_index == NULL) return sdsnewlen(buf, len);
     st.sampled++;
     sds c = hotFind(buf, len);
     if (c && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
