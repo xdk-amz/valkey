@@ -474,8 +474,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
      * an IO thread parsed is not offered here: its bytes are not in this
      * thread's cache, and IO threads select and hash such arguments instead.
      * A write that is not due for sampling only counts down the gate. */
-    if (internGateDue() && (c == NULL || c->cur_tid == 0 || server.active_io_threads_num <= 1))
-        dbInternDueValue(*valref);
+    if (internGateDue() && (c == NULL || !c->intern_io_parsed)) dbInternDueValue(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);

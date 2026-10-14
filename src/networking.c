@@ -410,6 +410,7 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->cur_tid = 0;
+    c->intern_io_parsed = 0;
     c->intern_pending = NULL;
     c->intern_read_epoch = 0;
     c->nwritten = 0;
@@ -3979,9 +3980,18 @@ void parseInlineBuffer(client *c) {
     for (c->argc = 0, j = 0; j < argc; j++) {
         /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
-        c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
+        size_t len = sdslen(argv[j]);
+        robj *arg = NULL;
+        if (j > 0 && !intern_is_main && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+            arg = internParseArg(&c->intern_pending, argv[j], len, j);
+        if (arg) {
+            sdsfree(argv[j]);
+        } else {
+            arg = createObject(OBJ_STRING, argv[j]);
+        }
+        c->argv[c->argc] = arg;
         c->argc++;
-        c->argv_len_sum += sdslen(argv[j]);
+        c->argv_len_sum += len;
     }
     zfree(argv);
 
@@ -4454,6 +4464,7 @@ int processPendingCommandAndInputBuffer(client *c) {
 void parseInputBuffer(client *c) {
     /* The command queue must be emptied before parsing. */
     serverAssert(c->cmd_queue.len == 0);
+    c->intern_io_parsed = !intern_is_main;
 
     /* Hold off transport read handlers for the duration of parsing (RDMA update_state
      * may otherwise re-enter readQueryFromClient and corrupt cmd_queue). */
