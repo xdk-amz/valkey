@@ -4297,8 +4297,13 @@ static int parseMultibulk(client *c,
                 sdsclear(c->querybuf);
             } else {
                 robj *arg = NULL;
-                if (internParseReady() && !stringObjectWouldEmbed(c->bulklen))
-                    arg = internParseArg(c->querybuf + c->qb_pos, c->bulklen);
+                /* Sorted set commands mark their arguments in place during
+                 * lookups, so their arguments are never shared. */
+                if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
+                    const char *name = objectGetVal((*argv)[0]);
+                    if (name[0] != 'z' && name[0] != 'Z')
+                        arg = internParseArg(c->querybuf + c->qb_pos, c->bulklen);
+                }
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;

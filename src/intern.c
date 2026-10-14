@@ -33,7 +33,7 @@ typedef struct internHdr {
 #define INTERN_HASH_FULL_MAX 512
 
 #define INTERN_LEVEL_MAX 4
-#define INTERN_LEVEL_START 2
+#define INTERN_LEVEL_START 0
 #define INTERN_WINDOW 64
 
 #define PROB_WAYS 4
@@ -307,6 +307,23 @@ static uint64_t intern_epoch;
 static int intern_sel_level;
 static uint32_t win_created, win_promoted;
 
+/* About one missed value per INTERN_SEL_FLOOR writes becomes a singleton
+ * whatever its hash, so a value that starts repeating is found even while
+ * selection has backed off. Its first repeat after that promotes it. A sampled
+ * miss stands for intern_gate.period writes, so the countdown steps by that. */
+#define INTERN_SEL_FLOOR 16
+static uint32_t sel_floor_tick = INTERN_SEL_FLOOR;
+
+static inline int selectSingleton(uint64_t h) {
+    uint32_t step = intern_gate.period;
+    if (sel_floor_tick <= step) {
+        sel_floor_tick = INTERN_SEL_FLOOR;
+        return 1;
+    }
+    sel_floor_tick -= step;
+    return (((h ^ intern_salt) >> 56) & intern_sel_mask) == 0;
+}
+
 static void setLevel(int level) {
     intern_level = level;
     intern_load_ready = (level == 0);
@@ -450,7 +467,7 @@ sds internAdmitSlow(sds s) {
     }
 
     observe(0);
-    if ((((h ^ intern_salt) >> 56) & intern_sel_mask) != 0) return s;
+    if (!selectSingleton(h)) return s;
     win_created++;
     sds sh = newShareable(s, len);
     sdsfree(s);
@@ -502,7 +519,7 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     if ((found = promote(h, buf, len, hi)) != NULL) return found;
 
     observe(0);
-    if ((((h ^ intern_salt) >> 56) & intern_sel_mask) != 0) {
+    if (!selectSingleton(h)) {
         sds s = sdsnewlen(buf, len);
         offered_last = s;
         return s;

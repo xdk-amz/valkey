@@ -1613,13 +1613,23 @@ typedef struct zset {
 /* Lookup-key marking for fbtree hashtable disambiguation.
  * Packed fbtree items ([score][ele]) are stored in the hashtable. When doing
  * a lookup with a plain sds key, we mark it so the hash/compare callbacks
- * can distinguish it from a packed stored item. */
+ * can distinguish it from a packed stored item. A shared string must not be
+ * marked: callers swap it for a private copy with zsetPrivateLookupKey(). */
 #define ZSET_LOOKUP_TYPE5_MARKER 6
 static inline void zsetMarkLookupKey(sds s) {
     if (sdsType(s) == SDS_TYPE_5)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | ZSET_LOOKUP_TYPE5_MARKER;
     else
         sdsSetAuxBit(s, 0, 1);
+}
+
+/* Returns `s`, or a private copy of it if `s` is a shared string, which must
+ * not be marked. Pair with zsetFreePrivateLookupKey(). */
+static inline sds zsetPrivateLookupKey(sds s) {
+    return sdsIsShared(s) ? sdsdup(s) : s;
+}
+static inline void zsetFreePrivateLookupKey(sds key, sds orig) {
+    if (key != orig) sdsfree(key);
 }
 static inline void zsetUnmarkLookupKey(sds s) {
     unsigned char type = s[-1] & SDS_TYPE_MASK;
