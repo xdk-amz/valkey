@@ -25,11 +25,43 @@ typedef struct internGate {
     uint32_t period; /* sample one call in `period` */
 } internGate;
 
-extern internGate intern_gate;
+#define INTERN_HOT_SLOTS 4096
+#define INTERN_FILTER_BUCKETS 256
 
-/* The private string internNewFrom(), internDupSds() or the loader last
- * returned. It was already offered, so internAdmit() of it returns at once. */
-extern const char *intern_offered;
+struct hashtable;
+struct probSlot;
+
+/* State that a sampled write reads, in one page-aligned object. Every write
+ * touches the gate, so the page stays in the TLB for the writes that are
+ * sampled. Fields after `offered` are private to intern.c. */
+typedef struct internState {
+    internGate gate;
+    /* The private string internNewFrom(), internDupSds() or the loader last
+     * returned. It was already offered, so internAdmit() of it returns at once. */
+    const char *offered;
+
+    uint64_t k0, k1, k2, k3; /* hash secrets */
+    uint64_t seed, salt, epoch, sel_mask;
+    struct hashtable *index;
+    struct probSlot *prob;
+    size_t prob_nsets, prob_count;
+    uint32_t prob_victim, sel_floor_tick;
+    int level, sel_level;
+    uint32_t win_sel, win_benefit, win_evict, win_created, win_promoted;
+    const char *memo_key, *probe_buf;
+    uint64_t memo_hash;
+    size_t probe_len;
+    struct {
+        size_t refs, shared_bytes, saved_bytes;
+        size_t hits, hot_hits, promotions, sampled, deferred;
+    } stats;
+    uint64_t hot_used[INTERN_HOT_SLOTS / 64]; /* hot cache slots in use */
+    uint64_t filter[INTERN_FILTER_BUCKETS];   /* fingerprints of indexed and probation strings */
+} internState;
+
+extern internState intern_state;
+#define intern_gate (intern_state.gate)
+#define intern_offered (intern_state.offered)
 
 sds internAdmitSlow(sds s);
 

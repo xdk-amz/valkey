@@ -20,7 +20,7 @@
 typedef struct internHdr {
     uint32_t refcount;
     uint32_t size : 24; /* bytes requested for the whole allocation */
-    uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION or 0 */
+    uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION (possibly evicted since) or 0 */
 } internHdr;
 
 #define INTERN_IN_INDEX 1
@@ -40,34 +40,44 @@ typedef struct internHdr {
 #define PROB_MIN_SETS 256
 #define PROB_MAX_SETS 16384
 
-internGate intern_gate = {1, 1};
+internState intern_state __attribute__((aligned(4096))) = {.gate = {1, 1}};
 int intern_load_ready = 0;
-const char *intern_offered;
 
 /* Set on the main thread at init; a forked child inherits it for its only thread. */
 __thread int intern_is_main;
 
-static uint64_t intern_seed;
-static hashtable *intern_index;
+/* Names for the private fields of intern_state. */
+#define intern_seed (intern_state.seed)
+#define intern_index (intern_state.index)
+#define prob (intern_state.prob)
+#define prob_nsets (intern_state.prob_nsets)
+#define prob_count (intern_state.prob_count)
+#define prob_victim (intern_state.prob_victim)
+#define intern_level (intern_state.level)
+#define intern_sel_level (intern_state.sel_level)
+#define intern_sel_mask (intern_state.sel_mask)
+#define intern_salt (intern_state.salt)
+#define intern_epoch (intern_state.epoch)
+#define win_sel (intern_state.win_sel)
+#define win_benefit (intern_state.win_benefit)
+#define win_evict (intern_state.win_evict)
+#define win_created (intern_state.win_created)
+#define win_promoted (intern_state.win_promoted)
+#define sel_floor_tick (intern_state.sel_floor_tick)
+#define memo_key (intern_state.memo_key)
+#define memo_hash (intern_state.memo_hash)
+#define probe_buf (intern_state.probe_buf)
+#define probe_len (intern_state.probe_len)
+#define st (intern_state.stats)
+#define K0 (intern_state.k0)
+#define K1 (intern_state.k1)
+#define K2 (intern_state.k2)
+#define K3 (intern_state.k3)
 
 typedef struct probSlot {
     uint64_t hash;
     sds s;
 } probSlot;
-
-static probSlot *prob;
-static size_t prob_nsets;
-static size_t prob_count;
-static uint32_t prob_victim;
-
-static int intern_level;
-static uint64_t intern_sel_mask;
-static uint32_t win_sel, win_benefit, win_evict;
-
-static struct {
-    size_t refs, shared_bytes, saved_bytes;
-    size_t hits, hot_hits, promotions, sampled, deferred;
-} st;
 
 static inline internHdr *internHdrOf(const_sds s) {
     return (internHdr *)((char *)s - sdsHdrSize(sdsType(s)) - sizeof(internHdr));
@@ -85,8 +95,6 @@ static inline size_t internSize(const_sds s) {
  * a block equal to a constant zeroes the product, which lets a client build
  * colliding strings without knowing the seed.
  *----------------------------------------------------------------------------*/
-
-static uint64_t K0, K1, K2, K3;
 
 static inline uint64_t mix(uint64_t a, uint64_t b) {
     __uint128_t r = (__uint128_t)a * b;
@@ -163,15 +171,10 @@ static uint64_t internHash(const char *buf, size_t len) {
  *----------------------------------------------------------------------------*/
 
 /* Admission already hashed the string it looks up, so the index reuses that
- * value instead of hashing again. Set right before an index call, cleared after. */
-static const char *memo_key;
-static uint64_t memo_hash;
-
-/* A lookup of plain bytes passes &probe_key as the key; the bytes are in
- * probe_buf and probe_len. */
+ * value instead of hashing again: memo_key and memo_hash are set right before an
+ * index call and cleared after. A lookup of plain bytes passes &probe_key as the
+ * key; the bytes are in probe_buf and probe_len. */
 static const char probe_key = 0;
-static const char *probe_buf;
-static size_t probe_len;
 
 static uint64_t indexHash(const void *key) {
     if (key == memo_key) return memo_hash;
@@ -211,12 +214,21 @@ static hashtableType internIndexType = {
  *----------------------------------------------------------------------------*/
 
 #define HOT_BITS 12
+static_assert((1 << HOT_BITS) == INTERN_HOT_SLOTS, "hot cache size");
 typedef struct hotSlotEntry {
     uint64_t tag; /* full mix of len + edge bytes; a mismatch skips the memcmp */
     sds s;
 } hotSlotEntry;
 
 static hotSlotEntry hot[1 << HOT_BITS];
+
+/* intern_state.hot_used has one bit per slot, set while the slot holds a
+ * string, so a lookup of an empty slot does not touch the slot's page. */
+#define hot_used (intern_state.hot_used)
+
+static inline int hotUsed(size_t i) {
+    return (hot_used[i >> 6] >> (i & 63)) & 1;
+}
 
 static inline uint64_t hotMix(const char *p, size_t len) {
     return mix(rd64((const unsigned char *)p) ^ K1 ^ len, rd64((const unsigned char *)p + len - 8) ^ K2);
@@ -228,22 +240,81 @@ static inline size_t hotSlot(const char *p, size_t len) {
 
 static inline void hotStore(const char *p, size_t len, sds s) {
     uint64_t m = hotMix(p, len);
-    hot[m >> (64 - HOT_BITS)] = (hotSlotEntry){m, s};
+    size_t i = m >> (64 - HOT_BITS);
+    hot[i] = (hotSlotEntry){m, s};
+    hot_used[i >> 6] |= 1ull << (i & 63);
 }
 
 static inline void hotForget(sds s) {
     size_t i = hotSlot(s, sdslen(s));
-    if (hot[i].s == s) hot[i].s = NULL;
+    if (hotUsed(i) && hot[i].s == s) {
+        hot[i].s = NULL;
+        hot_used[i >> 6] &= ~(1ull << (i & 63));
+    }
 }
 
 /* Returns the hot string equal to buf[0..len) or NULL. A fingerprint mismatch
  * returns without the memcmp, so a value the cache has not seen is cheap. */
 static inline sds hotFind(const char *buf, size_t len) {
     uint64_t m = hotMix(buf, len);
-    hotSlotEntry *e = &hot[m >> (64 - HOT_BITS)];
+    size_t i = m >> (64 - HOT_BITS);
+    if (!hotUsed(i)) return NULL;
+    hotSlotEntry *e = &hot[i];
     sds c = e->s;
     if (!c || e->tag != m || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
     return c;
+}
+
+/*-----------------------------------------------------------------------------
+ * Filter of the strings in the index or in probation, by hash. A bucket holds up
+ * to seven 8-bit fingerprints in its low bytes and, in its top byte, a count of
+ * the strings that did not fit. A lookup whose fingerprint is not in its bucket,
+ * when that count is zero, skips both tables and their pages. A full count
+ * stays full.
+ *----------------------------------------------------------------------------*/
+
+#define FILTER_WAYS 7
+#define FILTER_LOW 0x0001010101010101ull
+
+static inline uint64_t *filterBucket(uint64_t h) {
+    return &intern_state.filter[(h >> 8) & (INTERN_FILTER_BUCKETS - 1)];
+}
+
+static inline uint64_t filterFp(uint64_t h) {
+    uint64_t f = (h >> 32) & 0xff;
+    return f ? f : 1;
+}
+
+static void filterAdd(uint64_t h) {
+    uint64_t *b = filterBucket(h);
+    for (int i = 0; i < FILTER_WAYS; i++) {
+        if (((*b >> (8 * i)) & 0xff) == 0) {
+            *b |= filterFp(h) << (8 * i);
+            return;
+        }
+    }
+    if ((*b >> 56) != 0xff) *b += 1ull << 56;
+}
+
+static void filterRemove(uint64_t h) {
+    uint64_t *b = filterBucket(h);
+    uint64_t fp = filterFp(h);
+    for (int i = 0; i < FILTER_WAYS; i++) {
+        if (((*b >> (8 * i)) & 0xff) == fp) {
+            *b &= ~(0xffull << (8 * i));
+            return;
+        }
+    }
+    uint64_t over = *b >> 56;
+    serverAssert(over != 0);
+    if (over != 0xff) *b -= 1ull << 56;
+}
+
+static inline int filterMayHave(uint64_t h) {
+    uint64_t b = *filterBucket(h);
+    if (b >> 56) return 1;
+    uint64_t x = b ^ (filterFp(h) * FILTER_LOW);
+    return ((x - FILTER_LOW) & ~x & (FILTER_LOW << 7)) != 0;
 }
 
 /*-----------------------------------------------------------------------------
@@ -261,6 +332,7 @@ static sds probTake(uint64_t h, const char *buf, size_t len) {
         if (c && set[w].hash == h && sdslen(c) == len && memcmp(c, buf, len) == 0) {
             set[w].s = NULL;
             prob_count--;
+            filterRemove(h);
             internHdrOf(c)->where = 0;
             return c;
         }
@@ -275,28 +347,35 @@ static void probInsert(uint64_t h, sds s) {
         if (set[w].s == NULL) break;
     }
     if (w == PROB_WAYS) {
+        /* The evicted string keeps where == INTERN_IN_PROBATION; its header is
+         * cold, and release and defrag look the slot up before using it. */
         w = prob_victim++ & (PROB_WAYS - 1);
-        internHdrOf(set[w].s)->where = 0;
         prob_count--;
+        filterRemove(set[w].hash);
         win_evict++;
     }
     set[w].hash = h;
     set[w].s = s;
     prob_count++;
+    filterAdd(h);
     internHdrOf(s)->where = INTERN_IN_PROBATION;
 }
 
+/* Returns the probation slot holding `s`, or NULL if it was evicted. */
 static probSlot *probFind(sds s) {
     probSlot *set = probSet(internHash(s, sdslen(s)));
     for (int w = 0; w < PROB_WAYS; w++) {
         if (set[w].s == s) return &set[w];
     }
-    serverPanic("intern: probation entry not found");
+    return NULL;
 }
 
 static void probRemove(sds s) {
-    probFind(s)->s = NULL;
+    probSlot *slot = probFind(s);
+    if (slot == NULL) return;
+    slot->s = NULL;
     prob_count--;
+    filterRemove(slot->hash);
 }
 
 static void probResize(size_t nsets) {
@@ -308,6 +387,7 @@ static void probResize(size_t nsets) {
     for (size_t i = 0; i < old_slots; i++) {
         if (old[i].s) {
             internHdrOf(old[i].s)->where = 0;
+            filterRemove(old[i].hash);
             probInsert(old[i].hash, old[i].s);
         }
     }
@@ -323,17 +403,12 @@ static void probResize(size_t nsets) {
  * keep finding shared strings and back up when they do not.
  *----------------------------------------------------------------------------*/
 
-static uint64_t intern_salt;
-static uint64_t intern_epoch;
-
 /* Singleton selection has its own level. Creating a singleton costs a copy and
  * a probation slot, which only pays off when the value is seen again, so the
  * selection rate follows how many singletons are promoted, not the hit rate of
  * already shared strings. At selection level S a missed value becomes a
  * singleton when S bits of its salted hash are zero. */
 #define INTERN_SEL_MAX 8
-static int intern_sel_level;
-static uint32_t win_created, win_promoted;
 
 /* About one missed value per INTERN_SEL_FLOOR writes becomes a singleton
  * whatever its hash, so a value that starts repeating is found even while
@@ -342,7 +417,6 @@ static uint32_t win_created, win_promoted;
  * The floor only picks values whose shareable copy fits the allocation size
  * class of the private copy, so a singleton that never repeats costs no memory. */
 #define INTERN_SEL_FLOOR 1024
-static uint32_t sel_floor_tick = INTERN_SEL_FLOOR;
 
 static inline size_t allocClass(size_t size) {
 #if defined(USE_JEMALLOC)
@@ -471,6 +545,7 @@ static sds promote(uint64_t h, const char *buf, size_t len) {
     memo_key = NULL;
     /* An equal string already in the index has reached INTERN_REFS_MAX. */
     if (!added) return cand;
+    filterAdd(h);
     ch->where = INTERN_IN_INDEX;
     size_t sz = internSize(cand);
     st.refs += ch->refcount;
@@ -511,15 +586,17 @@ sds internAdmitSlow(sds s) {
     }
 
     uint64_t h = internHash(s, len);
-    sds found = indexFind(s, len, h);
-    if (found) {
-        if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
-        hotStore(s, len, found);
-        return shareIndexed(found, s);
-    }
-    if ((found = promote(h, s, len)) != NULL) {
-        sdsfree(s);
-        return found;
+    if (filterMayHave(h)) {
+        sds found = indexFind(s, len, h);
+        if (found) {
+            if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
+            hotStore(s, len, found);
+            return shareIndexed(found, s);
+        }
+        if ((found = promote(h, s, len)) != NULL) {
+            sdsfree(s);
+            return found;
+        }
     }
 
     observe(0);
@@ -597,12 +674,14 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     }
 
     uint64_t h = internHash(buf, len);
-    sds found = indexFind(buf, len, h);
-    if (found && internHdrOf(found)->refcount < INTERN_REFS_MAX) {
-        hotStore(buf, len, found);
-        return shareIndexed(found, NULL);
+    if (filterMayHave(h)) {
+        sds found = indexFind(buf, len, h);
+        if (found && internHdrOf(found)->refcount < INTERN_REFS_MAX) {
+            hotStore(buf, len, found);
+            return shareIndexed(found, NULL);
+        }
+        if ((found = promote(h, buf, len)) != NULL) return found;
     }
-    if ((found = promote(h, buf, len)) != NULL) return found;
 
     observe(0);
     if (!selectSingleton(h, len, privateSize(len))) {
@@ -635,7 +714,12 @@ static void releaseOnMain(sds s, uint32_t n) {
     if (h->refcount) return;
     if (h->where == INTERN_IN_INDEX) {
         hotForget(s);
+        uint64_t hash = internHash(s, sdslen(s));
+        memo_key = s;
+        memo_hash = hash;
         serverAssert(hashtableDelete(intern_index, s));
+        memo_key = NULL;
+        filterRemove(hash);
     } else if (h->where == INTERN_IN_PROBATION) {
         probRemove(s);
     }
@@ -838,7 +922,8 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
         size_t i = hotSlot(ns, sdslen(ns));
         if (hot[i].s == s) hot[i].s = ns;
     } else if (where == INTERN_IN_PROBATION) {
-        probFind(s)->s = ns;
+        probSlot *slot = probFind(s);
+        if (slot) slot->s = ns;
     }
     return ns;
 }
@@ -871,6 +956,7 @@ void internInit(void) {
     setLevel(INTERN_LEVEL_START);
     setSelLevel(INTERN_LEVEL_START);
     intern_gate.tick = intern_gate.period;
+    sel_floor_tick = INTERN_SEL_FLOOR;
     intern_is_main = 1;
     sdsSharedReleaseHook = releaseHook;
 }
