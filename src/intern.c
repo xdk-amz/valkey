@@ -439,14 +439,17 @@ static inline int shareableFits(size_t len, size_t priv_size) {
     return allocClass(shareableSize(len)) <= allocClass(priv_size);
 }
 
+/* The floor's turn: select the value if its shareable copy fits. */
+__attribute__((cold, noinline)) static int selectByFloor(uint64_t h, size_t len, size_t priv_size) {
+    sel_floor_tick = INTERN_SEL_FLOOR;
+    if (shareableFits(len, priv_size)) return 1;
+    return (((h ^ intern_salt) >> 56) & intern_sel_mask) == 0;
+}
+
 static inline int selectSingleton(uint64_t h, size_t len, size_t priv_size) {
     uint32_t step = intern_gate.period;
-    if (sel_floor_tick <= step) {
-        sel_floor_tick = INTERN_SEL_FLOOR;
-        if (shareableFits(len, priv_size)) return 1;
-    } else {
-        sel_floor_tick -= step;
-    }
+    if (unlikely(sel_floor_tick <= step)) return selectByFloor(h, len, priv_size);
+    sel_floor_tick -= step;
     return (((h ^ intern_salt) >> 56) & intern_sel_mask) == 0;
 }
 
@@ -472,10 +475,8 @@ void internResetSampling(void) {
     intern_gate.tick = intern_gate.period;
 }
 
-static void observe(int benefit) {
-    win_sel++;
-    win_benefit += benefit;
-    if (win_sel < INTERN_WINDOW) return;
+/* Ends a sampling window: moves the levels and changes the salt. */
+__attribute__((cold, noinline)) static void observeWindow(void) {
     if (win_benefit * 10 >= win_sel * 3) {
         if (intern_level > 0) setLevel(intern_level - 1);
         if (win_evict * 2 > win_sel && prob_nsets < PROB_MAX_SETS) probResize(prob_nsets * 2);
@@ -496,6 +497,12 @@ static void observe(int benefit) {
     if (intern_sel_level < intern_level) setSelLevel(intern_level);
     win_sel = win_benefit = win_evict = 0;
     intern_salt = mix(++intern_epoch ^ intern_seed, K2);
+}
+
+static inline void observe(int benefit) {
+    win_sel++;
+    win_benefit += benefit;
+    if (unlikely(win_sel >= INTERN_WINDOW)) observeWindow();
 }
 
 /*-----------------------------------------------------------------------------
@@ -572,6 +579,31 @@ static sds indexFind(const char *buf, size_t len, uint64_t h) {
     return found;
 }
 
+/* Looks `s` up in the index and probation, for a hash the filter may hold.
+ * Returns the string the holder must store, or NULL if there is no match. */
+__attribute__((cold, noinline)) static sds admitFromTables(sds s, size_t len, uint64_t h) {
+    sds found = indexFind(s, len, h);
+    if (found) {
+        if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
+        hotStore(s, len, found);
+        return shareIndexed(found, s);
+    }
+    if ((found = promote(h, s, len)) != NULL) {
+        sdsfree(s);
+        return found;
+    }
+    return NULL;
+}
+
+/* Replaces the private string `s` with a new probation singleton. */
+__attribute__((cold, noinline)) static sds makeSingleton(sds s, size_t len, uint64_t h) {
+    win_created++;
+    sds sh = newShareable(s, len);
+    sdsfree(s);
+    probInsert(h, sh);
+    return sh;
+}
+
 sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
     if (intern_index == NULL) return s;
@@ -580,33 +612,21 @@ sds internAdmitSlow(sds s) {
     st.sampled++;
 
     sds c = hotFind(s, len);
-    if (c) {
+    if (unlikely(c != NULL)) {
         if (internHdrOf(c)->refcount >= INTERN_REFS_MAX) return s;
         st.hot_hits++;
         return shareIndexed(c, s);
     }
 
     uint64_t h = internHash(s, len);
-    if (filterMayHave(h)) {
-        sds found = indexFind(s, len, h);
-        if (found) {
-            if (internHdrOf(found)->refcount >= INTERN_REFS_MAX) return s;
-            hotStore(s, len, found);
-            return shareIndexed(found, s);
-        }
-        if ((found = promote(h, s, len)) != NULL) {
-            sdsfree(s);
-            return found;
-        }
+    if (unlikely(filterMayHave(h))) {
+        sds r = admitFromTables(s, len, h);
+        if (r) return r;
     }
 
     observe(0);
-    if (!selectSingleton(h, len, sdsAllocSize(s))) return s;
-    win_created++;
-    sds sh = newShareable(s, len);
-    sdsfree(s);
-    probInsert(h, sh);
-    return sh;
+    if (unlikely(selectSingleton(h, len, sdsAllocSize(s)))) return makeSingleton(s, len, h);
+    return s;
 }
 
 static sds internAdmitBufSlow(const char *buf, size_t len);
