@@ -519,8 +519,8 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW) {
-        /* Dup the string. */
-        ptr = sdsdup(o->val_ptr);
+        /* Dup the string. A shared string takes one more reference instead. */
+        ptr = internDupSds(o->val_ptr);
     } else {
         serverAssert(objectGetType(o) != OBJ_STRING);
         /* There are multiple references to this non-string object. Most types

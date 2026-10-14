@@ -69,6 +69,11 @@ sds internAdmitLoaded(size_t len);
  * without allocating on a hit. Main thread only. */
 sds internNewFrom(const char *buf, size_t len);
 
+/* Copy of `s` for a new holder. A shared string gets one more reference. A
+ * private string is copied through internNewFrom(), so it is offered while its
+ * bytes are in cache. Main thread only. */
+sds internDupSds(const_sds s);
+
 /* Request parsing. While every write is being probed, a bulk argument equal to
  * a hot shared string becomes a string object that holds a reference on it, so
  * the argument costs no allocation or copy. Returns NULL otherwise, or when not

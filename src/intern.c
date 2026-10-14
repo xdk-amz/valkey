@@ -43,6 +43,9 @@ typedef struct internHdr {
 internGate intern_gate = {1, 1};
 int intern_load_ready = 0;
 
+/* Set on the main thread at init; a forked child inherits it for its only thread. */
+__thread int intern_is_main;
+
 static uint64_t intern_seed;
 static hashtable *intern_index;
 
@@ -501,6 +504,26 @@ sds internNewFrom(const char *buf, size_t len) {
     return internAdmitBufSlow(buf, len);
 }
 
+sds internDupSds(const_sds s) {
+    if (!intern_is_main) return sdsdup(s);
+    if (sdsIsShared(s)) {
+        internHdr *h = internHdrOf(s);
+        if (h->refcount < INTERN_REFS_MAX) {
+            h->refcount++;
+            if (h->where == INTERN_IN_INDEX) {
+                st.refs++;
+                st.saved_bytes += h->size;
+            }
+            return (sds)s;
+        }
+        return sdsdup(s);
+    }
+    sds d = internNewFrom(s, sdslen(s));
+    /* Already offered; a later internAdmit() of it returns at once. */
+    if (!sdsIsShared(d)) offered_last = d;
+    return d;
+}
+
 static sds internAdmitBufSlow(const char *buf, size_t len) {
     st.sampled++;
     size_t hi = hotSlot(buf, len);
@@ -669,8 +692,6 @@ size_t internDrainDeferred(void) {
     return applied;
 }
 
-/* Set on the main thread at init; a forked child inherits it for its only thread. */
-__thread int intern_is_main;
 
 robj *internParseArg(const char *buf, size_t len) {
     if (len > INTERN_MAX_LEN) return NULL;
