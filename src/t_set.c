@@ -148,8 +148,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         hashtablePosition position;
         if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
             /* Key doesn't already exist in the set. Add it but dup the key. */
-            if (sdsval == str) sdsval = sdsdup(sdsval);
-            sdsval = internAdmit(sdsval);
+            sdsval = (sdsval == str) ? internNewFrom(str, len) : internAdmit(sdsval);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
         } else if (sdsval != str) {
@@ -176,7 +175,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
             } else {
                 /* Size limit is reached. Convert to hashtable and add. */
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, lpLength(lp) + 1, 1);
-                serverAssert(hashtableAdd(objectGetVal(set), internAdmit(sdsnewlen(str, len))));
+                serverAssert(hashtableAdd(objectGetVal(set), internNewFrom(str, len)));
             }
             return 1;
         }
@@ -216,7 +215,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, intsetLen(objectGetVal(set)) + 1, 1);
                 /* The set *was* an intset and this value is not integer
                  * encodable, so hashtableAdd should always work. */
-                serverAssert(hashtableAdd(objectGetVal(set), internAdmit(sdsnewlen(str, len))));
+                serverAssert(hashtableAdd(objectGetVal(set), internNewFrom(str, len)));
                 return 1;
             }
         }
@@ -513,8 +512,12 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
 
         /* To add the elements we extract integers and create Objects */
         si = setTypeInitIterator(setobj);
-        while ((element = setTypeNextObject(si)) != NULL) {
-            serverAssert(hashtableAdd(ht, internAdmit(element)));
+        char *str;
+        size_t len;
+        int64_t llele;
+        while (setTypeNext(si, &str, &len, &llele) != -1) {
+            element = str ? internNewFrom(str, len) : sdsfromlonglong(llele);
+            serverAssert(hashtableAdd(ht, element));
         }
         setTypeReleaseIterator(si);
 

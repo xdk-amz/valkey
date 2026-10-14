@@ -500,7 +500,8 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
     }
 
     /* Allocate our target according to the uncompressed size. */
-    intern = (flags & RDB_LOAD_INTERN) && !plain && (sds || !stringObjectWouldEmbed(len)) && internLoadReady(len);
+    intern = (flags & RDB_LOAD_INTERN) && intern_load_ready && !plain && internLoadReady(len) &&
+             (sds || !stringObjectWouldEmbed(len));
     if (plain) {
         val = ztrymalloc(len);
     } else if (intern) {
@@ -639,7 +640,8 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
         }
     }
 
-    if ((flags & RDB_LOAD_INTERN) && !plain && (sds || !stringObjectWouldEmbed(len)) && internLoadReady(len)) {
+    if ((flags & RDB_LOAD_INTERN) && intern_load_ready && !plain && internLoadReady(len) &&
+        (sds || !stringObjectWouldEmbed(len))) {
         char *buf = internLoadScratch(len);
         if (len && rioRead(rdb, buf, len) == 0) return NULL;
         if (lenptr) *lenptr = len;

@@ -19,14 +19,13 @@
  * space and is never grown. */
 typedef struct internHdr {
     uint32_t refcount;
-    uint8_t where; /* INTERN_IN_INDEX, INTERN_IN_PROBATION or 0 */
-    uint8_t unused[3];
+    uint32_t size : 24; /* bytes requested for the whole allocation */
+    uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION or 0 */
 } internHdr;
 
 #define INTERN_IN_INDEX 1
 #define INTERN_IN_PROBATION 2
 
-#define INTERN_MIN_LEN 16
 #define INTERN_MAX_LEN (512 * 1024)
 #define INTERN_HASH_FULL_MAX 512
 
@@ -39,6 +38,7 @@ typedef struct internHdr {
 #define PROB_MAX_SETS 16384
 
 internGate intern_gate = {1, 1};
+int intern_load_ready = 0;
 
 static uint64_t intern_seed;
 static hashtable *intern_index;
@@ -59,7 +59,7 @@ static uint32_t win_sel, win_benefit, win_evict;
 
 static struct {
     size_t refs, shared_bytes, saved_bytes;
-    size_t hits, promotions, sampled, deferred;
+    size_t hits, hot_hits, promotions, sampled, deferred;
 } st;
 
 static inline internHdr *internHdrOf(const_sds s) {
@@ -67,7 +67,7 @@ static inline internHdr *internHdrOf(const_sds s) {
 }
 
 static inline size_t internSize(const_sds s) {
-    return sizeof(internHdr) + sdsHdrSize(sdsType(s)) + sdslen(s) + 1;
+    return internHdrOf(s)->size;
 }
 
 /*-----------------------------------------------------------------------------
@@ -160,6 +160,12 @@ static uint64_t internHash(const char *buf, size_t len) {
 static const char *memo_key;
 static uint64_t memo_hash;
 
+/* A lookup of plain bytes passes &probe_key as the key; the bytes are in
+ * probe_buf and probe_len. */
+static const char probe_key = 0;
+static const char *probe_buf;
+static size_t probe_len;
+
 static uint64_t indexHash(const void *key) {
     if (key == memo_key) return memo_hash;
     const_sds s = key;
@@ -168,8 +174,21 @@ static uint64_t indexHash(const void *key) {
 
 /* Returns non-zero when the keys are equal, as the hashtable expects. */
 static int indexCompare(const void *a, const void *b) {
-    size_t la = sdslen(a);
-    return la == sdslen(b) && memcmp(a, b, la) == 0;
+    const char *pa = a, *pb = b;
+    size_t la, lb;
+    if (pa == &probe_key) {
+        pa = probe_buf;
+        la = probe_len;
+    } else {
+        la = sdslen(pa);
+    }
+    if (pb == &probe_key) {
+        pb = probe_buf;
+        lb = probe_len;
+    } else {
+        lb = sdslen(pb);
+    }
+    return la == lb && memcmp(pa, pb, la) == 0;
 }
 
 static hashtableType internIndexType = {
@@ -276,11 +295,25 @@ static void probResize(size_t nsets) {
 static uint64_t intern_salt;
 static uint64_t intern_epoch;
 
+/* Singleton selection has its own level. Creating a singleton costs a copy and
+ * a probation slot, which only pays off when the value is seen again, so the
+ * selection rate follows how many singletons are promoted, not the hit rate of
+ * already shared strings. At selection level S a missed value becomes a
+ * singleton when S bits of its salted hash are zero. */
+#define INTERN_SEL_MAX 8
+static int intern_sel_level;
+static uint32_t win_created, win_promoted;
+
 static void setLevel(int level) {
     intern_level = level;
+    intern_load_ready = (level == 0);
     intern_gate.period = 1u << level;
-    intern_sel_mask = (1ull << level) - 1;
     if (intern_gate.tick > intern_gate.period) intern_gate.tick = intern_gate.period;
+}
+
+static void setSelLevel(int level) {
+    intern_sel_level = level;
+    intern_sel_mask = (1ull << level) - 1;
 }
 
 static void observe(int benefit) {
@@ -293,6 +326,18 @@ static void observe(int benefit) {
     } else if (win_benefit * 100 < win_sel * 3 && intern_level < INTERN_LEVEL_MAX) {
         setLevel(intern_level + 1);
     }
+    /* Keep selecting while at least one singleton in four gets promoted; back
+     * off when fewer than one in sixteen does. A floor of the sampling level
+     * keeps the overall singleton rate at or below one in 2^(2L). */
+    if (win_created >= INTERN_WINDOW / 4) {
+        if (win_promoted * 4 >= win_created && intern_sel_level > intern_level) {
+            setSelLevel(intern_sel_level - 1);
+        } else if (win_promoted * 16 < win_created && intern_sel_level < INTERN_SEL_MAX) {
+            setSelLevel(intern_sel_level + 1);
+        }
+        win_created = win_promoted = 0;
+    }
+    if (intern_sel_level < intern_level) setSelLevel(intern_level);
     win_sel = win_benefit = win_evict = 0;
     intern_salt = mix(++intern_epoch ^ intern_seed, K2);
 }
@@ -305,9 +350,11 @@ static sds newShareable(const char *buf, size_t len) {
     char type = sdsReqType(len);
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
     int hdrlen = sdsHdrSize(type);
-    char *p = zmalloc(sizeof(internHdr) + hdrlen + len + 1);
+    size_t size = sizeof(internHdr) + hdrlen + len + 1;
+    char *p = zmalloc(size);
     internHdr *h = (internHdr *)p;
     h->refcount = 1;
+    h->size = size;
     h->where = 0;
     sds s = sdswrite(p + sizeof(internHdr), hdrlen + len + 1, type, buf, len);
     s[-1] |= (char)(1 << (SDS_TYPE_BITS + SDS_AUX_SHARED));
@@ -324,7 +371,7 @@ static inline sds shareIndexed(sds found, sds s) {
     return found;
 }
 
-/* The string internAdmitBuf() last returned as a private copy. It was already
+/* The string internAdmitLoaded() last returned as a private copy. It was already
  * offered, so internAdmit() of the same pointer returns at once. A stale value
  * after that string is freed can only make one later call return early. */
 static const char *offered_last;
@@ -347,18 +394,21 @@ static sds promote(uint64_t h, const char *buf, size_t len, size_t hi) {
     st.shared_bytes += sz;
     st.saved_bytes += (size_t)(ch->refcount - 1) * sz;
     st.promotions++;
+    win_promoted++;
     hot[hi] = cand;
     observe(1);
     return cand;
 }
 
-/* Looks `key` (an sds with the same content as buf) up in the index. */
-static sds indexFind(sds key, uint64_t h) {
+/* Looks buf[0..len) up in the index. */
+static sds indexFind(const char *buf, size_t len, uint64_t h) {
     sds found = NULL;
     if (hashtableSize(intern_index) == 0) return NULL;
-    memo_key = key;
+    probe_buf = buf;
+    probe_len = len;
+    memo_key = &probe_key;
     memo_hash = h;
-    hashtableFind(intern_index, key, (void **)&found);
+    hashtableFind(intern_index, &probe_key, (void **)&found);
     memo_key = NULL;
     return found;
 }
@@ -376,10 +426,13 @@ sds internAdmitSlow(sds s) {
 
     size_t hi = hotSlot(s, len);
     sds c = hot[hi];
-    if (c && sdslen(c) == len && memcmp(c, s, len) == 0) return shareIndexed(c, s);
+    if (c && sdslen(c) == len && memcmp(c, s, len) == 0) {
+        st.hot_hits++;
+        return shareIndexed(c, s);
+    }
 
     uint64_t h = internHash(s, len);
-    sds found = indexFind(s, h);
+    sds found = indexFind(s, len, h);
     if (found) {
         hot[hi] = found;
         return shareIndexed(found, s);
@@ -391,11 +444,14 @@ sds internAdmitSlow(sds s) {
 
     observe(0);
     if ((((h ^ intern_salt) >> 56) & intern_sel_mask) != 0) return s;
+    win_created++;
     sds sh = newShareable(s, len);
     sdsfree(s);
     probInsert(h, sh);
     return sh;
 }
+
+static sds internAdmitBufSlow(const char *buf, size_t len);
 
 /* Scratch sds the loader reads candidate strings into. Its length is set to the
  * string being offered so it can be used as an index key. */
@@ -408,15 +464,32 @@ char *internLoadScratch(size_t len) {
 }
 
 sds internAdmitLoaded(size_t len) {
-    sds buf = load_scratch;
-    serverAssert(buf && sdslen(buf) == len);
+    serverAssert(load_scratch && sdslen(load_scratch) == len);
+    return internAdmitBufSlow(load_scratch, len);
+}
+
+sds internNewFrom(const char *buf, size_t len) {
+    if (--intern_gate.tick || len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
+        if (intern_gate.tick == 0) intern_gate.tick = intern_gate.period;
+        return sdsnewlen(buf, len);
+    }
+    intern_gate.tick = intern_gate.period;
+    sds s = internAdmitBufSlow(buf, len);
+    if (s == offered_last) offered_last = NULL;
+    return s;
+}
+
+static sds internAdmitBufSlow(const char *buf, size_t len) {
     st.sampled++;
     size_t hi = hotSlot(buf, len);
     sds c = hot[hi];
-    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0) return shareIndexed(c, NULL);
+    if (c && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+        st.hot_hits++;
+        return shareIndexed(c, NULL);
+    }
 
     uint64_t h = internHash(buf, len);
-    sds found = indexFind(buf, h);
+    sds found = indexFind(buf, len, h);
     if (found) {
         hot[hi] = found;
         return shareIndexed(found, NULL);
@@ -429,14 +502,12 @@ sds internAdmitLoaded(size_t len) {
         offered_last = s;
         return s;
     }
+    win_created++;
     sds sh = newShareable(buf, len);
     probInsert(h, sh);
     return sh;
 }
 
-int internLoadReady(size_t len) {
-    return intern_level == 0 && len >= INTERN_MIN_LEN && len <= INTERN_LOAD_MAX && onServerMainThread();
-}
 
 /*-----------------------------------------------------------------------------
  * Release.
@@ -640,6 +711,7 @@ void internInit(void) {
     prob_nsets = PROB_MIN_SETS;
     prob = zcalloc(prob_nsets * PROB_WAYS * sizeof(probSlot));
     setLevel(INTERN_LEVEL_START);
+    setSelLevel(INTERN_LEVEL_START);
     intern_gate.tick = intern_gate.period;
     sdsSharedReleaseHook = releaseHook;
 }
@@ -666,8 +738,10 @@ void internGetInfo(internInfo *info) {
     info->saved_bytes = st.saved_bytes;
     info->table_bytes = hashtableMemUsage(intern_index) + prob_nsets * PROB_WAYS * sizeof(probSlot);
     info->hits = st.hits;
+    info->hot_hits = st.hot_hits;
     info->promotions = st.promotions;
     info->sampled = st.sampled;
     info->deferred = st.deferred;
     info->level = intern_level;
+    info->sel_level = intern_sel_level;
 }

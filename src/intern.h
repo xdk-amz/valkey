@@ -34,6 +34,7 @@ sds internAdmitSlow(sds s);
  * is `s` itself or a shareable string that carries one reference for the
  * holder. Main thread only. */
 static inline sds internAdmit(sds s) {
+    if (sdsIsShared(s)) return s;
     if (--intern_gate.tick) return s;
     return internAdmitSlow(s);
 }
@@ -53,9 +54,20 @@ void internInit(void);
  * The returned sds is either shared or a fresh private or singleton copy. A
  * later internAdmit() of it is a no-op. Main thread only. */
 #define INTERN_LOAD_MAX (64 * 1024)
-int internLoadReady(size_t len);
+extern int intern_load_ready;
+#define INTERN_MIN_LEN 16
+/* The loader holds exclusive access to the keyspace (main thread, or a module
+ * thread that holds the GIL), so no thread check is needed here. */
+static inline int internLoadReady(size_t len) {
+    return intern_load_ready && len >= INTERN_MIN_LEN && len <= INTERN_LOAD_MAX;
+}
 char *internLoadScratch(size_t len);
 sds internAdmitLoaded(size_t len);
+
+/* Returns a new sds holding buf[0..len) to store in the keyspace, sharing an
+ * existing copy when there is one, like internAdmit(sdsnewlen(buf, len)) but
+ * without allocating on a hit. Main thread only. */
+sds internNewFrom(const char *buf, size_t len);
 
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */
@@ -86,10 +98,12 @@ typedef struct internInfo {
     size_t saved_bytes;   /* bytes not allocated thanks to sharing */
     size_t table_bytes;   /* index and probation table memory */
     size_t hits;          /* writes that took a reference on an indexed string */
+    size_t hot_hits;      /* hits found through the hot cache */
     size_t promotions;    /* singletons that gained a second holder */
     size_t sampled;       /* writes that were hashed */
     size_t deferred;      /* releases applied from other threads */
     int level;            /* sampling level, 0 = every write */
+    int sel_level;        /* singleton selection level, 0 = every missed value */
 } internInfo;
 
 void internGetInfo(internInfo *info);

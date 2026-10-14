@@ -6740,12 +6740,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                             "intern_table_bytes:%zu\r\n"
                             "intern_singletons:%zu\r\n"
                             "intern_hits:%zu\r\n"
+                            "intern_hot_hits:%zu\r\n"
                             "intern_promotions:%zu\r\n"
                             "intern_sampled:%zu\r\n"
                             "intern_deferred:%zu\r\n"
-                            "intern_level:%d\r\n",
+                            "intern_level:%d\r\n"
+                            "intern_sel_level:%d\r\n",
                             ii.shared, ii.refs, ii.shared_bytes, ii.saved_bytes, ii.table_bytes, ii.singletons,
-                            ii.hits, ii.promotions, ii.sampled, ii.deferred, ii.level);
+                            ii.hits, ii.hot_hits, ii.promotions, ii.sampled, ii.deferred, ii.level, ii.sel_level);
         freeMemoryOverheadData(mh);
     }
 
