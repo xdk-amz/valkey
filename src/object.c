@@ -804,6 +804,8 @@ void decrRefCount(robj *o) {
  * accumulate free buffers to free whole pages, while madvise is nop
  * if the buffer is less than a page.  */
 void dismissSds(sds s) {
+    /* Other keys the child has not dumped yet may reference a shared string. */
+    if (sdsIsShared(s)) return;
     sdsfree(s);
 }
 
