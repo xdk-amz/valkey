@@ -542,6 +542,7 @@ ENGINE_SERVER_OBJ = \
     crccombine.o \
     crcspeed.o \
     db.o \
+    dplus.o \
     debug.o \
     defrag.o \
     entry.o \
@@ -653,6 +654,7 @@ ENGINE_CLI_OBJ = \
     crccombine.o \
     crcspeed.o \
     hashtable.o \
+    dplus_stubs.o \
     monotonic.o \
     mt19937-64.o \
     release.o \
@@ -679,6 +681,7 @@ ENGINE_BENCHMARK_OBJ = \
     fuzzer_client.o \
     fuzzer_command_generator.o \
     hashtable.o \
+    dplus_stubs.o \
     monotonic.o \
     mt19937-64.o \
     release.o \

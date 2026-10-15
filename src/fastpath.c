@@ -6,6 +6,7 @@
 #include "memory_prefetch.h"
 #include "throttle.h"
 #include "module.h"
+#include "dplus.h"
 #ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
 #else
@@ -75,7 +76,7 @@ typedef struct fpThread {
     size_t main_clients;   /* main only: clients routed here and not yet taken back */
     size_t detach_pending; /* main only: detach requests the IO thread has not consumed */
     list *ret_overflow;    /* main only: detach requests a full ret ring could not take */
-    long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals;
+    long long reads, net_input_bytes, net_output_bytes, writes, batches, deferrals, speculated;
     /* Observability: why a client/command left the fast path, and batch-queue pressure. IO-owner-only,
      * incremented on a decision the owner already makes, so no extra hot-path work. */
     long long fb_gate;      /* commands that stayed on / returned to main because a dynamic gate was closed at harvest */
@@ -96,7 +97,7 @@ static client *fp_exec_client[IO_THREADS_MAX_NUM]; /* main-thread executor per I
 static size_t fastpath_clients = 0;                 /* main thread only */
 static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
 static unsigned fp_rr = 0;
-static long long fp_retired[11]; /* main thread only: counters of threads since retired */
+static long long fp_retired[12]; /* main thread only: counters of threads since retired */
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -175,6 +176,7 @@ void fastpathFreeThread(int tid) {
     fp_retired[8] += t->fb_error;
     fp_retired[9] += t->rq_gate;
     if (t->inflight_hwm > fp_retired[10]) fp_retired[10] = t->inflight_hwm; /* gauge: keep the peak across retired threads */
+    fp_retired[11] += t->speculated;
     while (fp_slots > 0 && fp_threads[fp_slots - 1].submit.buffer == NULL) fp_slots--;
 }
 
@@ -465,6 +467,15 @@ static void fpControlReleaseBytes(ClientControl *cc, size_t bytes) {
     if (bytes == 0) return;
     size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
     atomic_store_explicit(&cc->reply_bytes_released, released + bytes, memory_order_release);
+}
+
+/* Charges reply bytes the IO owner produced itself (speculated reads) and left in fp_out, so their
+ * later flush or hand-off release balances. Main owns reply_bytes_produced, so the charge is taken
+ * back from released, which only the IO owner writes. */
+static void fpControlChargeOwnBytes(ClientControl *cc, size_t bytes) {
+    if (bytes == 0) return;
+    size_t released = atomic_load_explicit(&cc->reply_bytes_released, memory_order_relaxed);
+    atomic_store_explicit(&cc->reply_bytes_released, released - bytes, memory_order_release);
 }
 
 /* Reply bytes charged to a control but not yet released: produced minus released, read with acquire so a
@@ -772,6 +783,26 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     q->off = q->len = 0;
 }
 
+static size_t fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
+
+/* Reads at the head of what a client just sent execute here, on its owning IO thread: a
+ * contiguous prefix of GETs is answered from the keyspace under D+ version validation and the
+ * replies go straight to the socket. The first command that cannot be executed here, and every
+ * command after it, goes to main in the batch, so a read never overtakes an earlier write of the
+ * same connection. For the same reason nothing is executed here while the client still has
+ * commands pending on main. */
+static void fpSpeculate(fpThread *t, int tid, client *c) {
+    if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
+    int n = dplusSpeculateBatch(c, tid);
+    if (n <= 0) return;
+    dplusConsumeSpeculated(c, n, tid);
+    t->speculated += n;
+    struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};
+    c->bufpos = 0;
+    size_t released = fpSend(t, c, &iov, 1);
+    fpControlChargeOwnBytes(c->control, iov.iov_len - released);
+}
+
 static void fpRead(fpThread *t, int tid, client *c) {
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     readToQueryBuf(c);
@@ -804,7 +835,8 @@ static void fpRead(fpThread *t, int tid, client *c) {
         int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
         prepareCommandQueue(c);
         aclOffloadBeginRead(c); /* snapshot the ACL epoch these commands are tagged under */
-        fpHarvest(t, tid, c);
+        fpSpeculate(t, tid, c);
+        if (c->control->lifecycle == FP_ACTIVE) fpHarvest(t, tid, c);
         /* Stop once the client has left the fast path, a partial command needs more
          * bytes, a parse error is pending for main, or the buffer is drained. */
         if (c->control->lifecycle != FP_ACTIVE) break;
@@ -1236,7 +1268,12 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         return;
     }
 
-    if (principal->flags & USER_FLAG_RETIRED) principal = ACLResolveUser(principal);
+    if (principal->flags & USER_FLAG_RETIRED) {
+        /* The IO thread may have tagged this command under the retired rule set after the epoch
+         * bump that retired it: its ALLOW does not describe the live successor. */
+        e->read_flags &= ~READ_FLAGS_ACL_ALLOWED;
+        principal = ACLResolveUser(principal);
+    }
     serverAssert(principal); /* a deleted user's clients are detaching */
     ec->user = principal;
     ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
@@ -1491,7 +1528,7 @@ void fastpathHandoffDone(client *c, int closing) {
 
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
-              batches = fp_retired[4], deferrals = fp_retired[5];
+              batches = fp_retired[4], deferrals = fp_retired[5], speculated = fp_retired[11];
     long long fb_gate = fp_retired[6], fb_ineligible = fp_retired[7], fb_error = fp_retired[8], rq_gate = fp_retired[9],
               inflight_hwm = fp_retired[10];
     int open = 0, quiescing = 0;
@@ -1506,6 +1543,7 @@ void fastpathInfo(sds *info) {
         writes += fp_threads[i].writes;
         batches += fp_threads[i].batches;
         deferrals += fp_threads[i].deferrals;
+        speculated += fp_threads[i].speculated;
         fb_gate += fp_threads[i].fb_gate;
         fb_ineligible += fp_threads[i].fb_ineligible;
         fb_error += fp_threads[i].fb_error;
@@ -1520,6 +1558,7 @@ void fastpathInfo(sds *info) {
                          "fastpath_writes:%lld\r\n"
                          "fastpath_batches:%lld\r\n"
                          "fastpath_deferrals:%lld\r\n"
+                         "fastpath_speculated:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n"
                          "fastpath_fallback_gate:%lld\r\n"
@@ -1527,6 +1566,6 @@ void fastpathInfo(sds *info) {
                          "fastpath_fallback_error:%lld\r\n"
                          "fastpath_requeue_gate:%lld\r\n"
                          "fastpath_inflight_batches_peak:%lld\r\n",
-                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, in, out, fb_gate,
-                         fb_ineligible, fb_error, rq_gate, inflight_hwm);
+                         fastpath_clients, open, quiescing, reads, writes, batches, deferrals, speculated, in, out,
+                         fb_gate, fb_ineligible, fb_error, rq_gate, inflight_hwm);
 }

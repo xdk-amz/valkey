@@ -47,6 +47,12 @@ typedef struct PrefetchCommandsBatch {
     void **keys;                    /* Array of keys to prefetch in the current batch */
     client **clients;               /* Array of clients in the current batch */
     robj **key_members;             /* Member to prefetch for each key (NULL = no nested prefetch) */
+    struct serverDb **dbs;          /* Db for each key — tables are resolved LATE (at
+                                     * prefetch time) because inline (non-batched)
+                                     * command execution between add-time and
+                                     * prefetch-time can free/replace a slot's
+                                     * hashtable in cluster mode (stale-pointer
+                                     * SIGSEGV in hashtableIncrementalFindStep). */
     hashtable **keys_tables;        /* Main table for each key */
     KeyPrefetchInfo *prefetch_info; /* Prefetch info for each key */
 } PrefetchCommandsBatch;
@@ -62,6 +68,7 @@ void freePrefetchCommandsBatch(void) {
     zfree(batch->key_members);
     zfree(batch->keys);
     zfree(batch->keys_tables);
+    zfree(batch->dbs);
     zfree(batch->slots);
     zfree(batch->prefetch_info);
     zfree(batch);
@@ -82,6 +89,7 @@ void prefetchCommandsBatchInit(void) {
     batch->key_members = zcalloc(max_prefetch_size * sizeof(robj *));
     batch->keys = zcalloc(max_prefetch_size * sizeof(void *));
     batch->keys_tables = zcalloc(max_prefetch_size * sizeof(hashtable *));
+    batch->dbs = zcalloc(max_prefetch_size * sizeof(struct serverDb *));
     batch->slots = zcalloc(max_prefetch_size * sizeof(int));
     batch->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
 }
@@ -312,6 +320,13 @@ static void prefetchCommands(void) {
         batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
     }
 
+    /* LATE table resolution — after every inline execution that could have
+     * freed/replaced a slot's hashtable. kvstoreGetHashtable may return NULL
+     * (slot emptied); initBatchInfo already handles NULL tables. */
+    for (size_t i = 0; i < batch->key_count; i++) {
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
+    }
+
     /* Prefetch hashtable keys for all commands. Prefetching is beneficial only if there are more than one key. */
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
@@ -372,7 +387,11 @@ static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, 
     for (int i = 0; i < num_keys && batch->key_count < batch->max_prefetch_size; i++) {
         batch->keys[batch->key_count] = argv[result->keys[i].pos];
         batch->slots[batch->key_count] = slot >= 0 ? slot : 0;
-        batch->keys_tables[batch->key_count] = kvstoreGetHashtable(db->keys, batch->slots[batch->key_count]);
+        /* Table resolution is deferred to prefetchCommands(): inline command
+         * execution between now and then can free/replace this slot's
+         * hashtable (cluster slot ops / DEL-empties) — a cached pointer here
+         * segfaults in hashtableIncrementalFindStep. */
+        batch->dbs[batch->key_count] = db;
         batch->key_members[batch->key_count] =
             (result->keys[i].flags & CMD_KEY_OW) && !(result->keys[i].flags & CMD_KEY_ACCESS) ? NULL : member;
         batch->key_count++;

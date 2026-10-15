@@ -1524,6 +1524,9 @@ typedef struct client {
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
+    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+                                           * unrestricted key read access, so IO threads may speculate.
+                                           * Written only on main at auth-state changes; read by IO threads. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
@@ -2056,6 +2059,7 @@ struct valkeyServer {
     int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
+    int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
@@ -2371,8 +2375,9 @@ struct valkeyServer {
                                                  * RDB save to disk has completed, or failed */
     _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
                                                  * disk-saving bio thread to abort the save */
-    long long bio_stat_net_repl_input_bytes;    /* Used to calculate stat_net_repl_input_bytes on the
-                                                 * replica's bio thread without touching main thread vars */
+    _Atomic(long long) bio_stat_net_repl_input_bytes; /* Written by the BIO RDB-load thread, read by main.
+                                                       * Used to calculate stat_net_repl_input_bytes on the
+                                                       * replica's bio thread without touching main thread vars */
     off_t bio_repl_transfer_size;               /* Used to calculate bio_repl_transfer_size on the
                                                  * replica's bio thread without touching main thread vars */
     off_t bio_repl_transfer_read;               /* Used to calculate bio_repl_transfer_read on the
@@ -3208,6 +3213,7 @@ void dictVanillaFree(void *val);
                                             permissions under client->acl_epoch_seen and it passed.    \
                                             Only ALLOW is recorded; a denial leaves the bit clear and  \
                                             main runs the stock check to produce the exact error. */
+#define READ_FLAGS_DPLUS_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                     \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
@@ -3523,6 +3529,20 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
+/* D+: bracket a mutation of a PUBLISHED key's value from command code without exposing
+ * dplus internals. Begin computes the shard from the table's own hash fn; End closes it. */
+typedef struct dbKeyBracket {
+    void *va; /* dplusVersionArray* (opaque here) */
+    unsigned shard;
+} dbKeyBracket;
+void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);
+void dbKeyBracketEnd(dbKeyBracket *brk);
+/* Ensure a published RAW string value has capacity for total_len bytes, safely vs speculative
+ * readers: unchanged sds when capacity suffices, else a published replacement with the old
+ * allocation defer-freed. Call INSIDE a bracket. */
+sds dbGrowPublishedStringValue(robj *o, size_t total_len);
+robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
+robj *objectSetExpireEx(robj *o, long long expire, robj **retired);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
@@ -4212,6 +4232,8 @@ void armNoMainThreadFree(void);
 void disarmNoMainThreadFree(void);
 int noMainThreadFreeArmed(void);
 int inMainThread(void);
+void lazyfreeObjPrejudged(robj *obj);
+int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
 #define assertNoMainThreadFree() serverAssert(!(inMainThread() && noMainThreadFreeArmed()))
 #else

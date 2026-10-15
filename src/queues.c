@@ -84,9 +84,13 @@ size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     if (limit > max_jobs) limit = max_jobs;
 
     for (size_t i = 0; i < limit; ++i) {
-        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_relaxed);
+        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_acquire);
 
-        /* Stop if slot is reserved but data not yet written */
+        /* Stop if slot is reserved but data not yet written.
+         * NOTE: acquire ordering above synchronizes with the producer's release
+         * store to this slot, preventing ARM/weak-memory stale-NULL reads that
+         * caused silent command loss (the consumer saw an advanced tail but a
+         * stale buffer slot, breaking out prematurely). */
         if (!data) break;
 
         jobs_out[popped_count++] = data;

@@ -5,6 +5,7 @@
  */
 
 #include "io_threads.h"
+#include "dplus.h"
 #include "ae.h"
 #include "cluster.h"
 #include "cluster_legacy.h"
@@ -975,6 +976,10 @@ static void flushPendingIOResponses(int blocking) {
 void cleanupThreadResources(void *dummy) {
     UNUSED(dummy);
 
+    /* Cancellation cannot leave an ACTIVE epoch pin behind. Main still waits
+     * for pthread_join before publishing OFFLINE. */
+    dplusReaderWorkerQuiescent(thread_id);
+
     /* Blocking flush: ensure all pending jobs are sent before thread dies. A process
      * exit needs none of them and main is not draining, so it must not wait. */
     if (!atomic_load_explicit(&io_threads_exiting, memory_order_acquire)) flushPendingIOResponses(1);
@@ -1155,6 +1160,7 @@ static void *IOThreadMain(void *myid) {
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
+                dplusReaderAssertParkSafe(id); /* no ACTIVE epoch pin across a park */
                 pthread_mutex_lock(&io_threads_mutex[id]);
                 pthread_mutex_unlock(&io_threads_mutex[id]);
             }
@@ -1209,6 +1215,8 @@ static int createIOThread(int id) {
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
+    /* Publish a safe lifecycle state before the new thread can run. */
+    dplusReaderWorkerOnline(id);
     io_worker_parked[id] = 1;
     atomic_store_explicit(&io_worker_state[id], IO_WORKER_RUNNING, memory_order_release);
     if (id + 1 > io_worker_hwm) io_worker_hwm = id + 1;
@@ -1246,6 +1254,8 @@ static void shutdownIOThread(int id) {
     if ((err = pthread_join(tid, NULL)) != 0) {
         serverLog(LL_WARNING, "IO thread(tid:%lu) can not be joined: %s", (unsigned long)tid, strerror(err));
     } else {
+        /* Join is the proof that no stale worker can publish into this slot. */
+        dplusReaderWorkerOffline(id);
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);

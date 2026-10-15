@@ -1599,8 +1599,15 @@ int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
 
 /* Return the UNIX time in microseconds */
 long long ustime(void) {
-    static long long ust = 0;
-    static monotime mono_at_last_timeofday = 0;
+    /* D+ (S1.6): thread-local, NOT shared statics. IO threads call
+     * mstime()/ustime() on the speculative expiry-check path, racing main's
+     * writes to a shared calibration cache -- TSan-confirmed. A reader could
+     * observe the new monotonic anchor with the stale ust and return a time
+     * up to ~1ms in the past. Per-thread calibration keeps the fast path
+     * syscall-free with zero sharing; cost is one gettimeofday per thread
+     * per millisecond at worst. */
+    static __thread long long ust = 0;
+    static __thread monotime mono_at_last_timeofday = 0;
 
     /* Fast path. Only call gettimeofday() periodically and add monotonic delta.
      * This avoids a syscall if we have a no-syscall monotonic clock. */
