@@ -30,6 +30,7 @@
 
 #include "io_threads.h"
 #include "fastpath.h"
+#include "staged_loop.h"
 #include "sds.h"
 #include "server.h"
 #include "hotkeys.h"
@@ -2838,6 +2839,10 @@ static int updateMaxclients(const char **err) {
             return 0;
         }
     }
+    if (stagedResize(server.maxclients + CONFIG_FDSET_INCR) != 0) {
+        *err = "The staged event loop poller is not able to handle the specified number of clients";
+        return 0;
+    }
     return 1;
 }
 
@@ -3424,7 +3429,6 @@ static int applyClientMaxMemoryUsage(const char **err) {
     listRewind(server.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (c->flag.fastpath) continue; /* IO-owned: accounted through the fast-path registry, never touched here */
         if (server.maxmemory_clients == 0) {
             /* Remove client from memory usage bucket. */
             removeClientFromMemUsageBucket(c, 0);
@@ -3433,9 +3437,6 @@ static int applyClientMaxMemoryUsage(const char **err) {
             updateClientMemUsageAndBucket(c);
         }
     }
-
-    /* Apply the same enable/disable synchronously to the fast-path registry through its main-only API. */
-    fastpathApplyMaxmemoryClients(server.maxmemory_clients != 0);
 
     if (server.maxmemory_clients == 0) freeServerClientMemUsageBuckets();
     return 1;
@@ -3512,6 +3513,8 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
+    createIntConfig("keyspace-shard-bits", NULL, IMMUTABLE_CONFIG, 0, CLUSTER_SLOT_MASK_BITS, server.keyspace_shard_bits, 0, INTEGER_CONFIG, NULL, NULL),
+    createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
@@ -3593,11 +3596,7 @@ standardConfig static_configs[] = {
     createIntConfig("prefetch-ring-stride", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.prefetch_ring_stride, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-inflight", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 512, server.io_batch_inflight, 16, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-drain-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_batch_drain_us, 0, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("io-batch-hold-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 10000, server.io_batch_hold_us, 50, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */
     createIntConfig("list-max-listpack-size", "list-max-ziplist-size", MODIFIABLE_CONFIG, INT_MIN, INT_MAX, server.list_max_listpack_size, -2, INTEGER_CONFIG, NULL, NULL),

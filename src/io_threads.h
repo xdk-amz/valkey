@@ -38,8 +38,6 @@ typedef enum {
     JOB_RES_CLUSTER_WRITE,
     JOB_RES_CLUSTER_ACCEPT,
     JOB_RES_WRITE_SLAB, /* the write slab coming back with every client written */
-    JOB_RES_FP_CLOSE,   /* fast path: the IO thread is done with a closing client, main frees it */
-    JOB_RES_FP_HANDOFF, /* fast path: the IO thread hands a client to the main path */
     JOB_RES_COUNT
 } JobResult;
 static_assert(JOB_RES_COUNT <= 8, "JOB_RES_COUNT must not exceed 8 for pointer arithmetic");
@@ -50,6 +48,9 @@ void initIOThreads(int prev_threads_num);
 void killIOThreads(void);
 int inMainThread(void);
 int trySendReadToIOThreads(client *c);
+/* Main, staged loop: queue a read that drains the socket before parsing; C_OK when queued or
+ * when the client is already busy with IO. */
+int ioThreadsSendStagedRead(client *c);
 int trySendWriteToIOThreads(client *c);
 void flushWriteSlab(void);
 /* Partitioned client sockets remain owned by one IO thread. */
@@ -63,14 +64,6 @@ int partitionedClientHold(client *c);
 int partitionedClientInputWaiting(client *c);
 void ioThreadQueueReadCompletion(client *c);
 void reconcileLazyWrite(client *c);
-int ioThreadEpollFd(int tid);
-/* Main, after publishing work for thread tid: wakes it if it announced sleep. */
-void ioThreadWake(int tid);
-/* IO thread, after publishing results for main: wakes main if it announced sleep. */
-void ioThreadsWakeMain(void);
-/* beforeSleep: whether the event loop must poll without blocking; afterSleep clears the announcement. */
-int ioThreadsMainMustPoll(void);
-void ioThreadsMainAwake(void);
 void partitionedClientRelease(client *c);
 int partitionedClientHoldReads(client *c);
 int partitionedClientClaimRead(client *c);
@@ -100,6 +93,10 @@ int trySendClusterReadToIOThreads(struct clusterLink *link);
 int trySendClusterWriteToIOThreads(struct clusterLink *link);
 int trySendClusterAcceptToIOThreads(connection *conn);
 int updateIOThreads(const char **err);
+int ioThreadsStagedIdle(void);
+int ioThreadsInboxPending(void);
+void ioThreadsStagedUnpark(void);
+int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize);
 int applyIOThreadsFastpathConfig(const char **err);
 /* Worker lifecycle: main reconciles live threads with the configuration from beforeSleep. */
 void ioThreadsConverge(void);
@@ -111,6 +108,7 @@ void ioThreadsDebugFailCreate(int tid);
 long long getIOThreadActiveTimeMicroseconds(int id);
 int clientHasPendingIO(struct client *c);
 int processIOThreadsResponses(void);
+int inIOThreadsResponses(void);
 void commitIOJobs(void);
 int getCurTid(void);
 void sendToMainThread(void *data, int type);

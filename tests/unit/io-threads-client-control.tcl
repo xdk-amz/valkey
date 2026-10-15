@@ -60,11 +60,10 @@ proc cc_wait_workers_open {n} {
     }
 }
 
-# Every retirement finished and no worker is still quiescing.
+# Every retirement finished.
 proc cc_wait_settled {} {
     wait_for_condition 500 20 {
-        [getInfoProperty [r info server] io_threads_retiring] == 0 &&
-        [getInfoProperty [r info fastpath] fastpath_workers_quiescing] == 0
+        [getInfoProperty [r info server] io_threads_retiring] == 0
     } else {
         fail "workers did not settle: [r info server] [r info fastpath]"
     }
@@ -166,8 +165,9 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
         $ctl client setname cc-ctl
         assert_equal OK [$ctl read]
         set batches [cc_batches]
-        # DEBUG SLEEP holds main; the client's batch publishes while it sleeps, then
-        # the reconfigure lands. The late batch must run once, in order, before close.
+        # DEBUG SLEEP holds main, then the reconfigure lands in the same write phase.
+        # IO threads read only between write phases, so the pipeline is read either
+        # before the reconfigure or by main after it; either way it runs once, in order.
         set payload [cc_resp debug sleep 0.4]
         append payload [cc_resp config set io-threads 1]
         $ctl write $payload
@@ -175,11 +175,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
         after 50
         for {set j 0} {$j < 40} {incr j} { $c incr cc:d }
         $c flush
-        wait_for_condition 100 20 {
-            [cc_batches] > $batches
-        } else {
-            fail "no batch published while main slept"
-        }
         assert_equal OK [$ctl read]
         assert_equal OK [$ctl read]
         for {set j 1} {$j <= 40} {incr j} { assert_equal $j [$c read] }
@@ -335,7 +330,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
     }
 
     test {Control: queue backpressure during a lifecycle transition does not deadlock} {
-        assert_equal OK [r config set io-batch-inflight 1]
         set clients {}
         for {set i 0} {$i < 8} {incr i} {
             set c [cc_open_counter cc:j$i]
@@ -345,8 +339,8 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
         set i 0
         foreach c $clients { for {set j 0} {$j < 200} {incr j} { $c incr cc:j$i }; incr i }
         foreach c $clients { $c flush }
-        # Handoff every client to main while the in-flight window is one batch deep:
-        # publication cannot outrun return, so the transition must still drain.
+        # Hand every client back to main with its pipelines still arriving:
+        # every reply is delivered, in order, across the transition.
         assert_equal OK [r config set io-threads 1]
         set i 0
         foreach c $clients {
@@ -357,7 +351,6 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
         cc_wait_settled
         cc_assert_healthy
         foreach c $clients { $c close }
-        assert_equal OK [r config set io-batch-inflight 16]
         assert_equal OK [r config set io-threads 4]
         cc_wait_running 3
         cc_wait_workers_open 3

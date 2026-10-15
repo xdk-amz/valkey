@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -46,6 +47,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "staged_loop.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -2411,13 +2413,12 @@ void clearClientConnectionState(client *c) {
 int freeClient(client *c) {
     listNode *ln;
 
-    /* Fast-path teardown waits for every in-flight batch to return. */
+    /* A staged client is freed once main took it back after a reply barrier. */
     if (c->flag.fastpath) {
-        fastpathRequestDetach(c);
         freeClientAsync(c);
         return 0;
     }
-    /* Handed back with a detach still in its IO thread's ring: the pointer must stay valid until consumed. */
+    /* A recorded close not yet applied: the pointer must stay valid until main unmapped the client. */
     if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) {
         freeClientAsync(c);
         return 0;
@@ -2566,6 +2567,9 @@ int freeClient(client *c) {
  * a context where calling freeClient() is not possible, because the client
  * should be valid for the continuation of the flow of the program. */
 void freeClientAsync(client *c) {
+    debugServerAssert(inMainThread());
+    /* A staged client needs the close recorded, or it stays on the fast path and is never freed. */
+    if (c->flag.fastpath) fastpathRequestDetach(c);
     if (c->flag.close_asap || c->flag.script) return;
     c->flag.close_asap = 1;
     debugServerAssertWithInfo(c, NULL, listSearchKey(server.clients_to_close, c) == NULL);
@@ -2730,8 +2734,8 @@ int freeClientsInAsyncFreeQueue(void) {
             c->flag.protected_rdb_channel = 0;
         }
 
-        if (c->flag.fastpath) continue;                                     /* freed when its IO thread reports JOB_RES_FP_CLOSE */
-        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue; /* its IO thread may still meet the pointer */
+        if (c->flag.fastpath) continue; /* main unmaps it after the reply phase */
+        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue;
 
         reconcileLazyWrite(c);
         partitionedClientDetach(c);
@@ -4688,7 +4692,10 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
-        if (processCommandAndResetClient(c) == C_ERR) {
+        if (c->flag.primary && replApplyDefer(c)) {
+            c->flag.pending_command = 0;
+            commandProcessed(c);
+        } else if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
     }
@@ -4702,6 +4709,7 @@ int processPendingCommandAndInputBuffer(client *c) {
     if ((c->querybuf && sdslen(c->querybuf) > 0) || c->cmd_queue.off < c->cmd_queue.len) {
         return processInputBuffer(c);
     }
+    replApplyFlush(c);
     return C_OK;
 }
 
@@ -4853,12 +4861,13 @@ static int addKeysToIncrFindBatch(client *c,
             kvstore_idx = keyHashSlot(objectGetVal(first_key), sdslen(objectGetVal(first_key)));
         }
         hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
-        if (ht != NULL) {
-            for (int i = 0; i < numkeys && num < max; i++) {
-                hashtableIncrementalFindState *incr_state = &incr_states[num++];
-                robj *keyobj = argv[result.keys[i].pos];
-                hashtableIncrementalFindInit(incr_state, ht, objectGetVal(keyobj));
-            }
+        for (int i = 0; i < numkeys && num < max; i++) {
+            robj *keyobj = argv[result.keys[i].pos];
+            /* Standalone shards hold keys by their own hash, not by the first key's. */
+            if (!server.cluster_enabled && server.keyspace_shard_bits)
+                ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(keyobj)));
+            if (ht == NULL) continue;
+            hashtableIncrementalFindInit(&incr_states[num++], ht, objectGetVal(keyobj));
         }
     }
     getKeysFreeResult(&result);
@@ -4871,6 +4880,7 @@ static int addKeysToIncrFindBatch(client *c,
  * is used with I/O threading. */
 static void prefetchCommandQueueKeys(client *c) {
     if (c->read_flags & READ_FLAGS_PREFETCHED) return;
+    if (c->flag.primary && replApplyMayDefer()) return; /* the lanes, not main, touch these keys */
     c->read_flags |= READ_FLAGS_PREFETCHED;
 
     /* Prefetching states */
@@ -4932,7 +4942,19 @@ static void prefetchCommandQueueKeys(client *c) {
     }
 }
 
+static int processInputBufferLoop(client *c);
+
+/* Held replicated writes are applied before the caller sees the buffer's effects. */
 int processInputBuffer(client *c) {
+    int rc = processInputBufferLoop(c);
+    if (rc == C_OK)
+        replApplyFlush(c);
+    else
+        serverAssert(!replApplyPending());
+    return rc;
+}
+
+static int processInputBufferLoop(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
@@ -4976,6 +4998,14 @@ int processInputBuffer(client *c) {
              * This avoids unintentionally modifying the shared qb during processCommand as we may use
              * the shared qb for other clients during processEventsWhileBlocked */
             resetSharedQueryBuf(c);
+        }
+
+        if (c->flag.primary) {
+            if (replApplyDefer(c)) {
+                commandProcessed(c);
+                continue;
+            }
+            replApplyFlush(c);
         }
 
         /* We are finally ready to execute the command. */
@@ -7486,6 +7516,9 @@ void processEventsWhileBlocked(void) {
         if (!events) break;
     }
 
+    /* Fast-path clients are not on ae: give them one nested staged pass. */
+    stagedNestedIteration();
+
     whileBlockedCron();
 
     ProcessingEventsWhileBlocked--;
@@ -7512,6 +7545,8 @@ int postponeClientRead(client *c) {
 int strictOffloadActive(void) {
     /* Re-entrant event processing cannot drain deferred reads. */
     if (ProcessingEventsWhileBlocked) return 0;
+    /* The staged loop serves every non-fast-path client on main in its write phase. */
+    if (stagedLoopActive()) return 0;
     return server.io_threads_strict_offload && server.io_threads_num >= 2;
 }
 

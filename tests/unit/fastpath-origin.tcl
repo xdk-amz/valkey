@@ -85,7 +85,7 @@ proc fp_monitor_line_matching {m pattern} {
     fail "no MONITOR line matching $pattern"
 }
 
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000 enable-debug-command yes}} {
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     # Named clients stay on the main path, so the control connection is never counted.
@@ -105,13 +105,19 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         assert {$id_a != $id_b}
         assert {$peer_a ne $peer_b}
 
+        # Park main so both commands are collected by the same iteration; with one IO
+        # thread they then share one batch.
+        set ctl [fp_ctl_client]
         set batches [getInfoProperty [r info fastpath] fastpath_batches]
+        $ctl debug sleep 0.3
+        after 50
         $a get denied:a
         $b get denied:b
+        assert_equal OK [$ctl read]
         assert_error {*NOPERM*} {$a read}
         assert_error {*NOPERM*} {$b read}
-        # Both commands were held into the same batch.
         assert_equal [expr {$batches + 1}] [getInfoProperty [r info fastpath] fastpath_batches]
+        $ctl close
 
         set ea [lindex [fp_acl_log_entries_for_object denied:a] 0]
         set eb [lindex [fp_acl_log_entries_for_object denied:b] 0]
@@ -415,11 +421,8 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         after 50
         $a set deluser:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
         assert_equal 0 [r exists deluser:k]
@@ -442,11 +445,8 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         after 50
         $a set kill:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
         assert_equal 0 [r exists kill:k]
@@ -494,7 +494,7 @@ proc fp_write_acl {dir bob_rules} {
 }
 fp_write_acl $fp_acl_dir {~* &* +@all}
 
-start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2 io-batch-hold-us 10000]] {
+start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2]] {
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients
 
@@ -555,11 +555,8 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
         after 50
         $a set gone:k v
         $a flush
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_batches] == $batches + 1
-        } else {
-            fail "command was not published while main slept"
-        }
+        # IO threads read only between main's write phases, so the close lands first and
+        # the command is never read.
         assert_equal OK [$ctl read]
         assert_equal OK [$ctl read]
         assert_equal 0 [r exists gone:k]
@@ -574,7 +571,7 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
 }
 
 # With the default user password-protected no client is admitted at accept; it joins the fast path after AUTH.
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {requirepass fppw io-threads 2 io-batch-hold-us 10000}} {
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {requirepass fppw io-threads 2}} {
     r auth fppw
     r client setname fp-control
     r select 0

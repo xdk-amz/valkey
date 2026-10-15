@@ -116,6 +116,8 @@ void throttle_removeClient(client *c);
  * command cannot be blocked. Once a client is passed to this function, it will not be
  * throttled again for the same command after unblocking. */
 bool throttle_throttleClientIfNeeded(client *c);
+/* Any throttler is registered. */
+bool throttle_anyThrottlers(void);
 
 /* Get the metrics associated with a given metrics name.
  * The caller provides the metrics structure. */

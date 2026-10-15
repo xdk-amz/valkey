@@ -389,7 +389,8 @@ static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, 
     robj *member = (member_idx > 0 && member_idx < argc) ? argv[member_idx] : NULL;
     for (int i = 0; i < num_keys && batch->key_count < batch->max_prefetch_size; i++) {
         batch->keys[batch->key_count] = argv[result->keys[i].pos];
-        batch->slots[batch->key_count] = slot >= 0 ? slot : 0;
+        batch->slots[batch->key_count] =
+            slot >= 0 ? slot : getKVStoreIndexForKey(objectGetVal(argv[result->keys[i].pos]));
         /* Table resolution is deferred to prefetchCommands(): inline command
          * execution between now and then can free/replace this slot's
          * hashtable (cluster slot ops / DEL-empties) — a cached pointer here
@@ -478,7 +479,8 @@ void prefetchBatchRun(void) {
         if (key->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(key));
     }
     for (size_t i = 0; i < batch->key_count; i++) batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
-    resolveKeyTables();
+    for (size_t i = 0; i < batch->key_count; i++)
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
         hashtablePrefetch(batch->keys_tables);

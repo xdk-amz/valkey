@@ -51,10 +51,8 @@
 #include "monotonic.h"
 #include "config.h"
 #include "util.h"
-#include "dplus.h"
 
 #include <limits.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -321,28 +319,8 @@ struct hashtable {
     int16_t pause_auto_shrink; /* Non-zero = automatic resizing disallowed. */
     size_t child_buckets[2];   /* Number of allocated child buckets. */
     iter *safe_iterators;      /* Head of linked list of safe iterators */
-    /* Shard seqlocks for IO-thread speculative readers. Allocated only for a type
-     * with speculative_reads once speculative reads are enabled; NULL otherwise,
-     * in which case no reader walks this table and mutations publish nothing. */
-    dplusVersionArray *versions;
     void *metadata[];
 };
-
-/* Set once by hashtableEnableSpeculativeReads; never cleared. */
-static bool speculative_reads_enabled = false;
-
-/* Forward declarations for dplus version bump helpers (defined below). */
-static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash);
-static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash);
-static inline void dplusBracketAllBegin(hashtable *ht);
-static inline void dplusBracketAllEnd(hashtable *ht);
-
-/* Frees a bucket that a speculative walk may still hold; the free waits for
- * walk quiescence on a table with versions. */
-static inline void freeReachableBucket(hashtable *ht, bucket *b) {
-    if (!ht->versions || !dplusDeferFreeRaw(b)) zfree(b);
-}
-
 
 struct iter {
     hashtable *hashtable;
@@ -387,10 +365,7 @@ typedef struct {
     short pos;
     hashtable *hashtable;
     bucket *bucket;
-    union {
-        const void *key; /* while searching */
-        void *found;     /* once FOUND: the entry that matched, as read when it matched */
-    };
+    const void *key;
     uint64_t hash;
 } incrementalFind;
 
@@ -523,11 +498,6 @@ static void swapTables(hashtable *ht) {
 /* Swaps the tables and frees the old table. */
 static void rehashingCompleted(hashtable *ht) {
     if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
-    /* A speculative walk may hold pointers into the old bucket array: the
-     * seqlock validates results, not the walk's memory safety. Drain in-flight
-     * speculation until the free and swap are done. */
-    bool exclusive = ht->tables[0] && ht->versions;
-    if (exclusive) dplusExclusiveEnter();
     if (ht->tables[0]) {
         zfree(ht->tables[0]);
         if (ht->type->trackMemUsage) {
@@ -538,7 +508,6 @@ static void rehashingCompleted(hashtable *ht) {
     swapTables(ht);
     resetTable(ht, 1);
     ht->rehash_idx = -1;
-    if (exclusive) dplusExclusiveLeave();
 }
 
 /* Reverse bits, adapted to use bswap, from
@@ -575,27 +544,9 @@ size_t nextCursor(size_t v, size_t mask) {
     return v;
 }
 
-/* A chained bucket's last slot holds its child with bit 0 set. Entries of a table that
- * takes speculative reads (robj pointers) never have it, so a walk racing a chain change
- * can tell a child from an entry even when it sees the chained bit and the slot from
- * different moments. */
-#define CHILD_TAG ((uintptr_t)1)
-
-static inline void bucketSetChild(bucket *b, bucket *child) {
-    b->entries[ENTRIES_PER_BUCKET - 1] = (void *)((uintptr_t)child | CHILD_TAG);
-}
-
-static inline bool isChildPointer(const void *slot) {
-    return ((uintptr_t)slot & CHILD_TAG) != 0;
-}
-
-/* Returns the next bucket in a bucket chain, or NULL if there's no next. The slot is read
- * once; an untagged value is an entry a racing walk saw before the chain change, and ends
- * the chain. */
+/* Returns the next bucket in a bucket chain, or NULL if there's no next. */
 static bucket *getChildBucket(bucket *b) {
-    if (!b->chained) return NULL;
-    void *slot = b->entries[ENTRIES_PER_BUCKET - 1];
-    return isChildPointer(slot) ? (bucket *)((uintptr_t)slot & ~CHILD_TAG) : NULL;
+    return b->chained ? b->entries[ENTRIES_PER_BUCKET - 1] : NULL;
 }
 
 /* Attempts to defrag bucket 'b' using the defrag callback function. If the
@@ -605,7 +556,7 @@ static bucket *getChildBucket(bucket *b) {
 static bucket *bucketDefrag(bucket *prev, bucket *b, void *(*defragfn)(void *)) {
     bucket *reallocated = defragfn(b);
     if (reallocated == NULL) return b;
-    bucketSetChild(prev, reallocated);
+    prev->entries[ENTRIES_PER_BUCKET - 1] = reallocated;
     return reallocated;
 }
 
@@ -650,11 +601,11 @@ static void dismissRehashedBucketsIfNeeded(hashtable *ht) {
  * handle the cleanup of old buckets, such as clearing presence bits. */
 static void rehashStepFinalize(hashtable *ht) {
     size_t idx = ht->rehash_idx;
-    /* Free child bucket. Incremental rehash steps run while walks are in flight. */
+    /* Free child bucket. */
     bucket *b = getChildBucket(ht->tables[0] + idx);
     while (b != NULL) {
         bucket *next = getChildBucket(b);
-        freeReachableBucket(ht, b);
+        zfree(b);
         if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
         ht->child_buckets[0]--;
         b = next;
@@ -769,19 +720,11 @@ static void rehashStepShrink(hashtable *ht) {
  * old to the new hash table. */
 static void rehashStep(hashtable *ht) {
     assert(hashtableIsRehashing(ht));
-    /* S2.2b (rehash memo Option 3): bracket the entire step. Entry moves and
-     * in-place bucket clears were previously published by a single trailing
-     * bump-all -- a reader overlapping the step could validate against
-     * mid-move state. Odd during the step = refuse/punt; detection, not
-     * exclusion. rehashingCompleted's exclusive gate nests safely (readers
-     * punt on odd, so the drain is immediate). */
-    dplusBracketAllBegin(ht);
     if (ht->bucket_exp[1] < ht->bucket_exp[0]) {
         rehashStepShrink(ht);
-    } else {
-        rehashStepExpand(ht);
+        return;
     }
-    dplusBracketAllEnd(ht);
+    rehashStepExpand(ht);
 }
 
 /* Called internally on lookup and other reads to the table. */
@@ -856,16 +799,10 @@ static bool resize(hashtable *ht, size_t min_capacity, int *malloc_failed) {
         new_table = zcalloc(alloc_size);
     }
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, alloc_size);
-    /* S2.2 bracket: publish the new table + rehash_idx flip atomically w.r.t.
-     * validation. Completion (exclusive-gated) and instant-rehash steps
-     * (self-bracketed) stay OUTSIDE this bracket -- brackets do not nest on
-     * the same version array. */
-    dplusBracketAllBegin(ht);
     ht->bucket_exp[1] = exp;
     ht->tables[1] = new_table;
     ht->used[1] = 0;
     ht->rehash_idx = 0;
-    dplusBracketAllEnd(ht);
     if (ht->type->rehashingStarted) ht->type->rehashingStarted(ht);
 
     /* If the old table was empty, the rehashing is completed immediately. */
@@ -1018,7 +955,6 @@ static void moveEntry(bucket *bucket_to, int pos_to, bucket *bucket_from, int po
     bucket_to->hashes[pos_to] = bucket_from->hashes[pos_from];
     bucket_to->presence |= (1 << pos_to);
     bucket_from->presence &= ~(1 << pos_from);
-    bucket_from->entries[pos_from] = NULL; /* an empty slot never keeps a pointer that can be freed */
 }
 
 /* Converts a full bucket b to a chained bucket and adds a new child bucket. */
@@ -1031,14 +967,13 @@ static void bucketConvertToChained(hashtable *ht, bucket *b) {
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, sizeof(bucket));
     moveEntry(child, 0, b, pos);
     b->chained = 1;
-    bucketSetChild(b, child);
+    b->entries[pos] = child;
 }
 
 /* Converts a bucket with a next-bucket pointer to one without one. */
 static void bucketConvertToUnchained(bucket *b) {
     assert(b->chained);
     b->chained = 0;
-    b->entries[ENTRIES_PER_BUCKET - 1] = NULL;
     assert(!isPositionFilled(b, ENTRIES_PER_BUCKET - 1));
 }
 
@@ -1061,7 +996,7 @@ static void pruneLastBucket(hashtable *ht, bucket *before_last, bucket *last, in
         int pos_in_last = __builtin_ctz(last->presence);
         moveEntry(before_last, ENTRIES_PER_BUCKET - 1, last, pos_in_last);
     }
-    freeReachableBucket(ht, last);
+    zfree(last);
     if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
     ht->child_buckets[table_index]--;
 }
@@ -1102,8 +1037,8 @@ static void compactBucketChain(hashtable *ht, size_t bucket_index, int table_ind
         if (next->chained && next->presence == 0) {
             /* Empty bucket in the middle of the chain. Remove it from the chain. */
             bucket *next_next = getChildBucket(next);
-            bucketSetChild(b, next_next);
-            freeReachableBucket(ht, next);
+            b->entries[ENTRIES_PER_BUCKET - 1] = next_next;
+            zfree(next);
             if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, -sizeof(bucket));
             ht->child_buckets[table_index]--;
             continue;
@@ -1167,12 +1102,10 @@ static void insert(hashtable *ht, uint64_t hash, void *entry) {
     int pos_in_bucket;
     int table_index;
     bucket *b = findBucketForInsert(ht, hash, &pos_in_bucket, &table_index);
-    dplusBracketShardBegin(ht, hash);
     b->entries[pos_in_bucket] = entry;
     b->presence |= (1 << pos_in_bucket);
     b->hashes[pos_in_bucket] = highBits(hash);
     ht->used[table_index]++;
-    dplusBracketShardEnd(ht, hash);
 }
 
 /* A 64-bit fingerprint of some of the state of the hash table. */
@@ -1327,59 +1260,6 @@ static void invalidateAllSafeIterators(hashtable *ht) {
     while (ht->safe_iterators) untrackSafeIterator(ht->safe_iterators);
 }
 
-/* --- D+ sharded version functions --- */
-
-void dplusVersionArrayInit(dplusVersionArray *va) {
-    memset(va, 0, sizeof(*va));
-}
-
-/* Odd/even brackets: Begin before the first mutating store, End after the last.
- * A table without versions has no concurrent readers and publishes nothing. */
-static inline void dplusBracketShardBegin(hashtable *ht, uint64_t hash) {
-    if (ht->versions) dplusVersionBracketBegin(ht->versions, DPLUS_SHARD_INDEX(hash));
-}
-static inline void dplusBracketShardEnd(hashtable *ht, uint64_t hash) {
-    if (ht->versions) dplusVersionBracketEnd(ht->versions, DPLUS_SHARD_INDEX(hash));
-}
-static inline void dplusBracketAllBegin(hashtable *ht) {
-    if (ht->versions) dplusVersionBracketAllBegin(ht->versions);
-}
-static inline void dplusBracketAllEnd(hashtable *ht) {
-    if (ht->versions) dplusVersionBracketAllEnd(ht->versions);
-}
-
-/* Returns the table's version array, or NULL when the table takes no speculative reads. */
-dplusVersionArray *hashtableGetVersionArray(hashtable *ht) {
-    return ht->versions;
-}
-
-static size_t versionsMemUsage(const hashtable *ht) {
-    return ht->versions ? sizeof(dplusVersionArray) : 0;
-}
-
-static void allocVersions(hashtable *ht) {
-    ht->versions = zmalloc_cache_aligned(sizeof(dplusVersionArray));
-    dplusVersionArrayInit(ht->versions);
-}
-
-/* From now on, tables of a type with speculative_reads get versions when created. */
-void hashtableEnableSpeculativeReads(void) {
-    speculative_reads_enabled = true;
-}
-
-/* Gives an existing table versions if its type takes speculative reads. Must run
- * before any reader can reach the table. */
-void hashtableEnableVersions(hashtable *ht) {
-    if (ht->versions || !ht->type->speculative_reads) return;
-    allocVersions(ht);
-    if (ht->type->trackMemUsage) ht->type->trackMemUsage(ht, sizeof(dplusVersionArray));
-}
-
-/* Returns hash of a key using the hashtable's hash function. */
-uint64_t hashtableHashKey(hashtable *ht, const void *key) {
-    return hashKey(ht, key);
-}
-
 /* --- API functions --- */
 
 /* Allocates and initializes a new hashtable specified by the given type. */
@@ -1395,22 +1275,15 @@ hashtable *hashtableCreate(hashtableType *type) {
     ht->pause_rehash = 0;
     ht->pause_auto_shrink = 0;
     ht->safe_iterators = NULL;
-    ht->versions = NULL;
-    if (type->speculative_reads && speculative_reads_enabled) allocVersions(ht);
     resetTable(ht, 0);
     resetTable(ht, 1);
-    if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size + versionsMemUsage(ht));
+    if (type->trackMemUsage) type->trackMemUsage(ht, alloc_size);
     return ht;
 }
 
 /* Deletes all the entries. If a callback is provided, it is called from time
  * to time to indicate progress. */
 void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
-    /* This frees both bucket arrays, which a speculative walk may hold. Exclusive
-     * mode is counter based, so it nests inside FLUSHALL's own window. Off main it
-     * does nothing: a table freed there was unpublished by main first. */
-    bool exclusive = ht->versions != NULL;
-    if (exclusive) dplusExclusiveEnter();
     if (hashtableIsRehashing(ht)) {
         /* Pretend rehashing completed. */
         if (ht->type->rehashingCompleted) ht->type->rehashingCompleted(ht);
@@ -1453,7 +1326,6 @@ void hashtableEmpty(hashtable *ht, void(callback)(hashtable *)) {
         }
         resetTable(ht, table_index);
     }
-    if (exclusive) dplusExclusiveLeave();
 }
 
 /* Deletes all the entries and frees the table. */
@@ -1462,11 +1334,10 @@ void hashtableRelease(hashtable *ht) {
     hashtableEmpty(ht, NULL);
     /* Call trackMemUsage before zfree, so trackMemUsage can access ht. */
     if (ht->type->trackMemUsage) {
-        size_t alloc_size = sizeof(hashtable) + versionsMemUsage(ht);
+        size_t alloc_size = sizeof(hashtable);
         if (ht->type->getMetadataSize) alloc_size += ht->type->getMetadataSize();
         ht->type->trackMemUsage(ht, -alloc_size);
     }
-    zfree(ht->versions);
     zfree(ht);
 }
 
@@ -1516,7 +1387,7 @@ size_t hashtableMemUsage(const hashtable *ht) {
     size_t num_buckets = numBuckets(ht->bucket_exp[0]) + numBuckets(ht->bucket_exp[1]);
     num_buckets += ht->child_buckets[0] + ht->child_buckets[1];
     size_t metasize = ht->type->getMetadataSize ? ht->type->getMetadataSize() : 0;
-    return sizeof(hashtable) + metasize + versionsMemUsage(ht) + sizeof(bucket) * num_buckets;
+    return sizeof(hashtable) + metasize + sizeof(bucket) * num_buckets;
 }
 
 /* Pauses automatic shrinking. This can be called before deleting a lot of
@@ -1763,23 +1634,6 @@ void **hashtableFindRef(hashtable *ht, const void *key) {
     return b ? &b->entries[pos_in_bucket] : NULL;
 }
 
-/* Like hashtableFindRef, but also exposes the hash computed with THIS table's
- * hash function via *hash_out (valid only when the return value is non-NULL).
- * Callers that need the entry's hash after a lookup (e.g. the D+ shard
- * version bump on value replacement) MUST reuse this value instead of
- * recomputing with a hardcoded hash function: the table's hashFunction may
- * use the configurable seed (hash-seed config), and speculative readers
- * validate shard indices derived from the table's own function -- a bump
- * computed with a different seed lands on an uncorrelated shard. */
-void **hashtableFindRefWithHash(hashtable *ht, const void *key, uint64_t *hash_out) {
-    if (hashtableSize(ht) == 0) return NULL;
-    uint64_t hash = hashKey(ht, key);
-    int pos_in_bucket = 0;
-    bucket *b = findBucket(ht, hash, key, &pos_in_bucket, NULL);
-    if (b && hash_out) *hash_out = hash;
-    return b ? &b->entries[pos_in_bucket] : NULL;
-}
-
 /* Adds an entry. Returns true on success. Returns false if there was already an entry
  * with the same key. */
 bool hashtableAdd(hashtable *ht, void *entry) {
@@ -1868,14 +1722,10 @@ void hashtableInsertAtPosition(hashtable *ht, void *entry, hashtablePosition *po
     int pos_in_bucket = p->pos_in_bucket;
     int table_index = p->table_index;
     assert(!isPositionFilled(b, pos_in_bucket));
-    /* Hash bits are already set by hashtableFindPositionForInsert; the bracket
-     * needs the full hash, which the position does not carry. */
-    uint64_t d_hash = ht->versions ? hashKey(ht, entryGetKey(ht, entry)) : 0;
-    dplusBracketShardBegin(ht, d_hash);
     b->presence |= (1 << pos_in_bucket);
     b->entries[pos_in_bucket] = entry;
     ht->used[table_index]++;
-    dplusBracketShardEnd(ht, d_hash);
+    /* Hash bits are already set by hashtableFindPositionForInsert. */
 }
 
 /* Removes the entry with the matching key and returns it. The entry
@@ -1889,15 +1739,7 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
     bucket *b = findBucket(ht, hash, key, &pos_in_bucket, &table_index);
     if (b) {
         if (popped) *popped = b->entries[pos_in_bucket];
-        /* S2.2 bracket: presence clear + chain compaction. fillBucketHole
-         * moves an entry from the chain tail into the hole; the moved
-         * entry's shard may differ from 'hash' and is NOT bracketed here.
-         * That is safe under the E4 miss-punt policy: a reader that misses
-         * the entry mid-move punts to main (never replies nil), and a reader
-         * that finds it reads the same unchanged robj pointer. */
-        dplusBracketShardBegin(ht, hash);
         b->presence &= ~(1 << pos_in_bucket);
-        b->entries[pos_in_bucket] = NULL;
         ht->used[table_index]--;
         if (b->chained && !hashtableIsRehashingPaused(ht)) {
             /* Rehashing is paused while iterating and when a scan callback is
@@ -1905,7 +1747,6 @@ bool hashtablePop(hashtable *ht, const void *key, void **popped) {
              * iterator code instead. */
             fillBucketHole(ht, b, pos_in_bucket, table_index);
         }
-        dplusBracketShardEnd(ht, hash);
         hashtableShrinkIfNeeded(ht);
         return true;
     }
@@ -1945,9 +1786,7 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
             for (int pos = 0; pos < numBucketPositions(b); pos++) {
                 if (isPositionFilled(b, pos) && b->hashes[pos] == h2 && b->entries[pos] == old_entry) {
                     /* It's a match. */
-                    dplusBracketShardBegin(ht, hash);
                     b->entries[pos] = new_entry;
-                    dplusBracketShardEnd(ht, hash);
                     return true;
                 }
             }
@@ -2026,12 +1865,7 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
 
     /* Delete the entry and resume rehashing. */
     assert(isPositionFilled(b, pos_in_bucket));
-    /* S2.2 bracket: no hash in the position struct, so bracket all shards
-     * (rare operation). Span covers the presence clear through the chain
-     * compaction (fillBucketHole moves an entry between buckets). */
-    dplusBracketAllBegin(ht);
     b->presence &= ~(1 << pos_in_bucket);
-    b->entries[pos_in_bucket] = NULL;
     ht->used[table_index]--;
     /* When we resume rehashing, it may cause the bucket to be deleted due to
      * auto shrink. */
@@ -2044,7 +1878,6 @@ void hashtableTwoPhasePopDelete(hashtable *ht, hashtablePosition *pos) {
          * we do the compaction in the scan and iterator code instead. */
         fillBucketHole(ht, b, pos_in_bucket, table_index);
     }
-    dplusBracketAllEnd(ht);
     hashtableResumeAutoShrink(ht);
 }
 
@@ -2080,15 +1913,10 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
         {
             hashtable *ht = data->hashtable;
             void *entry = data->bucket->entries[data->pos];
-            /* A walk racing main (a speculative reader) can find a slot whose presence bit it
-             * read before the slot changed: the slot then holds NULL (emptied) or a child
-             * pointer (the bucket was chained). Neither is an entry. On main a filled slot
-             * always holds an entry. */
-            const void *elem_key = (entry && !(ht->versions && isChildPointer(entry))) ? entryGetKey(ht, entry) : NULL;
-            if (elem_key && compareKeys(ht, data->key, elem_key)) {
-                /* It's a match. Keep the entry: the slot may change before the result is read. */
+            const void *elem_key = entryGetKey(ht, entry);
+            if (compareKeys(ht, data->key, elem_key)) {
+                /* It's a match. */
                 data->state = validateElementIfNeeded(ht, entry) ? HASHTABLE_FOUND : HASHTABLE_NOT_FOUND;
-                data->found = entry;
                 return false;
             }
             /* No match. Look for next candidate entry in the bucket. */
@@ -2117,39 +1945,28 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
          * chain, or in next table, and prefetch it. */
         {
             hashtable *ht = data->hashtable;
-            bucket *child = data->bucket ? getChildBucket(data->bucket) : NULL;
-            bucket *table = NULL;
-            size_t bucket_idx = 0;
             if (data->bucket == NULL) {
                 data->table = 0;
                 size_t mask = expToMask(ht->bucket_exp[0]);
-                bucket_idx = data->hash & mask;
+                size_t bucket_idx = data->hash & mask;
                 if (ht->rehash_idx >= 0 && bucket_idx < (size_t)ht->rehash_idx) {
                     /* Skip already rehashed bucket in table 0. */
                     data->table = 1;
                     mask = expToMask(ht->bucket_exp[1]);
                     bucket_idx = data->hash & mask;
                 }
-                table = ht->tables[data->table];
-            } else if (child != NULL) {
-                data->bucket = child;
+                data->bucket = &ht->tables[data->table][bucket_idx];
+            } else if (getChildBucket(data->bucket) != NULL) {
+                data->bucket = getChildBucket(data->bucket);
             } else if (data->table == 0 && ht->rehash_idx >= 0) {
                 data->table = 1;
                 size_t mask = expToMask(ht->bucket_exp[1]);
-                bucket_idx = data->hash & mask;
-                table = ht->tables[1];
+                size_t bucket_idx = data->hash & mask;
+                data->bucket = &ht->tables[data->table][bucket_idx];
             } else {
                 /* No more tables. */
                 data->state = HASHTABLE_NOT_FOUND;
                 return false;
-            }
-            if (child == NULL) {
-                /* A walk racing a resize can see the new table's size before the table itself. */
-                if (table == NULL) {
-                    data->state = HASHTABLE_NOT_FOUND;
-                    return false;
-                }
-                data->bucket = &table[bucket_idx];
             }
             valkey_prefetch(data->bucket);
             data->state = HASHTABLE_NEXT_ENTRY;
@@ -2171,7 +1988,7 @@ bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state) {
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found) {
     incrementalFind *data = incrementalFindFromOpaque(state);
     if (data->state == HASHTABLE_FOUND) {
-        if (found) *found = data->found;
+        if (found) *found = data->bucket->entries[data->pos];
         return true;
     } else {
         assert(data->state == HASHTABLE_NOT_FOUND);

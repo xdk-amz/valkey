@@ -497,4 +497,29 @@ start_cluster 2 0 {overrides {cluster-node-timeout 1000}} {
 
 }
 
+set modules [list loadmodule $testmodule_nokey loadmodule $testmodule_auth]
+start_cluster 1 0 [list config_lines $modules] {
+    test "Module-blocked command runs once after it is released" {
+        R 0 config resetstat
+        set rd [valkey_deferring_client 0]
+        $rd block.block 0
+        $rd flush
+        wait_for_blocked_clients_count 1 50 100 0
+        R 0 block.release 0
+        assert_equal {0} [$rd read]
+        wait_for_blocked_clients_count 0 50 100 0
+        assert_match {*calls=1,*} [cmdrstat block.block [srv 0 client]]
+        $rd close
+    }
+
+    test "Blocking module AUTH completes after unblock" {
+        R 0 acl setuser foo >pwd on ~* &* +@all
+        assert_equal {OK} [R 0 testmoduleone.rm_register_blocking_auth_cb]
+        set rc [valkey_client 0]
+        assert_equal {OK} [$rc AUTH foo block_allow]
+        assert_equal {foo} [$rc acl whoami]
+        $rc close
+    }
+}
+
 } ;# end tag

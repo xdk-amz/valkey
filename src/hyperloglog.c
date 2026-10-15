@@ -676,7 +676,8 @@ int hllSparseToDense(robj *o) {
     }
 
     /* Free the old representation and set the new one. */
-    dbReplacePublishedStringBuffer(o, dense);
+    sdsfree(objectGetVal(o));
+    objectSetVal(o, dense);
     return C_OK;
 }
 
@@ -720,7 +721,7 @@ static int hllSparseSet(robj *o, long index, uint8_t count) {
             min(newlen,
                 300); /* Greediness: double 'newlen' if it is smaller than 300, or add 300 to it when it exceeds 300 */
         if (newlen > server.hll_sparse_max_bytes) newlen = server.hll_sparse_max_bytes;
-        dbGrowPublishedStringValue(o, newlen);
+        objectSetVal(o, sdsResize(objectGetVal(o), newlen, 1));
     }
 
     /* Step 1: we need to locate the opcode we need to modify to check

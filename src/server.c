@@ -60,6 +60,7 @@
 #include "throttle_repl.h"
 #include "util.h"
 #include "forkless.h"
+#include "staged_loop.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -1294,8 +1295,13 @@ static void clientsCron(int clients_this_cycle) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
-        if (c->flag.fastpath) continue; /* owned by an IO thread; main touches nothing of it */
-        reconcileLazyWrite(c);          /* a silent client's last write is settled here at the latest */
+        if (c->flag.fastpath) {
+            /* Crons run between staged phases, so the idle timeout may close a staged client; the
+             * close takes effect after the next reply phase. Nothing else here applies to it. */
+            if (fastpathStagedOn()) clientsCronHandleTimeout(c, now);
+            continue;
+        }
+        reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
         /* The following functions do different service checks on the client.
@@ -2034,10 +2040,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
-    /* D+: fold per-IO-thread speculated command counters into stat_numcommands, then seal this
-     * loop's retirements, advance the epoch and reclaim what no reader can still reach. */
+    /* D+: fold per-IO-thread speculated command counters into stat_numcommands. */
     dplusAggregateStats();
-    dplusReclaimRetired();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -2209,6 +2213,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
             server.el_cmd_cnt_max = el_command_cnt;
         }
     }
+
+    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
+     * connection has pending data). Fast-path batches arrive on rings the
+     * event loop knows nothing about, so main polls while such clients exist;
+     * the staged loop waits on its poller instead. */
+    aeSetDontWait(server.el, dont_sleep);
 
     updateCopyAvoidPressure(current_time);
 
@@ -3017,6 +3027,8 @@ void resetServerStats(void) {
 
     dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     server.stat_numcommands = 0;
+    server.stat_repl_parallel_applied = 0;
+    server.stat_repl_apply_phases = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredfields = 0;
@@ -3141,6 +3153,8 @@ serverDb *createDatabase(int id) {
     if (server.cluster_enabled) {
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
+    } else {
+        slot_count_bits = server.keyspace_shard_bits;
     }
 
     serverDb *db = zmalloc(sizeof(serverDb));
@@ -4340,35 +4354,7 @@ void call(client *c, int flags) {
         }
     }
 
-    /* D+: a speculative read must not see a unit of work half applied. Scripts, transactions and
-     * the other commands below drain readers for their whole run. Multi-key string writes, in-place
-     * string writers and module write commands hold the shards of their keys instead. Inside an
-     * exclusive window (an EXEC body) readers are already kept out; a nested call inside a unit
-     * adds its shards to it, and the call that opened the unit releases it. */
-    int dplus_exclusive = 0, dplus_unit_opened = 0;
-    if (server.io_threads_num > 1 && !dplusInExclusiveWindow()) {
-        serverCommandProc *proc = c->cmd->proc;
-        int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
-                                     (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
-                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-unpin") ||
-                                      !strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-stats"));
-        if (proc == evalCommand || proc == evalShaCommand || proc == fcallCommand || proc == execCommand ||
-            proc == keysCommand || proc == flushdbCommand || proc == flushallCommand ||
-            (proc == debugCommand && !dplus_epoch_debug_hook)) {
-            dplusExclusiveEnter();
-            dplus_exclusive = 1;
-        } else if (proc == msetCommand || proc == msetnxCommand || proc == msetexCommand || proc == setbitCommand ||
-                   proc == bitfieldCommand || proc == pfaddCommand || proc == pfmergeCommand ||
-                   proc == pfcountCommand || proc == pfdebugCommand ||
-                   (c->cmd->module_cmd && !(c->cmd->flags & CMD_READONLY))) {
-            dplus_unit_opened = dbUnitHoldCommandKeys(c);
-        }
-    }
-
     c->cmd->proc(c);
-
-    if (dplus_unit_opened) dplusUnitRelease();
-    if (dplus_exclusive) dplusExclusiveLeave();
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
         robj **argv = c->original_argv ? c->original_argv : c->argv;
@@ -7053,6 +7039,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
+                "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + fp_net_in + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + fp_net_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
@@ -8471,7 +8459,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
+    stagedMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
 }

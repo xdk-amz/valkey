@@ -80,10 +80,6 @@ typedef struct {
     size_t (*getMetadataSize)(void);
     /* Flag to disable incremental rehashing */
     unsigned instant_rehashing : 1;
-    /* IO threads may read entries concurrently with the owning thread once
-     * speculative reads are enabled; such tables publish mutations through a
-     * version array and defer bucket frees until readers are quiescent. */
-    unsigned speculative_reads : 1;
 
 } hashtableType;
 
@@ -156,7 +152,6 @@ void hashtableSetCanAbortShrink(bool can_abort);
 bool hashtableFind(hashtable *ht, const void *key, void **found);
 uint32_t hashtableFindBatch(hashtable *ht, int numkeys, const void **keys, void **found_entries);
 void **hashtableFindRef(hashtable *ht, const void *key);
-void **hashtableFindRefWithHash(hashtable *ht, const void *key, uint64_t *hash_out);
 bool hashtableAdd(hashtable *ht, void *entry);
 bool hashtableAddOrFind(hashtable *ht, void *entry, void **existing);
 bool hashtableFindPositionForInsert(hashtable *ht, void *key, hashtablePosition *position, void **existing);
@@ -169,14 +164,6 @@ bool hashtableReplaceReallocatedEntry(hashtable *ht, const void *old_entry, void
 void hashtableIncrementalFindInit(hashtableIncrementalFindState *state, hashtable *ht, const void *key);
 bool hashtableIncrementalFindStep(hashtableIncrementalFindState *state);
 bool hashtableIncrementalFindGetResult(hashtableIncrementalFindState *state, void **found);
-
-/* D+ speculative read support */
-struct dplusVersionArray;
-typedef struct dplusVersionArray dplusVersionArray;
-dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
-void hashtableEnableSpeculativeReads(void);
-void hashtableEnableVersions(hashtable *ht);
-uint64_t hashtableHashKey(hashtable *ht, const void *key);
 
 /* Iteration & scan */
 size_t hashtableScan(hashtable *ht, size_t cursor, hashtableScanFunction fn, void *privdata);

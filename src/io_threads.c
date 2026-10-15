@@ -5,12 +5,14 @@
  */
 
 #include "io_threads.h"
-#include "dplus.h"
 #include "ae.h"
 #include "cluster.h"
 #include "cluster_legacy.h"
 #include "connhelpers.h"
 #include "fastpath.h"
+#include "staged_loop.h"
+#include "repl_apply.h"
+#include "phase_barrier.h"
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
@@ -48,9 +50,6 @@ static inline void cpuRelax(void) {
 
 /* io_epoll_seq lets main wait out stale references from the last epoll pass. */
 static int io_epfd[IO_THREADS_MAX_NUM];
-int ioThreadEpollFd(int tid) {
-    return io_epfd[tid];
-}
 static _Atomic uint64_t io_epoll_seq[IO_THREADS_MAX_NUM];
 static unsigned partition_rr = 0;      /* main-thread only */
 static size_t partitioned_clients = 0; /* main-thread only */
@@ -501,6 +500,11 @@ static int clientIsPartitionable(client *c) {
     return 1;
 }
 
+/* Flags that describe the command held in argv; processCommand() needs them if it runs again. */
+#define READ_FLAGS_CURRENT_COMMAND                                                                  \
+    (READ_FLAGS_PARSING_COMPLETED | READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY | READ_FLAGS_NO_KEYS | \
+     READ_FLAGS_CROSSSLOT)
+
 static void setClientReadFlagsForOffload(client *c) {
     /* A blocked command stays in argv and re-executes after unblock with its parse-time slot outcome. */
     int keep = c->flag.pending_command ? c->read_flags & (READ_FLAGS_NO_KEYS | READ_FLAGS_CROSSSLOT) : 0;
@@ -513,6 +517,7 @@ static void setClientReadFlagsForOffload(client *c) {
 
 /* One-shot readiness serializes IO-thread reads against main-thread command drains. */
 int tryPartitionClient(client *c) {
+    if (stagedLoopActive()) return C_ERR; /* IO threads only run staged phases */
     if (!clientIsPartitionable(c)) return C_ERR;
     if (io_ready_num < 2) return C_ERR;
     int tid = 1 + (int)(partition_rr++ % (unsigned)(io_ready_num - 1));
@@ -711,12 +716,6 @@ static int ioThreadPollPartitionWait(int id, int timeout_ms) {
             continue;
         }
         client *c = (client *)evs[i].data.ptr;
-        if (c->flag.fastpath) {
-            if (evs[i].events & EPOLLOUT) fastpathClientWritable(id, c);
-            if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) fastpathClientReadable(id, c);
-            processed++;
-            continue;
-        }
         if (!partitionedClientClaimRead(c)) continue;
         ioThreadReadQueryFromClient(c);
         processed++;
@@ -949,34 +948,37 @@ static size_t getPendingIOResponsesCount(void) {
     return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
 }
 
-static int ioThreadsMainHasWork(void) {
-    for (int p = 0; p < JOB_PRIORITY_COUNT; p++)
-        if (mpscConsumerHasItem(&io_shared_outbox[p])) return 1;
-    for (int tid = 1; tid < io_worker_hwm; tid++)
-        if (io_cmd_ring[tid].buffer && spscBacklog(&io_cmd_ring[tid]) > 0) return 1;
-    return fastpathMainHasWork();
+/* The staged loop may start only when no stock IO job, response or offloaded poll is outstanding:
+ * staged workers take jobs only at a phase start, so nothing may wait on one in between. */
+int ioThreadsStagedIdle(void) {
+    return getPendingIOThreadsJobs() == 0 && getPendingIOResponsesCount() == 0 &&
+           server.io_poll_state == AE_IO_STATE_NONE && partitioned_clients == 0;
 }
 
-/* beforeSleep, as the last step: whether the event loop must poll without blocking because IO threads
- * may publish results it does not watch. After io-threads-idle-us without results main announces sleep
- * instead, and a thread that publishes for it then wakes it. */
-int ioThreadsMainMustPoll(void) {
-    if (fastpathClientCount() == 0 && getPendingIOResponsesCount() == 0) return 0;
-    if (!mainIOIdle() || server.io_poll_state != AE_IO_STATE_NONE) return 1;
-    /* Reads and writes that could not be offloaded are retried on the next pass. */
-    if (listLength(server.clients_pending_read) || listLength(server.clients_pending_write)) return 1;
-    atomic_store_explicit(&main_sleep.sleeping, 1, memory_order_relaxed);
-    atomic_thread_fence(memory_order_seq_cst);
-    if (ioThreadsMainHasWork()) {
-        atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
-        return 1;
-    }
-    return 0;
+/* Jobs queued for staged workers that a read phase should pick up even with no ready client. */
+int ioThreadsInboxPending(void) {
+    for (int i = 1; i < io_ready_num; i++)
+        if (!spscIsEmpty(&io_private_inbox[i])) return 1;
+    return !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_HIGH]) || !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
 }
 
-/* afterSleep */
-void ioThreadsMainAwake(void) {
-    atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
+/* Main: CPU mask of IO thread tid into a cpu_set_t of cpusetsize bytes; 0 on success. */
+int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize) {
+#ifdef __linux__
+    if (tid <= 0 || tid >= IO_THREADS_MAX_NUM || io_threads[tid] == 0) return -1;
+    return pthread_getaffinity_np(io_threads[tid], cpusetsize, (cpu_set_t *)cpuset) == 0 ? 0 : -1;
+#else
+    UNUSED(tid);
+    UNUSED(cpuset);
+    UNUSED(cpusetsize);
+    return -1;
+#endif
+}
+
+/* Staged workers are never parked on their mutex; every ready thread counts as active. */
+void ioThreadsStagedUnpark(void) {
+    for (int i = 1; i < io_ready_num; i++) ioWorkerUnpark(i);
+    server.active_io_threads_num = io_ready_num;
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -985,6 +987,11 @@ void drainIOThreadsQueue(void) {
     serverAssert(inMainThread());
     flushWriteSlab();
     commitIOJobs();
+    if (stagedLoopActive()) {
+        /* Staged workers take jobs only at a phase start. */
+        while (getPendingIOThreadsJobs()) stagedDrainWorkers();
+        return;
+    }
     while (getPendingIOThreadsJobs()) {
         atomic_thread_fence(memory_order_acquire);
     }
@@ -1034,6 +1041,8 @@ void IOThreadsBeforeSleep(long long current_time) {
     flushWriteSlab();
     commitIOJobs();
 
+    if (stagedLoopActive()) return; /* staged workers wait on the phase barrier; no park policy */
+
     if (server.io_threads_always_active) {
         /* active_all_io_threads state is for debug purposes: deactivate all threads before sleep if no pending jobs,
          * and reactivate all after sleep. We can't leave it active all the time as it will consume much CPU that will interfere with tests */
@@ -1065,6 +1074,10 @@ void IOThreadsBeforeSleep(long long current_time) {
 void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_num == 1) return;
     serverAssert(inMainThread());
+    if (stagedLoopActive()) {
+        ioThreadsStagedUnpark();
+        return;
+    }
     /* Always Active Policy */
     if (server.io_threads_always_active) {
         if ((numevents > 0 || strictOffloadActive()) && server.active_io_threads_num < io_ready_num) {
@@ -1206,10 +1219,6 @@ static void flushPendingIOResponses(int blocking) {
 void cleanupThreadResources(void *dummy) {
     UNUSED(dummy);
 
-    /* Cancellation cannot leave an ACTIVE epoch pin behind. Main still waits
-     * for pthread_join before publishing OFFLINE. */
-    dplusReaderWorkerQuiescent(thread_id);
-
     /* Blocking flush: ensure all pending jobs are sent before thread dies. A process
      * exit needs none of them and main is not draining, so it must not wait. */
     if (!atomic_load_explicit(&io_threads_exiting, memory_order_acquire)) flushPendingIOResponses(1);
@@ -1308,38 +1317,72 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
     }
 }
 
-#define IO_SLEEP_MAX_MS 100
+/* Drain the private and shared job inboxes; returns the number of jobs run. */
+static int ioThreadDrainInboxes(long id, void **batch_jobs) {
+    int processed = 0;
+    size_t batch_count;
+    /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
+    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+        for (size_t i = 0; i < batch_count; i++) {
+            void *data;
+            int type;
+            untagJob(batch_jobs[i], &data, &type);
 
-/* Nothing the thread consumes is waiting, so only an event or a wake gives it work. */
-static int ioThreadMaySleep(int id) {
-    if (ioWorkerState(id) != IO_WORKER_RUNNING) return 0; /* a retiring thread keeps handing back */
-    if (spscBacklog(&io_private_inbox[id]) > 0) return 0;
-    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
-        if (pending_io_responses[p]) return 0;
-        if (spmcConsumerHasItem(&io_shared_inbox[p])) return 0;
+            switch (type) {
+            case JOB_SPSC_FREE_ARGV:
+                ioThreadFreeArgv((robj **)data);
+                break;
+            case JOB_SPSC_POLL:
+                ioThreadPoll((aeEventLoop *)data);
+                break;
+            case JOB_SPSC_WRITE_SLAB:
+                ioThreadWriteSlab((writeSlab *)data);
+                break;
+            case JOB_SPSC_FREE_SLAB:
+                ioThreadFreeSlab((freeSlab *)data);
+                break;
+            default:
+                serverPanic("Invalid SPSC job type: %d", type);
+            }
+        }
+        processed += batch_count;
     }
-    return fastpathThreadIdle(id);
+
+    for (int shared_n = 0; shared_n < 64; shared_n++) {
+        void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
+        if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
+        if (!tagged_job) break;
+        processTaggedSPMCJob(tagged_job);
+        processed++;
+    }
+
+    if (processed) {
+        atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
+    }
+    return processed;
 }
 
-/* Blocks until a socket event, a wake or the timeout; returns the events handled. */
-static int ioThreadSleep(int id) {
-    ioSleepSlot *s = &io_sleep[id];
-    if (s->rfd < 0) return 0; /* no wake channel: keep polling */
-    atomic_store_explicit(&s->sleeping, 1, memory_order_relaxed);
-    atomic_thread_fence(memory_order_seq_cst);
-    if (!ioThreadMaySleep(id)) {
-        atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
-        return 0;
+/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Every phase starts
+ * by draining the job inboxes, so free offload keeps working while the thread waits on the barrier. */
+static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
+    phaseBarrier *b = stagedBarrier();
+    for (;;) {
+        int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
+        if (phase == PHASE_BARRIER_EXIT) return;
+        monotime start = getMonotonicUs();
+        ioThreadDrainInboxes(id, batch_jobs);
+        if (phase == STAGED_PHASE_READ)
+            fastpathStagedReadPhase((int)id);
+        else if (phase == STAGED_PHASE_REPLY)
+            fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_APPLY)
+            replApplyRunLane((int)id);
+        if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
+            flushPendingIOResponses(0);
+        atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
+        phaseBarrierDone(b);
+        if (phase == STAGED_PHASE_SYNC) return;
     }
-#ifdef HAVE_FASTPATH_EPOLL
-    return ioThreadPollPartitionWait(id, IO_SLEEP_MAX_MS);
-#else
-    struct pollfd pfd = {.fd = s->rfd, .events = POLLIN};
-    poll(&pfd, 1, IO_SLEEP_MAX_MS);
-    atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
-    ioSleepDrain(s);
-    return 0;
-#endif
 }
 
 static void *IOThreadMain(void *myid) {
@@ -1357,13 +1400,19 @@ static void *IOThreadMain(void *myid) {
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
-    monotime idle_since = 0;
+    uint64_t staged_seen = 0;
+    uint32_t staged_gen = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
         /* A stop lands between iterations, after every dequeued job has run. */
         if (ioWorkerState((int)id) == IO_WORKER_STOPPING) break;
-        size_t batch_count = 0;
+        if (ioWorkerState((int)id) == IO_WORKER_RUNNING && stagedWorkerEnrolled((int)id, &staged_seen, &staged_gen)) {
+            ioThreadStagedLoop(id, batch_jobs, &staged_seen);
+            processed = 0;
+            work_start_time = getMonotonicUs();
+            continue;
+        }
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
         if (processed != 0) {
@@ -1371,50 +1420,9 @@ static void *IOThreadMain(void *myid) {
                                       work_start_time - prev_work_start_time,
                                       memory_order_relaxed);
         }
-        processed = 0;
-        /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
-            for (size_t i = 0; i < batch_count; i++) {
-                void *data;
-                int type;
-                untagJob(batch_jobs[i], &data, &type);
-
-                switch (type) {
-                case JOB_SPSC_FREE_ARGV:
-                    ioThreadFreeArgv((robj **)data);
-                    break;
-                case JOB_SPSC_POLL:
-                    ioThreadPoll((aeEventLoop *)data);
-                    break;
-                case JOB_SPSC_WRITE_SLAB:
-                    ioThreadWriteSlab((writeSlab *)data);
-                    break;
-                case JOB_SPSC_FREE_SLAB:
-                    ioThreadFreeSlab((freeSlab *)data);
-                    break;
-                default:
-                    serverPanic("Invalid SPSC job type: %d", type);
-                }
-            }
-            processed += batch_count;
-        }
-
-        for (int shared_n = 0; shared_n < 64; shared_n++) {
-            void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
-            if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
-            if (!tagged_job) break;
-            processTaggedSPMCJob(tagged_job);
-            processed++;
-        }
-
-        if (processed) {
-            atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
-        }
+        processed = ioThreadDrainInboxes(id, batch_jobs);
 
         if (io_epfd[id] > 0) processed += ioThreadPollPartitionWait(id, 0);
-
-        processed += fastpathProcessReturns(id);
-        fastpathSubmitPending(id);
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
@@ -1426,7 +1434,6 @@ static void *IOThreadMain(void *myid) {
                 flushPendingIOResponses(0);
             } else {
                 /* If it is locked. We should block until main thread unlocks it. */
-                dplusReaderAssertParkSafe(id); /* no ACTIVE epoch pin across a park */
                 pthread_mutex_lock(&io_threads_mutex[id]);
                 pthread_mutex_unlock(&io_threads_mutex[id]);
                 monotime now = getMonotonicUs();
@@ -1494,8 +1501,6 @@ static int createIOThread(int id) {
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
     /* Publish a safe lifecycle state before the new thread can run. */
-    dplusEnableSpeculativeReads();
-    dplusReaderWorkerOnline(id);
     io_worker_parked[id] = 1;
     atomic_store_explicit(&io_worker_state[id], IO_WORKER_RUNNING, memory_order_release);
     if (id + 1 > io_worker_hwm) io_worker_hwm = id + 1;
@@ -1533,8 +1538,6 @@ static void shutdownIOThread(int id) {
     if ((err = pthread_join(tid, NULL)) != 0) {
         serverLog(LL_WARNING, "IO thread(tid:%lu) can not be joined: %s", (unsigned long)tid, strerror(err));
     } else {
-        /* Join is the proof that no stale worker can publish into this slot. */
-        dplusReaderWorkerOffline(id);
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
@@ -1572,6 +1575,7 @@ void ioThreadsStopForExit(void) {
         any = 1;
     }
     if (!any) return;
+    stagedStopWorkers(); /* staged workers wait on the barrier, not on their mutex */
     monotime deadline = getMonotonicUs() + 2000000;
     for (int id = 1; id < io_worker_hwm; id++) {
         if (io_threads[id] == 0) continue;
@@ -1602,14 +1606,11 @@ static void ioWorkerRetire(int tid) {
     spscCommit(&io_private_inbox[tid]); /* the last jobs main batched for it */
     ioWorkerUnpark(tid);
     atomic_store_explicit(&io_worker_state[tid], IO_WORKER_QUIESCING, memory_order_release);
-    ioThreadWake(tid);
-    fastpathWorkerQuiesce(tid);
     unpartitionWorkerClients(tid);
 }
 
 /* Preconditions for STOPPING: nothing main owns still names the thread and nothing can reach it. */
 static int ioWorkerDrained(int tid) {
-    if (!fastpathWorkerDrained(tid)) return 0;
     if (listLength(io_partition_clients[tid]) > 0) return 0;
     while (processCommandRingOne(tid, 0) > 0) { /* completions a partitioned client left behind */
     }
@@ -1618,18 +1619,6 @@ static int ioWorkerDrained(int tid) {
     /* The shared inbox is drained by whichever threads remain; the last one finishes it. */
     if (io_ready_num <= 1 && getPendingIOThreadsJobs() > 0) return 0;
     return 1;
-}
-
-/* Fast-path role of a running thread follows the configuration; a quiesce completes before a reopen. */
-static int ioWorkerReconcileFastpath(int tid) {
-    int want = server.io_threads_fast_path && server.io_threads_strict_offload && server.io_threads_num >= 2;
-    int role = fastpathWorkerRole(tid);
-    if (!want) {
-        fastpathWorkerQuiesce(tid);
-        return role == FP_ROLE_QUIESCING || fastpathWorkerOwnedClients(tid) > 0;
-    }
-    if (role == FP_ROLE_OPEN) return 0;
-    return !fastpathWorkerReopen(tid);
 }
 
 static void ioThreadsInitShared(void) {
@@ -1668,6 +1657,7 @@ static int ioThreadsConvergeOnce(int teardown) {
     for (int tid = io_worker_hwm - 1; tid >= 1; tid--) {
         int st = ioWorkerState(tid);
         if (st == IO_WORKER_ABSENT) continue;
+        if (tid < target && st == IO_WORKER_RUNNING) continue;
         if (st == IO_WORKER_RUNNING) {
             if (tid < target) continue;
             ioWorkerRetire(tid);
@@ -1711,11 +1701,6 @@ static int ioThreadsConvergeOnce(int teardown) {
             pending = 1;
             break;
         }
-    }
-
-    for (int tid = 1; tid < io_worker_hwm; tid++) {
-        if (ioWorkerState(tid) != IO_WORKER_RUNNING) continue;
-        if (ioWorkerReconcileFastpath(tid)) pending = 1;
     }
 
     io_converging = pending;
@@ -1850,9 +1835,19 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
 void testOnlySetCurTid(int tid) {
     thread_id = tid;
 }
+static int sendReadToIOThreads(client *c, int read_flags);
 
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    if (stagedLoopActive()) return stagedDeferRead(c) ? C_OK : C_ERR;
+    return sendReadToIOThreads(c, 0);
+}
+
+int ioThreadsSendStagedRead(client *c) {
+    return sendReadToIOThreads(c, READ_FLAGS_DRAIN);
+}
+
+static int sendReadToIOThreads(client *c, int read_flags) {
     /* Fake/teardown clients may have no connection; never offload those. */
     if (!c->conn) return C_ERR;
     /* If IO thread is still reading, return C_OK so the main thread does not race it. */
@@ -1875,7 +1870,7 @@ int trySendReadToIOThreads(client *c) {
      * During this phase, the main thread writes snapshot data directly via connWrite(). */
     if (c->slot_migration_job && !clusterSlotMigrationShouldInstallWriteHandler(c)) return C_ERR;
 
-    c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    c->read_flags = read_flags | (canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE);
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
     c->read_flags |= c->flag.primary ? READ_FLAGS_DRAIN : 0;
@@ -1903,6 +1898,8 @@ int trySendReadToIOThreads(client *c) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
+    if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;
     reconcileLazyWrite(c);
     if (c->flag.close_asap) return C_ERR;
@@ -2277,7 +2274,7 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
 
 /* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
-    if (inline_reclaim_depth) { /* emergency reclaim frees inline */
+    if (inline_reclaim_depth || repl_apply_in_lane) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
         return;
     }
@@ -2366,7 +2363,7 @@ static int getIOThreadPollResults(aeEventLoop *eventLoop) {
 }
 
 void trySendPollJobToIOThreads(void) {
-    if (server.active_io_threads_num <= 1) {
+    if (server.active_io_threads_num <= 1 || stagedLoopActive()) {
         return;
     }
 
@@ -2450,7 +2447,7 @@ static void ioThreadAccept(client *c) {
  *   conn - The connection object to perform the accept operation on
  */
 int trySendAcceptToIOThreads(connection *conn) {
-    if (server.io_threads_num <= 1) {
+    if (server.io_threads_num <= 1 || stagedLoopActive()) {
         return C_ERR;
     }
 
@@ -2568,8 +2565,6 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 client *c = (client *)data;
                 serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                 write_jobs[write_count++] = c;
-            } else if (job_type == JOB_RES_FP_CLOSE || job_type == JOB_RES_FP_HANDOFF) {
-                fastpathHandoffDone((client *)data, job_type == JOB_RES_FP_CLOSE);
             } else if (job_type == JOB_RES_WRITE_SLAB) {
                 if (write_count) {
                     handleWriteJobs(write_jobs, write_count);
@@ -2621,18 +2616,20 @@ static int processOutboxBatch(mpscQueue *outbox) {
 }
 
 /* Response draining is bounded so main returns to the event loop under sustained load. */
+static int io_responses_depth = 0;
+
+/* True while main is executing commands drained from IO thread responses. */
+int inIOThreadsResponses(void) {
+    return io_responses_depth > 0;
+}
+
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
-    int fp_processed = fastpathDrain();
-    fp_processed += fastpathResumeHandedOff(); /* clients a busy command left waiting come first */
+    if (getPendingIOResponsesCount() == 0) return 0;
 
-    if (getPendingIOResponsesCount() == 0 && fastpathClientCount() == 0) {
-        if (fp_processed) main_io_work_at = getMonotonicUs();
-        return fp_processed;
-    }
-
-    int total_processed = fp_processed + processCommandRing();
+    io_responses_depth++;
+    int total_processed = processCommandRing();
     int batches = 0;
     while (batches++ < IO_RESPONSE_BATCHES_PER_CALL) {
         /* 1. Strict Priority: First, drain high-priority events (cluster bus, replication, and slot migration jobs) */
@@ -2649,6 +2646,6 @@ int processIOThreadsResponses(void) {
     }
     total_processed += fastpathResumeHandedOff();
     flushWriteSlab();
-    if (total_processed) main_io_work_at = getMonotonicUs();
+    io_responses_depth--;
     return total_processed;
 }

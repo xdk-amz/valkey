@@ -19,6 +19,8 @@ typedef void (*kvstoreScanFunction)(void *privdata, void *entry, int didx);
 
 #define KVSTORE_INDEX_NOT_FOUND (-1)
 
+/* Allow concurrent mutation of distinct hashtables of a kvstore; see kvs_shared_lock. */
+void kvstoreSetConcurrent(int on);
 kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags);
 void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *));
 void kvstoreRelease(kvstore *kvs);
@@ -85,7 +87,6 @@ unsigned long kvstoreHashtableScanDefrag(kvstore *kvs,
 unsigned long kvstoreHashtableDefragTables(kvstore *kvs, unsigned long cursor, void *(*defragfn)(void *));
 bool kvstoreHashtableFind(kvstore *kvs, int didx, void *key, void **found);
 void **kvstoreHashtableFindRef(kvstore *kvs, int didx, const void *key);
-void **kvstoreHashtableFindRefWithHash(kvstore *kvs, int didx, const void *key, uint64_t *hash_out);
 bool kvstoreHashtableAdd(kvstore *kvs, int didx, void *entry);
 
 bool kvstoreHashtableFindPositionForInsert(kvstore *kvs, int didx, void *key, hashtablePosition *position, void **existing);
@@ -96,6 +97,5 @@ void kvstoreHashtableTwoPhasePopDelete(kvstore *kvs, int didx, void *position);
 bool kvstoreHashtablePop(kvstore *kvs, int didx, const void *key, void **popped);
 bool kvstoreHashtableDelete(kvstore *kvs, int didx, const void *key);
 hashtable *kvstoreGetHashtable(kvstore *kvs, int didx);
-hashtable *kvstoreGetHashtableAcquire(kvstore *kvs, int didx);
 
 #endif /* KVSTORE_H */

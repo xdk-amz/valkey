@@ -1308,11 +1308,11 @@ typedef struct ClientFlags {
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
     uint64_t partitioned : 1;              /* Socket readiness is watched by the IO thread in io_tid, not by the main event loop. */
-    uint64_t ring_epilogue : 1;            /* beforeNextClient called from the ring's read epilogue (main thread only) */
-    uint64_t fastpath : 1;                 /* Owned by an IO thread end to end; main executes its commands from batches and never touches it. */
-    uint64_t executor : 1;                 /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
-    uint64_t fp_detach_sent : 1;           /* Main asked the owning IO thread to detach this fast-path client. */
-    uint64_t fp_readmit : 1;               /* Authenticated on main; joins the fast path once main has nothing further to do for it. */
+    uint64_t ring_epilogue : 1; /* beforeNextClient called from the ring's read epilogue (main thread only) */
+    uint64_t fastpath : 1;       /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
+    uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
+    uint64_t fp_detach_sent : 1; /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
+    uint64_t fp_readmit : 1;     /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1537,21 +1537,16 @@ typedef struct client {
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
-    uint32_t fp_inflight;                 /* Fast path: commands of this client on main right now (IO thread only) */
-    size_t fp_inflight_argv;              /* Fast path: argv bytes of those commands (IO thread only) */
-    size_t fp_input_published;            /* Fast path: input memory last published on the control (IO thread only) */
-    uint8_t fp_mem_hinted;                /* Fast path: main was told this client alone exceeds maxmemory-clients (IO thread only) */
-    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue (IO thread only) */
-    uint8_t fp_deferred;                  /* Fast path: waiting in the owning IO thread's deferred FIFO. Not a flag bit: the IO thread writes it while main writes flag. */
-    uint32_t fp_owner_slot;               /* Fast path: index in the owning IO thread's private connection table */
-    sds fp_out;                           /* Fast path: output not yet written (IO thread only) */
-    listNode io_owner_node;               /* Registry link of the IO thread that owns the socket: linked by that thread for fast-path clients, by main for partitioned ones */
-    listNode fp_defer_node;               /* Fast path: link in the owning IO thread's deferred FIFO while fp_deferred is set (IO thread only) */
+    uint32_t fp_inflight;                 /* Fast path: commands of this client batched for main and not yet replied */
+    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue */
+    sds fp_out;                           /* Fast path: output not yet written */
+    listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
+    listNode fp_stage_node;               /* Staged loop: link in the leaving list of the IO thread that saw the client leave */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
     const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
-    struct ClientControl *control;        /* Shared control for this connection: allocated once when it first becomes crossing-capable, reclaimed once at free. NULL until then. */
+    struct ClientControl *control;        /* Fast-path control: allocated at the first fast-path admission, reclaimed at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -2058,6 +2053,8 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int keyspace_shard_bits;    /* Standalone: split each db into 2^bits hashtables by key slot. */
+    int replica_parallel_apply; /* Replica: apply eligible replicated writes on the staged IO threads. */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
@@ -2066,9 +2063,6 @@ struct valkeyServer {
     int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
     int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
-    int io_batch_inflight;                    /* Fast path: batches in flight per IO thread */
-    int io_batch_drain_us;                    /* Fast path: main keeps collecting batches this long per loop iteration */
-    int io_batch_hold_us;                     /* Fast path: an IO thread holds a partial batch this long before submitting */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
@@ -2102,6 +2096,8 @@ struct valkeyServer {
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
     long long stat_numcommands;                    /* Number of processed commands */
+    long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
+    long long stat_repl_apply_phases;              /* APPLY phases run */
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */
@@ -3250,6 +3246,7 @@ void dictVanillaFree(void *val);
 client *createClient(connection *conn);
 int freeClient(client *c);
 void freeClientAsync(client *c);
+void handleQbLimitReached(client *c);
 void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
@@ -3558,24 +3555,6 @@ int compareStringObjects(const robj *a, const robj *b);
 int collateStringObjects(const robj *a, const robj *b);
 int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
-/* D+: bracket a mutation of a PUBLISHED key's value from command code without exposing
- * dplus internals. Begin computes the shard from the table's own hash fn; End closes it. */
-typedef struct dbKeyBracket {
-    void *va; /* dplusVersionArray* (opaque here) */
-    unsigned shard;
-} dbKeyBracket;
-void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk);
-void dbKeyBracketEnd(dbKeyBracket *brk);
-/* Ensure a published RAW string value has capacity for total_len bytes, safely vs speculative
- * readers: unchanged sds when capacity suffices, else a published replacement with the old
- * allocation defer-freed. Call INSIDE a bracket. */
-sds dbGrowPublishedStringValue(robj *o, size_t total_len);
-/* Publish news as the value of a RAW string, freeing the old buffer once readers are quiescent. */
-void dbReplacePublishedStringBuffer(robj *o, sds news);
-/* Hold the shards of the command's keys until dplusUnitRelease; see dplusUnit. */
-int dbUnitHoldCommandKeys(client *c);
-robj *objectSetKeyAndExpireEx(robj *o, const_sds key, long long expire, robj **retired);
-robj *objectSetExpireEx(robj *o, long long expire, robj **retired);
 #define sdsEncodedObject(objptr) (objectGetEncoding(objptr) == OBJ_ENCODING_RAW || objectGetEncoding(objptr) == OBJ_ENCODING_EMBSTR)
 
 /* Objects with val and/or key embedded */
@@ -4267,8 +4246,6 @@ void armNoMainThreadFree(void);
 void disarmNoMainThreadFree(void);
 int noMainThreadFreeArmed(void);
 int inMainThread(void);
-void lazyfreeObjPrejudged(robj *obj);
-int lazyfreeShouldBeAsync(robj *key, robj *obj, int dbid);
 #ifdef DEBUG_NEVER_FREE_ON_MAIN
 #define assertNoMainThreadFree() serverAssert(!(inMainThread() && noMainThreadFreeArmed()))
 #else

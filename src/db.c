@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "listpack.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
@@ -54,7 +55,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
 static keyStatus expireIfNeeded(serverDb *db, robj *key, robj *val, int flags);
 static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash);
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -213,10 +214,9 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void **oldref = NULL;
     if (update_if_existing) {
-        uint64_t key_hash;
-        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &key_hash);
+        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
         if (oldref != NULL) {
-            dbSetValue(db, key, valref, 1, oldref, &key_hash);
+            dbSetValue(db, key, valref, 1, oldref);
             return;
         }
     } else {
@@ -231,8 +231,10 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     dbTrackKeyWithVolatileItems(db, val);
     initObjectLRUOrLFU(val);
     kvstoreHashtableAdd(db->keys, dict_index, val);
-    signalKeyAsReady(db, key, val->type);
-    notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    if (!repl_apply_in_lane) {
+        signalKeyAsReady(db, key, val->type);
+        notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    }
     *valref = val;
 }
 
@@ -241,14 +243,39 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 }
 
 /* Returns which dict index should be used with kvstore for a given key, computed from the key itself. */
+/* Standalone shard of a key. Nothing depends on it beyond being stable per key, so it skips
+ * hash tags and hashes a word at a time. */
+static int keyspaceShard(sds key) {
+    if (key == repl_apply_key) return repl_apply_shard;
+    const unsigned char *s = (const unsigned char *)key;
+    size_t len = sdslen(key);
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ len;
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+        s += 8;
+        len -= 8;
+    }
+    uint64_t w = 0;
+    for (size_t i = 0; i < len; i++) w |= (uint64_t)s[i] << (8 * i);
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 29;
+    return (int)(h & ((1u << server.keyspace_shard_bits) - 1));
+}
+
 int getKVStoreIndexForKey(sds key) {
-    return server.cluster_enabled ? (int)keyHashSlot(key, (int)sdslen(key)) : 0;
+    if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
+    if (server.keyspace_shard_bits) return keyspaceShard(key);
+    return 0;
 }
 
 /* Same as getKVStoreIndexForKey(), but reuses the slot cached on the client rather than hashing the key.
  * Only valid for keys the currently executing command declared, since the cached slot is that command's. */
 int getKVStoreIndexUsingCachedSlot(sds key) {
-    return server.cluster_enabled ? getCachedKeySlot(key) : 0;
+    if (server.cluster_enabled) return getCachedKeySlot(key);
+    return server.keyspace_shard_bits ? getKVStoreIndexForKey(key) : 0;
 }
 
 /* Returns the slot cached on the client for the currently executing command, computing it from the key
@@ -335,19 +362,17 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
  * value should be stored.
  *
  * The program is aborted if the key was not already present. */
-static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref, const uint64_t *key_hash) {
+static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref) {
     robj *val = *valref;
-    uint64_t computed_hash;
     if (oldref == NULL) {
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
-        oldref = kvstoreHashtableFindRefWithHash(db->keys, dict_index, objectGetVal(key), &computed_hash);
-        if (oldref != NULL) key_hash = &computed_hash;
+        oldref = kvstoreHashtableFindRef(db->keys, dict_index, objectGetVal(key));
     }
     serverAssertWithInfo(NULL, key, oldref != NULL);
     robj *old = *oldref;
     robj *new;
 
-    if (overwrite) {
+    if (overwrite && !repl_apply_in_lane) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain old */
         incrRefCount(old);
@@ -362,18 +387,6 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         old = *oldref;
     }
 
-    /* S2.2 bracket: both branches below mutate the published entry (in-place
-     * ptr/type/encoding swap, or ref replacement via *oldref). Begin before
-     * the first mutating store; End after volatile-items tracking, where the
-     * single trailing bump used to be. Hash MUST come from the table's own
-     * hash function (I3). */
-    hashtable *d_ht = kvstoreGetHashtable(db->keys, getKVStoreIndexForKey(objectGetVal(key)));
-    dplusVersionArray *d_va = d_ht ? hashtableGetVersionArray(d_ht) : NULL;
-    uint64_t d_h = 0;
-    if (d_va) {
-        d_h = key_hash ? *key_hash : hashtableHashKey(d_ht, objectGetVal(key));
-        dplusVersionBracketBegin(d_va, DPLUS_SHARD_INDEX(d_h));
-    }
     if ((old->refcount == 1 && old->encoding != OBJ_ENCODING_EMBSTR) &&
         (val->refcount == 1 && val->encoding != OBJ_ENCODING_EMBSTR)) {
         /* Keep old object in the database. Just swap it's ptr, type and
@@ -416,22 +429,14 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* S2.2: close the bracket opened above the swap/replace block. */
-    if (d_va) dplusVersionBracketEnd(d_va, DPLUS_SHARD_INDEX(d_h));
-
-    /* D+ entry-lifetime: defer the old object's free past walk quiescence;
-     * with no speculative readers possible the terminal free is routed off
-     * main as before. Mutation ordering is preserved either way. */
-    int limbo_route = DPLUS_LIMBO_OFFLOAD_PREF;
-    if (server.lazyfree_lazy_server_del && lazyfreeShouldBeAsync(key, old, db->id)) limbo_route = DPLUS_LIMBO_ASYNC;
-    if (!dplusDeferFree(old, limbo_route)) freeValueNeverOnMain(key, old, db->id);
+    freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
 /* Replace an existing key with a new value, we just replace value and don't
  * emit any events */
 void dbReplaceValue(serverDb *db, robj *key, robj **valref) {
-    dbSetValue(db, key, valref, 0, NULL, NULL);
+    dbSetValue(db, key, valref, 0, NULL);
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -464,7 +469,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else if (keyfound < 0) {
         dbAddInternal(db, key, valref, 1);
     } else {
-        dbSetValue(db, key, valref, 1, NULL, NULL);
+        dbSetValue(db, key, valref, 1, NULL);
     }
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
@@ -546,13 +551,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        /* D+ entry-lifetime: the unlinked object may still be read by an
-         * in-flight speculative walk; defer the free to the quiescence flush,
-         * recording the routing decision now. With no walkers possible the
-         * terminal free is routed off main; `async` no longer selects its route. */
-        int route = DPLUS_LIMBO_SYNC;
-        if (async && lazyfreeShouldBeAsync(key, val, db->id)) route = DPLUS_LIMBO_ASYNC;
-        if (!dplusDeferFree(val, route)) freeValueNeverOnMain(key, val, db->id);
+        /* Terminal frees always leave main, whatever `async` asked for. */
+        UNUSED(async);
+        freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
@@ -1591,16 +1592,9 @@ void renameGenericCommand(client *c, int nx) {
          * with the same name. */
         dbDelete(c->db, c->argv[2]);
     }
-    /* D+ (B10): hold exclusive across delete→re-add. The table's decref
-     * must apply immediately — a limbo-deferred decref leaves the value's
-     * refcount inflated, and the key re-embed (objectSetKeyAndExpire)
-     * panics for non-string types with refcount > 1. The drain also makes
-     * the old shell's free safe against in-flight speculative walks. */
-    dplusExclusiveEnter();
     dbDelete(c->db, c->argv[1]);
     dbAdd(c->db, c->argv[2], &o);
     if (expire != -1) o = setExpire(c, c->db, c->argv[2], expire);
-    dplusExclusiveLeave();
     signalModifiedKey(c, c->db, c->argv[1]);
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
@@ -1675,13 +1669,10 @@ void moveCommand(client *c) {
     }
 
     incrRefCount(o); /* ref counter = 2 */
-    /* D+ (B10): exclusive across delete→re-add — see renameGenericCommand. */
-    dplusExclusiveEnter();
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);
     if (expire != -1) o = setExpire(c, dst, c->argv[1], expire);
-    dplusExclusiveLeave();
 
     /* OK! key moved */
     signalModifiedKey(c, src, c->argv[1]);
@@ -1868,14 +1859,6 @@ int dbSwapDatabases(int id1, int id2) {
     scanDatabaseForDeletedKeys(db1, db2);
     scanDatabaseForDeletedKeys(db2, db1);
 
-    /* D+ (S1.3): the table-pointer swap yanks db->keys out from under
-     * speculative readers -- a reader that resolved the old kvstore may
-     * compute a reply from a table that no longer belongs to its db
-     * (linearization violation even when nothing is freed). Drain in-flight
-     * walks and punt new ones for the duration of the swap; SWAPDB is rare
-     * and the drain is bounded by one in-flight read. */
-    dplusExclusiveEnter();
-
     /* Swap hash tables. Note that we don't swap blocking_keys,
      * ready_keys and watched_keys, since we want clients to
      * remain in the same DB they were. */
@@ -1888,8 +1871,6 @@ int dbSwapDatabases(int id1, int id2) {
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
     copyDbExpiry(db2, &aux);
-
-    dplusExclusiveLeave();
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1923,11 +1904,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);
 
-        /* D+ (S1.3): same table-pointer-swap hazard as dbSwapDatabases,
-         * plus the displaced tables are freed shortly after this returns
-         * (old main db discarded post-replication-load). Gate the swap. */
-        dplusExclusiveEnter();
-
         /* Swap hash tables. Note that we don't swap blocking_keys,
          * ready_keys and watched_keys, since clients
          * remain in the same DB they were. */
@@ -1940,8 +1916,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         newdb->expires = aux.expires;
         newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
         copyDbExpiry(newdb, &aux);
-
-        dplusExclusiveLeave();
 
         /* Now we need to handle clients blocked on lists: as an effect
          * of swapping the two DBs, a client that was waiting for list
@@ -1990,80 +1964,12 @@ void swapdbCommand(client *c) {
  * Expires API
  *----------------------------------------------------------------------------*/
 
-/* --- D+ S3 helpers: bracketing published-value mutations from command code --- */
-
-void dbKeyBracketBegin(serverDb *db, robj *key, dbKeyBracket *brk) {
-    brk->va = NULL;
-    int dict_index = getKVStoreIndexForKey(objectGetVal(key));
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-    if (!ht) return;
-    dplusVersionArray *va = hashtableGetVersionArray(ht);
-    if (!va) return;
-    uint64_t h = hashtableHashKey(ht, objectGetVal(key));
-    brk->va = va;
-    brk->shard = DPLUS_SHARD_INDEX(h);
-    dplusVersionBracketBegin(va, brk->shard);
-}
-
-void dbKeyBracketEnd(dbKeyBracket *brk) {
-    if (!brk->va) return;
-    dplusVersionBracketEnd((dplusVersionArray *)brk->va, brk->shard);
-    brk->va = NULL;
-}
-
-/* Publishes news as the value of the RAW string o. The old buffer stays readable for
- * in-flight readers and is freed once they are quiescent. */
-void dbReplacePublishedStringBuffer(robj *o, sds news) {
-    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
-    sds old = objectGetVal(o);
-    objectSetVal(o, news);
-    if (!dplusDeferFreeRaw(sdsAllocPtr(old))) sdsfree(old);
-}
-
-sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
-    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
-    sds s = objectGetVal(o);
-    if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
-    /* Same copy a realloc move would perform, but the old buffer is freed only after
-     * readers that may be copying it are quiescent. */
-    sds news = sdsnewlen(SDS_NOINIT, total_len);
-    memcpy(news, s, sdslen(s));
-    sdssetlen(news, sdslen(s));
-    dbReplacePublishedStringBuffer(o, news);
-    return news;
-}
-
-/* Holds the shards of the command's keys in c->db until dplusUnitRelease, so readers see
- * all of its writes there or none. A command that declares no keys holds every shard.
- * Returns 1 if this call opened the unit, and so must release it. */
-int dbUnitHoldCommandKeys(client *c) {
-    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0); /* speculation runs only outside cluster mode */
-    dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
-    if (va == NULL) return 0;
-    int opening = dplus_unit.va == NULL;
-    getKeysResult result;
-    initGetKeysResult(&result);
-    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
-    if (numkeys == 0) dplusUnitHoldAll(va);
-    for (int i = 0; i < numkeys; i++) {
-        sds key = objectGetVal(c->argv[result.keys[i].pos]);
-        dplusUnitHoldShard(va, DPLUS_SHARD_INDEX(hashtableHashKey(ht, key)));
-    }
-    getKeysFreeResult(&result);
-    return opening && dplus_unit.va != NULL;
-}
-
 int removeExpire(serverDb *db, robj *key) {
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void *popped;
     if (kvstoreHashtablePop(db->expires, dict_index, objectGetVal(key), &popped)) {
         robj *val = popped;
-        /* D+ S3: the embedded-expiry clear is an in-place 8-byte write on a
-         * published shell (S1.2a finding b) -- bracket it. */
-        dbKeyBracket brk;
-        dbKeyBracketBegin(db, key, &brk);
         robj *newval = objectSetExpire(val, -1);
-        dbKeyBracketEnd(&brk);
         serverAssert(newval == val);
         debugServerAssert(getExpire(db, key) == -1);
         return 1;
@@ -2091,23 +1997,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     val = *valref;
     long long old_when = objectGetExpire(val);
 
-    robj *retired = NULL;
-    /* D+ (S1.2a): first-time expire REALLOCATES the shell of a published,
-     * reader-reachable object. The pre-fix code freed the old shell
-     * immediately (and cleared its val_ptr) — a confirmed UAF / NULL-deref
-     * against in-flight speculative readers
-     * (sharded-version-safety-audit-sep4.md, defect 1). The Ex variant keeps
-     * the displaced shell fully intact and hands it back for shell-only
-     * retirement past reader quiescence. */
-    /* D+ S3: when val already has an expire field, objectSetExpireEx writes
-     * the embedded 8-byte expiry IN PLACE (no realloc) -- bracket it. The
-     * realloc path's publication is bracketed separately below (S2.2). */
-    dbKeyBracket ttl_brk;
-    int ttl_inplace = val->hasexpire;
-    if (ttl_inplace) dbKeyBracketBegin(db, key, &ttl_brk);
-    robj *newval = objectSetExpireEx(val, when, &retired);
-    if (ttl_inplace) dbKeyBracketEnd(&ttl_brk);
-    serverAssert(retired == NULL || newval != val);
+    robj *newval = objectSetExpire(val, when);
     if (objectGetType(newval) == OBJ_HASH && hashTypeHasVolatileFields(newval)) {
         /* Replace the pointer in the keys_with_volatile_items table without accessing the old pointer. */
         int dict_index = getKVStoreIndexUsingCachedSlot(objectGetKey(newval));
@@ -2124,30 +2014,7 @@ robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
         /* No old expire. Update the pointer in the keys hashtable, if needed,
          * and add it to the expires hashtable. */
         if (newval != val) {
-            /* Publish the replacement (single pointer store — a concurrent
-             * reader sees either shell; both are dereferenceable), then bump
-             * the shard so in-flight readers of the old shell fail
-             * validation, then retire the displaced shell. Pre-fix this path
-             * had NO bump: a reader could validate successfully against the
-             * freed shell. */
-            hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
-            dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
-            uint64_t h = 0;
-            if (va) {
-                h = hashtableHashKey(ht, objectGetVal(key));
-                dplusVersionBracketBegin(va, DPLUS_SHARD_INDEX(h));
-            }
             val = *valref = newval;
-            if (va) dplusVersionBracketEnd(va, DPLUS_SHARD_INDEX(h));
-            if (retired) {
-                /* Shell-only free: val_ptr ownership transferred to newval
-                 * (or the value is inline in the shell allocation). RAW
-                 * route = zfree at quiescence flush; fallback zfree is safe
-                 * only because no reader can hold this shell when the defer
-                 * machinery is inactive. */
-                if (!dplusDeferFreeRaw(retired)) zfree(retired);
-                retired = NULL;
-            }
         }
         bool added = kvstoreHashtableAdd(db->expires, dict_index, newval);
         serverAssert(added);
@@ -2465,6 +2332,7 @@ static int dbExpandGeneric(kvstore *kvs, uint64_t db_size, int try_expand) {
         db_size = db_size / slots;
         ret = kvstoreExpand(kvs, db_size, try_expand, dbExpandSkipSlot);
     } else {
+        if (server.keyspace_shard_bits) db_size >>= server.keyspace_shard_bits;
         ret = kvstoreExpand(kvs, db_size, try_expand, NULL);
     }
 

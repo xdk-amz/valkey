@@ -31,10 +31,10 @@ proc lc_wait_fastpath_clients {n} {
     }
 }
 
-# Every retirement finished and every running worker's role matches the configuration.
+# Every retirement finished.
 proc lc_wait_settled {} {
     wait_for_condition 500 20 {
-        [lc_retiring] == 0 && [getInfoProperty [r info fastpath] fastpath_workers_quiescing] == 0
+        [lc_retiring] == 0
     } else {
         fail "workers did not settle: [r info server] [r info fastpath]"
     }
@@ -141,13 +141,15 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
         set c [lc_client]
         $c set lc:b v
         assert_equal OK [$c read]
-        lc_wait_fastpath_clients 1
-        # Clients handed off by the previous shrink keep working on the main path.
+        # Clients handed off by the previous shrink rejoin the fast path with the new one.
+        lc_wait_fastpath_clients 9
+        set total 0
         foreach old $::lc_clients {
             $old incr lc:c
-            assert_match {[0-9]*} [$old read]
-            $old close
+            assert_equal [incr total] [$old read]
         }
+        assert_equal 9 [lc_fastpath_clients]
+        foreach old $::lc_clients { $old close }
         $c close
         lc_wait_fastpath_clients 0
     }
@@ -164,7 +166,18 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
         lc_assert_incr_replies $clients lc:d $total
         lc_wait_running 15
         lc_wait_settled
+        # Every client handed back on the way down is on the fast path again.
+        lc_wait_fastpath_clients 6
+        lc_pipeline_incr $clients lc:d 10
+        set i 0
+        foreach c $clients {
+            for {set j 1} {$j <= 10} {incr j} { assert_equal [expr {$total + $j}] [$c read] }
+            assert_equal [expr {$total + 10}] [r get lc:d$i]
+            incr i
+        }
+        assert_equal 6 [lc_fastpath_clients]
         foreach c $clients { $c close }
+        lc_wait_fastpath_clients 0
     }
 
     test {Lifecycle: raising io-threads while workers are still retiring recreates them} {
@@ -248,11 +261,8 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
             after 50
             for {set j 0} {$j < 40} {incr j} { $c incr lc:i }
             $c flush
-            wait_for_condition 100 20 {
-                [getInfoProperty [r info fastpath] fastpath_batches] > $batches
-            } else {
-                fail "commands were not published while main slept"
-            }
+            # IO threads read only between main's write phases: the pipeline is read after
+            # the reconfigure, by whichever path owns the client then, and runs once in order.
             assert_equal OK [$ctl read]
             assert_equal OK [$ctl read]
             for {set j 1} {$j <= 40} {incr j} { assert_equal $j [$c read] }
@@ -322,7 +332,6 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
     }
 
     test {Lifecycle: batch backpressure during quiescing does not deadlock} {
-        assert_equal OK [r config set io-batch-inflight 1]
         set clients [lc_open_counters 8 lc:l]
         lc_pipeline_incr $clients lc:l 200
         assert_equal OK [r config set io-threads 1]
@@ -330,7 +339,6 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
         lc_assert_incr_replies $clients lc:l 300
         lc_wait_settled
         foreach c $clients { $c close }
-        assert_equal OK [r config set io-batch-inflight 16]
         assert_equal OK [r config set io-threads 4]
         lc_wait_running 3
         lc_wait_workers_open 3

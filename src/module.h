@@ -210,6 +210,7 @@ void moduleBlockedClientTimedOut(client *c, int from_module);
 void modulePipeReadable(aeEventLoop *el, int fd, void *privdata, int mask);
 size_t moduleCount(void);
 int moduleHasServerEventListener(uint64_t eid);
+int moduleObservesWrites(void);
 void moduleAcquireGIL(void);
 int moduleTryAcquireGIL(void);
 void moduleReleaseGIL(void);
