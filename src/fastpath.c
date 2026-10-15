@@ -306,10 +306,19 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         }
     } else if (c->read_flags & READ_FLAGS_ERROR_MASK) {
         leave = 1;
+    } else if (c->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
+        c->read_flags = 0; /* an empty multibulk is skipped, as on main */
+        c->reqtype = 0;
     }
 
     while (!leave && q->off < q->len) {
         parsedCommand *p = &q->cmds[q->off];
+        if (p->read_flags & READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN) {
+            /* An empty multibulk: nothing to run. It ends the queue, so the next command starts fresh. */
+            q->off++;
+            c->reqtype = 0;
+            continue;
+        }
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
         if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
@@ -398,7 +407,7 @@ static void fpRead(fpThread *t, int tid, client *c) {
     for (;;) {
         size_t pos = c->qb_pos;
         parseInputBuffer(c);
-        int completed = c->read_flags & READ_FLAGS_PARSING_COMPLETED;
+        int completed = c->read_flags & (READ_FLAGS_PARSING_COMPLETED | READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN);
         prepareCommandQueue(c);
         fpSpeculate(t, tid, c);
         if (c->control->lifecycle == FP_ACTIVE) fpHarvest(t, tid, c);
