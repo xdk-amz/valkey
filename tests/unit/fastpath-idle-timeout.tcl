@@ -1,7 +1,6 @@
 # Idle-timeout enforcement for IO-owned fast-path clients. Fast-path clients are authenticated
 # CLIENT_TYPE_NORMAL, so the normal `timeout` (maxidletime) applies; enforcement runs on main through
-# the limit registry against an IO-owner-written stamp, never by touching the IO-owned client. An idle
-# close is its own reason and counts through expired_clients even though it publishes a CLOSE.
+# the clients cron, as for any other client.
 
 # A deferring client that sends nothing before its first command, so it stays on the fast path
 # (a SELECT would move it to the main path).
@@ -17,30 +16,25 @@ proc fpit_wait_fastpath_clients {n} {
     }
 }
 
-proc fpit_expired {} {
-    return [getInfoProperty [r info stats] client_idle_timeout_disconnections]
-}
 
 start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients
 
-    test {Fast path idle timeout: an idle client closes and increments expired_clients} {
+    test {Fast path idle timeout: an idle client closes} {
         r config set timeout 1
-        set base [fpit_expired]
         set a [fpit_client]
         $a ping ;# one command puts it on the fast path
         assert_equal PONG [$a read]
         fpit_wait_fastpath_clients 1
 
-        # Stay idle: the amortized cron closes it once idle strictly longer than the timeout.
+        # Stay idle: the clients cron closes it once idle strictly longer than the timeout.
         wait_for_condition 100 100 {
-            [fpit_expired] == $base + 1
+            [getInfoProperty [r info fastpath] fastpath_clients] == 0
         } else {
-            fail "idle disconnection was not counted: [r info stats]"
+            fail "idle fast-path client was not closed: [r info fastpath]"
         }
-        fpit_wait_fastpath_clients 0
         catch {$a read} e
         assert_match {*I/O error*} $e
         $a close
@@ -49,7 +43,6 @@ start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {i
 
     test {Fast path idle timeout: a periodic PING keeps the client alive} {
         r config set timeout 1
-        set base [fpit_expired]
         set a [fpit_client]
         $a ping
         assert_equal PONG [$a read]
@@ -64,7 +57,6 @@ start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {i
             assert_equal PONG [$a read]
         }
         assert_equal 1 [getInfoProperty [r info fastpath] fastpath_clients]
-        assert_equal $base [fpit_expired]
         $a close
         fpit_wait_fastpath_clients 0
         r config set timeout 0
@@ -72,7 +64,6 @@ start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {i
 
     test {Fast path idle timeout: zero timeout never closes an idle client} {
         r config set timeout 0
-        set base [fpit_expired]
         set a [fpit_client]
         $a ping
         assert_equal PONG [$a read]
@@ -81,7 +72,6 @@ start_server {tags {"fastpath idle-timeout external:skip tls:skip"} overrides {i
         # A quiet stretch well past the earlier one-second window: disabled, so nothing closes.
         after 2500
         assert_equal 1 [getInfoProperty [r info fastpath] fastpath_clients]
-        assert_equal $base [fpit_expired]
         $a ping ;# still serving normally
         assert_equal PONG [$a read]
         $a close
