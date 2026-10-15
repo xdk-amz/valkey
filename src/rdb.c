@@ -2303,6 +2303,8 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
         }
     } else if (rdbtype == RDB_TYPE_SET_2) {
+        hashtable *dupSearchHashtable = NULL;
+
         if ((len = rdbLoadLen(rdb, NULL)) == RDB_LENERR) return NULL;
         if (len == 0) goto emptykey;
         if (len > server.set_max_listpack_entries) {
@@ -2316,6 +2318,9 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             }
         } else {
             o = createSetListpackObject();
+            /* An expired member is dropped before it reaches the listpack, so the
+             * duplicate search must see every member read. */
+            dupSearchHashtable = hashtableCreate(&setHashtableType);
         }
 
         long volatile_members = 0;
@@ -2323,6 +2328,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             sds sdsele;
 
             if ((sdsele = rdbGenericLoadStringObject(rdb, RDB_LOAD_SDS, NULL)) == NULL) {
+                if (dupSearchHashtable) hashtableRelease(dupSearchHashtable);
                 decrRefCount(o);
                 return NULL;
             }
@@ -2330,8 +2336,21 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             long long itemexpiry = rdbLoadMillisecondTime(rdb, RDB_VERSION);
             if (itemexpiry < EXPIRY_NONE || rioGetReadError(rdb)) {
                 sdsfree(sdsele);
+                if (dupSearchHashtable) hashtableRelease(dupSearchHashtable);
                 decrRefCount(o);
                 return NULL;
+            }
+
+            if (dupSearchHashtable) {
+                sds sdsele_dup = sdsdup(sdsele);
+                if (!hashtableAdd(dupSearchHashtable, sdsele_dup)) {
+                    rdbReportCorruptRDB("Duplicate set members detected");
+                    sdsfree(sdsele_dup);
+                    sdsfree(sdsele);
+                    hashtableRelease(dupSearchHashtable);
+                    decrRefCount(o);
+                    return NULL;
+                }
             }
 
             if (iAmPrimary() && !(rdbflags & RDBFLAGS_AOF_PREAMBLE) && now != 0 && itemexpiry != EXPIRY_NONE &&
@@ -2362,18 +2381,11 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
                     if (setTypeConvertAndExpand(o, OBJ_ENCODING_HASHTABLE, len, 0) != C_OK) {
                         rdbReportCorruptRDB("OOM in hashtableTryExpand %llu", (unsigned long long)len);
                         sdsfree(sdsele);
+                        if (dupSearchHashtable) hashtableRelease(dupSearchHashtable);
                         decrRefCount(o);
                         return NULL;
                     }
                 } else {
-                    unsigned char *lp = objectGetVal(o);
-                    unsigned char *p = lpFirst(lp);
-                    if (p && lpFind(lp, p, (unsigned char *)sdsele, elelen, 0)) {
-                        rdbReportCorruptRDB("Duplicate set members detected");
-                        sdsfree(sdsele);
-                        decrRefCount(o);
-                        return NULL;
-                    }
                     objectSetVal(o, lpAppend(objectGetVal(o), (unsigned char *)sdsele, elelen));
                     if (itemexpiry != EXPIRY_NONE) {
                         unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
@@ -2400,11 +2412,13 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error, int rd
             if (!added) {
                 rdbReportCorruptRDB("Duplicate set members detected");
                 smemberFree(m);
+                if (dupSearchHashtable) hashtableRelease(dupSearchHashtable);
                 decrRefCount(o);
                 return NULL;
             }
             if (itemexpiry != EXPIRY_NONE) setTypeTrackMember(o, m);
         }
+        if (dupSearchHashtable) hashtableRelease(dupSearchHashtable);
 
         if (setTypeSize(o) == 0) {
             decrRefCount(o);

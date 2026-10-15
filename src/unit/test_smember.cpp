@@ -56,7 +56,10 @@ class SmemberTest : public ::testing::Test {
         if (expiry == EXPIRY_NONE) {
             sds reference = sdsnewlen(str, len);
             ASSERT_EQ(sdsType(m), sdsType(reference));
+#ifdef USE_JEMALLOC
+            /* Other allocators can return different usable sizes for equal requests. */
             ASSERT_EQ(smemberMemUsage(m), sdsAllocSize(reference));
+#endif
             sdsfree(reference);
         }
     }

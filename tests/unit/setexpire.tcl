@@ -92,6 +92,17 @@ proc dump_payload_type {payload} {
     return $type
 }
 
+# A SET_2 DUMP payload of member-expiry pairs, with a zero checksum that only
+# DEBUG SET-SKIP-CHECKSUM-VALIDATION 1 accepts.
+proc set2_payload {pairs} {
+    set payload [binary format cc 24 [expr {[llength $pairs] / 2}]]
+    foreach {member expiry} $pairs {
+        append payload [binary format c [string length $member]] $member [binary format w $expiry]
+    }
+    append payload [binary format sw 82 0]
+    return $payload
+}
+
 proc seed_expired_member {r key} {
     $r SADDEX $key EX $::live_member_ttl MEMBERS 1 live
     $r SADD $key expired
@@ -392,6 +403,7 @@ start_server {tags {"setexpire"}} {
             assert_error "*ERR syntax error" {r $reader myset MEMBERS 1 a b}
             assert_error "*ERR syntax error" {r $reader myset MEMBERS 0 a}
             assert_error "*not an integer or out of range" {r $reader myset MEMBERS a b}
+            assert_error "*ERR syntax error" {r $reader myset FIELDS 1 a}
         }
     }
 
@@ -525,6 +537,8 @@ start_server {tags {"setexpire"}} {
     # 1 when the TTLs are applied, 0 when the condition fails, though neither adds a member.
     test {SADDEX MXX EX - all or nothing over the whole call} {
         r FLUSHALL
+        assert_equal 0 [r SADDEX nokey MXX EX $::live_member_ttl MEMBERS 1 a]
+        assert_equal 0 [r EXISTS nokey]
         r SADD myset a
         assert_equal 0 [r SADDEX myset MXX EX $::live_member_ttl MEMBERS 2 a b]
         assert_equal -1 [set_member_ttl r myset a]
@@ -1057,6 +1071,27 @@ start_server {tags {"setexpire"}} {
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
 
+        # A listpack replies integer members through their own branches.
+        test "SPOP and SRANDMEMBER return the live integer members - $encoding" {
+            flush_and_disable_active_expiry
+            use_set_encoding $encoding
+            r SADD myset 1 2 3 4 5 6 7 8
+            make_members_expired r myset {1 2 3 4 5 6}
+            assert_encoding $encoding myset
+            for {set i 0} {$i < 20} {incr i} {
+                set got [r SRANDMEMBER myset 1]
+                assert_equal 1 [llength $got]
+                assert_all_live $got {7 8}
+                set got [r SRANDMEMBER myset -3]
+                assert_equal 3 [llength $got]
+                assert_all_live $got {7 8}
+            }
+            assert_equal {7 8} [lsort [r SRANDMEMBER myset 5]]
+            assert_equal {7 8} [lsort [r SPOP myset 5]]
+            assert_equal 6 [r SCARD myset]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+
         test "SPOP with a count below the live size returns live members only - $encoding" {
             flush_and_disable_active_expiry
             use_set_encoding $encoding
@@ -1477,10 +1512,12 @@ start_server {tags {"setexpire external:skip"}} {
 
         # Adding m2 makes the otherwise no-op KEEPTTL command propagate.
         r SADDEX myset KEEPTTL MEMBERS 2 m1 m2
+        r SADDEX myset XX KEEPTTL MEMBERS 2 m1 m3
 
         assert_replication_stream $repl {
             {select *}
             {saddex myset KEEPTTL MEMBERS 2 m1 m2}
+            {saddex myset KEEPTTL MEMBERS 2 m1 m3}
         }
         close_replication_stream $repl
     }
@@ -1565,9 +1602,11 @@ start_server {tags {"setexpire external:skip"}} {
         set repl [attach_to_replication_stream]
 
         assert_equal 1 [r SREM myset live expired missing]
+        assert_equal 1 [r SREM myset expired keep missing]
         assert_replication_stream $repl {
             {select *}
             {srem myset live}
+            {srem myset keep}
         }
         close_replication_stream $repl
         r DEBUG SET-ACTIVE-EXPIRE 1
@@ -2091,6 +2130,19 @@ start_server {tags {"setexpire external:skip"}} {
 
         r DEBUG SET-ACTIVE-EXPIRE 1
     } {OK} {needs:debug}
+
+    # RESTORE keeps expired members, so both copies reach the duplicate check.
+    foreach encoding {listpack hashtable} {
+        test "RESTORE rejects a payload that repeats an expired member - $encoding" {
+            r FLUSHALL
+            use_set_encoding $encoding
+            r DEBUG SET-SKIP-CHECKSUM-VALIDATION 1
+            assert_error "*Bad data format*" {r RESTORE myset 0 [set2_payload {aa 1 aa -1}]}
+            assert_equal 0 [r EXISTS myset]
+            r DEBUG SET-SKIP-CHECKSUM-VALIDATION 0
+            use_set_encoding listpack
+        } {OK} {needs:debug}
+    }
 
     test {COPY of a hashtable set keeps an expired member and its TTL} {
         flush_and_disable_active_expiry
@@ -2898,6 +2950,32 @@ start_server {tags {"setexpire external:skip"}} {
             assert_equal {} [read_from_replication_stream $repl]
             close_replication_stream $repl
             assert_equal 0 [r EXISTS dst{t}]
+            r DEBUG SET-ACTIVE-EXPIRE 1
+        } {OK} {needs:debug}
+    }
+
+    # The result is replayed from the destination, whose listpack integer members
+    # and ordered index each take their own branch.
+    foreach {zencoding zentries} {listpack 128 btree 0} {
+        test "ZUNIONSTORE over a set source with hidden members propagates integer members - $zencoding" {
+            flush_and_disable_active_expiry
+            r CONFIG SET zset-max-listpack-entries $zentries
+            r SADD s{t} 1 2 3 gone
+            make_members_expired r s{t} {gone}
+
+            set repl [attach_to_replication_stream]
+            assert_equal 3 [r ZUNIONSTORE dst{t} 1 s{t}]
+            assert_encoding $zencoding dst{t}
+
+            assert_replication_stream $repl {
+                {multi}
+                {select *}
+                {unlink dst{t}}
+                {zadd dst{t} 1 1 1 2 1 3}
+                {exec}
+            }
+            close_replication_stream $repl
+            r CONFIG SET zset-max-listpack-entries 128
             r DEBUG SET-ACTIVE-EXPIRE 1
         } {OK} {needs:debug}
     }
