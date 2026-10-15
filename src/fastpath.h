@@ -54,6 +54,7 @@ typedef struct cmdBatch {
 int fastpathEligible(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);
+int fastpathExecutorOutputLimitReached(client *ec);
 /* acl-offload: a reading thread brackets its rule-set reads; main waits them out after an ACL change. */
 void fastpathAdmitReadBegin(void);
 void fastpathAdmitReadEnd(void);

@@ -598,6 +598,25 @@ static int fpControlDetaching(ClientControl *cc) {
     return cc && cc->closing;
 }
 
+static cmdEntry *fp_exec_entry = NULL; /* main only: the entry an executor is running */
+
+/* Main, from closeClientOnOutputBufferLimitReached while an executor builds a reply: a reply past the
+ * normal class hard limit closes its client, as on the main path. The reply is dropped and commands
+ * that build long replies stop at close_asap. */
+int fastpathExecutorOutputLimitReached(client *ec) {
+    cmdEntry *e = fp_exec_entry;
+    if (!e || !e->control) return 0;
+    if (ec->flag.close_asap) return 1;
+    clientBufferLimitsConfig *l = &server.client_obuf_limits[CLIENT_TYPE_NORMAL];
+    if (!l->hard_limit_bytes || getClientOutputBufferMemoryUsage(ec) < l->hard_limit_bytes) return 0;
+    ec->flag.close_asap = 1;
+    freeClientAsync(e->c); /* records the close; main frees it once it took the client back */
+    serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
+              (unsigned long long)e->control->client_id);
+    server.stat_client_outbuf_limit_disconnections++;
+    return 1;
+}
+
 /* The executor borrows argv and writes replies into the batch arena. */
 static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     char *saved_buf = ec->buf;
@@ -632,8 +651,16 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->flag.buf_encoded = 0;
     ec->flag.pending_command = 1;
 
+    fp_exec_entry = e;
     processCommandAndResetClient(ec);
-
+    fp_exec_entry = NULL;
+    if (ec->flag.close_asap) {
+        /* Closed for the output buffer limit: nothing of this reply is sent. */
+        ec->flag.close_asap = 0;
+        listEmpty(ec->reply);
+        ec->reply_bytes = 0;
+        ec->bufpos = 0;
+    }
     e->reply_off = (uint32_t)b->arena_used;
     e->reply_len = (uint32_t)ec->bufpos;
     b->arena_used += ec->bufpos;
