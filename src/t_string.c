@@ -269,24 +269,26 @@ void setCommand(client *c) {
         return;
     }
 
-    if (!c->flag.argv_borrowed) {
+    /* T9: skip encoding when the IO thread already installed a store-ready
+     * value object (embedded key) into argv at parse time. */
+    if (!c->flag.argv_borrowed && !c->argv[2]->hasembkey) {
         c->argv[2] = tryObjectEncoding(c->argv[2]);
     }
     setGenericCommand(c, flags, c->argv[1], c->argv[2], expire, unit, NULL, NULL, comparison);
 }
 
 void setnxCommand(client *c) {
-    if (!c->flag.argv_borrowed) c->argv[2] = tryObjectEncoding(c->argv[2]);
+    if (!c->flag.argv_borrowed && !c->argv[2]->hasembkey) c->argv[2] = tryObjectEncoding(c->argv[2]);
     setGenericCommand(c, ARGS_SET_NX, c->argv[1], c->argv[2], NULL, 0, shared.cone, shared.czero, NULL);
 }
 
 void setexCommand(client *c) {
-    if (!c->flag.argv_borrowed) c->argv[3] = tryObjectEncoding(c->argv[3]);
+    if (!c->flag.argv_borrowed && !c->argv[3]->hasembkey) c->argv[3] = tryObjectEncoding(c->argv[3]);
     setGenericCommand(c, ARGS_EX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_SECONDS, NULL, NULL, NULL);
 }
 
 void psetexCommand(client *c) {
-    if (!c->flag.argv_borrowed) c->argv[3] = tryObjectEncoding(c->argv[3]);
+    if (!c->flag.argv_borrowed && !c->argv[3]->hasembkey) c->argv[3] = tryObjectEncoding(c->argv[3]);
     setGenericCommand(c, ARGS_PX | ARGS_ARGV3, c->argv[1], c->argv[3], c->argv[2], UNIT_MILLISECONDS, NULL, NULL, NULL);
 }
 
@@ -453,7 +455,7 @@ void getsetCommand(client *c) {
         setKey(c, c->db, c->argv[1], &val, 0);
         rewriteClientCommandArgument(c, 2, val);
     } else {
-        val = tryObjectEncoding(val);
+        if (!val->hasembkey) val = tryObjectEncoding(val);
         setKey(c, c->db, c->argv[1], &val, 0);
         incrRefCount(val);
         c->argv[2] = val;
@@ -611,7 +613,7 @@ void msetGenericCommand(client *c, int nx) {
             setKey(c, c->db, c->argv[j], &val, setkey_flags);
             rewriteClientCommandArgument(c, j + 1, val);
         } else {
-            val = tryObjectEncoding(val);
+            if (!val->hasembkey) val = tryObjectEncoding(val);
             setKey(c, c->db, c->argv[j], &val, setkey_flags);
             incrRefCount(val);
             c->argv[j + 1] = val;

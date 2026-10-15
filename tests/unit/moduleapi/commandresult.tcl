@@ -706,3 +706,58 @@ start_server {tags {"modules"}} {
         assert_equal {OK} [r module unload commandresult]
     }
 }
+
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
+    r module load $testmodule
+
+    proc fp_module_client_id {r_peer} {
+        foreach line [split [string trim [r client list]] "\n"] {
+            if {[string match "*addr=$r_peer *" $line]} {
+                regexp {id=(\d+)} $line -> id
+                return $id
+            }
+        }
+        fail "no client with peer $r_peer"
+    }
+
+    test {Module commandresult - fast-path events carry the originating client id} {
+        r client setname fp-control ;# named clients stay on the main path
+        r cmdresult.reset
+        r cmdresult.register all
+        r acl setuser default resetkeys ~allowed:*
+
+        # A client that sends no SELECT stays on the fast path.
+        set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        set sock [fconfigure [$rd channel] -sockname]
+        set peer "[lindex $sock 0]:[lindex $sock 2]"
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] == 1
+        } else {
+            fail "client did not attach to the fast path"
+        }
+        set id [fp_module_client_id $peer]
+
+        $rd get allowed:x
+        assert_equal {} [$rd read]
+        $rd get denied:x
+        assert_error {*NOPERM*} {$rd read}
+        $rd close
+
+        set acl_entry {}
+        set success_entry {}
+        foreach entry [r cmdresult.getlog 16] {
+            if {[dict get $entry command] ne "get"} continue
+            if {[dict get $entry status] eq "acl_rejected"} { set acl_entry $entry }
+            if {[dict get $entry status] eq "success"} { set success_entry $entry }
+        }
+        assert {$acl_entry ne {}}
+        assert {$success_entry ne {}}
+        assert_equal $id [dict get $acl_entry client_id]
+        assert_equal $id [dict get $success_entry client_id]
+        assert_equal 0 [dict get $acl_entry is_module_client]
+
+        r acl setuser default resetkeys allkeys
+        r cmdresult.unsubscribe
+        assert_equal {OK} [r module unload commandresult]
+    }
+}

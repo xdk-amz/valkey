@@ -56,7 +56,6 @@ static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
-
 /* Lookup a key for read or write operations, or return NULL if the key is not
  * found in the specified DB. This function implements the functionality of
  * lookupKeyRead(), lookupKeyWrite() and their ...WithFlags() variants.
@@ -401,14 +400,8 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
-    if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
-        /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
-        freeObjAsync(key, old, db->id);
-    } else {
-        decrRefCount(old);
-    }
+    /* Preserve mutation ordering; only the old value's terminal free is deferred. */
+    freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
@@ -527,11 +520,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        if (async) {
-            freeObjAsync(key, val, db->id);
-        } else {
-            decrRefCount(val);
-        }
+        /* All unlink side effects precede the terminal free; `async` no longer selects its route. */
+        UNUSED(async);
+        freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
@@ -1843,7 +1834,6 @@ int dbSwapDatabases(int id1, int id2) {
     db1->keys_with_volatile_items = db2->keys_with_volatile_items;
     copyDbExpiry(db1, db2);
 
-
     db2->keys = aux.keys;
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
@@ -2037,7 +2027,6 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
     server.stat_expiredkeys++;
 }
-
 
 /* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {

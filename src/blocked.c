@@ -69,6 +69,7 @@
 #include "latency.h"
 #include "monotonic.h"
 #include "cluster_slot_stats.h"
+#include "io_threads.h"
 #include "module.h"
 
 /* forward declarations */
@@ -176,15 +177,22 @@ void processUnblockedClients(void) {
             continue;
         }
 
-        if (c->conn && !connHasReadHandler(c->conn)) {
+        /* A throttled client had its read handler removed; a client that reads
+         * on an IO thread (partitioned or fast path) has none by design. */
+        if (c->conn && !connHasReadHandler(c->conn) && !c->flag.partitioned && !c->flag.fastpath) {
             if (connSetReadHandler(c->conn, readQueryFromClient) == C_ERR) {
                 freeClient(c);
                 continue;
             }
         }
-        /* If we have a queued command, execute it now. */
-        if (processPendingCommandAndInputBuffer(c) == C_ERR) {
-            continue;
+        /* Hold a partitioned client's socket until any landed read drains after unblock. */
+        if (!c->flag.blocked) {
+            if (c->io_read_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_COMPLETED_IO) continue;
+            if (!partitionedClientHold(c)) continue;
+            /* If we have a queued command, execute it now. */
+            int rc = processPendingCommandAndInputBuffer(c);
+            if (rc == C_ERR) continue;
+            partitionedClientRelease(c);
         }
         beforeNextClient(c);
     }

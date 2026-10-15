@@ -6,6 +6,13 @@ proc wait_for_io_threads_to_go_idle {} {
         # policy disabled and then restore the original test setting.
         assert_equal {OK} [r config set io-threads-always-active no]
     }
+    set io_threads_strict_offload [dict get [r config get io-threads-strict-offload] io-threads-strict-offload]
+    if {$io_threads_strict_offload eq {yes}} {
+        # Strict offload keeps a floor of active IO threads (main never
+        # touches sockets), so io_threads_active can never reach 0. Observe
+        # the idle transition with strict offload disabled, then restore.
+        assert_equal {OK} [r config set io-threads-strict-offload no]
+    }
 
     set errcode [catch {
         wait_for_condition 1000 50 {
@@ -15,6 +22,9 @@ proc wait_for_io_threads_to_go_idle {} {
         }
     } result]
 
+    if {$io_threads_strict_offload eq {yes}} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+    }
     if {$io_threads_always_active eq {yes}} {
         assert_equal {OK} [r config set io-threads-always-active yes]
     }
@@ -169,5 +179,134 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         $rd close
 
         assert_equal {PONG} [r ping]
+    }
+
+    # A scale-up resets the active worker count to 1. Strict offload defers
+    # the reply until a worker is active again, and the always-active policy
+    # used to ignite workers only on a socket event. The client waiting on the
+    # reply produces no event, so the reply stalled until unrelated traffic
+    # arrived on another connection.
+    test {Scale-up reply is delivered under strict offload with always-active} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        assert_equal {OK} [r config set io-threads 1]
+
+        # Read without blocking so a missing reply fails instead of hanging.
+        # Nothing else may touch the server while waiting: any other
+        # connection's event would wake the workers and mask the stall.
+        set rd [valkey_deferring_client]
+        $rd config set io-threads 5
+        $rd flush
+        fconfigure [$rd channel] -blocking 0
+        set reply {}
+        for {set i 0} {$i < 50 && $reply ne "+OK\r\n"} {incr i} {
+            after 100
+            append reply [$rd rawread]
+        }
+        assert_equal "+OK\r\n" $reply
+        $rd close
+
+        assert_equal {io-threads 5} [r config get io-threads]
+    }
+}
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    proc fastpath_clients {} {
+        regexp {fastpath_clients:(\d+)} [r info fastpath] -> n
+        return $n
+    }
+    # The default test client selects db 9 first; SELECT leaves the fast path.
+    proc fastpath_client {} {
+        return [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+    }
+
+    # Clients typically open with a connectivity PING. It carries no key and
+    # used to hand the connection off to the main-thread path for good.
+    test {PING keeps a client on the fast path} {
+        set base [fastpath_clients]
+        set rd [fastpath_client]
+        assert_equal {PONG} [$rd ping]
+        assert_equal {hello} [$rd ping hello]
+        assert_equal {OK} [$rd set fpkey v]
+        assert_equal {v} [$rd get fpkey]
+        after 200
+        assert_equal [expr {$base + 1}] [fastpath_clients]
+        $rd close
+    }
+
+    # The parser accumulates the request byte count; the fast path never went
+    # through resetClient, so it grew for the life of the connection and every
+    # command was logged as a large request once it passed the threshold.
+    test {Fast-path commands do not accumulate into the large-request log} {
+        r config set commandlog-request-larger-than 200
+        r commandlog reset large-request
+        set rd [fastpath_client]
+        assert_equal {OK} [$rd set fpkey v]
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal {v} [$rd get fpkey]
+        }
+        assert_equal 0 [r commandlog len large-request]
+        $rd close
+        r config set commandlog-request-larger-than 1048576
+    }
+
+    # A raw socket that writes several commands in one packet, with nothing
+    # (no SELECT, no HELLO) sent first, so the connection stays on the fast path.
+    proc fastpath_raw_socket {} {
+        wait_for_condition 100 20 { [fastpath_clients] == 0 } else { fail "fast-path clients linger" }
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1
+        return $fd
+    }
+    proc fastpath_raw_read {fd n} {
+        set out {}
+        fconfigure $fd -blocking 0
+        set deadline [expr {[clock milliseconds] + 2000}]
+        while {[llength $out] < $n && [clock milliseconds] < $deadline} {
+            set line [gets $fd]
+            if {$line eq ""} { after 5; continue }
+            lappend out $line
+        }
+        fconfigure $fd -blocking 1
+        return $out
+    }
+
+    # Only the multibulk parser queues pipelined commands; an inline command
+    # after the first one used to sit in the query buffer until the next read.
+    test {Fast path drains inline commands pipelined in one write} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "SET fpinline old\r\n"
+        flush $fd
+        assert_equal {+OK} [fastpath_raw_read $fd 1]
+        puts -nonewline $fd "SET fpinline new\r\nGET fpinline\r\nGET fpinline\r\n"
+        flush $fd
+        assert_equal {+OK {$3} new {$3} new} [fastpath_raw_read $fd 5]
+        puts -nonewline $fd "PING\r\n"
+        flush $fd
+        assert_equal {+PONG} [fastpath_raw_read $fd 1]
+        assert_equal 1 [fastpath_clients]
+        close $fd
+    }
+
+    test {Fast path drains an inline command written after a RESP command} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "*3\r\n\$3\r\nSET\r\n\$8\r\nfpinline\r\n\$3\r\nrsp\r\nGET fpinline\r\n*1\r\n\$4\r\nPING\r\n"
+        flush $fd
+        assert_equal {+OK {$3} rsp +PONG} [fastpath_raw_read $fd 4]
+        assert_equal 1 [fastpath_clients]
+        close $fd
+    }
+
+    # A packet ending mid-command must wait for more bytes, not spin or leave.
+    test {Fast path holds a trailing partial inline command for the next read} {
+        set fd [fastpath_raw_socket]
+        puts -nonewline $fd "GET fpinline\r\nGET fpin"
+        flush $fd
+        assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+        puts -nonewline $fd "line\r\n"
+        flush $fd
+        assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+        assert_equal 1 [fastpath_clients]
+        close $fd
     }
 }

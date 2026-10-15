@@ -82,12 +82,16 @@ start_server {tags {"lazyfree"}} {
         r xgroup destroy s bla
         r unlink s
 
-        # make sure it was not lazy freed
         wait_for_condition 50 100 {
             [s lazyfree_pending_objects] == 0
         } else {
             fail "lazyfree isn't done"
         }
-        assert_equal [s lazyfreed_objects] 0
+        # Stream terminal frees use bio only while IO threads are active.
+        if {[lindex [r config get io-threads] 1] >= 2} {
+            assert_equal [s lazyfreed_objects] 1
+        } else {
+            assert_equal [s lazyfreed_objects] 0
+        }
     } {} {needs:config-resetstat}
 }

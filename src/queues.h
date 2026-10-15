@@ -136,8 +136,14 @@ bool spscIsFull(spscQueue *q);
 void spscEnqueue(spscQueue *q, void *data, bool commit);
 /* Publishes any pending batched enqueues by advancing the shared tail pointer */
 void spscCommit(spscQueue *q);
+
+/* Producer side: number of slots currently free. */
+size_t spscFreeSlots(spscQueue *q);
 /* Pops up to num_jobs items from the queue and returns the actual number popped */
 size_t spscDequeueBatch(spscQueue *q, void **jobs_out, size_t num_jobs);
+
+/* Consumer side: entries published and not yet dequeued. */
+size_t spscBacklog(spscQueue *q);
 /* Check if queue is empty from producer's perspective. */
 bool spscIsEmpty(spscQueue *q);
 
