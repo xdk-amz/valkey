@@ -896,21 +896,38 @@ static void deferRecord(sds s) {
     deferPut(m, s, 1);
 }
 
+/* Releases are applied a slice at a time, so a large asynchronous free does not
+ * hold up the event loop. drain_msg is the message being applied, followed by
+ * the rest of the list it came in; drain_pos is its next entry. */
+#define INTERN_DRAIN_SLICE 1024
+static deferMsg *drain_msg;
+static size_t drain_pos;
+
 size_t internDrainDeferred(void) {
-    if (atomic_load_explicit(&defer_head, memory_order_relaxed) == NULL) return 0;
-    deferMsg *msg = atomic_exchange_explicit(&defer_head, NULL, memory_order_acquire);
-    size_t applied = 0;
-    while (msg) {
-        deferMsg *next = msg->next;
-        for (size_t i = 0; i < msg->count; i++) {
-            releaseOnMain(msg->e[i].s, msg->e[i].n);
-            applied += msg->e[i].n;
+    if (drain_msg == NULL) {
+        if (atomic_load_explicit(&defer_head, memory_order_relaxed) == NULL) return 0;
+        drain_msg = atomic_exchange_explicit(&defer_head, NULL, memory_order_acquire);
+        drain_pos = 0;
+    }
+    size_t applied = 0, budget = INTERN_DRAIN_SLICE;
+    while (drain_msg != NULL && budget > 0) {
+        deferMsg *msg = drain_msg;
+        for (; drain_pos < msg->count && budget > 0; drain_pos++, budget--) {
+            releaseOnMain(msg->e[drain_pos].s, msg->e[drain_pos].n);
+            applied += msg->e[drain_pos].n;
         }
-        zfree(msg);
-        msg = next;
+        if (drain_pos == msg->count) {
+            drain_msg = msg->next;
+            drain_pos = 0;
+            zfree(msg);
+        }
     }
     st.deferred += applied;
     return applied;
+}
+
+int internDrainPending(void) {
+    return drain_msg != NULL || atomic_load_explicit(&defer_head, memory_order_relaxed) != NULL;
 }
 
 
