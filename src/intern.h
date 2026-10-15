@@ -170,8 +170,11 @@ void internDeferPublish(void);
 void internDeferCoalesce(void);
 void internDeferFlush(void);
 
-/* Applies releases queued by other threads. Main thread only. */
+/* Applies releases queued by other threads, at most a fixed number of strings
+ * per call. internDrainPending() is non-zero while some are left, so the caller
+ * can poll again without waiting for events. Main thread only. */
 size_t internDrainDeferred(void);
+int internDrainPending(void);
 
 /* Moves a shareable string with a single holder using `defragfn`, keeping the
  * table consistent. Returns the new sds, or NULL if it did not move. The caller
