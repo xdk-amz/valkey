@@ -1389,7 +1389,7 @@ void syncCommand(client *c) {
 
     /* Wait for any IO pending operation to finish before changing the client state to replica */
     unpartitionClient(c); /* replication links are main-owned */
-    waitForClientIO(c);
+    if (!settleClientWrite(c)) return;
 
     /* Check if this is a failover request to a replica with the same replid and
      * become a primary if so. */

@@ -520,6 +520,8 @@ void debugCommand(client *c) {
             "    Stop the server for <seconds>. Decimals allowed.",
             "IO-THREADS-FAIL-CREATE <id>",
             "    Make the next attempt to create IO thread <id> fail (for testing rollback).",
+            "IO-WRITE-DONE-DELAY <microseconds>",
+            "    IO threads wait this long after writing a reply before they report the write done (0 to stop).",
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -660,6 +662,15 @@ void debugCommand(client *c) {
         for (int i = 0; i < 8; i++) addReplyLongLong(c, (long long)stats[i]);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char *)objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "io-write-done-delay") && c->argc == 3) {
+        long long us;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &us, NULL) != C_OK) return;
+        if (us < 0 || us > 10000000) {
+            addReplyError(c, "delay out of range");
+            return;
+        }
+        __atomic_store_n(&server.debug_io_write_done_delay_us, (int)us, __ATOMIC_RELAXED);
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "io-threads-fail-create") && c->argc == 3) {
         long long id;

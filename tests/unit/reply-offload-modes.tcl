@@ -7,7 +7,7 @@ proc mkbig {nbytes} {
     return [string range $s 0 [expr {$nbytes - 1}]]
 }
 
-start_server {tags {"reply-offload"} overrides {io-threads 6 enable-debug-command yes save ""}} {
+start_server {tags {"reply-offload external:skip needs:debug logreqres:skip"} overrides {io-threads 6 enable-debug-command yes save ""}} {
     assert_equal {io-threads 6} [r config get io-threads]
 
     test {avoid-copy-reply-mode off: large GET byte-exact and zero offload} {

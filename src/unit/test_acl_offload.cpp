@@ -263,3 +263,42 @@ TEST_F(AclOffloadTest, QuiesceIsSafeWithNoWorkers) {
     aclOffloadQuiesce();
     EXPECT_EQ(server.stat_acl_offload_quiesce_count, q0 + 1);
 }
+
+struct TagOnThreadArgs {
+    client *c;
+    robj **argv;
+    int read_flags;
+};
+
+static void *tagAsIOThread1(void *p) {
+    TagOnThreadArgs *a = static_cast<TagOnThreadArgs *>(p);
+    testOnlySetCurTid(1);
+    aclOffloadTagCommand(a->c, lookupCommandByCString("get"), a->argv, 2, 0, &a->read_flags);
+    return NULL;
+}
+
+/* The tag's admission read is published on the tagging thread's own slot, the one aclOffloadQuiesce
+ * waits on, whatever cur_tid the client carries: a client never read through the partitioned path
+ * has cur_tid 0, a slot no IO thread owns and quiesce never examines. */
+TEST_F(AclOffloadTest, TagBracketsOnTheTaggingThreadsSlot) {
+    user *u = makeRestricted();
+    aclMarkUserBound(u);
+    robj *argv[2] = {createStringObject("GET", 3), createStringObject("foo:1", 5)};
+    client c;
+    memset(&c, 0, sizeof(c));
+    c.user = u;
+    c.db = server.db[0];
+    c.cur_tid = 0;
+    TagOnThreadArgs a = {&c, argv, READ_FLAGS_PARSING_COMPLETED};
+    uint32_t own0 = testOnlyFastpathAdmitSeq(1), other0 = testOnlyFastpathAdmitSeq(0);
+
+    pthread_t th;
+    ASSERT_EQ(pthread_create(&th, NULL, tagAsIOThread1, &a), 0);
+    pthread_join(th, NULL);
+    EXPECT_TRUE(a.read_flags & READ_FLAGS_ACL_ALLOWED);
+    EXPECT_EQ(testOnlyFastpathAdmitSeq(1), own0 + 2);
+    EXPECT_EQ(testOnlyFastpathAdmitSeq(0), other0);
+
+    ACLFreeUser(u);
+    freeObjs(argv, 2);
+}

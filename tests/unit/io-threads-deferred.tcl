@@ -56,9 +56,15 @@ start_server {tags {"io-threads-deferred external:skip tls:skip"} overrides {io-
         assert_equal OK [r config set io-batch-inflight 1]
         set before [df_info fastpath_deferrals]
         set clients [df_open_clients 16 df:a]
+        # Main sleeps while the pipelines arrive: the first batch stays in flight and caps the rest.
+        set sleeper [valkey_deferring_client]
+        $sleeper debug sleep 1
+        after 200
         set i 0
         foreach c $clients { for {set j 0} {$j < 100} {incr j} { $c incr df:a$i }; incr i }
         foreach c $clients { $c flush }
+        assert_equal OK [$sleeper read]
+        $sleeper close
         set i 0
         foreach c $clients {
             for {set j 1} {$j <= 100} {incr j} { assert_equal $j [$c read] }

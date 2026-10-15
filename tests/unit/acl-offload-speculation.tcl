@@ -10,7 +10,7 @@ als_write_aclfile [file join $server_path "users.acl"] {
 }
 start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-threads" 4 \
         "io-threads-always-active" "yes" "acl-offload" "yes" "save" ""] \
-        tags [list "acl acl-offload external:skip tls:skip"]] {
+        tags [list acl acl-offload external:skip tls:skip]] {
 
     set aclfile [file join $server_path "users.acl"]
     r select 0 ;# the same db as the fast-path client

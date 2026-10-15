@@ -83,4 +83,8 @@ uint32_t lrulfu_getIdleness(uint32_t lrulfu, uint32_t *idleness);
 /* Add a touch to the LRU or LFU value, returning the updated LRU/LFU.  */
 uint32_t lrulfu_touch(uint32_t lrulfu);
 
+/* Same as lrulfu_touch, with r (uniform in [0, 1]) as the random number the LFU increment uses,
+ * for a caller with its own generator. */
+uint32_t lrulfu_touchWithRandom(uint32_t lrulfu, double r);
+
 #endif

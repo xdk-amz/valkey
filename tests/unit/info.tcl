@@ -544,10 +544,9 @@ start_server {tags {"info" "external:skip"}} {
         assert_equal [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] {0}
         # overhead.db.hashtable.lut = memory overhead of hashtable including hashtable struct and tables
         set hashtable_overhead [dict get $mem_stats overhead.db.hashtable.lut]
-        # The D+ version array adds a fixed 2KB LUT per hashtable, so infer
-        # architecture directly and widen the absolute bound (ported from
-        # the Lane C fix for the same feature-1 test debt).
-        set bits [expr {$::tcl_platform(wordSize) * 8}]
+        # The D+ version array adds a fixed 2KB per hashtable, so the overhead
+        # no longer tells 32-bit from 64-bit; ask the server.
+        set bits [s arch_bits]
         assert_range $hashtable_overhead 1 4096
         assert_equal [dict get $mem_stats overhead.db.hashtable.rehashing] {0}
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {0}

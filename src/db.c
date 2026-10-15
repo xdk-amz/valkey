@@ -2011,20 +2011,46 @@ void dbKeyBracketEnd(dbKeyBracket *brk) {
     brk->va = NULL;
 }
 
+/* Publishes news as the value of the RAW string o. The old buffer stays readable for
+ * in-flight readers and is freed once they are quiescent. */
+void dbReplacePublishedStringBuffer(robj *o, sds news) {
+    serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
+    sds old = objectGetVal(o);
+    objectSetVal(o, news);
+    if (!dplusDeferFreeRaw(sdsAllocPtr(old))) sdsfree(old);
+}
+
 sds dbGrowPublishedStringValue(robj *o, size_t total_len) {
     serverAssert(objectGetEncoding(o) == OBJ_ENCODING_RAW && !o->hasembval);
     sds s = objectGetVal(o);
     if (sdsalloc(s) >= total_len) return s; /* in-place capacity; bytes mutate under the caller's bracket */
-    /* Replacement publication: same copy a realloc move would perform. The
-     * old buffer stays intact and dereferenceable for in-flight readers and
-     * is freed at quiescence (universal deferred free -- the realloc's
-     * implicit free was the H4/H5 UAF). */
+    /* Same copy a realloc move would perform, but the old buffer is freed only after
+     * readers that may be copying it are quiescent. */
     sds news = sdsnewlen(SDS_NOINIT, total_len);
     memcpy(news, s, sdslen(s));
     sdssetlen(news, sdslen(s));
-    objectSetVal(o, news);
-    if (!dplusDeferFreeRaw(sdsAllocPtr(s))) sdsfree(s);
+    dbReplacePublishedStringBuffer(o, news);
     return news;
+}
+
+/* Holds the shards of the command's keys in c->db until dplusUnitRelease, so readers see
+ * all of its writes there or none. A command that declares no keys holds every shard.
+ * Returns 1 if this call opened the unit, and so must release it. */
+int dbUnitHoldCommandKeys(client *c) {
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, 0); /* speculation runs only outside cluster mode */
+    dplusVersionArray *va = ht ? hashtableGetVersionArray(ht) : NULL;
+    if (va == NULL) return 0;
+    int opening = dplus_unit.va == NULL;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int numkeys = getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+    if (numkeys == 0) dplusUnitHoldAll(va);
+    for (int i = 0; i < numkeys; i++) {
+        sds key = objectGetVal(c->argv[result.keys[i].pos]);
+        dplusUnitHoldShard(va, DPLUS_SHARD_INDEX(hashtableHashKey(ht, key)));
+    }
+    getKeysFreeResult(&result);
+    return opening && dplus_unit.va != NULL;
 }
 
 int removeExpire(serverDb *db, robj *key) {

@@ -93,7 +93,7 @@ proc cc_assert_healthy {} {
     assert_equal 0 [string match {*=== ASSERTION FAILED ===*} $log]
 }
 
-start_server {tags {"io-threads-client-control external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
     assert_equal {io-threads 4} [r config get io-threads]
     r select 0
 

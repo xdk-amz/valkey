@@ -215,6 +215,8 @@ struct ValkeyModuleKey {
     robj *value; /* Value object, or NULL if the key was not found. */
     void *iter;  /* Iterator. */
     int mode;    /* Opening mode. */
+    /* Readers are kept out until close: a write DMA pointer was handed out. */
+    int dma_exclusive;
 
     union {
         struct {
@@ -4340,6 +4342,7 @@ static void moduleInitKey(ValkeyModuleKey *kp, ValkeyModuleCtx *ctx, robj *keyna
     kp->value = value;
     kp->iter = NULL;
     kp->mode = mode;
+    kp->dma_exclusive = 0;
     if (kp->value) moduleInitKeyTypeSpecific(kp);
 }
 
@@ -4439,6 +4442,7 @@ static void moduleCloseKey(ValkeyModuleKey *key) {
         }
     }
     serverAssert(key->iter == NULL);
+    if (key->dma_exclusive) dplusExclusiveLeave();
     decrRefCount(key->key);
 }
 
@@ -4683,6 +4687,13 @@ char *VM_StringDMA(ValkeyModuleKey *key, size_t *len, int mode) {
     if ((mode & VALKEYMODULE_WRITE) || objectGetEncoding(key->value) != OBJ_ENCODING_RAW)
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
 
+    /* The module may write through the pointer until the key is closed, with no bracket around
+     * its writes, so speculative readers are kept out until then. */
+    if ((mode & VALKEYMODULE_WRITE) && !key->dma_exclusive) {
+        dplusExclusiveEnter();
+        key->dma_exclusive = 1;
+    }
+
     *len = sdslen(objectGetVal(key->value));
     return objectGetVal(key->value);
 }
@@ -4714,17 +4725,24 @@ int VM_StringTruncate(ValkeyModuleKey *key, size_t newlen) {
         setKey(key->ctx->client, key->db, key->key, &o, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
         key->value = o;
     } else {
-        /* Unshare and resize. */
+        /* Unshare and resize. A replaced buffer is freed only once speculative readers that may
+         * be copying it are quiescent, and the bytes change inside the key's bracket. */
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
+        dbKeyBracket brk;
+        dbKeyBracketBegin(key->db, key->key, &brk);
         size_t curlen = sdslen(objectGetVal(key->value));
         if (newlen > curlen) {
-            objectSetVal(key->value, sdsgrowzero(objectGetVal(key->value), newlen));
+            sds grown = dbGrowPublishedStringValue(key->value, newlen);
+            objectSetVal(key->value, sdsgrowzero(grown, newlen));
         } else if (newlen < curlen) {
             sdssubstr(objectGetVal(key->value), 0, newlen);
             /* If the string is too wasteful, reallocate it. */
-            if (sdslen(objectGetVal(key->value)) < sdsavail(objectGetVal(key->value)))
-                objectSetVal(key->value, sdsRemoveFreeSpace(objectGetVal(key->value), 0));
+            if (sdslen(objectGetVal(key->value)) < sdsavail(objectGetVal(key->value))) {
+                sds old = objectGetVal(key->value);
+                dbReplacePublishedStringBuffer(key->value, sdsnewlen(old, sdslen(old)));
+            }
         }
+        dbKeyBracketEnd(&brk);
     }
     return VALKEYMODULE_OK;
 }
@@ -9399,6 +9417,7 @@ void moduleGILAfterLock(void) {
     /* We should never get here if we already inside a module
      * code block which already opened a context. */
     serverAssert(server.execution_nesting == 0);
+    dplusGilWriterBegin();
     /* Bump up the nesting level to prevent immediate propagation
      * of possible VM_Call from th thread */
     enterExecutionUnit(1, 0);
@@ -9441,6 +9460,7 @@ void moduleGILBeforeUnlock(void) {
      * released we have to propagate here). */
     exitExecutionUnit();
     postExecutionUnitOperations();
+    dplusGilWriterEnd();
 }
 
 /* Release the server lock after a thread safe API call was executed. */
@@ -11762,6 +11782,10 @@ int moduleHasCommandFilters(void) {
     return moduleCommandFilters != NULL && listLength(moduleCommandFilters) > 0;
 }
 
+int moduleHasKeyspaceSubscribers(void) {
+    return moduleKeyspaceSubscribers != NULL && listLength(moduleKeyspaceSubscribers) > 0;
+}
+
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 
@@ -13270,6 +13294,19 @@ void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
             moduleFreeContext(&ctx);
         }
     }
+}
+
+/* Returns 1 if a module listens to server event 'eid'. */
+int moduleHasServerEventListener(uint64_t eid) {
+    if (ValkeyModule_EventListeners == NULL) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(ValkeyModule_EventListeners, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleEventListener *el = ln->value;
+        if (el->event.id == eid) return 1;
+    }
+    return 0;
 }
 
 /* Remove all the listeners for this module: this is used before unloading

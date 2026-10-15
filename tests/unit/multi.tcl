@@ -1165,6 +1165,22 @@ start_server {overrides {appendonly {yes} appendfilename {appendonly.aof} append
     } {}
 }
 
+start_server {overrides {appendonly {yes} appendfilename {appendonly.aof} appendfsync always io-threads 2 enable-debug-command yes} tags {external:skip}} {
+    test {EXEC reply waits for the AOF fsync when its client rejoins the fast path} {
+        set aof [get_last_incr_aof_path r]
+        # The flush sleeps before writing, so a reply sent before it finds nothing in the AOF.
+        r debug aof-flush-sleep 500000
+        r multi
+        r set foo bar
+        r exec
+        assert_aof_content $aof {
+            {select *}
+            {set foo bar}
+        }
+        r debug aof-flush-sleep 0
+    } {OK} {needs:debug}
+}
+
 start_cluster 1 0 {tags {"external:skip cluster"}} {
     test "Regression test for multi-exec with RANDOMKEY accessing the wrong per-slot dictionary" {
         R 0 SETEX FOO 10000 BAR

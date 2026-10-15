@@ -36,6 +36,7 @@
 #include "dplus.h"
 #include "cluster_migrateslots.h"
 #include "io_threads.h"
+#include "fastpath.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -296,6 +297,8 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
             overhead += dc->last_memory_usage;
         }
     }
+    /* Likewise fast-path clients already evicted or closed whose IO thread has not handed them back. */
+    overhead += fastpathTerminalPendingMem();
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
 
     /* Pending off-main frees count as reclaimed so eviction does not over-evict. */
@@ -633,17 +636,13 @@ int performEvictions(void) {
                  * transmission here inside the loop. */
                 if (replicas) flushReplicasOutputBuffers();
 
-                /* With IO threads active, memory tied up in freed clients'
-                 * reply buffers and evicted values returns asynchronously.
-                 * Commit any dispatched IO jobs (they are otherwise invisible
-                 * to workers until beforeSleep) and drain completed responses
-                 * so the off-main frees land before the next re-poll, keeping
-                 * key eviction from racing ahead of memory that is already
-                 * on its way back. */
-                if (server.active_io_threads_num > 1) {
-                    commitIOJobs();
-                    processIOThreadsResponses();
-                }
+                /* With IO threads active, memory of evicted values and freed
+                 * clients returns asynchronously; getMaxmemoryState already
+                 * discounts it. Commit dispatched jobs so workers start those
+                 * frees now. Responses are not processed here: that would run
+                 * other commands, possibly the same client's, in the middle of
+                 * this one. */
+                if (server.active_io_threads_num > 1) commitIOJobs();
 
                 /* Normally our stop condition is the ability to release
                  * a fixed, pre-computed amount of memory. However when we

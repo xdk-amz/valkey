@@ -3,6 +3,7 @@
 
 #include "server.h"
 #include "dplus.h"
+#include "hotkeys.h"
 #include "io_threads.h"
 
 #include <string.h>
@@ -21,7 +22,7 @@ static _Atomic(long long) dplus_debug_reader_hold_us = 0;
 static _Atomic(long long) dplus_debug_prevalidate_hold_us = 0;
 static _Atomic(int) dplus_debug_prevalidate_bump = 0;
 static _Atomic(uint64_t) dplus_debug_prevalidate_consumed = 0;
-static char dplus_debug_pv_last_key[32] = "";      /* diagnostic only */
+static char dplus_debug_pv_last_key[32] = ""; /* diagnostic only */
 static _Atomic(uint64_t) dplus_debug_pv_last_client = 0;
 static _Atomic(int) dplus_debug_reader_holding = 0;
 static _Atomic(int) dplus_debug_reader_release = 0;
@@ -78,10 +79,34 @@ uint64_t dplusStatsSum(size_t field_offset) {
 
 /* --- Component 4: Exclusive mode implementation --- */
 
+static void dplusCheckTouchWord(void);
+
+/* Speculation reads only the keyspace and never in cluster mode, so only keyspace
+ * tables carry versions, and only once an IO thread can exist. One way: tables
+ * keep their versions when IO threads scale down. Main only, before the first
+ * IO thread starts. */
+void dplusEnableSpeculativeReads(void) {
+    static int enabled = 0;
+    if (enabled || server.cluster_enabled) return;
+    enabled = 1;
+    dplusCheckTouchWord();
+    hashtableEnableSpeculativeReads();
+    if (!server.db) return;
+    for (int i = 0; i < server.dbnum; i++) {
+        serverDb *db = server.db[i];
+        if (!db) continue;
+        for (int didx = 0; didx < kvstoreNumHashtables(db->keys); didx++) {
+            hashtable *ht = kvstoreGetHashtable(db->keys, didx);
+            if (ht) hashtableEnableVersions(ht);
+        }
+    }
+}
+
 /* A slot is published before its thread can read speculative pointers and is
  * excluded only after join, preventing slot-reuse ABA during runtime resize. */
 void dplusReaderWorkerOnline(int tid) {
     serverAssert(tid > 0 && tid < DPLUS_MAX_IO_THREADS);
+    dplus_write_tax[tid].history = ~(uint64_t)0; /* a new worker starts out speculating */
     atomic_store_explicit(&dplus_reader_slots[tid].state, DPLUS_READER_QUIESCENT, memory_order_seq_cst);
     atomic_fetch_or_explicit(&dplus_reader_online[tid / 64], UINT64_C(1) << (tid % 64), memory_order_seq_cst);
 }
@@ -136,10 +161,30 @@ static int dplusReaderEnter(int tid) {
     }
 }
 
-/* Exclusive mode remains a counter because nested main/BIO windows are valid.
- * Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. Scan
- * all slots until runtime-resize ordering is proven under the new lifecycle. */
+/* Writer thread only: depth of exclusive windows the writer has entered and finished draining. */
+static int dplus_main_exclusive_depth = 0;
+
+/* Set while a module thread holds the GIL: it is then the keyspace writer, as main is otherwise. */
+static _Thread_local int dplus_gil_writer = 0;
+
+void dplusGilWriterBegin(void) {
+    dplus_gil_writer = 1;
+}
+
+void dplusGilWriterEnd(void) {
+    dplus_gil_writer = 0;
+}
+
+static int dplusOnWriterThread(void) {
+    return dplus_gil_writer || onServerMainThread();
+}
+
+/* Exclusive mode is a counter because windows nest. Only the writer enters it: a table
+ * freed on another thread (BIO, an IO thread) was unpublished by the writer first, so no
+ * reader can reach it, and a window opened there would let the writer free retired memory
+ * before readers drain. Every ACTIVE(epoch) slot is a reader; OFFLINE and QUIESCENT are safe. */
 void dplusExclusiveEnter(void) {
+    if (!dplusOnWriterThread()) return;
     atomic_fetch_add_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Test-only: a debug-held reader models a descheduled thread. ANY
@@ -164,10 +209,67 @@ void dplusExclusiveEnter(void) {
             }
         }
     }
+    dplus_main_exclusive_depth++;
 }
 
 void dplusExclusiveLeave(void) {
+    if (!dplusOnWriterThread()) return;
+    serverAssert(dplus_main_exclusive_depth > 0);
+    dplus_main_exclusive_depth--;
     atomic_fetch_sub_explicit(&dplus_exclusive_mode, 1, memory_order_seq_cst);
+}
+
+/* True while the writer is inside an exclusive window: readers are drained and kept out. */
+int dplusInExclusiveWindow(void) {
+    return dplus_main_exclusive_depth > 0;
+}
+
+/* --- Units --- */
+
+dplusUnit dplus_unit = {0};
+
+/* Holds one shard of va until dplusUnitRelease. Returns 0 if the unit already holds
+ * another table, whose writes then bracket themselves as usual. */
+int dplusUnitHoldShard(dplusVersionArray *va, unsigned shard) {
+    if (va == NULL || (dplus_unit.va != NULL && dplus_unit.va != va)) return 0;
+    if (dplusShardHeld(va, shard)) return 1;
+    dplusVersionBracketBegin(va, shard);
+    dplus_unit.va = va;
+    dplus_unit.held[shard / 64] |= UINT64_C(1) << (shard % 64);
+    return 1;
+}
+
+/* Holds every shard of va until dplusUnitRelease. */
+int dplusUnitHoldAll(dplusVersionArray *va) {
+    if (va == NULL || (dplus_unit.va != NULL && dplus_unit.va != va)) return 0;
+    if (dplus_unit.all) return 1;
+    dplusVersionBracketAllBegin(va); /* skips the shards already held */
+    dplus_unit.va = va;
+    dplus_unit.all = 1;
+    return 1;
+}
+
+void dplusUnitRelease(void) {
+    dplusUnit unit = dplus_unit;
+    if (unit.va == NULL) return;
+    memset(&dplus_unit, 0, sizeof(dplus_unit)); /* the brackets below must not see the holds */
+    if (unit.all) {
+        dplusVersionBracketAllEnd(unit.va);
+        return;
+    }
+    for (int word = 0; word < DPLUS_VERSION_SHARDS / 64; word++) {
+        uint64_t bits = unit.held[word];
+        while (bits) {
+            int shard = word * 64 + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            dplusVersionBracketEnd(unit.va, shard);
+        }
+    }
+}
+
+/* The writer is unpublishing a table: a unit must not touch its versions afterwards. */
+void dplusUnitForgetTable(dplusVersionArray *va) {
+    if (va != NULL && dplus_unit.va == va) memset(&dplus_unit, 0, sizeof(dplus_unit));
 }
 
 /* --- ACL/AUTH gate for speculation --- */
@@ -202,14 +304,17 @@ void dplusRecomputeSpecAclOk(client *c) {
             /* Synthetic argv: the helper only needs cmd identity + dbid for
              * the command/db checks; the ALLKEYS-or-%R~* requirement is what
              * actually gates key access, so a placeholder key can only cause
-             * a (safe) conservative punt, never a false allow. */
-            robj *argv[2];
-            argv[0] = createStringObject("get", 3);
-            argv[1] = createStringObject("k", 1);
-            int dbid = c->db ? c->db->id : 0;
-            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
-            decrRefCount(argv[0]);
-            decrRefCount(argv[1]);
+             * a (safe) conservative punt, never a false allow. A sentinel has no
+             * GET and never speculates. */
+            if (get_cmd) {
+                robj *argv[2];
+                argv[0] = createStringObject("get", 3);
+                argv[1] = createStringObject("k", 1);
+                int dbid = c->db ? c->db->id : 0;
+                if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
+                decrRefCount(argv[0]);
+                decrRefCount(argv[1]);
+            }
         }
     }
     atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
@@ -301,14 +406,70 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
 
 /* Per-key state for the batched prefetch + validate pipeline. */
 typedef struct dplusBatchEntry {
-    void *key_sds;                           /* SDS key string */
-    uint64_t hash;                           /* Pre-computed hash */
-    unsigned shard;                          /* Version shard index */
-    uint64_t v_before;                       /* Version read before find */
+    void *key_sds;                            /* SDS key string */
+    uint64_t hash;                            /* Pre-computed hash */
+    unsigned shard;                           /* Version shard index */
+    uint64_t v_before;                        /* Version read before find */
     hashtableIncrementalFindState find_state; /* Incremental find state */
-    int is_first_cmd;                        /* 1 if this is c->argv, 0 if queue */
-    int queue_idx;                           /* Index in cmd_queue (if !is_first_cmd) */
+    int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
+    int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } dplusBatchEntry;
+
+/* --- LRU/LFU touch for speculated GETs ---
+ * A GET served here touches its key as lookupKey does on main. The reader never plainly
+ * stores into an object the writer may change at the same time: it swaps the 32-bit word
+ * holding type, encoding and the LRU/LFU field only if the word is still what it read, so
+ * a concurrent writer change makes the touch fail rather than be undone, and a writer that
+ * later overwrites the word only loses the touch. */
+static int dplus_touch_word_ok = 0; /* type, encoding and lru fill exactly the first 32 bits */
+
+static void dplusCheckTouchWord(void) {
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.type = 15;
+    probe.encoding = 15;
+    probe.lru = (1u << LRULFU_BITS) - 1;
+    uint32_t word;
+    memcpy(&word, &probe, sizeof(word));
+    int ok = word == UINT32_MAX;
+    const unsigned char *rest = (const unsigned char *)&probe + sizeof(word);
+    for (size_t i = 0; i < sizeof(probe) - sizeof(word); i++) ok = ok && rest[i] == 0;
+    dplus_touch_word_ok = ok;
+}
+
+/* xorshift64*, one generator per IO thread: lrulfu_touch's rand() is not meant for these threads. */
+static _Thread_local uint64_t dplus_touch_rng = 0;
+
+static double dplusTouchRandom(void) {
+    uint64_t x = dplus_touch_rng;
+    if (x == 0) x = ((uint64_t)(uintptr_t)&dplus_touch_rng ^ (uint64_t)getMonotonicUs()) | 1;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    dplus_touch_rng = x;
+    return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
+}
+
+static void dplusTouch(client *c, robj *o) {
+    if (!dplus_touch_word_ok || c->flag.no_touch || hasActiveChildProcess()) return;
+    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    memcpy(&probe, &seen, sizeof(seen));
+    uint32_t lru = lrulfu_touchWithRandom(probe.lru, dplusTouchRandom());
+    if (lru == probe.lru) return;
+    probe.lru = lru;
+    uint32_t touched;
+    memcpy(&touched, &probe, sizeof(touched));
+    __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+/* The commandlog threshold of a type, or -1 while that log records nothing. */
+static long long dplusCommandlogThreshold(int type) {
+    if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
+    return server.commandlog[type].threshold;
+}
 
 /* Execute the validate+copy+reply phase for a single prefetched entry.
  * Returns 1 on success (reply written), 0 on punt. */
@@ -421,9 +582,14 @@ static int dplusValidateAndReply(client *c, dplusBatchEntry *e, hashtable *ht, i
         return 0;
     }
 
+    /* A reply the large-reply commandlog would record goes to main, which records it. */
+    long long reply_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
+
     /* Version valid — write reply. */
     int written = dplusWriteBulkReply(c, valbuf, vallen);
     if (written <= 0) return 0;
+    dplusTouch(c, o);
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     DPLUS_STAT_ADD(speculative_hits, 1);
@@ -460,6 +626,12 @@ int dplusSpeculateBatch(client *c, int tid) {
      * and a speculation racing a role change is no different from one racing
      * any main-thread write, which the validate step already covers. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
+
+    /* DURABILITY GATE: under appendfsync always no reply may expose a write before its fsync, and a
+     * speculated read replies without waiting for main's fsync point. Plain-word reads of main-written
+     * config, stale only for the batch racing a CONFIG SET. */
+    if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) && server.aof_fsync == AOF_FSYNC_ALWAYS)
+        return 0;
 
     /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
      * execute only at EXEC — speculating a GET here would execute it early
@@ -504,6 +676,16 @@ int dplusSpeculateBatch(client *c, int tid) {
      * every attached monitor. Global, diagnostic-rare gate -- zero cost when no
      * monitor is attached. */
     if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
+
+    /* HOT-KEY GUARD: hot-key detection samples lookups on main; a speculated GET would be
+     * invisible to it. Detection is an operator diagnostic, off by default. */
+    if (hotkeysEnabled()) return 0;
+
+    /* COMMANDLOG GUARD: a GET the commandlog would record goes to main, which records it. With a
+     * slow threshold of 0 it records every command; large requests are checked per GET below. */
+    if (dplusCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
+    long long request_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    if (request_threshold >= 0 && (long long)c->net_input_bytes_curr_cmd >= request_threshold) return 0;
 
     /* DEFRAG GUARD: active defrag MOVES allocations (entries/sds) and frees
      * the originals outside the limbo hooks — reads racing a move are the
@@ -554,7 +736,7 @@ int dplusSpeculateBatch(client *c, int tid) {
     /* --- Phase 1: Collect eligible prefix keys into batch --- */
     serverDb *db = c->db;
     int dict_index = 0;
-    hashtable *ht = kvstoreGetHashtable(db->keys, dict_index);
+    hashtable *ht = kvstoreGetHashtableAcquire(db->keys, dict_index);
     if (!ht) goto out;
 
     dplusVersionArray *va = hashtableGetVersionArray(ht);
@@ -567,7 +749,6 @@ int dplusSpeculateBatch(client *c, int tid) {
     if (c->argc == 2 && c->parsed_cmd != NULL &&
         c->parsed_cmd == dplus_get_cmd &&
         (c->parsed_cmd->flags & (CMD_READONLY | CMD_FAST)) == (CMD_READONLY | CMD_FAST)) {
-
         /* Write-tax gate: first command IS eligible (GET), so we know the
          * workload can speculate. Check the gate to decide whether recent
          * traffic justifies the prefetch investment. If traffic has been
@@ -662,7 +843,8 @@ int dplusSpeculateBatch(client *c, int tid) {
         while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
             if (p->cmd == NULL || !(p->cmd->flags & CMD_READONLY) || p->argc != 2 ||
-                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd) {
+                !(p->cmd->flags & CMD_FAST) || p->cmd != dplus_get_cmd ||
+                (request_threshold >= 0 && (long long)p->input_bytes >= request_threshold)) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
@@ -672,11 +854,14 @@ int dplusSpeculateBatch(client *c, int tid) {
             e->shard = DPLUS_SHARD_INDEX(e->hash);
             e->v_before = dplusVersionRead(va, e->shard);
             if (e->v_before & 1) {
-                /* S2.2a: writer bracket open -- refuse at entry */
+                /* A writer holds this shard: end the prefix here, as for the first GET. Waiting for
+                 * the shard to turn even keeps this reader active, and main can be the writer while
+                 * it drains readers (rehash completion, the retirement hard limit). */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
                 DPLUS_STAT_ADD(bracket_entry_punts, 1);
 #endif
-                continue;
+                prefix_open = 0;
+                break;
             }
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
@@ -686,7 +871,7 @@ int dplusSpeculateBatch(client *c, int tid) {
             queue_pos++;
         }
         if (queue_pos >= queue->len) prefix_open = 0; /* queue exhausted — drain */
-        if (head == tail) break; /* nothing in flight and nothing to fill */
+        if (head == tail) break;                      /* nothing in flight and nothing to fill */
 
         /* Sweep: one find step per pending slot (one prefetch each). */
         for (unsigned s = head; s < tail; s++) {
@@ -758,8 +943,10 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         /* CRITICAL: clear pending_command — the parse path set it, and without
          * clearing it here the main thread's processPendingCommandAndInputBuffer
          * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
-         * (the removed main-side skip path used to clear this flag). */
-        c->flag.pending_command = 0;
+         * (the removed main-side skip path used to clear this flag). A fast-path
+         * client never has it set, and must not write flag: main writes other
+         * bits of the same word while the IO thread owns the client. */
+        if (c->flag.pending_command) c->flag.pending_command = 0;
         /* Free argv INLINE — do NOT call freeClientArgv() which routes through
          * tryOffloadFreeArgvToIOThreads(). That function increments the non-atomic
          * io_jobs_submitted from the IO thread (data race with main) and enqueues
@@ -772,9 +959,11 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         c->argv = NULL;
         c->argc = 0;
         c->cmd = NULL;
+        if (c->parsed_cmd) c->lastcmd = c->parsed_cmd;
         c->parsed_cmd = NULL;
         c->argv_len_sum = 0;
         c->argv_len = 0;
+        c->net_input_bytes_curr_cmd = 0; /* the parser accumulates; resetClient never runs for it */
         c->slot = -1;
         c->commands_processed++;
         consumed++;
@@ -787,6 +976,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
         if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
         p->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
         queue->off++;
+        if (p->cmd) c->lastcmd = p->cmd;
         /* Free argv for the consumed command. */
         for (int j = 0; j < p->argc; j++) {
             decrRefCount(p->argv[j]);
@@ -862,12 +1052,14 @@ void dplusAggregateStats(void) {
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
+        long long calls = 0, calls_usec = 0;
         long long n = dplus_thread_stats[i].commands_processed;
         if (n > seen_calls[i]) {
             long long delta = n - seen_calls[i];
             seen_calls[i] = n;
             server.stat_numcommands += delta;
             if (get_cmd) get_cmd->calls += delta;
+            calls = delta;
         }
         /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
          * bypasses main's lookupKey where this is normally incremented). Same
@@ -883,7 +1075,11 @@ void dplusAggregateStats(void) {
             long long delta = us - seen_usec[i];
             seen_usec[i] = us;
             if (get_cmd) get_cmd->microseconds += delta;
+            calls_usec = delta;
         }
+        /* Latencystats parity: the folded GETs enter the histogram at their average duration. */
+        if (get_cmd && calls > 0 && server.latency_tracking_enabled)
+            updateCommandLatencyHistogramCount(&get_cmd->latency_histogram, calls_usec * 1000 / calls, calls);
         /* Fix #2 (main-free completion): fold worker-side write completions
          * into the global write stats. Same monotonic-delta scheme. */
         long long w = dplus_thread_stats[i].owned_writes;
@@ -1045,9 +1241,9 @@ static int dplusAppendRetired(void *ptr, int route) {
     /* No configured workers, or no ownership (speculation is gated on it), means
      * no speculative pointer can exist: the caller frees on its own route. */
     if (server.io_threads_num <= 1) return 0;
-    /* Exclusive mode has already drained readers. Immediate free is required
-     * by RENAME/MOVE refcount re-embedding and maxmemory delta accounting. */
-    if (atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0) return 0;
+    /* Main has drained readers in its own exclusive window. Immediate free is required by
+     * RENAME/MOVE refcount re-embedding and maxmemory delta accounting. */
+    if (dplus_main_exclusive_depth > 0) return 0;
     serverAssert(inMainThread());
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     /* Deterministic test handshake: do not begin the armed pressure command
@@ -1239,7 +1435,7 @@ static void dplusTrimRetireFreelists(void) {
 }
 
 void dplusForceReclaimAll(void) {
-    serverAssert(atomic_load_explicit(&dplus_exclusive_mode, memory_order_relaxed) > 0);
+    serverAssert(dplus_main_exclusive_depth > 0);
     dplus_forced_reclaims++;
     dplusSealRetireEpoch();
     dplusReclaimSealed(1);
@@ -1369,7 +1565,7 @@ sds dplusInfoString(sds info) {
      * consume the same values for correctness. */
     uint64_t entries = 0, retries = 0, epoch_exclusive_punts = 0, pressure_punts = 0;
     unsigned online = 0, active = 0, quiescent = 0;
-    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0;
+    long long doorbell_rings = 0, doorbell_coalesced = 0, punted_replies = 0, speculated = 0;
     int debug_reader_holding = 0;
     long long debug_reader_hold_us = 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -1392,101 +1588,104 @@ sds dplusInfoString(sds info) {
         doorbell_rings += dplus_thread_stats[i].doorbell_rings;
         doorbell_coalesced += dplus_thread_stats[i].doorbell_coalesced;
         punted_replies += dplus_thread_stats[i].punted_replies_written;
+        speculated += dplus_thread_stats[i].commands_processed;
     }
     info = sdscatprintf(info,
-        "# Dplus\r\n"
-        "dplus_reclaim_epoch:%llu\r\n"
-        "dplus_epoch_reader_entries:%llu\r\n"
-        "dplus_epoch_reader_retries:%llu\r\n"
-        "dplus_epoch_exclusive_punts:%llu\r\n"
-        "dplus_epoch_pressure_punts:%llu\r\n"
-        "dplus_reclaim_pressure_gate:%d\r\n"
-        "dplus_pressure_activations:%llu\r\n"
-        "dplus_epoch_workers_online:%u\r\n"
-        "dplus_epoch_workers_active:%u\r\n"
-        "dplus_epoch_workers_quiescent:%u\r\n"
-        "dplus_retired_entries:%zu\r\n"
-        "dplus_retired_bytes_lower_bound:%zu\r\n"
-        "dplus_retired_segments:%zu\r\n"
-        "dplus_retired_peak:%zu\r\n"
-        "dplus_reclaimed_entries:%llu\r\n"
-        "dplus_epoch_advances:%llu\r\n"
-        "dplus_epoch_scans:%llu\r\n"
-        "dplus_reclaim_budget_exhaustions:%llu\r\n"
-        "dplus_forced_reclaims:%llu\r\n"
-        "dplus_pressure_forced_drains:%llu\r\n"
-        "dplus_pressure_forced_wait_us:%llu\r\n"
-        "dplus_epoch_debug_reader_holding:%d\r\n"
-        "dplus_epoch_debug_reader_hold_us:%lld\r\n"
-        "dplus_doorbell_rings:%llu\r\n"
-        "dplus_doorbell_coalesced:%llu\r\n"
-        "dplus_punted_replies_written:%llu\r\n",
-        (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
-        (unsigned long long)entries,
-        (unsigned long long)retries,
-        (unsigned long long)epoch_exclusive_punts,
-        (unsigned long long)pressure_punts,
-        atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed),
-        (unsigned long long)dplus_pressure_activations,
-        online,
-        active,
-        quiescent,
-        dplus_retired_entries,
-        dplus_retired_bytes_lower_bound,
-        dplus_retired_segments,
-        dplus_retired_peak,
-        (unsigned long long)dplus_reclaimed_entries,
-        (unsigned long long)dplus_epoch_advances,
-        (unsigned long long)dplus_epoch_scans,
-        (unsigned long long)dplus_reclaim_budget_exhaustions,
-        (unsigned long long)dplus_forced_reclaims,
-        (unsigned long long)dplus_pressure_forced_drains,
-        (unsigned long long)dplus_pressure_forced_wait_us,
-        debug_reader_holding,
-        debug_reader_hold_us,
-        (unsigned long long)doorbell_rings,
-        (unsigned long long)doorbell_coalesced,
-        (unsigned long long)punted_replies);
+                        "# Dplus\r\n"
+                        "dplus_speculated_commands:%lld\r\n"
+                        "dplus_reclaim_epoch:%llu\r\n"
+                        "dplus_epoch_reader_entries:%llu\r\n"
+                        "dplus_epoch_reader_retries:%llu\r\n"
+                        "dplus_epoch_exclusive_punts:%llu\r\n"
+                        "dplus_epoch_pressure_punts:%llu\r\n"
+                        "dplus_reclaim_pressure_gate:%d\r\n"
+                        "dplus_pressure_activations:%llu\r\n"
+                        "dplus_epoch_workers_online:%u\r\n"
+                        "dplus_epoch_workers_active:%u\r\n"
+                        "dplus_epoch_workers_quiescent:%u\r\n"
+                        "dplus_retired_entries:%zu\r\n"
+                        "dplus_retired_bytes_lower_bound:%zu\r\n"
+                        "dplus_retired_segments:%zu\r\n"
+                        "dplus_retired_peak:%zu\r\n"
+                        "dplus_reclaimed_entries:%llu\r\n"
+                        "dplus_epoch_advances:%llu\r\n"
+                        "dplus_epoch_scans:%llu\r\n"
+                        "dplus_reclaim_budget_exhaustions:%llu\r\n"
+                        "dplus_forced_reclaims:%llu\r\n"
+                        "dplus_pressure_forced_drains:%llu\r\n"
+                        "dplus_pressure_forced_wait_us:%llu\r\n"
+                        "dplus_epoch_debug_reader_holding:%d\r\n"
+                        "dplus_epoch_debug_reader_hold_us:%lld\r\n"
+                        "dplus_doorbell_rings:%llu\r\n"
+                        "dplus_doorbell_coalesced:%llu\r\n"
+                        "dplus_punted_replies_written:%llu\r\n",
+                        speculated,
+                        (unsigned long long)atomic_load_explicit(&dplus_reclaim_epoch, memory_order_relaxed),
+                        (unsigned long long)entries,
+                        (unsigned long long)retries,
+                        (unsigned long long)epoch_exclusive_punts,
+                        (unsigned long long)pressure_punts,
+                        atomic_load_explicit(&dplus_reclaim_pressure_gate, memory_order_relaxed),
+                        (unsigned long long)dplus_pressure_activations,
+                        online,
+                        active,
+                        quiescent,
+                        dplus_retired_entries,
+                        dplus_retired_bytes_lower_bound,
+                        dplus_retired_segments,
+                        dplus_retired_peak,
+                        (unsigned long long)dplus_reclaimed_entries,
+                        (unsigned long long)dplus_epoch_advances,
+                        (unsigned long long)dplus_epoch_scans,
+                        (unsigned long long)dplus_reclaim_budget_exhaustions,
+                        (unsigned long long)dplus_forced_reclaims,
+                        (unsigned long long)dplus_pressure_forced_drains,
+                        (unsigned long long)dplus_pressure_forced_wait_us,
+                        debug_reader_holding,
+                        debug_reader_hold_us,
+                        (unsigned long long)doorbell_rings,
+                        (unsigned long long)doorbell_coalesced,
+                        (unsigned long long)punted_replies);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
-        "dplus_speculative_attempts:%llu\r\n"
-        "dplus_speculative_hits:%llu\r\n"
-        "dplus_validation_misses:%llu\r\n"
-        "dplus_exclusive_punts:%llu\r\n"
-        "dplus_large_value_punts:%llu\r\n"
-        "dplus_prevalidate_consumed:%llu\r\n"
-        "dplus_pv_last_key:%s\r\n"
-        "dplus_pv_last_client:%llu\r\n"
-        "dplus_bracket_entry_punts:%llu\r\n"
-        "dplus_expired_replies:%llu\r\n"
-        "dplus_intra_batch_write_punts:%llu\r\n"
-        "dplus_miss_punts:%llu\r\n"
-        "dplus_b13_waiting_transitions:%llu\r\n"
-        "dplus_b13_handler_fires:%llu\r\n"
-        "dplus_b13_read_suspends:%llu\r\n"
-        "dplus_b13_rearms:%llu\r\n"
-        "dplus_b13_info_lock_calls:%llu\r\n"
-        "dplus_b13_info_lock_wait_us:%llu\r\n"
-        "dplus_b13_info_lock_hold_us:%llu\r\n",
-        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
-        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
-        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
-        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
-        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
-        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
-        dplus_debug_pv_last_key,
-        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
-        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
-        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
-        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
-        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
-        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
-        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
-        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
-        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
+                        "dplus_speculative_attempts:%llu\r\n"
+                        "dplus_speculative_hits:%llu\r\n"
+                        "dplus_validation_misses:%llu\r\n"
+                        "dplus_exclusive_punts:%llu\r\n"
+                        "dplus_large_value_punts:%llu\r\n"
+                        "dplus_prevalidate_consumed:%llu\r\n"
+                        "dplus_pv_last_key:%s\r\n"
+                        "dplus_pv_last_client:%llu\r\n"
+                        "dplus_bracket_entry_punts:%llu\r\n"
+                        "dplus_expired_replies:%llu\r\n"
+                        "dplus_intra_batch_write_punts:%llu\r\n"
+                        "dplus_miss_punts:%llu\r\n"
+                        "dplus_b13_waiting_transitions:%llu\r\n"
+                        "dplus_b13_handler_fires:%llu\r\n"
+                        "dplus_b13_read_suspends:%llu\r\n"
+                        "dplus_b13_rearms:%llu\r\n"
+                        "dplus_b13_info_lock_calls:%llu\r\n"
+                        "dplus_b13_info_lock_wait_us:%llu\r\n"
+                        "dplus_b13_info_lock_hold_us:%llu\r\n",
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
+                        (unsigned long long)DPLUS_STAT_SUM(validation_misses),
+                        (unsigned long long)DPLUS_STAT_SUM(exclusive_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
+                        (unsigned long long)atomic_load_explicit(&dplus_debug_prevalidate_consumed, memory_order_seq_cst),
+                        dplus_debug_pv_last_key,
+                        (unsigned long long)atomic_load_explicit(&dplus_debug_pv_last_client, memory_order_seq_cst),
+                        (unsigned long long)DPLUS_STAT_SUM(bracket_entry_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
+                        (unsigned long long)DPLUS_STAT_SUM(intra_batch_write_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(miss_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_waiting_transitions),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_handler_fires),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_read_suspends),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_rearms),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_calls),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_wait_us),
+                        (unsigned long long)DPLUS_STAT_SUM(b13_info_lock_hold_us));
 #endif
     return info;
 }

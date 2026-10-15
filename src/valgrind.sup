@@ -33,3 +33,25 @@
    ...
    fun:allocBioJob
 }
+
+{
+   <io_thread_shared_query_buffer_in_fork_child>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:initSharedQueryBuf
+   fun:IOThreadMain
+}
+
+{
+   <io_thread_replacement_shared_query_buffer_in_fork_child>
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:initSharedQueryBuf
+   fun:resetSharedQueryBuf
+   ...
+   fun:ioThreadReadQueryFromClient
+}

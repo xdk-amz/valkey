@@ -121,7 +121,12 @@ start_server {} {
                 fail "client should start using a private query buffer"
             }
         } e
-        assert {![client_exists $cname]}
+        # A client served by an IO thread is closed by that thread just after main evicts it.
+        wait_for_condition 100 10 {
+            ![client_exists $cname]
+        } else {
+            fail "client should be evicted"
+        }
         $rr close
 
         # Restore settings

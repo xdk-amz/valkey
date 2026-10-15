@@ -11,6 +11,7 @@
 #include "generated_wrappers.hpp"
 
 #include <cstring>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -120,7 +121,10 @@ class FastpathLifecycleTest : public ::testing::Test {
         EXPECT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
     }
 
+    /* Waits up to 5 s, so a missing reply fails the test instead of hanging it. */
     static std::string recv(int peer) {
+        struct pollfd pfd = {peer, POLLIN, 0};
+        if (poll(&pfd, 1, 5000) != 1) return std::string();
         char buf[4096];
         ssize_t n = read(peer, buf, sizeof(buf));
         return n > 0 ? std::string(buf, n) : std::string();
@@ -166,8 +170,9 @@ TEST_F(FastpathLifecycleTest, QuiesceCancelsUnpublishedBatchAndHandsOffInOrder) 
     EXPECT_EQ(fastpathWorkerReopen(1), 0);
 
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(c->flag.fastpath, 0u);
-    EXPECT_EQ(mainBuf(c), ":1\r\n:2\r\n:3\r\n");
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
+    EXPECT_EQ(c->flag.fastpath, 0u); /* the drained thread admits nothing, so it stays on main */
+    EXPECT_EQ(recv(peer), ":1\r\n:2\r\n:3\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));
     EXPECT_EQ(fastpathWorkerReopen(1), 1);
     EXPECT_EQ(fastpathWorkerRole(1), FP_ROLE_OPEN);
@@ -203,7 +208,9 @@ TEST_F(FastpathLifecycleTest, QuiesceWaitsForInflightBatchThenCancelsTheRest) {
     EXPECT_EQ(fastpathDrain(), 0);
 
     fastpathHandoffDone(c, 0);
-    EXPECT_EQ(mainBuf(c), ":3\r\n:4\r\n");
+    EXPECT_EQ(fastpathResumeHandedOff(), 1);
+    EXPECT_EQ(c->flag.fastpath, 0u);
+    EXPECT_EQ(recv(peer), ":3\r\n:4\r\n");
     EXPECT_TRUE(fastpathWorkerDrained(1));
     EXPECT_EQ(fastpathWorkerReopen(1), 1);
     freeHandedOff(c, peer);
@@ -273,6 +280,33 @@ TEST_F(FastpathLifecycleTest, DetachIsConsumedBeforeMainMayFree) {
     EXPECT_TRUE(fastpathWorkerDrained(1));
     EXPECT_EQ(fastpathWorkerReopen(1), 1);
     freeHandedOff(c, peer);
+}
+
+static client *dequeue_probe_client = NULL;
+static int dequeue_probe_consumed = -1;
+
+static void probeDetachAfterDequeue(int tid) {
+    (void)tid;
+    if (dequeue_probe_consumed == -1) dequeue_probe_consumed = fastpathDetachConsumed(dequeue_probe_client);
+}
+
+/* The thread dequeues a batch of records before it handles them, so a close request that is dequeued
+ * but not yet handled must not let main free the client. */
+TEST_F(FastpathLifecycleTest, DetachIsNotConsumedBetweenDequeueAndHandling) {
+    int peer;
+    client *c = newFastpathClient(&peer);
+    fastpathProcessReturns(1);
+    fastpathRequestDetach(c);
+    dequeue_probe_client = c;
+    dequeue_probe_consumed = -1;
+    testOnlyFastpathAfterDequeue(probeDetachAfterDequeue);
+    fastpathProcessReturns(1); /* owned: closes, hands back FP_CLOSE */
+    testOnlyFastpathAfterDequeue(NULL);
+    EXPECT_EQ(dequeue_probe_consumed, 0);
+    EXPECT_EQ(c->control->lifecycle, FP_CLOSING);
+    EXPECT_TRUE(fastpathDetachConsumed(c));
+    fastpathHandoffDone(c, 1); /* frees it */
+    close(peer);
 }
 
 /* Destroying a thread that still owns a client is a precondition failure. */

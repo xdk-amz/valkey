@@ -255,6 +255,10 @@ void emptyDbAsync(serverDb *db) {
      * drain is bounded by one in-flight read. The BIO handoff itself stays
      * async and unordered — safety comes from the drain, not the free. */
     dplusExclusiveEnter();
+    for (int didx = 0; didx < kvstoreNumHashtables(oldkeys); didx++) {
+        hashtable *ht = kvstoreGetHashtable(oldkeys, didx);
+        if (ht) dplusUnitForgetTable(hashtableGetVersionArray(ht)); /* BIO frees it */
+    }
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);

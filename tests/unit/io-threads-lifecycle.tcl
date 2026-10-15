@@ -111,7 +111,7 @@ proc lc_run_behind_sleep {ctl secs cmds} {
     $ctl flush
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes enable-debug-command yes}} {
     assert_equal {io-threads 16} [r config get io-threads]
     r select 0
 
@@ -166,9 +166,26 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         lc_wait_settled
         foreach c $clients { $c close }
     }
+
+    test {Lifecycle: raising io-threads while workers are still retiring recreates them} {
+        # One EXEC runs both changes before any retirement can finish.
+        r multi
+        r config set io-threads 1
+        r config set io-threads 4
+        assert_equal {OK OK} [r exec]
+        lc_wait_running 3
+        lc_wait_settled
+        set c [lc_client]
+        $c set lc:r v
+        assert_equal OK [$c read]
+        $c close
+        assert_equal OK [r config set io-threads 16]
+        lc_wait_running 15
+        lc_wait_settled
+    }
 }
 
-start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
+start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes}} {
     assert_equal {io-threads 4} [r config get io-threads]
     r select 0
 

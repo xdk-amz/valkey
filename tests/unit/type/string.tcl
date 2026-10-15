@@ -1310,7 +1310,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         for {set i 0} {$i < 10} {incr i} { lappend keys msk:$i }
         foreach k $keys { r del $k }
         r mset msk:0 aaa msk:1 12345 msk:2 [string repeat z 40] \
-               msk:3 hello msk:4 999999999999 msk:5 [string repeat q 200] \
+               msk:3 hello msk:4 2000000000 msk:5 [string repeat q 200] \
                msk:6 x msk:7 42 msk:8 world msk:9 [string repeat w 10]
         assert_equal aaa [r get msk:0]
         assert_equal 12345 [r get msk:1]

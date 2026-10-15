@@ -68,6 +68,10 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
     }
     after 20 ;# a 1ms probe arm expires harmlessly if set
 
+    # The P1 checks assert exact version deltas, and a resize of the keyspace table brackets every
+    # shard. The cron resizes the table once the P1 keys fill it, so resizing stays off while they run.
+    r debug dict-resizing 0
+
     test {P1-BRACKET-SET-INSERT: fresh SET brackets its shard (+even, +2 min)} {
         r set p1:a v1
         set v [shard_version r p1:a]
@@ -154,6 +158,77 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         set v1 [shard_version r p1:j]
         assert {$v1 % 2 == 0 && $v1 >= $v0 + 4} ;# del bracket + insert bracket
     }
+
+    # Retired plus reclaimed: grows by one for every buffer whose free waits for readers.
+    proc retired_total {r} {
+        set s [$r debug dplus-epoch-stats]
+        return [expr {[lindex $s 1] + [lindex $s 2]}]
+    }
+
+    test {P1-UNIT-MSET: one bracket for a key MSET writes twice} {
+        r set p1:k old
+        set v0 [shard_version r p1:k]
+        r mset p1:k first p1:k second
+        # Two writes, one bracket: no reader can see "first".
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:k]
+        assert_equal second [r get p1:k]
+    }
+
+    test {P1-UNIT-MSETNX: one bracket for a key MSETNX writes twice} {
+        set v0 [shard_version r p1:l]
+        r msetnx p1:l first p1:l second
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:l]
+        assert_equal second [r get p1:l]
+    }
+
+    test {P1-BRACKET-SETBIT: SETBIT on an existing bitmap brackets} {
+        r setbit p1:m 7 1
+        set v0 [shard_version r p1:m]
+        r setbit p1:m 6 1
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:m]
+        assert_equal 2 [r bitcount p1:m]
+    }
+
+    test {P1-BRACKET-SETBIT-GROW: growing a bitmap defers the old buffer's free} {
+        r setbit p1:n 7 1
+        set v0 [shard_version r p1:n]
+        set t0 [retired_total r]
+        r setbit p1:n 80000 1
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:n]
+        assert {[retired_total r] > $t0}
+        assert_equal 10001 [r strlen p1:n]
+    }
+
+    test {P1-BRACKET-BITFIELD: BITFIELD SET brackets} {
+        r bitfield p1:o set u8 0 1
+        set v0 [shard_version r p1:o]
+        r bitfield p1:o set u8 8 2 incrby u8 0 5
+        assert_equal [expr {$v0 + 2}] [shard_version r p1:o]
+        assert_equal {6 2} [r bitfield p1:o get u8 0 get u8 8]
+    }
+
+    test {P1-BRACKET-PFADD: PFADD and the PFCOUNT cache refresh bracket} {
+        r pfadd p1:p a
+        set v0 [shard_version r p1:p]
+        r pfadd p1:p b
+        set v1 [shard_version r p1:p]
+        assert_equal [expr {$v0 + 2}] $v1
+        r pfcount p1:p                      ;# rewrites the cached cardinality
+        assert_equal [expr {$v1 + 2}] [shard_version r p1:p]
+    }
+
+    test {P1-BRACKET-HLL-GROW: growing or promoting an HLL defers the old buffer's free} {
+        r pfadd p1:q a
+        set t0 [retired_total r]
+        for {set i 0} {$i < 200} {incr i} { r pfadd p1:q e$i }  ;# sparse growth
+        set t1 [retired_total r]
+        assert {$t1 > $t0}
+        r pfdebug todense p1:q
+        assert {[retired_total r] > $t1}
+        assert_equal dense [r pfdebug encoding p1:q]
+    }
+
+    r debug dict-resizing 1
 
     if {$::dplus_instrumented} {
     test {P2-PUNT-INJECTED-BRACKET: version change inside the copy-validate window forces punt} {
@@ -268,5 +343,58 @@ start_server {tags {"dplus-correctness"} overrides {io-threads 4 save {}}} {
         }
         $rd close
         assert_equal "PONG" [r ping]
+    }
+
+    # Runs n pipelined GETs of key on a fast-path client and returns how many were speculated.
+    proc speculated_gets {r key n} {
+        set rd [dplus_client]
+        ensure_engaged $r $rd touch:warm
+        set before [dplus_field $r dplus_speculated_commands]
+        for {set i 0} {$i < $n} {incr i} { $rd get $key }
+        for {set i 0} {$i < $n} {incr i} { $rd read }
+        set after [dplus_field $r dplus_speculated_commands]
+        $rd close
+        return [expr {$after - $before}]
+    }
+
+    test {T-TOUCH-LRU: speculated GETs refresh the key's idle time} {
+        r set touch:warm w
+        r set touch:lru v
+        set dump [r dump touch:lru]
+        r del touch:lru
+        r restore touch:lru 0 $dump idletime 1000
+        assert {[r object idletime touch:lru] >= 1000}
+        assert_equal 20 [speculated_gets r touch:lru 20] ;# none ran on main
+        assert {[r object idletime touch:lru] < 10}
+    } {} {tls:skip}
+
+    test {T-TOUCH-LFU: speculated GETs raise the key's LFU counter} {
+        r config set maxmemory-policy allkeys-lfu
+        r set touch:warm w
+        r set touch:lfu v
+        set dump [r dump touch:lfu]
+        r del touch:lfu
+        r restore touch:lfu 0 $dump freq 0
+        assert_equal 0 [r object freq touch:lfu]
+        assert_equal 20 [speculated_gets r touch:lfu 20]
+        # Below the initial value an access always counts, so 20 accesses pass it.
+        assert {[r object freq touch:lfu] > 5}
+        r config set maxmemory-policy noeviction
+    } {OK} {tls:skip}
+
+    test {T-TOUCH-NO-TOUCH: a NO-TOUCH client's GETs leave the key idle} {
+        r set touch:warm w
+        r set touch:nt v
+        set dump [r dump touch:nt]
+        r del touch:nt
+        r restore touch:nt 0 $dump idletime 1000
+        set rd [dplus_client]
+        $rd client no-touch on
+        assert_equal OK [$rd read]
+        ensure_engaged r $rd touch:warm
+        for {set i 0} {$i < 20} {incr i} { $rd get touch:nt }
+        for {set i 0} {$i < 20} {incr i} { $rd read }
+        $rd close
+        assert {[r object idletime touch:nt] >= 1000}
     }
 }

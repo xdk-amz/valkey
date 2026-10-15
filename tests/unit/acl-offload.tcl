@@ -27,7 +27,8 @@ proc ao_default_allow {rules} { r acl setuser default on nopass resetkeys resetc
 
 start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes io-batch-hold-us 10000 acl-offload yes enable-debug-command yes}} {
     assert_equal {acl-offload yes} [r config get acl-offload]
-    r client setname ao-control ;# named client stays on the main path
+    r client setname ao-control
+    r client tracking on ;# tracking keeps the control connection on the main path
     r select 0
     # The control connection must keep full rights while we reshape the DEFAULT user (which the
     # raw fast-path clients are bound to). Authenticate it as a dedicated admin first.
@@ -242,6 +243,23 @@ start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-thre
         # deletable now the holder is gone (no dangling member left behind).
         assert_equal PONG [r ping]
         assert_equal 1 [r acl delrole drole]
+        ao_default_allow {~foo:* +@read +set}
+    }
+
+    test {acl-offload: DELROLE right after DELUSER of its last holder, whose fast-path client is still closing} {
+        r acl setrole erole "~e:*" +@read +set
+        r acl setuser eholder on nopass "~e:*" +@read +set role=erole
+        set rd [ao_client]; $rd auth eholder ""; assert_equal OK [$rd read]
+        $rd set e:1 v; assert_equal OK [$rd read]
+        # One EXEC runs both commands, so the deleted holder's fast-path client cannot finish closing between them.
+        r multi
+        r acl deluser eholder
+        r acl delrole erole
+        catch {r exec} res
+        assert_equal {1 1} $res
+        catch {$rd close}
+        assert_equal {} [r acl getrole erole]
+        assert_equal PONG [r ping]
         ao_default_allow {~foo:* +@read +set}
     }
 

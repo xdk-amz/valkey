@@ -24,12 +24,13 @@
  * same batch.
  */
 
-#include <assert.h> /* S2.2 bracket parity checks */
-
 #ifndef DPLUS_H
 #define DPLUS_H
 
+#ifndef __cplusplus
+#include "serverassert.h" /* bracket parity checks */
 #include <stdatomic.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -66,7 +67,9 @@ struct dplusVersionArray {
 /* Global exclusive_mode flag. Set by commands that require full atomicity
  * (EVAL, MULTI-EXEC, KEYS, DEBUG, FLUSHALL/FLUSHDB, active defrag start).
  * Readers check this before speculating. */
+#ifndef __cplusplus
 extern _Atomic(int) dplus_exclusive_mode;
+#endif
 
 /* Epoch/QSBR reader states. OFFLINE and QUIESCENT never hold speculative
  * pointers; every other value is the epoch announced by an active reader. */
@@ -76,6 +79,7 @@ extern _Atomic(int) dplus_exclusive_mode;
 
 /* IO-thread lifecycle hooks. A slot is initialized QUIESCENT before thread
  * creation and becomes OFFLINE only after pthread_join completes. */
+void dplusEnableSpeculativeReads(void);
 void dplusReaderWorkerOnline(int tid);
 void dplusReaderWorkerQuiescent(int tid);
 void dplusReaderWorkerOffline(int tid);
@@ -88,14 +92,14 @@ void dplusReaderWorkerOffline(int tid);
  * The main thread aggregates (add-and-zero) once per event-loop iteration in
  * beforeSleep — a per-LOOP touch, not per-command. */
 typedef struct dplusThreadStats {
-    long long commands_processed; /* speculated commands consumed on this thread */
-    long long usec;               /* wall time spent executing them (for commandstats) */
-    long long owned_writes;       /* clean owned-local writes completed worker-side (fix #2) */
-    long long owned_net_bytes;    /* bytes written by those completions */
-    long long doorbell_rings;     /* wakeup-pipe bytes actually written (coalescing prototype) */
-    long long doorbell_coalesced; /* responses that skipped the pipe write (doorbell armed) */
+    long long commands_processed;     /* speculated commands consumed on this thread */
+    long long usec;                   /* wall time spent executing them (for commandstats) */
+    long long owned_writes;           /* clean owned-local writes completed worker-side (fix #2) */
+    long long owned_net_bytes;        /* bytes written by those completions */
+    long long doorbell_rings;         /* wakeup-pipe bytes actually written (coalescing prototype) */
+    long long doorbell_coalesced;     /* responses that skipped the pipe write (doorbell armed) */
     long long punted_replies_written; /* F7: punted-command replies staged by main, written by owner */
-    long long keyspace_hits;      /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long keyspace_hits;          /* E3: speculative GET hits (bypass main's stat_keyspace_hits) */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusThreadStats;
 
 extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
@@ -112,10 +116,10 @@ extern dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS];
  * If popcount < threshold, skip. Updated per-batch in dplusSpeculateBatch.
  * No shared-line reads (each thread owns its own counter). */
 #define DPLUS_WRITE_TAX_WINDOW 64
-#define DPLUS_WRITE_TAX_THRESHOLD 8  /* Skip if < 8/64 recent batches speculated */
+#define DPLUS_WRITE_TAX_THRESHOLD 8 /* Skip if < 8/64 recent batches speculated */
 
 typedef struct dplusWriteTaxGate {
-    uint64_t history;  /* Shift register: bit=1 means batch was speculated */
+    uint64_t history; /* Shift register: bit=1 means batch was speculated */
 } __attribute__((aligned(DPLUS_CACHELINE))) dplusWriteTaxGate;
 
 extern dplusWriteTaxGate dplus_write_tax[DPLUS_MAX_IO_THREADS];
@@ -162,12 +166,33 @@ uint64_t dplusStatsSum(size_t field_offset);
 
 /* D5: owned-client over-limit signal (correctness machinery — present in
  * flagless builds, NOT gated on IO_LOOKUP_OFFLOAD_STATS). */
-extern _Atomic int dplus_client_mem_pressure;
+#ifndef __cplusplus
+extern _Atomic(int) dplus_client_mem_pressure;
+#endif
 
 /* --- API declarations --- */
 
+/* A unit holds shards of one table odd for a whole command, so readers see either all of
+ * its writes to those shards or none. A bracket on a shard the unit holds does nothing.
+ * Writer thread only: main, or a module thread holding the GIL. */
+typedef struct dplusUnit {
+    dplusVersionArray *va; /* table whose shards are held, or NULL */
+    int all;               /* every shard of va is held */
+    uint64_t held[DPLUS_VERSION_SHARDS / 64];
+} dplusUnit;
+extern dplusUnit dplus_unit;
+int dplusUnitHoldShard(dplusVersionArray *va, unsigned shard);
+int dplusUnitHoldAll(dplusVersionArray *va);
+void dplusUnitRelease(void);
+void dplusUnitForgetTable(dplusVersionArray *va);
+int dplusInExclusiveWindow(void);
+
 /* Component 1: Version manipulation (implemented in hashtable.c) */
 void dplusVersionArrayInit(dplusVersionArray *va);
+#ifndef __cplusplus /* C11 atomics; unit tests in C++ use the declarations only */
+static inline bool dplusShardHeld(dplusVersionArray *va, unsigned shard) {
+    return dplus_unit.va == va && (dplus_unit.all || ((dplus_unit.held[shard / 64] >> (shard % 64)) & 1));
+}
 static inline uint64_t dplusVersionRead(dplusVersionArray *va, unsigned shard) {
     return atomic_load_explicit(&va->lines[shard / 8].v[shard % 8], memory_order_acquire);
 }
@@ -189,75 +214,49 @@ static inline bool dplusVersionValidate(dplusVersionArray *va, unsigned shard, u
 /* --- S2.2: odd/even bracket primitives (§5.2 paired protocol) ---
  * Every main-thread mutation of reader-reachable state is bracketed:
  * Begin makes the version ODD (new readers refuse at entry; in-flight
- * readers will fail validation), End makes it EVEN again. Both are release
- * stores (S1.1). Parity is a global invariant: versions are even at rest --
+ * readers will fail validation), End makes it EVEN again. Begin's release
+ * fence orders the odd store before the bracketed data stores, and End's
+ * release orders those stores before the even store; without the fence a
+ * weakly ordered CPU can expose new data under the old even version.
+ * Parity is a global invariant: versions are even at rest --
  * ALL bump sites must use brackets; a lone bump leaves odd residue that
- * permanently punts the shard. assert() (compiled out with NDEBUG) checks
- * parity at each transition. */
+ * permanently punts the shard. assert() checks parity at each transition. */
 static inline void dplusVersionBracketBegin(dplusVersionArray *va, unsigned shard) {
+    if (dplusShardHeld(va, shard)) return;
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
     assert((v & 1) == 0); /* even at rest */
-    atomic_store_explicit(slot, v + 1, memory_order_release);
+    atomic_store_explicit(slot, v + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
 }
 static inline void dplusVersionBracketEnd(dplusVersionArray *va, unsigned shard) {
+    if (dplusShardHeld(va, shard)) return;
     _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
     uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
     assert((v & 1) == 1); /* odd inside a bracket */
     atomic_store_explicit(slot, v + 1, memory_order_release);
 }
 static inline void dplusVersionBracketAllBegin(dplusVersionArray *va) {
-    atomic_thread_fence(memory_order_release);
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        if (dplusShardHeld(va, i)) continue;
         _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
         uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
         assert((v & 1) == 0);
         atomic_store_explicit(slot, v + 1, memory_order_relaxed);
     }
+    atomic_thread_fence(memory_order_release);
 }
 static inline void dplusVersionBracketAllEnd(dplusVersionArray *va) {
     atomic_thread_fence(memory_order_release);
     for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
+        if (dplusShardHeld(va, i)) continue;
         _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
         uint64_t v = atomic_load_explicit(slot, memory_order_relaxed);
         assert((v & 1) == 1);
         atomic_store_explicit(slot, v + 1, memory_order_relaxed);
     }
 }
-static inline void dplusVersionBumpShard(dplusVersionArray *va, unsigned shard) {
-    /* Release store — single writer (main thread), so non-RMW load+store is
-     * safe. Release is REQUIRED here, not optional: the reader validates by
-     * acquire-reloading this slot, and without release the mutation's prior
-     * stores may become visible AFTER the bump on weakly-ordered targets
-     * (ARM64/Graviton), letting a reader observe the old version alongside
-     * torn data and validate successfully. The earlier claim that ordering
-     * rides other sync points does not hold for the validation window (see
-     * sharded-version-safety-audit-sep4.md). Free on x86-TSO; str→stlr on
-     * ARM64. */
-    _Atomic(uint64_t) *slot = &va->lines[shard / 8].v[shard % 8];
-    atomic_store_explicit(slot, atomic_load_explicit(slot, memory_order_relaxed) + 1, memory_order_release);
-}
-static inline void dplusVersionBumpAll(dplusVersionArray *va) {
-    /* Structural mutation (rehash/resize): publish prior writes, then bump
-     * all shards. The release fence must be SEQUENCED BEFORE the relaxed
-     * stores (C11 fence–store pairing: an acquire load that observes one of
-     * these stores synchronizes with the fence). The previous placement —
-     * fence AFTER the stores — provided no synchronizes-with edge for the
-     * bumps at all. One fence + relaxed stores is cheaper than 256 release
-     * stores on ARM; rare operation either way. */
-    atomic_thread_fence(memory_order_release);
-    for (unsigned i = 0; i < DPLUS_VERSION_SHARDS; i++) {
-        _Atomic(uint64_t) *slot = &va->lines[i / 8].v[i % 8];
-        atomic_store_explicit(slot, atomic_load_explicit(slot, memory_order_relaxed) + 1, memory_order_relaxed);
-    }
-}
-
-/* Component 2: Read-only find (implemented in hashtable.c) */
-bool hashtableFindReadOnly(hashtable *ht, const void *key, void **found);
-
-/* Component 2: Speculative find with pre-computed hash (implemented in hashtable.c) */
-bool hashtableFindSpeculative(void *ht, const void *key, void **found, uint64_t hash,
-                              unsigned shard, uint64_t *ver_out);
+#endif
 
 /* Component 2: Hash key accessor (implemented in hashtable.c) */
 uint64_t hashtableHashKey(hashtable *ht, const void *key);
@@ -266,8 +265,11 @@ uint64_t hashtableHashKey(hashtable *ht, const void *key);
 dplusVersionArray *hashtableGetVersionArray(hashtable *ht);
 
 /* Component 4: Exclusive mode helpers (implemented in dplus.c) */
-void dplusExclusiveEnter(void);  /* Main thread: set exclusive + spin-wait */
-void dplusExclusiveLeave(void);  /* Main thread: clear exclusive */
+void dplusExclusiveEnter(void); /* Writer thread: set exclusive + spin-wait */
+void dplusExclusiveLeave(void); /* Writer thread: clear exclusive */
+/* A module thread holding the GIL is the keyspace writer while it holds it. */
+void dplusGilWriterBegin(void);
+void dplusGilWriterEnd(void);
 
 /* ACL/AUTH gate for speculation (main-thread writers; workers read the
  * per-client spec_acl_ok byte inside dplusSpeculateBatch). */

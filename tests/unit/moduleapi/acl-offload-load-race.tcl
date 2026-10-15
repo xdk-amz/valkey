@@ -16,7 +16,7 @@
 # Run under ThreadSanitizer to prove the survivor remap is data-race-free (build both the server and
 # the module instrumented, and extend the timeout to absorb TSan's slowdown):
 #   make -j SANITIZER=thread && make -C tests/modules SANITIZER=thread
-#   ./runtest --single unit/acl-offload-load-race --timeout 2400
+#   ./runtest-moduleapi --single unit/moduleapi/acl-offload-load-race --timeout 2400
 # The role-holder's admission still reads u->roles (the offload-eligibility check) while ACL LOAD
 # swaps it, so a regression to in-place mutation surfaces here as a TSan report on u->roles.
 
@@ -28,6 +28,13 @@ proc alr_write_aclfile {path lines} {
     close $fd
 }
 proc alr_offload_hits {} { getInfoProperty [r info stats] acl_offload_hits }
+# ACL LOAD disconnects clients of users the file does not define, module users included. A read after the
+# disconnect would reconnect and wait forever, so reading stops at the first error.
+proc alr_read_until_closed {c n} {
+    for {set i 0} {$i < $n} {incr i} {
+        if {[catch {$c read}]} break
+    }
+}
 
 set server_path [tmpdir "acl-offload-load-race"]
 # The server aborts startup if aclfile is missing; seed it before start_server.
@@ -37,7 +44,7 @@ alr_write_aclfile [file join $server_path "users.acl"] {
 }
 start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-threads" 4 \
         "io-threads-always-active" "yes" "acl-offload" "yes" "enable-module-command" "yes" \
-        "loadmodule" $modpath] tags [list "acl acl-offload modules external:skip tls:skip"]] {
+        "loadmodule" $modpath] tags [list acl acl-offload modules external:skip tls:skip]] {
 
     set aclfile [file join $server_path "users.acl"]
 
@@ -53,11 +60,12 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         # the role-holder pipelines commands from a raw fast-path-ish conn
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         $c aclcheck.auth.module.user.with.role modu1 hr
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # now DROP the role via ACL LOAD (file no longer defines role hr) while commands are in flight
         alr_write_aclfile $aclfile { {user default on nopass ~* &* +@all} }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping] ;# survivor roles-list remap (drop) did not crash/UAF
         catch {$c close}; catch {$rd close}
     }
@@ -70,6 +78,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         r acl load
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         $c aclcheck.auth.module.user.with.role modu2 hr
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # redefine role hr with different rules -> LOAD creates a NEW hr object; survivor must remap to it
         alr_write_aclfile $aclfile {
@@ -77,7 +86,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
             {role hr ~h:* ~extra:* +@read +set}
         }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping]
         # the surviving module user still holds the (remapped) role -- read its ACL string via the module
         assert_match "*role=*hr*" [r aclcheck.get.module.user.acl]
@@ -94,6 +103,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
         set c [valkey [srv 0 host] [srv 0 port] 1 $::tls]
         # module user holds BOTH roles in one assignment (role= replaces the set with the named list)
         $c aclcheck.auth.module.user.with.role modu3 hr,hr2
+        assert_equal OK [$c read] ;# the role holder exists before ACL LOAD runs on another connection
         for {set i 0} {$i < 20} {incr i} { $c get h:$i }
         # drop hr but keep hr2 -> survivor's multi-role list must lose exactly one node, atomically
         alr_write_aclfile $aclfile {
@@ -101,7 +111,7 @@ start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-
             {role hr2 ~h2:* +@read +set}
         }
         r acl load
-        for {set i 0} {$i < 20} {incr i} { catch {$c read} }
+        alr_read_until_closed $c 20
         assert_equal PONG [r ping]
         set acl [r aclcheck.get.module.user.acl]
         assert_match "*hr2*" $acl   ;# retained

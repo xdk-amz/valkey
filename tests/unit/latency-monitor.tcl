@@ -170,8 +170,11 @@ tags {"needs:debug"} {
         # The expired value is never freed on the main thread (IO thread slab
         # with io-threads >= 2, bio fallback with io-threads 1, regardless of
         # lazyfree-lazy-expire), so the expire cycle stays under the latency
-        # threshold and no expire-cycle event is recorded.
-        assert_no_match {*expire-cycle*} [r latency latest]
+        # threshold and no expire-cycle event is recorded. Under valgrind any
+        # expire cycle can take longer than 1 ms.
+        if {!$::valgrind} {
+            assert_no_match {*expire-cycle*} [r latency latest]
+        }
 
         r config set latency-monitor-threshold 200
         r config set lazyfree-lazy-expire yes

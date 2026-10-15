@@ -835,11 +835,11 @@ void freeStreamObject(robj *o) {
 
 /* Refcounts stay main-thread-owned except terminal decrements of sole references. */
 #ifdef DEBUG_REFCOUNT_DISCIPLINE
-#define assertIncrRefCountThread(o)                                                                                     \
-    serverAssert(inMainThread() || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT ||                                       \
+#define assertIncrRefCountThread(o)                                               \
+    serverAssert(inMainThread() || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT || \
                  objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
-#define assertDecrRefCountThread(o)                                                                                     \
-    serverAssert(inMainThread() || objectGetRefcount(o) == 1 || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT ||          \
+#define assertDecrRefCountThread(o)                                                                            \
+    serverAssert(inMainThread() || objectGetRefcount(o) == 1 || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT || \
                  objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
 #else
 #define assertIncrRefCountThread(o) ((void)0)

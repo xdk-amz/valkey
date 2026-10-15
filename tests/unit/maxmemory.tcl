@@ -625,15 +625,20 @@ start_server {tags {"maxmemory external:skip"}} {
         r config set maxmemory-eviction-batch no
     }
 
-    # Returns the number of successful pipelined writes.
+    # Returns the number of successful pipelined writes. Replies are read after
+    # every batch, so the client never has the whole storm outstanding at once.
     proc pipelined_write_storm {count vsize} {
         set val [string repeat x $vsize]
         set rd [valkey_deferring_client]
-        for {set j 0} {$j < $count} {incr j} { $rd set stormkey:$j $val }
         set ok 0
-        for {set j 0} {$j < $count} {incr j} {
-            catch {$rd read} res
-            if {$res eq {OK}} { incr ok }
+        set batch 256
+        for {set i 0} {$i < $count} {incr i $batch} {
+            set n [expr {min($batch, $count - $i)}]
+            for {set j 0} {$j < $n} {incr j} { $rd set stormkey:[expr {$i + $j}] $val }
+            for {set j 0} {$j < $n} {incr j} {
+                catch {$rd read} res
+                if {$res eq {OK}} { incr ok }
+            }
         }
         $rd close
         return $ok

@@ -710,6 +710,7 @@ hashtableType kvstoreKeysHashtableType = {
     .rehashingCompleted = kvstoreHashtableRehashingCompleted,
     .trackMemUsage = kvstoreHashtableTrackMemUsage,
     .getMetadataSize = kvstoreHashtableMetadataSize,
+    .speculative_reads = 1,
 };
 
 /* Kvstore->expires */
@@ -980,10 +981,14 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
+    return clientResizeQueryBuffer(c, server.unixtime - c->last_interaction);
+}
+
+/* The policy itself, for whichever thread owns the client's query buffer. */
+int clientResizeQueryBuffer(client *c, time_t idletime) {
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
-    time_t idletime = server.unixtime - c->last_interaction;
 
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
@@ -1045,10 +1050,10 @@ int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms) {
 
     if (buffer_target_shrink_size >= PROTO_REPLY_MIN_BYTES && c->buf_peak < buffer_target_shrink_size) {
         new_buffer_size = max(PROTO_REPLY_MIN_BYTES, c->buf_peak + 1);
-        server.stat_reply_buffer_shrinks++;
+        __atomic_fetch_add(&server.stat_reply_buffer_shrinks, 1, __ATOMIC_RELAXED);
     } else if (buffer_target_expand_size < PROTO_REPLY_CHUNK_BYTES * 2 && c->buf_peak == c->buf_usable_size) {
         new_buffer_size = min(PROTO_REPLY_CHUNK_BYTES, buffer_target_expand_size);
-        server.stat_reply_buffer_expands++;
+        __atomic_fetch_add(&server.stat_reply_buffer_expands, 1, __ATOMIC_RELAXED);
     }
 
     serverAssertWithInfo(c, NULL, (!new_buffer_size) || (new_buffer_size >= (size_t)c->bufpos));
@@ -1290,7 +1295,7 @@ static void clientsCron(int clients_this_cycle) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
         if (c->flag.fastpath) continue; /* owned by an IO thread; main touches nothing of it */
-        reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */
+        reconcileLazyWrite(c);          /* a silent client's last write is settled here at the latest */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
         /* The following functions do different service checks on the client.
@@ -1298,17 +1303,23 @@ static void clientsCron(int clients_this_cycle) {
          * terminated. */
         if (clientsCronHandleTimeout(c, now)) continue;
         if (clientsCronTcpIsClosing(c)) continue;
-        /* Hold armed sockets while clientsCron mutates read-side buffers. */
         if (c->flag.partitioned) {
+            /* An armed read can start as soon as the hold is released, so every check that reads the query
+             * buffer or the parsed arguments runs under it; none of them frees the client. A client whose
+             * read is starting is checked on a later pass, and so is one whose input is waiting: holding it
+             * makes its IO thread pass over the readiness and read it after clients whose input came later. */
+            if (c->flag.pending_read && partitionedClientInputWaiting(c)) continue;
+            if (!partitionedClientHold(c)) continue;
+            clientsCronResizeQueryBuffer(c);
+            clientsCronResizeOutputBuffer(c, now);
+            clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot);
+            if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+            partitionedClientRelease(c);
+            if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
             armPartitionedClientRead(c);
-            if (partitionedClientHold(c)) {
-                int terminated = clientsCronResizeQueryBuffer(c);
-                partitionedClientRelease(c);
-                if (terminated) continue;
-            }
-        } else if (clientsCronResizeQueryBuffer(c)) {
             continue;
         }
+        if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
 
@@ -1625,11 +1636,13 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
+        long long fp_in, fp_out;
+        fastpathNetBytes(&fp_in, &fp_out);
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + fp_in + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
-                                 server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
+                                 server.stat_net_output_bytes + fp_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
@@ -1698,6 +1711,9 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     /* Handle background operations on databases. */
     databasesCron();
+
+    /* Enforce fast-path client output-buffer limits and re-account maxmemory-clients over a rotating subset of IO-owned controls. */
+    fastpathLimitsCron();
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. We don't start the rewrite if there is an
@@ -2004,6 +2020,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * command yields to the event loop. */
         processed += processPendingReplStreamDecode();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
+        fastpathReleaseDurableReplies(); /* held write replies are now durable; publish them, never before the fsync */
         processed += handleClientsWithPendingWrites();
         int last_processed = 0;
         do {
@@ -2115,6 +2132,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * in case of appendfsync=always. */
     if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
 
+    /* Held fast-path write replies are durable at the flush above; publish them now, never before. */
+    fastpathReleaseDurableReplies();
+
     /* Record time consumption of AOF writing. */
     monotime aof_duration = getMonotonicUs() - aof_start_time;
     durationAddSample(EL_DURATION_TYPE_AOF, aof_duration);
@@ -2136,8 +2156,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;
 
-    /* Try to process more IO reads that are ready to be processed. */
-    if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
+    /* Try to process more IO reads that are ready to be processed. Not when a module listens to the
+     * event loop: its before-sleep event has fired, and no command runs until its after-sleep event. */
+    if (server.aof_fsync != AOF_FSYNC_ALWAYS && !moduleHasServerEventListener(VALKEYMODULE_EVENT_EVENTLOOP)) {
         int io_responses_after = processIOThreadsResponses();
         if (io_responses_after > 0) {
             server.el_iteration_active = true;
@@ -2189,17 +2210,18 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
         }
     }
 
-    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
-     * connection has pending data). Fast-path batches arrive on rings the
-     * event loop knows nothing about, so main polls while such clients exist. */
-    aeSetDontWait(server.el, dont_sleep || fastpathClientCount() > 0);
-
     updateCopyAvoidPressure(current_time);
 
     if (strictOffloadActive()) processDeferredReads();
 
     ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
+
+    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
+     * connection has pending data). Results of offloaded clients arrive on
+     * rings the event loop does not watch, so main polls without blocking
+     * until it has been idle a while; then the IO threads wake it. */
+    aeSetDontWait(server.el, dont_sleep || ioThreadsMainMustPoll());
 
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
@@ -2237,6 +2259,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         }
         /* Set the eventloop start time. */
         server.el_start = getMonotonicUs();
+        ioThreadsMainAwake();
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
@@ -3028,10 +3051,13 @@ void resetServerStats(void) {
     server.stat_io_writes_processed = 0;
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
+    server.stat_io_primary_drain_jobs = 0;
+    server.stat_io_primary_drain_bytes = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
     server.stat_client_outbuf_limit_disconnections = 0;
+    server.stat_client_idle_timeout_disconnections = 0;
     for (j = 0; j < STATS_METRIC_COUNT; j++) {
         server.inst_metric[j].idx = 0;
         server.inst_metric[j].last_sample_base = 0;
@@ -3043,6 +3069,7 @@ void resetServerStats(void) {
     server.stat_aofrw_consecutive_failures = 0;
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
+    fastpathResetNetStats();
     server.stat_reply_copy_avoided = 0;
     server.stat_net_repl_input_bytes = 0;
     atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
@@ -3058,12 +3085,12 @@ void resetServerStats(void) {
     server.stat_acl_offload_quiesce_max_us = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
-    server.stat_reply_buffer_shrinks = 0;
+    __atomic_store_n(&server.stat_reply_buffer_shrinks, 0, __ATOMIC_RELAXED);
     server.stat_cluster_threaded_reads_processed = 0;
     server.stat_cluster_threaded_writes_processed = 0;
     server.stat_cluster_threaded_accepts_processed = 0;
     server.stat_cluster_io_main_thread_fallbacks = 0;
-    server.stat_reply_buffer_expands = 0;
+    __atomic_store_n(&server.stat_reply_buffer_expands, 0, __ATOMIC_RELAXED);
     memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
     server.el_cmd_cnt_max = 0;
     server.priority_el_cmd_cnt_max = 0;
@@ -4055,12 +4082,17 @@ void preventCommandReplication(client *c) {
  * The latency unit is nano-seconds.
  * If needed it will allocate the histogram memory and trim the duration to the upper/lower tracking limits*/
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist) {
+    updateCommandLatencyHistogramCount(latency_histogram, duration_hist, 1);
+}
+
+/* Records 'count' commands that took duration_hist nanoseconds each. */
+void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count) {
     if (duration_hist < LATENCY_HISTOGRAM_MIN_VALUE) duration_hist = LATENCY_HISTOGRAM_MIN_VALUE;
     if (duration_hist > LATENCY_HISTOGRAM_MAX_VALUE) duration_hist = LATENCY_HISTOGRAM_MAX_VALUE;
     if (*latency_histogram == NULL)
         hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
                  latency_histogram);
-    hdr_record_value(*latency_histogram, duration_hist);
+    hdr_record_values(*latency_histogram, duration_hist, count);
 }
 
 /* Handle the alsoPropagate() API to handle commands that want to propagate
@@ -4308,11 +4340,13 @@ void call(client *c, int flags) {
         }
     }
 
-    /* D+: exclusive mode for commands whose partial state a speculative read must not observe
-     * (multi-key atomic operations). Plain writes are covered by the sharded version bump. Only
-     * the top-level command enters; nested calls (EVAL/EXEC bodies) are already covered. */
-    int dplus_exclusive = 0;
-    if (server.io_threads_num > 1 && server.execution_nesting == 1) {
+    /* D+: a speculative read must not see a unit of work half applied. Scripts, transactions and
+     * the other commands below drain readers for their whole run. Multi-key string writes, in-place
+     * string writers and module write commands hold the shards of their keys instead. Inside an
+     * exclusive window (an EXEC body) readers are already kept out; a nested call inside a unit
+     * adds its shards to it, and the call that opened the unit releases it. */
+    int dplus_exclusive = 0, dplus_unit_opened = 0;
+    if (server.io_threads_num > 1 && !dplusInExclusiveWindow()) {
         serverCommandProc *proc = c->cmd->proc;
         int dplus_epoch_debug_hook = proc == debugCommand && c->argc == 2 &&
                                      (!strcasecmp(objectGetVal(c->argv[1]), "dplus-epoch-pin") ||
@@ -4323,11 +4357,17 @@ void call(client *c, int flags) {
             (proc == debugCommand && !dplus_epoch_debug_hook)) {
             dplusExclusiveEnter();
             dplus_exclusive = 1;
+        } else if (proc == msetCommand || proc == msetnxCommand || proc == msetexCommand || proc == setbitCommand ||
+                   proc == bitfieldCommand || proc == pfaddCommand || proc == pfmergeCommand ||
+                   proc == pfcountCommand || proc == pfdebugCommand ||
+                   (c->cmd->module_cmd && !(c->cmd->flags & CMD_READONLY))) {
+            dplus_unit_opened = dbUnitHoldCommandKeys(c);
         }
     }
 
     c->cmd->proc(c);
 
+    if (dplus_unit_opened) dplusUnitRelease();
     if (dplus_exclusive) dplusExclusiveLeave();
 
     if (c->flag.argv_borrowed && server.enable_debug_assert) {
@@ -4716,7 +4756,6 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
         } else if (argc == 5 && p == setCommand && setIsPureExpireForm(argv)) {
             prebuildArgvEntry(argv, 1, 2);
         } else if ((p == msetCommand || p == msetnxCommand) && (argc & 1) == 1) {
-
             for (int j = 1; j + 1 < argc; j += 2) prebuildArgvEntry(argv, j, j + 1);
         }
     }
@@ -7005,6 +7044,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             server.stat_last_eviction_exceeded_time ? (ustime_t)elapsedUs(server.stat_last_eviction_exceeded_time) : 0;
         ustime_t current_active_defrag_time =
             server.stat_last_active_defrag_time ? (ustime_t)elapsedUs(server.stat_last_active_defrag_time) : 0;
+        long long fp_net_in, fp_net_out;
+        fastpathNetBytes(&fp_net_in, &fp_net_out);
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
@@ -7013,13 +7054,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
-                "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + fp_net_in + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
+                "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + fp_net_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
                 "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
                 "copy_avoid_mode:%s\r\n",
-                (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE   ? "adaptive"
-                 : server.copy_avoid_mode == COPY_AVOID_MODE_OFF      ? "off"
-                                                                      : "static"),
+                (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE ? "adaptive"
+                 : server.copy_avoid_mode == COPY_AVOID_MODE_OFF    ? "off"
+                                                                    : "static"),
                 "copy_avoid_current_floor:%d\r\n", server.copy_avoid_current_floor,
                 "main_thread_busy_pct:%d\r\n", (int)(server.copy_avoid_busy_ema + 0.5),
                 "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),
@@ -7079,12 +7120,15 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
+                "io_threaded_primary_drain_jobs:%lld\r\n", server.stat_io_primary_drain_jobs,
+                "io_threaded_primary_drain_bytes:%lld\r\n", server.stat_io_primary_drain_bytes,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
-                "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
-                "reply_buffer_expands:%lld\r\n", server.stat_reply_buffer_expands,
+                "client_idle_timeout_disconnections:%lld\r\n", server.stat_client_idle_timeout_disconnections,
+                "reply_buffer_shrinks:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_shrinks, __ATOMIC_RELAXED),
+                "reply_buffer_expands:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_expands, __ATOMIC_RELAXED),
                 "eventloop_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].cnt,
                 "eventloop_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].sum,
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,

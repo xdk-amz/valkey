@@ -648,7 +648,9 @@ robj *lookupStringForBitCommand(client *c, uint64_t maxbit, int *dirty) {
     } else {
         o = dbUnshareStringValue(c->db, c->argv[1], o);
         size_t oldlen = sdslen(objectGetVal(o));
-        objectSetVal(o, sdsgrowzero(objectGetVal(o), byte + 1));
+        /* Growing never frees the buffer in place: a speculative reader may be copying it. */
+        sds grown = dbGrowPublishedStringValue(o, byte + 1);
+        objectSetVal(o, sdsgrowzero(grown, byte + 1));
         if (dirty && oldlen != sdslen(objectGetVal(o))) *dirty = 1;
     }
     return o;

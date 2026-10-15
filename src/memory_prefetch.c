@@ -282,6 +282,15 @@ static void hashtablePrefetch(hashtable **tables) {
     }
 }
 
+/* Resolve each key's table only now: a command executed since the key was added
+ * can free or replace a slot's table in cluster mode. A NULL table (slot emptied)
+ * is skipped by initBatchInfo. */
+static void resolveKeyTables(void) {
+    for (size_t i = 0; i < batch->key_count; i++) {
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
+    }
+}
+
 static void resetCommandsBatch(void) {
     batch->cur_idx = 0;
     batch->keys_done = 0;
@@ -320,12 +329,7 @@ static void prefetchCommands(void) {
         batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
     }
 
-    /* LATE table resolution — after every inline execution that could have
-     * freed/replaced a slot's hashtable. kvstoreGetHashtable may return NULL
-     * (slot emptied); initBatchInfo already handles NULL tables. */
-    for (size_t i = 0; i < batch->key_count; i++) {
-        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
-    }
+    resolveKeyTables();
 
     /* Prefetch hashtable keys for all commands. Prefetching is beneficial only if there are more than one key. */
     if (batch->key_count > 1) {
@@ -378,8 +382,7 @@ void processClientsCommandsBatch(void) {
  * key array grown for a wide command is reused (and freed once) rather than
  * allocated and freed per command. getKeysUsingKeySpecs() accumulates onto
  * result->numkeys, so it is reset here before each extraction. */
-static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
-                              getKeysResult *result) {
+static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, getKeysResult *result) {
     result->numkeys = 0;
     int num_keys = getKeysFromCommand(cmd, argv, argc, result);
     int member_idx = cmd->member_arg_index;
@@ -459,8 +462,7 @@ int prefetchBatchEnabled(void) {
     return batch != NULL && batch->max_prefetch_size > 1;
 }
 
-int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot,
-                            void *result) {
+int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, void *result) {
     if (batch->key_count >= batch->max_prefetch_size) return 0;
     for (int j = 1; j < argc; j++) valkey_prefetch(argv[j]);
     addCommandToBatch(cmd, argv, argc, db, slot, (getKeysResult *)result);
@@ -476,6 +478,7 @@ void prefetchBatchRun(void) {
         if (key->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(key));
     }
     for (size_t i = 0; i < batch->key_count; i++) batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
+    resolveKeyTables();
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
         hashtablePrefetch(batch->keys_tables);

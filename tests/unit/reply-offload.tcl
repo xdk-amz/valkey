@@ -32,7 +32,7 @@ proc mkbig {nbytes} {
     return [string range $s 0 [expr {$nbytes - 1}]]
 }
 
-start_server {tags {"reply-offload"} overrides {io-threads 3 enable-debug-command yes save ""}} {
+start_server {tags {"reply-offload external:skip needs:debug logreqres:skip"} overrides {io-threads 3 enable-debug-command yes save ""}} {
     assert_equal {io-threads 3} [r config get io-threads]
 
     # DEBUG COPY-AVOID makes adaptive gating deterministic.

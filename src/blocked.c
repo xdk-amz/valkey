@@ -86,10 +86,14 @@ void initClientBlockingState(client *c) {
     c->bstate->btype = BLOCKED_NONE;
     c->bstate->timeout = 0;
     c->bstate->unblock_on_nokey = 0;
+    c->bstate->wait_write = 0;
     c->bstate->keys = dictCreate(&objectKeyHeapPointerValueDictType);
     c->bstate->numreplicas = 0;
     c->bstate->numlocal = 0;
     c->bstate->reploffset = 0;
+    c->bstate->kill_pending = 0;
+    c->bstate->kill_close_self = 0;
+    c->bstate->kill_reply = 0;
     c->bstate->generic_blocked_list_node = NULL;
     c->bstate->module_blocked_handle = NULL;
     c->bstate->async_rm_call_handle = NULL;
@@ -108,6 +112,7 @@ void freeClientBlockingState(client *c) {
 void blockClient(client *c, int btype) {
     /* Replicated clients should never be blocked unless pause or module */
     serverAssert(!(isReplicatedClient(c) && btype != BLOCKED_MODULE && btype != BLOCKED_POSTPONE));
+    serverAssert(!c->flag.executor); /* its argv and replies belong to a batch entry, not to a waiting client */
 
     initClientBlockingState(c);
 
@@ -188,6 +193,7 @@ void processUnblockedClients(void) {
         /* Hold a partitioned client's socket until any landed read drains after unblock. */
         if (!c->flag.blocked) {
             if (c->io_read_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_COMPLETED_IO) continue;
+            partitionedClientWaitArm(c); /* no read follows an arm while the client waits for its reply */
             if (!partitionedClientHold(c)) continue;
             /* If we have a queued command, execute it now. */
             int rc = processPendingCommandAndInputBuffer(c);
@@ -243,12 +249,16 @@ void unblockClient(client *c, int queue_for_reprocessing) {
         serverAssert(c->bstate->postponed_list_node);
         listDelNode(server.postponed_clients, c->bstate->postponed_list_node);
         c->bstate->postponed_list_node = NULL;
+        c->bstate->wait_write = 0;
         break;
     case BLOCKED_SHUTDOWN:
         /* No special cleanup. */
         break;
     case BLOCKED_INUSE:
         unlinkBlockInUseClient(c);
+        break;
+    case BLOCKED_KILL:
+        unblockClientWaitingKills(c);
         break;
     default:
         serverPanic("Unknown btype in unblockClient().");
@@ -363,6 +373,9 @@ void disconnectOrRedirectAllBlockedClients(void) {
             /* BLOCKED_INUSE clients will reprocess their command when unblocked
              * by the caller. Sending error replies here would be incorrect. */
             if (c->bstate->btype == BLOCKED_INUSE) continue;
+
+            /* CLIENT KILL does not depend on the role; it replies once its kills complete. */
+            if (c->bstate->btype == BLOCKED_KILL) continue;
 
             if (server.cluster_enabled) {
                 if (clusterRedirectBlockedClientIfNeeded(c))

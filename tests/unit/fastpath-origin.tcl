@@ -253,16 +253,59 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         $a close
     }
 
-    test {Fast path: other unsupported commands keep the client on the main path} {
+    test {Fast path: an unsupported command runs on main, then the client rejoins the fast path} {
         set a [fp_client]
         fp_wait_fastpath_clients 1
+        # CLIENT ID is unsupported on the fast path: it runs on main, which leaves the
+        # client on the main path only transiently. With nothing further owed to it, the
+        # client rejoins, so its next command is served from a fast-path batch again.
         $a client id
         $a read
-        fp_wait_fastpath_clients 0
+        fp_wait_fastpath_clients 1
+        set batches [getInfoProperty [r info fastpath] fastpath_batches]
         $a set stay:k v
         assert_equal OK [$a read]
-        assert_equal 0 [getInfoProperty [r info fastpath] fastpath_clients]
+        assert_equal [expr {$batches + 1}] [getInfoProperty [r info fastpath] fastpath_batches]
         $a close
+        fp_wait_fastpath_clients 0
+    }
+
+    test {Fast path: an empty multibulk does not stall or break the commands around it} {
+        set a [fp_client]
+        fp_wait_fastpath_clients 1
+        r del fp:empty
+        # A count below one is an empty command: it is skipped and the commands after it still run,
+        # whether it leads the read or follows another command, and whatever protocol comes next.
+        $a write "*-10\r\n*0\r\n*2\r\n\$4\r\nincr\r\n\$8\r\nfp:empty\r\n*-1\r\nincr fp:empty\r\n"
+        $a flush
+        wait_for_condition 50 100 {
+            [r get fp:empty] eq 2
+        } else {
+            fail "commands around an empty multibulk did not run: [r get fp:empty]"
+        }
+        assert_equal 1 [$a read]
+        assert_equal 2 [$a read]
+        $a close
+        fp_wait_fastpath_clients 0
+    }
+
+    test {Fast path: a pipeline that hands its last queued command to main keeps parsing} {
+        set a [fp_client]
+        fp_wait_fastpath_clients 1
+        # SET and GET run on the fast path; CLIENT ID, the last queued command, sends the client
+        # to main, which then parses the inline PING left in the buffer.
+        $a write "*3\r\n\$3\r\nset\r\n\$7\r\nfp:pipe\r\n\$1\r\nv\r\n*2\r\n\$3\r\nget\r\n\$7\r\nfp:pipe\r\n*2\r\n\$6\r\nclient\r\n\$2\r\nid\r\nPING\r\n"
+        $a flush
+        assert_equal OK [$a read]
+        assert_equal v [$a read]
+        assert_morethan [$a read] 0
+        assert_equal PONG [$a read]
+        # Back on the fast path, the next read starts from an empty command queue.
+        fp_wait_fastpath_clients 1
+        $a ping
+        assert_equal PONG [$a read]
+        $a close
+        fp_wait_fastpath_clients 0
     }
 
     test {Fast path: MONITOR names the origin peer} {
@@ -379,12 +422,14 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         }
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
-        fp_wait_fastpath_clients 0
         assert_equal 0 [r exists deluser:k]
         catch {$a read} e
         assert_match {*I/O error*} $e
         $a close
+        # The control connection ran ACL DELUSER on main; with nothing further owed to it
+        # it rejoins the fast path, so close it before asserting no fast-path clients remain.
         $ctl close
+        fp_wait_fastpath_clients 0
     }
 
     test {Fast path: CLIENT KILL drops the killed client's queued commands} {
@@ -404,12 +449,14 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         }
         assert_equal OK [$ctl read]
         assert_equal 1 [$ctl read]
-        fp_wait_fastpath_clients 0
         assert_equal 0 [r exists kill:k]
         catch {$a read} e
         assert_match {*I/O error*} $e
         $a close
+        # The control connection ran CLIENT KILL on main and then rejoins the fast path,
+        # so close it before asserting no fast-path clients remain.
         $ctl close
+        fp_wait_fastpath_clients 0
     }
 
     test {Fast path: CLIENT PAUSE postpones fast-path clients on the main path} {
@@ -480,13 +527,14 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
         assert_equal bob [dict get $e username]
         assert_match "id=$id addr=$peer *user=bob*" [dict get $e client-info]
 
-        # Still connected, still on the fast path, under the new rules.
-        assert_equal 1 [getInfoProperty [r info fastpath] fastpath_clients]
+        # The control connection ran ACL LOAD on main and rejoins the fast path; close it so
+        # the only remaining fast-path client is $a, still connected under the new rules.
+        $ctl close
+        fp_wait_fastpath_clients 1
         $a get load:k
         assert_equal {} [$a read]
         assert_match "*user=bob*" [fp_client_list_entry $peer]
         $a close
-        $ctl close
         fp_wait_fastpath_clients 0
     }
 
@@ -514,12 +562,14 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
         }
         assert_equal OK [$ctl read]
         assert_equal OK [$ctl read]
-        fp_wait_fastpath_clients 0
         assert_equal 0 [r exists gone:k]
         catch {$a read} e
         assert_match {*I/O error*} $e
         $a close
+        # The control connection ran ACL LOAD on main and rejoins the fast path; close it so
+        # no fast-path client remains after the disconnected $a is gone.
         $ctl close
+        fp_wait_fastpath_clients 0
     }
 }
 
