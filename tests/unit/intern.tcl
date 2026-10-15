@@ -64,23 +64,6 @@ start_server {tags {"intern"}} {
         }
     }
 
-    test {An async flush of many distinct shared strings releases all of them} {
-        r flushall
-        # More distinct shared strings than one drain slice applies.
-        for {set i 0} {$i < 3000} {incr i} {
-            set v "[string repeat p 150]$i"
-            r mset a$i $v b$i $v c$i $v d$i $v
-        }
-        assert_morethan [intern_stat intern_strings] 1024
-        r flushall async
-        assert_equal PONG [r ping]
-        wait_for_condition 50 100 {
-            [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
-        } else {
-            fail "intern references not released"
-        }
-    }
-
     test {DEBUG RELOAD keeps shared values intact} {
         r flushall
         set v [string repeat r 500]
@@ -211,6 +194,26 @@ start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-a
         for {set i 0} {$i < 3000} {incr i} {r set k$i $w}
         for {set i 0} {$i < 3000} {incr i 89} {assert_equal $w [r get k$i]}
         r flushall
+        wait_for_condition 50 100 {
+            [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
+        } else {
+            fail "intern references not released"
+        }
+    }
+}
+
+# The setup relies on every write being offered, which holds only for commands
+# parsed on the main thread.
+start_server {tags {"intern"} overrides {io-threads 1}} {
+    test {An async flush of many distinct shared strings releases all of them} {
+        # More distinct shared strings than one drain slice applies.
+        for {set i 0} {$i < 3000} {incr i} {
+            set v "[string repeat p 150]$i"
+            r mset a$i $v b$i $v c$i $v d$i $v
+        }
+        assert_morethan [intern_stat intern_strings] 1024
+        r flushall async
+        assert_equal PONG [r ping]
         wait_for_condition 50 100 {
             [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
         } else {
