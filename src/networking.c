@@ -2692,8 +2692,8 @@ void beforeNextClient(client *c) {
         return;
     }
 
-    if (!c->flag.ring_epilogue && !c->flag.fastpath) updateClientMemUsageAndBucket(c);
-    if (c->flag.fp_readmit && fastpathTryReadmit(c)) return;
+    if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
+    if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
@@ -3512,142 +3512,6 @@ void releaseReplyReferences(client *c) {
     }
 }
 
-/* Fast path: an executor's reply leaves main as a region inside its batch. The encoding stays
- * private to this file. */
-
-/* Main only. Moves the region's string references to refs, which own them until replyReleaseRefs,
- * settles slot stats of untracked headers as releaseBufReferences does, and returns the bytes the
- * region sends. */
-size_t replyRegionTakeRefs(char *buf, size_t len, robj ***refs, uint32_t *nrefs, uint32_t *cap) {
-    size_t wire = 0;
-    char *ptr = buf;
-    while (ptr < buf + len) {
-        payloadHeader *header = (payloadHeader *)ptr;
-        ptr += sizeof(payloadHeader);
-        if (isStrRefPayload(header->payload_type)) {
-            size_t reply_len = 0;
-            bulkStrRef *str_ref = (bulkStrRef *)ptr;
-            for (size_t left = header->payload_len; left > 0; left -= sizeof(bulkStrRef), str_ref++) {
-                size_t str_len = sdslen(str_ref->str);
-                if (header->payload_type == BULK_STR_REF)
-                    reply_len += digits10(str_len) + 3 + str_len + 2;
-                else
-                    reply_len += str_len;
-                if (*nrefs == *cap) {
-                    *cap = *cap ? *cap * 2 : 16;
-                    *refs = zrealloc(*refs, sizeof(robj *) * *cap);
-                }
-                (*refs)[(*nrefs)++] = str_ref->obj;
-            }
-            header->reply_len = reply_len;
-            if (!header->track_bytes) clusterSlotStatsAddNetworkBytesOutForSlot(header->slot, reply_len);
-            wire += reply_len;
-        } else {
-            wire += header->payload_len;
-        }
-        ptr += header->payload_len;
-    }
-    serverAssert(ptr == buf + len);
-    return wire;
-}
-
-/* Main only: drop references taken by replyRegionTakeRefs. */
-void replyReleaseRefs(robj **refs, uint32_t n) {
-    for (uint32_t i = 0; i < n; i++) freeValueNeverOnMain(NULL, refs[i], -1);
-}
-
-/* Emits a region's wire bytes in order. A transient segment points at scratch memory that is valid
- * only during the call. Touches only the region and the strings it references, which stay immutable
- * while referenced, so the IO owner may walk it. */
-void replyRegionWalk(const char *buf, size_t len, replySegmentFn *emit, void *ctx) {
-    static const char crlf[] = "\r\n";
-    const char *ptr = buf;
-    while (ptr < buf + len) {
-        const payloadHeader *header = (const payloadHeader *)ptr;
-        ptr += sizeof(payloadHeader);
-        if (header->payload_type == PLAIN_REPLY) {
-            emit(ctx, ptr, header->payload_len, 0);
-        } else {
-            const bulkStrRef *str_ref = (const bulkStrRef *)ptr;
-            for (size_t left = header->payload_len; left > 0; left -= sizeof(bulkStrRef), str_ref++) {
-                size_t str_len = sdslen(str_ref->str);
-                if (header->payload_type == BULK_STR_REF) {
-                    char prefix[BULK_STR_LEN_PREFIX_MAX_SIZE];
-                    prefix[0] = '$';
-                    size_t num_len = ll2string(prefix + 1, sizeof(prefix) - 3, str_len);
-                    prefix[num_len + 1] = '\r';
-                    prefix[num_len + 2] = '\n';
-                    emit(ctx, prefix, num_len + 3, 1);
-                    emit(ctx, str_ref->str, str_len, 0);
-                    emit(ctx, crlf, 2, 0);
-                } else {
-                    emit(ctx, str_ref->str, str_len, 0);
-                }
-            }
-        }
-        ptr += header->payload_len;
-    }
-}
-
-/* Main only: whether the client's buffer or any reply block carries headers. */
-int replyIsEncoded(client *c) {
-    if (c->bufpos > 0 && c->flag.buf_encoded) return 1;
-    listIter iter;
-    listNode *ln;
-    listRewind(c->reply, &iter);
-    while ((ln = listNext(&iter))) {
-        clientReplyBlock *o = listNodeValue(ln);
-        if (o && o->flag.buf_encoded) return 1;
-    }
-    return 0;
-}
-
-/* Main only: the client's buffer and reply list as one encoded region, plain pieces wrapped in
- * plain headers so references keep their order. Empties the list; the region owns the references. */
-char *replyFlattenEncoded(client *c, size_t *len_out) {
-    size_t total = c->bufpos > 0 ? (size_t)c->bufpos + (c->flag.buf_encoded ? 0 : sizeof(payloadHeader)) : 0;
-    listIter iter;
-    listNode *ln;
-    listRewind(c->reply, &iter);
-    while ((ln = listNext(&iter))) {
-        clientReplyBlock *o = listNodeValue(ln);
-        if (o->used) total += o->used + (o->flag.buf_encoded ? 0 : sizeof(payloadHeader));
-    }
-    char *out = zmalloc(total);
-    size_t off = 0;
-    int encoded = c->flag.buf_encoded;
-    char *piece = c->buf;
-    size_t used = c->bufpos;
-    listRewind(c->reply, &iter);
-    for (;;) {
-        if (used) {
-            if (!encoded) {
-                payloadHeader *h = (payloadHeader *)(out + off);
-                h->payload_type = PLAIN_REPLY;
-                h->payload_len = used;
-                h->reply_len = 0;
-                h->slot = -1;
-                h->track_bytes = 0;
-                h->reserved = 0;
-                h->tracked_for_cob = 0;
-                off += sizeof(payloadHeader);
-            }
-            memcpy(out + off, piece, used);
-            off += used;
-        }
-        if ((ln = listNext(&iter)) == NULL) break;
-        clientReplyBlock *o = listNodeValue(ln);
-        encoded = o->flag.buf_encoded;
-        piece = o->buf;
-        used = o->used;
-    }
-    serverAssert(off == total);
-    listEmpty(c->reply);
-    c->reply_bytes = 0;
-    *len_out = total;
-    return out;
-}
-
 static void _postWriteToClient(client *c) {
     if (c->nwritten <= 0) return;
     if (getClientType(c) == CLIENT_TYPE_SLOT_EXPORT) {
@@ -3753,7 +3617,7 @@ int postWriteToClient(client *c) {
         }
     }
 
-    if (!c->flag.fastpath && !(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
+    if (!(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
     return C_OK;
 }
 
@@ -4657,7 +4521,7 @@ int processCommandAndResetClient(client *c) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
          * processed command. */
-        if (c->conn && !c->flag.fastpath) updateClientMemUsageAndBucket(c);
+        if (c->conn) updateClientMemUsageAndBucket(c);
     }
 
     if (server.current_client == NULL) deadclient = 1;
@@ -5378,22 +5242,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     *p = '\0';
 
     /* Compute the total memory consumed by this client. */
-    size_t obufmem;
-    int io_owned = client->flag.fastpath && client->control;
-    size_t total_mem = io_owned ? fastpathClientMemory(client->control, &obufmem)
-                                : getClientMemoryUsage(client, &obufmem);
-    fastpathBufferInfo bufs;
-    time_t last_interaction = client->last_interaction;
-    if (io_owned) {
-        fastpathClientBuffers(client->control, &bufs);
-        last_interaction = fastpathControlLastInteraction(client->control);
-    } else {
-        bufs.qbuf = client->querybuf ? sdslen(client->querybuf) : 0;
-        bufs.qbuf_free = client->querybuf ? sdsavail(client->querybuf) : 0;
-        bufs.argv_mem = client->argv_len_sum;
-        bufs.rbs = client->buf_usable_size;
-        bufs.rbp = client->buf_peak;
-    }
+    size_t obufmem, total_mem = getClientMemoryUsage(client, &obufmem);
 
     size_t used_blocks_of_repl_buf = 0;
     if (client->repl_data && client->repl_data->ref_repl_buf_node) {
@@ -5410,7 +5259,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
             " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char *)objectGetVal(client->name) : ""),
             " age=%I", (long long)(commandTimeSnapshot() / 1000 - client->ctime),
-            " idle=%I", (long long)(server.unixtime - last_interaction),
+            " idle=%I", (long long)(server.unixtime - client->last_interaction),
             " flags=%s", flags,
             " capa=%s", capa,
             " db=%i", client->db->id,
@@ -5419,12 +5268,12 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " ssub=%i", client->pubsub_data ? (int)hashtableSize(client->pubsub_data->pubsubshard_channels) : 0,
             " multi=%i", client->mstate ? client->mstate->count : -1,
             " watch=%i", client->mstate ? (int)listLength(&client->mstate->watched_keys) : 0,
-            " qbuf=%U", (unsigned long long)bufs.qbuf,
-            " qbuf-free=%U", (unsigned long long)bufs.qbuf_free,
-            " argv-mem=%U", (unsigned long long)bufs.argv_mem,
+            " qbuf=%U", client->querybuf ? (unsigned long long)sdslen(client->querybuf) : 0,
+            " qbuf-free=%U", client->querybuf ? (unsigned long long)sdsavail(client->querybuf) : 0,
+            " argv-mem=%U", (unsigned long long)client->argv_len_sum,
             " multi-mem=%U", client->mstate ? (unsigned long long)client->mstate->argv_len_sums : 0,
-            " rbs=%U", (unsigned long long)bufs.rbs,
-            " rbp=%U", (unsigned long long)bufs.rbp,
+            " rbs=%U", (unsigned long long)client->buf_usable_size,
+            " rbp=%U", (unsigned long long)client->buf_peak,
             " obl=%U", (unsigned long long)client->bufpos,
             " oll=%U", (unsigned long long)listLength(client->reply) + used_blocks_of_repl_buf,
             " omem=%U", (unsigned long long)obufmem, /* should not include client->buf since we want to see 0 for static clients. */
@@ -7268,9 +7117,8 @@ int checkClientOutputBufferLimits(client *c) {
  *
  * Returns 1 if client was (flagged) closed. */
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
-    if (c->flag.fake) return 0; /* It is unsafe to free fake clients. */
-    if (c->flag.executor) return fastpathExecutorOutputLimitReached(c);
-    if (c->flag.fastpath) return 0; /* IO-owned: COB is enforced through the fast-path control registry, not the client */
+    if (c->flag.fake) return 0;     /* It is unsafe to free fake clients. */
+    if (c->flag.executor) return 0; /* replies return to the IO thread with the batch */
     serverAssert(c->conn);
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
@@ -7697,7 +7545,6 @@ size_t getClientEvictionLimit(void) {
 
 void evictClients(void) {
     if (!server.client_mem_usage_buckets) return;
-    fastpathServeMemHints(); /* input an IO thread just reported for a client over the limit */
     /* Start eviction from topmost bucket (largest clients) */
     int curr_bucket = CLIENT_MEM_USAGE_BUCKETS - 1;
     listIter bucket_iter;
@@ -7705,35 +7552,15 @@ void evictClients(void) {
     size_t client_eviction_limit = getClientEvictionLimit();
     if (client_eviction_limit == 0) return;
 
-    /* Variable to track memory of clients marked for close but not yet freed. Seed it with the fast-path
-     * entries that were already made terminal (evicted or COB-closed) but whose stat contribution is still
-     * charged until the IO hand-off removes it: like a normal close_asap client re-counted on each call,
-     * this persists that not-yet-freed memory across repeated calls so a lingering terminal fast-path
-     * client does not read as live pressure and evict a healthy client. */
-    size_t pending_freed = fastpathTerminalPendingMem();
+    /* Variable to track memory of clients marked for close but not yet freed */
+    size_t pending_freed = 0;
 
     while (server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] +
                server.stat_clients_type_memory[CLIENT_TYPE_PUBSUB] >
            client_eviction_limit + pending_freed) {
-        /* Fast-path clients live in a private bucket set keyed by the same size class. When their largest
-         * bucket outranks the normal size class under the cursor, that client is the biggest remaining, so
-         * evict it first to keep selection size-fair across both sets. Its aggregate/stat removal happens
-         * once at hand-off, so count the estimate as pending_freed to avoid over-evicting meanwhile. */
-        int fp_bucket = fastpathEvictionMaxBucket();
-        if (fp_bucket > curr_bucket) {
-            pending_freed += fastpathEvictTopFromBucket(fp_bucket);
-            continue;
-        }
         listNode *ln = listNext(&bucket_iter);
         if (ln) {
             client *c = ln->value;
-            if (c->flag.fastpath) {
-                /* Invariant defense, not normal accounting: an IO-owned client is accounted through the
-                 * fast-path registry and never linked into a normal bucket, so reaching here is impossible.
-                 * If a stale node ever appeared, quarantine it (never free an IO-owned client) and move on. */
-                removeClientFromMemUsageBucket(c, 0);
-                continue;
-            }
             if (c->flag.close_asap) {
                 /* Already scheduled to close. Count memory as freed and skip. */
                 pending_freed += c->last_memory_usage;
@@ -7755,18 +7582,18 @@ void evictClients(void) {
                 pending_freed += c->last_memory_usage;
                 continue;
             }
-        } else if (curr_bucket > 0) {
-            curr_bucket--;
-            listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
-        } else if (fp_bucket >= 0) {
-            /* Normal buckets are exhausted but fast-path clients remain: drain them largest first. */
-            pending_freed += fastpathEvictTopFromBucket(fp_bucket);
         } else {
-            serverLog(LL_WARNING, "Over client maxmemory after evicting all evictable clients");
-            break;
+            curr_bucket--;
+            if (curr_bucket < 0) {
+                serverLog(LL_WARNING, "Over client maxmemory after evicting all evictable clients");
+                break;
+            }
+            listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
         }
     }
+
 }
+
 
 /* IO threads functions */
 

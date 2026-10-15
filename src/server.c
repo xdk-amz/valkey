@@ -711,7 +711,6 @@ hashtableType kvstoreKeysHashtableType = {
     .rehashingCompleted = kvstoreHashtableRehashingCompleted,
     .trackMemUsage = kvstoreHashtableTrackMemUsage,
     .getMetadataSize = kvstoreHashtableMetadataSize,
-    .speculative_reads = 1,
 };
 
 /* Kvstore->expires */
@@ -1642,13 +1641,11 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
-        long long fp_in, fp_out;
-        fastpathNetBytes(&fp_in, &fp_out);
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + fp_in + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
-                                 server.stat_net_output_bytes + fp_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
+                                 server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
@@ -1717,9 +1714,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     /* Handle background operations on databases. */
     databasesCron();
-
-    /* Enforce fast-path client output-buffer limits and re-account maxmemory-clients over a rotating subset of IO-owned controls. */
-    fastpathLimitsCron();
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. We don't start the rewrite if there is an
@@ -2026,7 +2020,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
          * command yields to the event loop. */
         processed += processPendingReplStreamDecode();
         if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
-        fastpathReleaseDurableReplies(); /* held write replies are now durable; publish them, never before the fsync */
         processed += handleClientsWithPendingWrites();
         int last_processed = 0;
         do {
@@ -2136,9 +2129,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * in case of appendfsync=always. */
     if (server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) flushAppendOnlyFile(0);
 
-    /* Held fast-path write replies are durable at the flush above; publish them now, never before. */
-    fastpathReleaseDurableReplies();
-
     /* Record time consumption of AOF writing. */
     monotime aof_duration = getMonotonicUs() - aof_start_time;
     durationAddSample(EL_DURATION_TYPE_AOF, aof_duration);
@@ -2227,12 +2217,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
 
-    /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
-     * connection has pending data). Results of offloaded clients arrive on
-     * rings the event loop does not watch, so main polls without blocking
-     * until it has been idle a while; then the IO threads wake it. */
-    aeSetDontWait(server.el, dont_sleep || ioThreadsMainMustPoll());
-
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
      * time. */
@@ -2269,7 +2253,6 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         }
         /* Set the eventloop start time. */
         server.el_start = getMonotonicUs();
-        ioThreadsMainAwake();
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
@@ -3081,7 +3064,6 @@ void resetServerStats(void) {
     server.stat_aofrw_consecutive_failures = 0;
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
-    fastpathResetNetStats();
     server.stat_reply_copy_avoided = 0;
     server.stat_net_repl_input_bytes = 0;
     atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
@@ -7030,8 +7012,6 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             server.stat_last_eviction_exceeded_time ? (ustime_t)elapsedUs(server.stat_last_eviction_exceeded_time) : 0;
         ustime_t current_active_defrag_time =
             server.stat_last_active_defrag_time ? (ustime_t)elapsedUs(server.stat_last_active_defrag_time) : 0;
-        long long fp_net_in, fp_net_out;
-        fastpathNetBytes(&fp_net_in, &fp_net_out);
 
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(
@@ -7042,8 +7022,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
                 "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + fp_net_in + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
-                "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + fp_net_out + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
+                "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
                 "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
                 "copy_avoid_mode:%s\r\n",
                 (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE ? "adaptive"
