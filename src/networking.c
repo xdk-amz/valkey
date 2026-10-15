@@ -266,6 +266,16 @@ static void clientSetDefaultAuth(client *c) {
  * it will also set the ever_authenticated flag on the client in order to avoid low level
  * limiting of the client output buffer.*/
 void clientSetUser(client *c, user *u, int authenticated) {
+    /* acl-offload: rebinding a fast-path client to a different user can leave a verdict
+     * that was tagged under the old binding waiting on an in-flight entry. Main must not
+     * read IO-owned pending state to detect it, so bump conservatively on any real user
+     * change of a fast-path client; the client's own AUTH/HELLO never reaches here as a
+     * fast-path client (authRequired clients are ineligible). Rare. */
+    if (c->flag.fastpath && c->user != u) aclOffloadBumpEpoch();
+    /* From here on an IO thread may read u's rule set (and its roles'). Record it once;
+     * the guard keys off USER_FLAG_BOUND. Written only on the first bind so steady-state
+     * binds never dirty the cache line IO threads read. */
+    if (u) aclMarkUserBound(u);
     c->user = u;
     c->flag.authenticated = authenticated;
     if (authenticated)

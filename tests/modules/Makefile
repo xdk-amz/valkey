@@ -16,6 +16,25 @@ ifeq ($(uname_S),Linux)
     CC = gcc
 endif
 
+# Build test modules with the same sanitizer as the server. A module left
+# uninstrumented while the server runs under TSan/ASan reports races or leaks in
+# its own code that the test harness (check_sanitizer_errors) then fails on, so a
+# sanitizer server could not run any module-based suite cleanly without this.
+ifdef SANITIZER
+ifeq ($(SANITIZER),address)
+	SHOBJ_CFLAGS += -fsanitize=address -fno-sanitize-recover=all -fno-omit-frame-pointer
+	SHOBJ_LDFLAGS += -fsanitize=address
+else ifeq ($(SANITIZER),thread)
+	SHOBJ_CFLAGS += -fsanitize=thread -fno-sanitize-recover=all -fno-omit-frame-pointer
+	SHOBJ_LDFLAGS += -fsanitize=thread
+else ifeq ($(SANITIZER),undefined)
+	SHOBJ_CFLAGS += -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+	SHOBJ_LDFLAGS += -fsanitize=undefined
+else
+	$(error "unknown sanitizer=$(SANITIZER)")
+endif
+endif
+
 # OS X 11.x doesn't have /usr/lib/libSystem.dylib and needs an explicit setting.
 ifeq ($(uname_S),Darwin)
 ifeq ("$(wildcard /usr/lib/libSystem.dylib)","")

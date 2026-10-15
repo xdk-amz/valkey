@@ -26,7 +26,11 @@ static inline void cpuRelax(void) {
 #include "queues.h"
 #include "server.h"
 #include <sys/resource.h>
+#ifdef HAVE_FASTPATH_EPOLL
 #include <sys/epoll.h>
+#else
+#include "fastpath_no_epoll.h"
+#endif
 
 #define IO_MPSC_QUEUE_SIZE 16384
 #define IO_SPMC_QUEUE_SIZE 4096
