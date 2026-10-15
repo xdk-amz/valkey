@@ -1976,6 +1976,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int io_responses = processIOThreadsResponses();
 
     internDrainDeferred();
+    internEpochTick();
     if (io_responses > 0) server.el_iteration_active = true;
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */

@@ -25,6 +25,7 @@ typedef struct internHdr {
 
 #define INTERN_IN_INDEX 1
 #define INTERN_IN_PROBATION 2
+#define INTERN_RETIRED 3 /* dead or revived, freed or released by internEpochTick() */
 
 /* A string at this many references is not shared further. */
 #define INTERN_REFS_MAX (UINT32_MAX - 1)
@@ -238,17 +239,21 @@ static inline size_t hotSlot(const char *p, size_t len) {
     return hotMix(p, len) >> (64 - HOT_BITS);
 }
 
+/* Slots are written only on the main thread. IO threads read them while they
+ * parse, so writes are atomic and the string pointer is published last; a
+ * reader that pairs a tag with another slot's string fails the compare. */
 static inline void hotStore(const char *p, size_t len, sds s) {
     uint64_t m = hotMix(p, len);
     size_t i = m >> (64 - HOT_BITS);
-    hot[i] = (hotSlotEntry){m, s};
+    __atomic_store_n(&hot[i].tag, m, __ATOMIC_RELAXED);
+    __atomic_store_n(&hot[i].s, s, __ATOMIC_RELEASE);
     hot_used[i >> 6] |= 1ull << (i & 63);
 }
 
 static inline void hotForget(sds s) {
     size_t i = hotSlot(s, sdslen(s));
     if (hotUsed(i) && hot[i].s == s) {
-        hot[i].s = NULL;
+        __atomic_store_n(&hot[i].s, (sds)NULL, __ATOMIC_RELAXED);
         hot_used[i >> 6] &= ~(1ull << (i & 63));
     }
 }
@@ -454,7 +459,7 @@ static inline int selectSingleton(uint64_t h, size_t len, size_t priv_size) {
 }
 
 static void setLevel(int level) {
-    intern_level = level;
+    __atomic_store_n(&intern_level, level, __ATOMIC_RELAXED);
     intern_load_ready = (level == 0);
     intern_gate.period = 1u << level;
     if (intern_gate.tick > intern_gate.period) intern_gate.tick = intern_gate.period;
@@ -721,6 +726,9 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
  * Release.
  *----------------------------------------------------------------------------*/
 
+static uint64_t reads_inflight;
+static void retire(sds s);
+
 static void releaseOnMain(sds s, uint32_t n) {
     internHdr *h = internHdrOf(s);
     serverAssert(h->refcount >= n);
@@ -741,8 +749,15 @@ static void releaseOnMain(sds s, uint32_t n) {
         serverAssert(hashtableDelete(intern_index, s));
         memo_key = NULL;
         filterRemove(hash);
+        /* An IO thread may have read it from the hot cache. */
+        if (reads_inflight) {
+            retire(s);
+            return;
+        }
     } else if (h->where == INTERN_IN_PROBATION) {
         probRemove(s);
+    } else if (h->where == INTERN_RETIRED) {
+        return; /* freed by internEpochTick() */
     }
     zfree(h);
 }
@@ -916,7 +931,83 @@ int internDrainPending(void) {
 }
 
 
-robj *internParseArg(const char *buf, size_t len) {
+/*-----------------------------------------------------------------------------
+ * Parse-time sharing on IO threads. The IO thread reads the hot cache without
+ * taking references and records each shared argument. The main thread takes
+ * the references when it collects the read. A shared string that dies while
+ * reads are in flight is retired: it stays allocated until every read
+ * dispatched up to its death is collected, since one of those reads may still
+ * be comparing it or holding it unreferenced.
+ *----------------------------------------------------------------------------*/
+
+#define INTERN_PENDING_MAX 4096
+
+/* Arguments an IO thread selected for admission, with the hash and length it
+ * computed, so the main thread can admit them without reading their bytes. */
+typedef struct internSelected {
+    robj *o;
+    uint64_t hash;
+    size_t len;
+} internSelected;
+
+struct internPending {
+    uint32_t n, cap;   /* shared arguments waiting for their references */
+    uint32_t ns, scap; /* arguments selected for admission */
+    uint32_t hits;     /* sampled arguments that were shared */
+    robj **o;
+    internSelected *sel;
+};
+
+static internPending *pendingGet(internPending **pp) {
+    if (*pp == NULL) *pp = zcalloc(sizeof(internPending));
+    return *pp;
+}
+
+/* Makes room for one more entry in an array of `cap` entries holding `n`. */
+static int pendingGrow(void **arr, uint32_t n, uint32_t *cap, size_t entry) {
+    if (n < *cap) return 1;
+    uint32_t ncap = *cap ? *cap * 2 : 16;
+    if (ncap > INTERN_PENDING_MAX) return 0;
+    *arr = zrealloc(*arr, ncap * entry);
+    *cap = ncap;
+    return 1;
+}
+
+/* Each IO thread selects one eligible argument in 2^level, the main sampling
+ * level, but no more than one in INTERN_IO_MIN_PERIOD. */
+static __thread uint32_t io_sel_tick = 1;
+
+static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int argi) {
+    if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return NULL;
+    /* The command name and, usually, the key come first; values follow. */
+    int sampled = 0;
+    if (argi >= 2 && --io_sel_tick == 0) {
+        uint32_t period = 1u << __atomic_load_n(&intern_level, __ATOMIC_RELAXED);
+        io_sel_tick = period > INTERN_IO_MIN_PERIOD ? period : INTERN_IO_MIN_PERIOD;
+        sampled = 1;
+    }
+    uint64_t m = hotMix(buf, len);
+    hotSlotEntry *e = &hot[m >> (64 - HOT_BITS)];
+    sds c = __atomic_load_n(&e->s, __ATOMIC_ACQUIRE);
+    if (c && __atomic_load_n(&e->tag, __ATOMIC_RELAXED) == m && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+        internPending *p = pendingGet(pp);
+        if (!pendingGrow((void **)&p->o, p->n, &p->cap, sizeof(robj *))) return NULL;
+        robj *o = createObject(OBJ_STRING, c);
+        p->o[p->n++] = o;
+        /* A sampled hit, so the sampling level sees what parse-time sharing found. */
+        p->hits += sampled;
+        return o;
+    }
+    if (!sampled) return NULL;
+    internPending *p = pendingGet(pp);
+    if (!pendingGrow((void **)&p->sel, p->ns, &p->scap, sizeof(internSelected))) return NULL;
+    robj *o = createStringObject(buf, len);
+    p->sel[p->ns++] = (internSelected){o, internHash(buf, len), len};
+    return o;
+}
+
+robj *internParseArg(internPending **pending, const char *buf, size_t len, int argi) {
+    if (!intern_is_main) return parseArgIO(pending, buf, len, argi);
     if (len > INTERN_MAX_LEN) return NULL;
     sds c = hotFind(buf, len);
     if (!c) return NULL;
@@ -928,6 +1019,144 @@ robj *internParseArg(const char *buf, size_t len) {
     st.hits++;
     st.hot_hits++;
     return createObject(OBJ_STRING, c);
+}
+
+void internFreePending(internPending *pending) {
+    if (pending == NULL) return;
+    serverAssert(pending->n == 0 && pending->ns == 0);
+    zfree(pending->o);
+    zfree(pending->sel);
+    zfree(pending);
+}
+
+/* True for commands that store a value argument itself rather than a copy of
+ * it. Other commands copy their arguments, so sharing those on an IO thread
+ * would only add reference work on the main thread. */
+int internIOShares(const char *name, size_t len) {
+    static const char *cmds[] = {"set", "setex", "psetex", "setnx", "getset", "mset", "msetnx"};
+    if (len < 3 || len > 6) return 0;
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        if (strlen(cmds[i]) == len && strncasecmp(cmds[i], name, len) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Admits a private argument an IO thread selected, using the hash and length
+ * it computed. Returns the sds the argument must hold. The bytes are read only
+ * on a table hit or to copy a new singleton. */
+static sds admitSelected(sds s, size_t len, uint64_t h) {
+    st.sampled++;
+    if (unlikely(filterMayHave(h))) {
+        sds r = admitFromTables(s, len, h);
+        if (r) return r;
+    }
+    observe(0);
+    if (unlikely(selectSingleton(h, len, privateSize(len)))) return makeSingleton(s, len, h);
+    return s;
+}
+
+/* Takes the reference an IO thread left for the main thread. The string may
+ * have died since; it was retired, so it is still allocated, and this brings
+ * it back as a shared string outside the index. */
+static void takePendingRef(robj *o) {
+    sds s = objectGetVal(o);
+    internHdr *h = internHdrOf(s);
+    if (h->refcount >= INTERN_REFS_MAX) {
+        objectSetVal(o, sdsnewlen(s, sdslen(s)));
+        return;
+    }
+    h->refcount++;
+    if (h->where == INTERN_IN_INDEX) {
+        st.refs++;
+        st.saved_bytes += h->size;
+    }
+    st.hits++;
+    st.hot_hits++;
+}
+
+/* Read jobs in flight, counted by the epoch they were dispatched in. The epoch
+ * advances once per event loop iteration, but not onto a slot whose reads are
+ * still in flight, so every in-flight read is within the last READ_EPOCHS. */
+#define READ_EPOCHS 64
+static uint32_t read_inflight[READ_EPOCHS];
+static uint64_t read_epoch = 1, read_oldest = 1;
+
+typedef struct retiredString {
+    sds s;
+    uint64_t epoch;
+} retiredString;
+
+static retiredString *retired;
+static size_t retired_count, retired_cap;
+
+void internReadDispatched(uint32_t *epoch) {
+    uint32_t slot = read_epoch % READ_EPOCHS;
+    read_inflight[slot]++;
+    reads_inflight++;
+    *epoch = slot + 1;
+}
+
+void internReadCollected(internPending *pending, uint32_t *epoch) {
+    if (pending && pending->n) {
+        for (uint32_t i = 0; i < pending->n; i++) takePendingRef(pending->o[i]);
+        pending->n = 0;
+        for (; pending->hits; pending->hits--) observe(1);
+    }
+    if (pending && pending->ns) {
+        for (uint32_t i = 0; i < pending->ns; i++) {
+            internSelected *e = &pending->sel[i];
+            objectSetVal(e->o, admitSelected(objectGetVal(e->o), e->len, e->hash));
+        }
+        pending->ns = 0;
+    }
+    /* A long pipeline grows the arrays; do not keep them for an idle client. */
+    if (pending && (pending->cap > 64 || pending->scap > 64)) {
+        zfree(pending->o);
+        zfree(pending->sel);
+        pending->o = NULL;
+        pending->sel = NULL;
+        pending->cap = pending->scap = 0;
+    }
+    if (*epoch) {
+        serverAssert(read_inflight[*epoch - 1] > 0);
+        read_inflight[*epoch - 1]--;
+        reads_inflight--;
+        *epoch = 0;
+    }
+}
+
+static void retire(sds s) {
+    if (retired_count == retired_cap) {
+        retired_cap = retired_cap ? retired_cap * 2 : 64;
+        retired = zrealloc(retired, retired_cap * sizeof(retiredString));
+    }
+    internHdrOf(s)->where = INTERN_RETIRED;
+    retired[retired_count++] = (retiredString){s, read_epoch};
+}
+
+void internEpochTick(void) {
+    while (read_oldest < read_epoch && read_inflight[read_oldest % READ_EPOCHS] == 0) read_oldest++;
+    if (read_inflight[(read_epoch + 1) % READ_EPOCHS] == 0) {
+        read_epoch++;
+        if (reads_inflight == 0) read_oldest = read_epoch;
+    }
+    if (retired_count == 0) return;
+    size_t kept = 0;
+    for (size_t i = 0; i < retired_count; i++) {
+        retiredString r = retired[i];
+        /* Reads dispatched at r.epoch or later may still hold it. */
+        if (reads_inflight && r.epoch >= read_oldest) {
+            retired[kept++] = r;
+            continue;
+        }
+        internHdr *h = internHdrOf(r.s);
+        if (h->refcount == 0) {
+            zfree(h);
+        } else {
+            h->where = 0;
+        }
+    }
+    retired_count = kept;
 }
 
 static void releaseHook(sds s) {
@@ -951,6 +1180,10 @@ static void releaseHook(sds s) {
 sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     internHdr *h = internHdrOf(s);
     if (h->refcount != 1) return NULL;
+    /* The retire list holds the address, and IO threads may be reading an
+     * indexed string: moving it frees the old copy. */
+    if (h->where == INTERN_RETIRED) return NULL;
+    if (h->where == INTERN_IN_INDEX && server.io_threads_num > 1) return NULL;
     void *np = defragfn(h);
     if (np == NULL) return NULL;
     sds ns = (char *)np + ((char *)s - (char *)h);
@@ -958,7 +1191,7 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     if (where == INTERN_IN_INDEX) {
         serverAssert(hashtableReplaceReallocatedEntry(intern_index, s, ns));
         size_t i = hotSlot(ns, sdslen(ns));
-        if (hot[i].s == s) hot[i].s = ns;
+        if (hot[i].s == s) __atomic_store_n(&hot[i].s, ns, __ATOMIC_RELEASE);
     } else if (where == INTERN_IN_PROBATION) {
         /* The old copy is freed; hash the moved one. */
         probSlot *slot = probFind(ns, s);

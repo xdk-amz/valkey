@@ -410,6 +410,9 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->cur_tid = 0;
+    c->intern_io_parsed = 0;
+    c->intern_pending = NULL;
+    c->intern_read_epoch = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -2477,6 +2480,7 @@ int freeClient(client *c) {
     if (c->lib_ver) decrRefCount(c->lib_ver);
     freeClientMultiState(c);
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
+    internFreePending(c->intern_pending);
     sdsfree(c->peerid);
     sdsfree(c->sockname);
     zfree(c);
@@ -3976,9 +3980,18 @@ void parseInlineBuffer(client *c) {
     for (c->argc = 0, j = 0; j < argc; j++) {
         /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
-        c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
+        size_t len = sdslen(argv[j]);
+        robj *arg = NULL;
+        if (j > 0 && !intern_is_main && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+            arg = internParseArg(&c->intern_pending, argv[j], len, j);
+        if (arg) {
+            sdsfree(argv[j]);
+        } else {
+            arg = createObject(OBJ_STRING, argv[j]);
+        }
+        c->argv[c->argc] = arg;
         c->argc++;
-        c->argv_len_sum += sdslen(argv[j]);
+        c->argv_len_sum += len;
     }
     zfree(argv);
 
@@ -4301,8 +4314,9 @@ static int parseMultibulk(client *c,
                  * lookups, so their arguments are never shared. */
                 if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
                     const char *name = objectGetVal((*argv)[0]);
-                    if (name[0] != 'z' && name[0] != 'Z')
-                        arg = internParseArg(c->querybuf + c->qb_pos, c->bulklen);
+                    if (intern_is_main ? (name[0] != 'z' && name[0] != 'Z')
+                                       : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
+                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, *argc);
                 }
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
@@ -4450,6 +4464,7 @@ int processPendingCommandAndInputBuffer(client *c) {
 void parseInputBuffer(client *c) {
     /* The command queue must be emptied before parsing. */
     serverAssert(c->cmd_queue.len == 0);
+    c->intern_io_parsed = !intern_is_main;
 
     /* Hold off transport read handlers for the duration of parsing (RDMA update_state
      * may otherwise re-enter readQueryFromClient and corrupt cmd_queue). */
@@ -7067,6 +7082,7 @@ int processClientIOReadsDone(client *c) {
 
     c->flag.pending_read = 0;
     c->io_read_state = CLIENT_IDLE;
+    internReadCollected(c->intern_pending, &c->intern_read_epoch);
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return 0;
