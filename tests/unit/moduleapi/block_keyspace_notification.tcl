@@ -167,7 +167,7 @@ start_server {tags {"modules"}} {
 }
 
 
-start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
     test {Blocking keyspace notification for a client served by IO threads} {
         r client setname control ;# named clients stay on the main path
         set probe [valkey [srv 0 host] [srv 0 port] 1 $::tls]

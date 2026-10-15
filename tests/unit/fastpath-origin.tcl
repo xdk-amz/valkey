@@ -710,7 +710,7 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {require
 # the offloaded write reaches. A correct woff makes WAIT 1 wait on that new offset and time out at 0
 # while the replica is behind; a stale woff (0, the origin's pre-write value the replica already
 # acked) would return 1 at once. Release the replica and WAIT 1 returns 1.
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000 enable-debug-command yes}} {
+start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     start_server {overrides {io-threads 2}} {
         set replica [srv 0 client]
         set replica_pid [srv 0 pid]

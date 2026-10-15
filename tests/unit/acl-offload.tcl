@@ -25,7 +25,7 @@ proc ao_wait_fastpath_clients {n} {
 proc ao_default_allow {rules} { r acl setuser default on nopass resetkeys resetchannels -@all {*}$rules }
 
 
-start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes io-batch-hold-us 10000 acl-offload yes enable-debug-command yes}} {
+start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload yes enable-debug-command yes}} {
     assert_equal {acl-offload yes} [r config get acl-offload]
     r client setname ao-control
     r client tracking on ;# tracking keeps the control connection on the main path

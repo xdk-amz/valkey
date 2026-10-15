@@ -17,7 +17,7 @@ fpa_write_aclfile [file join $server_path "users.acl"] {
     {role hr ~h:* +@read +set}
 }
 start_server [list overrides [list "dir" $server_path "aclfile" "users.acl" "io-threads" 4 \
-        "io-threads-always-active" "yes" "io-batch-hold-us" 10000 "acl-offload" "yes" \
+        "io-threads-always-active" "yes" "acl-offload" "yes" \
         "enable-module-command" "yes" "loadmodule" $modpath] tags [list acl acl-offload modules external:skip tls:skip]] {
 
     proc fpa_fpc {} { getInfoProperty [r info fastpath] fastpath_clients }

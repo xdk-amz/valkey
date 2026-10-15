@@ -21,7 +21,7 @@ proc fpmm_evicted {} {
     return [getInfoProperty [r info stats] evicted_clients]
 }
 
-start_server {tags {"fastpath maxmemory-clients external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+start_server {tags {"fastpath maxmemory-clients external:skip tls:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fpmm-control
     r select 0 ;# the same db as the raw fast-path clients

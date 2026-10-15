@@ -27,7 +27,7 @@ start_server [list tags {"modules"} overrides [list loadmodule $testmodule]] {
     }
 }
 
-start_server [list tags {"modules external:skip tls:skip"} overrides [list io-threads 2 io-batch-hold-us 10000 loadmodule $testmodule]] {
+start_server [list tags {"modules external:skip tls:skip"} overrides [list io-threads 2 loadmodule $testmodule]] {
     r client setname control ;# named clients stay on the main path
 
     test "Module eventloop iteration for a client read by IO threads" {

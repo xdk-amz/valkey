@@ -20,7 +20,7 @@ proc fpol_disconnections {} {
     return [getInfoProperty [r info stats] client_output_buffer_limit_disconnections]
 }
 
-start_server {tags {"fastpath obuf-limits external:skip tls:skip"} overrides {io-threads 2 io-batch-hold-us 10000}} {
+start_server {tags {"fastpath obuf-limits external:skip tls:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients
