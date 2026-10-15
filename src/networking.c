@@ -327,7 +327,7 @@ static int shouldDeferPushMessage(client *c) {
  * that use _writeToClient handler to write replies to client connection */
 static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (server.copy_avoid_mode == COPY_AVOID_MODE_OFF) return 0;
-    if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
+    if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
