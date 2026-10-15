@@ -321,6 +321,9 @@ static void stagedLoopIteration(aeEventLoop *el) {
     collectFDs(el);
     readPhase();
     writePhase(el);
+    /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
+     * commands reach the AOF before the reply phase sends their replies. */
+    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) flushAppendOnlyFile(0);
     replyPhase();
     crons(el);
 }
