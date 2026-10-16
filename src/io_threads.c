@@ -1343,6 +1343,8 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
             fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_STREAM)
+            fastpathStagedStreamPhase((int)id);
         else if (phase == STAGED_PHASE_APPLY)
             replApplyRunLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
