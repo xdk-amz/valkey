@@ -49,8 +49,9 @@ static _Atomic uint32_t sl_gen[IO_THREADS_MAX_NUM];
 static uint64_t sl_enroll_seq[IO_THREADS_MAX_NUM];
 static _Atomic int sl_on_main_cpu[IO_THREADS_MAX_NUM]; /* worker is pinned to main's one CPU */
 
+/* Also read by IO threads deciding whether they may sleep; main writes both at iteration boundaries. */
 int stagedLoopActive(void) {
-    return sl_on || sl_want;
+    return __atomic_load_n(&sl_on, __ATOMIC_RELAXED) || __atomic_load_n(&sl_want, __ATOMIC_RELAXED);
 }
 
 int stagedWorkerCount(void) {
@@ -231,14 +232,14 @@ static void stagedReconcile(aeEventLoop *el) {
         pollerUnregister(sl_poller, sl_ae_fd);
         pollerStop(sl_poller);
         sl_ae_fd = -1;
-        sl_on = 0;
-        sl_want = 0;
+        __atomic_store_n(&sl_on, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&sl_want, 0, __ATOMIC_RELAXED);
         sl_read_client = 0; /* its fd is still readable, so ae serves it on main */
         stagedSetWorkers(0);
         serverLog(LL_NOTICE, "Staged event loop stopped");
         return;
     }
-    sl_want = want;
+    __atomic_store_n(&sl_want, want, __ATOMIC_RELAXED);
     if (!want) return;
     if (!sl_on) {
         /* Stock offload is refused from here on; start once what it had in flight has landed. The
@@ -254,7 +255,7 @@ static void stagedReconcile(aeEventLoop *el) {
         int fd = aeGetPollFd(el);
         if (fd < 0 || pollerRegister(sl_poller, fd, POLLER_READABLE, stagedAeReady, NULL, POLLER_AFF_MAIN) != 0) {
             serverLog(LL_WARNING, "Staged event loop: cannot watch the ae poll fd; staying on the stock loop");
-            sl_want = 0;
+            __atomic_store_n(&sl_want, 0, __ATOMIC_RELAXED);
             return;
         }
         sl_ae_fd = fd;
@@ -263,7 +264,7 @@ static void stagedReconcile(aeEventLoop *el) {
     if (!sl_on) {
         if (pollerStart(sl_poller) != 0)
             serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
-        sl_on = 1;
+        __atomic_store_n(&sl_on, 1, __ATOMIC_RELAXED);
         fastpathStagedSet(1);
         fastpathStagedAdoptClients();
         serverLog(LL_NOTICE, "Staged event loop started with %d IO threads", sl_workers);
