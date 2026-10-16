@@ -268,6 +268,7 @@ void replStreamSenderRemove(client *replica) {
         replica->repl_data->stream_via_sender = 0;
         replica->repl_data->send_node = NULL;
         replica->repl_data->send_pos = 0;
+        replica->repl_data->send_seeded = 0;
     }
     pthread_mutex_unlock(&repl_sender_mutex);
 }
@@ -298,6 +299,7 @@ void replStreamSenderAdd(client *replica) {
         rd->stream_via_sender = 1;
         rd->send_node = rd->ref_repl_buf_node;
         rd->send_pos = rd->ref_block_pos;
+        rd->send_seeded = (rd->ref_repl_buf_node != NULL);
         atomic_store_explicit(&rd->sent_offset, cursor_off, memory_order_relaxed);
         atomic_store_explicit(&rd->send_error, 0, memory_order_relaxed);
         listAddNodeTail(repl_sender_replicas, replica);
@@ -325,6 +327,7 @@ void replStreamSenderAccount(void) {
             replica->repl_data->stream_via_sender = 0;
             replica->repl_data->send_node = NULL;
             replica->repl_data->send_pos = 0;
+            replica->repl_data->send_seeded = 0;
             listDelNode(repl_sender_replicas, ln);
         }
     }
@@ -342,17 +345,16 @@ void replStreamSenderAccount(void) {
         long long sent = atomic_load_explicit(&rd->sent_offset, memory_order_acquire);
         /* Advance main's cursor/refcounts to `sent` using the shared helper. */
         replStreamAccountCursor(replica, sent);
-        /* Seed the sender's own position from main's cursor the first time a cursor
-         * exists (main owns ref_repl_buf_node; reading it here is safe because this runs
-         * on main). After this the sender advances send_node itself and never reads the
-         * main-owned cursor, so there is no cross-thread race on it. Wait for the sender
-         * to finish any in-flight write before writing its send_node/send_pos. */
-        if (rd->send_node == NULL && rd->ref_repl_buf_node) {
+        /* Seed the sender's own position from main's cursor the first time a cursor exists.
+         * send_seeded is main-only, so this never reads the sender-owned send_node: once a
+         * block is attached (ref_repl_buf_node, main-owned) main hands it to the sender under
+         * the mutex while the sender is quiescent, and after that the sender owns send_node and
+         * main never touches it again. */
+        if (!rd->send_seeded && rd->ref_repl_buf_node) {
             replStreamSenderWaitQuiescent(replica);
-            if (rd->send_node == NULL) {
-                rd->send_node = rd->ref_repl_buf_node;
-                rd->send_pos = rd->ref_block_pos;
-            }
+            rd->send_node = rd->ref_repl_buf_node;
+            rd->send_pos = rd->ref_block_pos;
+            rd->send_seeded = 1;
         }
     }
     pthread_mutex_unlock(&repl_sender_mutex);
