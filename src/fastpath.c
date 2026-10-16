@@ -186,7 +186,7 @@ static int fpSessionEligible(client *c) {
     if (server.cluster_enabled) return 0;
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
     if (bgIteration_iterationActive()) return 0;                                        /* a forkless save may block commands on keys in use */
-    if (throttle_active()) return 0;                                                    /* a throttler may hold a command; main runs the check */
+    if (throttle_anyThrottlers()) return 0;                                             /* a throttler may hold a command; main runs the check */
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
@@ -657,7 +657,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         e->requeued = 1; /* a forkless save may block it on a key in use, which only a real client can wait for */
         return;
     }
-    if (throttle_active()) {
+    if (throttle_anyThrottlers()) {
         e->requeued = 1; /* a throttler may hold the command, which only a real client can wait for */
         return;
     }
