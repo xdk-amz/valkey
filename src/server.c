@@ -63,6 +63,7 @@
 #include "forkless.h"
 #include "staged_loop.h"
 #include "repl_apply.h"
+#include "maint.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -1426,46 +1427,54 @@ void databasesCron(void) {
      * other processes saving the DB on disk. Otherwise, rehashing is bad
      * as will cause a lot of copy-on-write of memory pages. */
     if (!hasActiveChildProcess()) {
-        /* We use global counters so if we stop the computation at a given
-         * DB we'll be able to start from the successive in the next
-         * cron loop iteration. */
-        static unsigned int resize_db = 0;
-        static unsigned int rehash_db = 0;
-        int dbs_per_call = CRON_DBS_PER_CALL;
-        int j;
+        /* When the MAINT phase handles table work, post a rightsize request for every table and a
+         * rehash request with the stock budget; maintRun runs them after crons(), in parallel when
+         * it can and inline on main otherwise. Falls back to today's code when lanes are off. */
+        if (server.cron_lanes && server.keyspace_shard_bits > 0 && stagedLoopActive()) {
+            maintRequest(MAINT_JOB_RESIZE, 0);
+            if (server.activerehashing) maintRequest(MAINT_JOB_REHASH, 1 * 1000000 / server.hz / 100);
+        } else {
+            /* We use global counters so if we stop the computation at a given
+             * DB we'll be able to start from the successive in the next
+             * cron loop iteration. */
+            static unsigned int resize_db = 0;
+            static unsigned int rehash_db = 0;
+            int dbs_per_call = CRON_DBS_PER_CALL;
+            int j;
 
-        /* Don't test more DBs than we have. */
-        if (dbs_per_call > server.dbnum) dbs_per_call = server.dbnum;
+            /* Don't test more DBs than we have. */
+            if (dbs_per_call > server.dbnum) dbs_per_call = server.dbnum;
 
-        for (j = 0; j < dbs_per_call; j++) {
-            serverDb *db = server.db[resize_db % server.dbnum];
-            resize_db++;
-            if (db == NULL) continue;
-            monotime rs = getMonotonicUs();
-            kvstoreTryResizeHashtables(db->keys, CRON_DICTS_PER_DB);
-            kvstoreTryResizeHashtables(db->expires, CRON_DICTS_PER_DB);
-            kvstoreTryResizeHashtables(db->keys_with_volatile_items, CRON_DICTS_PER_DB);
-            cronStatsRecord(CRON_JOB_SC_RESIZE, getMonotonicUs() - rs);
-        }
-
-        /* Rehash */
-        if (server.activerehashing) {
-            monotime rh = getMonotonicUs();
-            uint64_t elapsed_us = 0;
-            uint64_t threshold_us = 1 * 1000000 / server.hz / 100;
             for (j = 0; j < dbs_per_call; j++) {
-                serverDb *db = server.db[rehash_db % server.dbnum];
-                if (db != NULL) {
-                    elapsed_us += kvstoreIncrementallyRehash(db->keys, threshold_us - elapsed_us);
-                    if (elapsed_us >= threshold_us) break;
-                    elapsed_us += kvstoreIncrementallyRehash(db->expires, threshold_us - elapsed_us);
-                    if (elapsed_us >= threshold_us) break;
-                    elapsed_us += kvstoreIncrementallyRehash(db->keys_with_volatile_items, threshold_us - elapsed_us);
-                    if (elapsed_us >= threshold_us) break;
-                }
-                rehash_db++;
+                serverDb *db = server.db[resize_db % server.dbnum];
+                resize_db++;
+                if (db == NULL) continue;
+                monotime rs = getMonotonicUs();
+                kvstoreTryResizeHashtables(db->keys, CRON_DICTS_PER_DB);
+                kvstoreTryResizeHashtables(db->expires, CRON_DICTS_PER_DB);
+                kvstoreTryResizeHashtables(db->keys_with_volatile_items, CRON_DICTS_PER_DB);
+                cronStatsRecord(CRON_JOB_SC_RESIZE, getMonotonicUs() - rs);
             }
-            cronStatsRecord(CRON_JOB_SC_REHASH, getMonotonicUs() - rh);
+
+            /* Rehash */
+            if (server.activerehashing) {
+                monotime rh = getMonotonicUs();
+                uint64_t elapsed_us = 0;
+                uint64_t threshold_us = 1 * 1000000 / server.hz / 100;
+                for (j = 0; j < dbs_per_call; j++) {
+                    serverDb *db = server.db[rehash_db % server.dbnum];
+                    if (db != NULL) {
+                        elapsed_us += kvstoreIncrementallyRehash(db->keys, threshold_us - elapsed_us);
+                        if (elapsed_us >= threshold_us) break;
+                        elapsed_us += kvstoreIncrementallyRehash(db->expires, threshold_us - elapsed_us);
+                        if (elapsed_us >= threshold_us) break;
+                        elapsed_us += kvstoreIncrementallyRehash(db->keys_with_volatile_items, threshold_us - elapsed_us);
+                        if (elapsed_us >= threshold_us) break;
+                    }
+                    rehash_db++;
+                }
+                cronStatsRecord(CRON_JOB_SC_REHASH, getMonotonicUs() - rh);
+            }
         }
     }
 
@@ -3575,6 +3584,7 @@ void InitServerLast(void) {
     bioInit();
     initIOThreads(1);
     stagedSetLaneRunner(STAGED_PHASE_APPLY, replApplyRunLane);
+    maintInit();
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
 
     /* First set initial_memory_usage to zero as baseline for getMemoryOverheadData(). */

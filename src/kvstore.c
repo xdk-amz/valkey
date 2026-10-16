@@ -930,6 +930,12 @@ unsigned long kvstoreHashtableRehashingCount(kvstore *kvs) {
     return listLength(kvs->rehashing);
 }
 
+/* Whether table didx is mid-rehash. Reads only this table. */
+bool kvstoreHashtableRehashingAt(kvstore *kvs, int didx) {
+    hashtable *ht = kvstoreGetHashtable(kvs, didx);
+    return ht ? hashtableIsRehashing(ht) : false;
+}
+
 unsigned long kvstoreHashtableSize(kvstore *kvs, int didx) {
     hashtable *ht = kvstoreGetHashtable(kvs, didx);
     if (!ht) return 0;

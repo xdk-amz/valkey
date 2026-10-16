@@ -2055,6 +2055,7 @@ struct valkeyServer {
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
+    int cron_lanes;                           /* Run due table maintenance (rehash, resize) in a parallel MAINT phase. */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */

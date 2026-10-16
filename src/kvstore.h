@@ -71,7 +71,7 @@ void kvstoreReconcile(kvstore *kvs);
 size_t kvstoreOverheadHashtableLut(kvstore *kvs);
 size_t kvstoreOverheadHashtableRehashing(kvstore *kvs);
 unsigned long kvstoreHashtableRehashingCount(kvstore *kvs);
-
+bool kvstoreHashtableRehashingAt(kvstore *kvs, int didx);
 /* Specific hashtable access by hashtable-index */
 unsigned long kvstoreHashtableSize(kvstore *kvs, int didx);
 unsigned long kvstoreHashtableBuckets(kvstore *kvs, int didx);

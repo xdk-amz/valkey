@@ -12,6 +12,7 @@
 #include "io_threads.h"
 #include "repl_apply.h"
 #include "cronstats.h"
+#include "maint.h"
 
 #ifdef HAVE_FASTPATH_EPOLL
 
@@ -364,6 +365,7 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     crons(el);
     cronStatsRecord(CRON_JOB_SL_CRONS, getMonotonicUs() - t);
+    maintRun();
 }
 
 void stagedMain(aeEventLoop *el) {
