@@ -1037,7 +1037,9 @@ static void fpStagedHandoff(client *c) {
 }
 
 /* Main, after the reply phase: hand back the clients IO threads saw leave, then unmap the clients main
- * asked to close. */
+ * asked to close. A handoff can run the client's queued commands, and one that blocks (a busy script)
+ * runs nested iterations that call this again and change the leaving list, so that walk restarts from
+ * the head after every handoff instead of keeping a node across it. */
 void fastpathStagedFinish(void) {
     for (int tid = 1; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
@@ -1052,12 +1054,14 @@ void fastpathStagedFinish(void) {
         fpThread *t = &fp_threads[tid];
         listNode *ln = listFirst(&t->staged_leaving);
         while (ln) {
-            listNode *next = ln->next;
             client *c = listNodeValue(ln);
-            ln = next;
-            if (c->fp_inflight > 0) continue; /* entries of an outer iteration still on main */
+            if (c->fp_inflight > 0) { /* entries of an outer iteration still on main */
+                ln = ln->next;
+                continue;
+            }
             listUnlinkNode(&t->staged_leaving, &c->fp_stage_node);
             fpStagedHandoff(c);
+            ln = listFirst(&t->staged_leaving);
         }
     }
     if (!fp_staged_closing) return;
