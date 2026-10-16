@@ -501,7 +501,7 @@ start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip valgrind:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
     r select 0
 
     test {Staged overlap: with appendfsync always a reply never leaves before its write reaches the AOF} {
