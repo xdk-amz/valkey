@@ -1,5 +1,5 @@
 # Staged event loop reply streaming (staged-reply-overlap): the STREAM phase delivers completed
-# runs while main still executes. These tests exercise the config none|exec|loop under pipelined
+# runs while main still executes. These tests exercise the config none|exec under pipelined
 # load, exact per-connection reply order, teardown (CLIENT KILL and output-buffer-limit) while
 # replies stream, appendfsync always with the config on, and flipping the mode mid-load.
 # Every fast-path client is a raw db-0 socket; the framework's SELECT would move it off the path.
@@ -83,7 +83,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     # Each mode drives the same workload: 32 connections, each INCR its own key depth-16 pipelined,
     # many rounds. The reply sequence of each connection must be exactly 1,2,3,... with no gap,
     # reorder or duplicate, whether or not replies stream while main executes.
-    foreach mode {none exec loop} {
+    foreach mode {none exec} {
         test "Stream $mode: pipelined per-key INCR keep exact per-connection sequence (P16)" {
             r config set staged-reply-overlap $mode
             r flushall
@@ -127,8 +127,8 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 
     # A reader-heavy mix at P16: GETs stream behind the writers' INCRs. Each reader's view of its
-    # own counter is monotone, and the final values are exact, in exec and loop.
-    foreach mode {exec loop} {
+    # own counter is monotone, and the final values are exact, in exec.
+    foreach mode {exec} {
         test "Stream $mode: readers streaming behind writers stay monotone and exact" {
             r config set staged-reply-overlap $mode
             r flushall
@@ -164,13 +164,13 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         }
     }
 
-    # Flip the mode (none<->exec<->loop) between every in-flight burst. A CONFIG SET of the mode is
+    # Flip the mode (none<->exec) between every in-flight burst. A CONFIG SET of the mode is
     # read at the next iteration boundary; replies in flight across the change stay exact.
     test {Stream: CONFIG SET of the mode under load keeps every reply exact} {
         r flushall
         set n 16
         set fds [sls_open $n]
-        set modes {exec loop none exec none loop}
+        set modes {exec none exec none exec none}
         set base 0
         set depth 20
         set mi 0
@@ -201,7 +201,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 
     # CLIENT KILL while a large burst streams: the killed clients vanish, the survivors stay exact.
-    foreach mode {exec loop} {
+    foreach mode {exec} {
         test "Stream $mode: CLIENT KILL while replies stream leaves others exact" {
             r config set staged-reply-overlap $mode
             r flushall
@@ -249,7 +249,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 
     # An output-buffer-limit kill while replies stream closes the offender; the others are exact.
-    foreach mode {exec loop} {
+    foreach mode {exec} {
         test "Stream $mode: output buffer limit disconnects a streaming client, others unaffected" {
             r config set staged-reply-overlap $mode
             r flushall
@@ -291,7 +291,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
 start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
     r select 0
 
-    foreach mode {exec loop} {
+    foreach mode {exec} {
         test "Stream $mode: appendfsync always never replies before the write reaches the AOF" {
             r config set staged-reply-overlap $mode
             r flushall

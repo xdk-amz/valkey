@@ -1952,7 +1952,6 @@ typedef enum childInfoType {
 /* Staged loop reply overlap mode (staged-reply-overlap). */
 #define STAGED_REPLY_OVERLAP_NONE 0 /* Base behavior: exec then a separate reply phase. */
 #define STAGED_REPLY_OVERLAP_EXEC 1 /* Workers stream replies while main executes, closed before crons. */
-#define STAGED_REPLY_OVERLAP_LOOP 2 /* The stream stays open across crons and collect, closed at the next phase. */
 
 struct valkeyServer {
     /* General */

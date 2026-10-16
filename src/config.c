@@ -115,7 +115,6 @@ configEnum copy_avoid_mode_enum[] = {
 configEnum staged_reply_overlap_enum[] = {
     {"none", STAGED_REPLY_OVERLAP_NONE},
     {"exec", STAGED_REPLY_OVERLAP_EXEC},
-    {"loop", STAGED_REPLY_OVERLAP_LOOP},
     {NULL, 0}};
 
 configEnum shutdown_on_sig_enum[] = {
