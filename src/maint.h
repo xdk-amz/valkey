@@ -49,6 +49,10 @@ int maintPending(void);
  * touched kvstores and merge the per-thread stats. Clears the pending requests. */
 void maintRun(void);
 
+/* IO thread, in a MAINT phase: the monotonic time by which the phase's timed jobs must be done, or 0
+ * when only untimed jobs run. Spare lane time before it may drain the thread's job inboxes. */
+uint64_t maintPhaseDeadline(void);
+
 /* Clear pending requests without running them (iteration teardown, config change). */
 void maintReset(void);
 
