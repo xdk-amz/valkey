@@ -1295,9 +1295,13 @@ static void clientsCron(int clients_this_cycle) {
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
         if (c->flag.fastpath) {
-            /* Crons run between staged phases, so the idle timeout may close a staged client; the
-             * close takes effect after the next reply phase. Nothing else here applies to it. */
-            if (fastpathStagedOn()) clientsCronHandleTimeout(c, now);
+            /* Crons run between staged phases, so the idle timeout may close a staged client, and its
+             * memory, unwritten replies included, is accounted for maxmemory-clients; a close takes effect
+             * after the next reply phase. Nothing else here applies to it. */
+            if (fastpathStagedOn()) {
+                if (clientsCronHandleTimeout(c, now)) continue;
+                updateClientMemUsageAndBucket(c);
+            }
             continue;
         }
         reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */

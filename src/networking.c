@@ -6962,6 +6962,8 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
     }
 
     usage += atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed);
+    /* A staged fast-path client's unwritten replies, read by main between phases. */
+    if (c->flag.fastpath && c->fp_out) usage += sdsAllocSize(c->fp_out);
 
     return usage;
 }
