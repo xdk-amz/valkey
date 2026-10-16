@@ -1208,21 +1208,17 @@ void fastpathStagedStreamPhase(int tid) {
                 t->sb_streamed[d] = bi; /* REPLY resumes here */
                 return;
             }
-            /* Spin briefly for the next run, then yield the CPU so a worker sharing main's core
-             * cannot keep main from producing. */
-            int ready = 0;
-            for (int s = 0; s < 256; s++) {
-                if (atomic_load_explicit(&b->executed, memory_order_acquire) > b->delivered) {
-                    ready = 1;
-                    break;
-                }
+            /* Spin for the next chunk. Streaming is eligible only when no worker shares main's CPU
+             * (stagedStreamEligible), so this worker never steals main's core; a sched_yield would
+             * only hand this core to an unrelated thread and delay the next poll. */
+            for (int s = 0; s < 1024; s++) {
+                if (atomic_load_explicit(&b->executed, memory_order_acquire) > b->delivered) break;
 #if defined(__x86_64__) || defined(__i386__)
                 __builtin_ia32_pause();
 #elif defined(__aarch64__)
                 __asm__ __volatile__("isb" ::: "memory");
 #endif
             }
-            if (!ready) sched_yield();
         }
         bi++;
     }
