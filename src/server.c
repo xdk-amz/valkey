@@ -7374,6 +7374,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_sender_bytes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_bytes, memory_order_acquire),
                 "repl_sender_writes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_writes, memory_order_acquire),
                 "repl_sender_wakeups:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_wakeups, memory_order_acquire),
+                "repl_sender_main_wakes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_main_wakes, memory_order_acquire),
                 "repl_sender_write_errors:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_write_errors, memory_order_acquire),
                 "repl_sender_main_queued:%lld\r\n", sender_main_queued));
         }

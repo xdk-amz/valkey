@@ -2098,6 +2098,8 @@ struct valkeyServer {
     int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
                                                * dedicated sender thread, off the staged loop. One of
                                                * REPL_STREAM_SENDER_* (no/iteration/append). Default no. */
+    int repl_stream_sender_wake_bytes;        /* Hidden: in append mode, wake the parked sender only after this
+                                               * many bytes were published since its last wake (0 = every append). */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
@@ -2402,6 +2404,7 @@ struct valkeyServer {
     _Atomic(long long) stat_repl_sender_writes;       /* connWritev calls the sender made. */
     _Atomic(long long) stat_repl_sender_wakeups;      /* Times the sender ran its replica loop. */
     _Atomic(long long) stat_repl_sender_write_errors; /* Write errors the sender saw. */
+    _Atomic(long long) stat_repl_sender_main_wakes;   /* cond_signal calls main issued to the sender. */
     long long second_replid_offset;                   /* Accept offsets up to this for replid2. */
     _Atomic(long long) fsynced_reploff_pending;       /* Largest replication offset to
                                                        * potentially have been fsynced, applied to

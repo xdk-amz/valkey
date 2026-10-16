@@ -159,6 +159,68 @@ start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-c
     }
 }
 
+proc rss_sender_main_wakes {r} {
+    return [getInfoProperty [$r info replication] repl_sender_main_wakes]
+}
+
+# Append-mode wakes are rate-limited by repl-stream-sender-wake-bytes: a stream of small
+# appends must not produce a main wake each, and a large threshold must wake main less
+# than a tiny one does for the same traffic.
+start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-command yes}} {
+    set master [srv 0 client]
+    set master_host [srv 0 host]
+    set master_port [srv 0 port]
+    $master config set repl-stream-sender append
+    $master config set repl-diskless-sync no
+
+    start_server {overrides {io-threads 2 enable-debug-command yes}} {
+        set replica [srv 0 client]
+        $replica config set repl-stream-sender append
+        test "repl-stream-sender append: wake-bytes rate-limits per-append wakes" {
+            $replica replicaof $master_host $master_port
+            wait_for_sync $replica
+            wait_replica_online $master
+            wait_for_condition 50 100 {
+                [rss_sender_replicas $master] == 1
+            } else {
+                fail "sender did not take ownership of the replica"
+            }
+            # Pipeline many small appends into few loop iterations so the per-append wake
+            # path dominates: with threshold 0 each parked append signals, with a large
+            # threshold they coalesce. The per-iteration tick is the same for both, so the
+            # difference isolates the append-path wakes the threshold removes.
+            $master config set repl-stream-sender-wake-bytes 1048576
+            set w0 [rss_sender_main_wakes $master]
+            for {set batch 0} {$batch < 50} {incr batch} {
+                set pipe {}
+                for {set i 0} {$i < 200} {incr i} { append pipe "set k${batch}_$i v\r\n" }
+                $master write $pipe
+                $master flush
+                for {set i 0} {$i < 200} {incr i} { $master read }
+            }
+            wait_for_ofs_sync $master $replica
+            set wakes_large [expr {[rss_sender_main_wakes $master] - $w0}]
+            assert_equal [status $master master_repl_offset] [status $replica slave_repl_offset]
+
+            $master config set repl-stream-sender-wake-bytes 0
+            set w1 [rss_sender_main_wakes $master]
+            for {set batch 0} {$batch < 50} {incr batch} {
+                set pipe {}
+                for {set i 0} {$i < 200} {incr i} { append pipe "set j${batch}_$i v\r\n" }
+                $master write $pipe
+                $master flush
+                for {set i 0} {$i < 200} {incr i} { $master read }
+            }
+            wait_for_ofs_sync $master $replica
+            set wakes_zero [expr {[rss_sender_main_wakes $master] - $w1}]
+            # A large threshold must wake main strictly fewer times than threshold 0 for the
+            # same 10000 appends; coalescing never drops a byte (digest matches).
+            assert {$wakes_large < $wakes_zero}
+            assert_equal [$master debug digest] [$replica debug digest]
+        }
+    }
+}
+
 # A replica that connects and disconnects repeatedly under continuous write load races
 # the sender's send against main's Remove; the primary must stay correct and the final
 # dataset must match.
