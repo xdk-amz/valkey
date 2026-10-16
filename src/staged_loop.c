@@ -418,16 +418,35 @@ int stagedWorkerSpins(int tid) {
     return !atomic_load_explicit(&sl_on_main_cpu[tid], memory_order_relaxed);
 }
 
-void stagedRunApplyPhase(int with_workers) {
+/* Lane body per phase, bound once at startup; indexed by phase id. */
+static stagedLaneFn sl_lane_fn[STAGED_PHASE_MAINT + 1];
+
+void stagedSetLaneRunner(int phase, stagedLaneFn fn) {
+    serverAssert(phase >= 0 && phase <= STAGED_PHASE_MAINT);
+    sl_lane_fn[phase] = fn;
+}
+
+void stagedRunLane(int phase, int tid) {
+    stagedLaneFn fn = sl_lane_fn[phase];
+    if (fn) fn(tid);
+}
+
+/* Open phase for the enrolled workers, run main's lane when it takes one, and wait. with_workers 0,
+ * or no enrolled worker, runs lane 0 on main alone with no barrier. */
+void stagedRunLanePhase(int phase, int with_workers) {
     if (!with_workers) {
-        replApplyRunLane(0);
+        stagedRunLane(phase, 0);
         return;
     }
-    int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_APPLY);
+    int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
-    if (sl_main_lane) replApplyRunLane(0);
+    if (sl_main_lane) stagedRunLane(phase, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+}
+
+void stagedRunApplyPhase(int with_workers) {
+    stagedRunLanePhase(STAGED_PHASE_APPLY, with_workers);
 }
 
 void stagedStopWorkers(void) {
@@ -495,6 +514,19 @@ int stagedWorkerSpins(int tid) {
 void stagedRunApplyPhase(int with_workers) {
     UNUSED(with_workers);
     replApplyRunLane(0);
+}
+void stagedSetLaneRunner(int phase, stagedLaneFn fn) {
+    UNUSED(phase);
+    UNUSED(fn);
+}
+void stagedRunLanePhase(int phase, int with_workers) {
+    UNUSED(phase);
+    UNUSED(with_workers);
+    replApplyRunLane(0);
+}
+void stagedRunLane(int phase, int tid) {
+    UNUSED(phase);
+    UNUSED(tid);
 }
 void stagedStopWorkers(void) {
 }

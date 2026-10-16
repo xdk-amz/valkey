@@ -35,6 +35,7 @@
 #define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
 #define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
 #define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
+#define STAGED_PHASE_MAINT 6 /* workers run their lane of due table maintenance (rehash, resize, expire) */
 
 struct aeEventLoop;
 struct poller;
@@ -67,6 +68,17 @@ int stagedMainTakesLane(void);
 int stagedWorkerSpins(int tid);
 /* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
 void stagedRunApplyPhase(int with_workers);
+
+/* A phase's per-thread lane body, run by main (tid 0) and each enrolled worker (tid 1..n). */
+typedef void (*stagedLaneFn)(int tid);
+/* Main, once at startup: bind the lane body a phase runs. phase is STAGED_PHASE_APPLY or
+ * STAGED_PHASE_MAINT. */
+void stagedSetLaneRunner(int phase, stagedLaneFn fn);
+/* Main: open phase for the workers, run main's lane when stagedMainTakesLane(), and wait. With no
+ * enrolled worker, or with_workers 0, main runs lane 0 inline with no barrier. */
+void stagedRunLanePhase(int phase, int with_workers);
+/* IO thread: run the bound lane body for phase as thread tid. */
+void stagedRunLane(int phase, int tid);
 
 /* Main: grow the poller with maxclients, as ae grows; 0 on success. */
 int stagedResize(int setsize);
