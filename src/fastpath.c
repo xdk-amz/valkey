@@ -22,8 +22,12 @@
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
-static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
-              "cmdBatch is its header plus IO_BATCH_MAX inline entries");
+/* arena_used (main writes it per command) and executed (a STREAM worker spins on it) must sit on
+ * different cache lines, and the inline entries must start on their own line clear of executed. */
+static_assert(offsetof(cmdBatch, arena_used) / CACHE_LINE_SIZE != offsetof(cmdBatch, executed) / CACHE_LINE_SIZE,
+              "the polled executed must not share arena_used's cache line");
+static_assert(offsetof(cmdBatch, executed) / CACHE_LINE_SIZE != offsetof(cmdBatch, e) / CACHE_LINE_SIZE,
+              "the inline entries must not share the polled executed/delivered cache line");
 
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64

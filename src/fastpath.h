@@ -51,12 +51,15 @@ typedef struct cmdEntry {
 typedef struct cmdBatch {
     int count;
     int io_tid;
-    _Atomic(int) executed; /* entries main has finished executing; published release at client-run boundaries. */
-    int delivered;        /* worker-owned: entries this thread has already written in STREAM/REPLY. */
     char *arena;
     size_t arena_cap;
-    size_t arena_used;
-    cmdEntry e[IO_BATCH_MAX];
+    size_t arena_used;     /* main writes this per executed command while a STREAM worker reads the arena. */
+    /* executed and delivered are the streaming hand-off and sit on their own cache line, away from
+     * arena_used: a worker spins on executed (and reads delivered) while main advances arena_used per
+     * command, so sharing a line would bounce it to main on every reply byte. */
+    _Alignas(CACHE_LINE_SIZE) _Atomic(int) executed; /* entries main has finished executing; published release at client-run boundaries. */
+    int delivered;        /* worker-owned: entries this thread has already written in STREAM/REPLY. */
+    _Alignas(CACHE_LINE_SIZE) cmdEntry e[IO_BATCH_MAX]; /* own line so the first entries never share the polled line. */
 } cmdBatch;
 
 int fastpathEligible(client *c);
