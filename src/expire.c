@@ -461,6 +461,11 @@ typedef struct {
  * from state that cannot change during the exclusive MAINT phase. */
 static int lane_expire_free_inline = 0;
 
+/* Propagate-only mode: the only observer is propagation (AOF/replica, no exporting slot). A lane records
+ * each key's DEL/UNLINK for main to feed to the stream after the phase and frees the value itself (cheap
+ * ones in the lane, expensive ones through main), skipping the per-key replay observers. */
+static int lane_expire_propagate_only = 0;
+
 /* Replay-bounded phase budget. Instead of pre-dividing the cycle budget per thread, every lane shares
  * one ceiling: a lane stops once the phase's elapsed time plus the keys logged so far across all lanes
  * times the measured per-key replay cost reaches the budget. The replay is serial on main, so bounding
@@ -528,6 +533,32 @@ void activeExpireSetFreeInline(int free_inline) {
     lane_expire_free_inline = free_inline;
 }
 
+/* Main, before the MAINT phase opens: would replay be needed ONLY because the delete propagates (AOF or a
+ * replica/backlog), with no other observer and no slot exporting? Then a lane can record each key's
+ * DEL/UNLINK for main to feed to the stream after the phase and free the value itself, instead of the full
+ * per-key replay. An exporting slot keeps the per-key replay (propagateDeletion feeds the slot-migration
+ * job, which this path does not reproduce). Call only when maintExpireReplayNeeded() is already true. */
+int maintExpirePropagateOnly(void) {
+    if ((server.notify_keyspace_events & NOTIFY_EXPIRED) &&
+        (server.notify_keyspace_events & (NOTIFY_KEYSPACE | NOTIFY_KEYEVENT)) && serverPubsubSubscriptionCount() > 0)
+        return 0;
+    if (moduleNotifyKeyspaceSubscribersCnt() > 0) return 0;
+    if (trackingGetTotalKeys() > 0 || trackingHasActivePrefixes()) return 0;
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (!db) continue;
+        if (dictSize(db->watched_keys) > 0) return 0;
+        if (dictSize(db->blocking_keys) > 0) return 0;
+    }
+    if (clusterIsAnySlotExporting()) return 0;
+    /* The only remaining reason replay was needed is AOF or replica/backlog propagation. */
+    return shouldPropagateExpire();
+}
+
+void activeExpireSetPropagateOnly(int propagate_only) {
+    lane_expire_propagate_only = propagate_only;
+}
+
 /* Main, before opening the phase: arm the shared replay-bounded budget. budget_us is the whole-phase
  * budget; replay_us is the measured per-key replay cost (pass 0 in free-inline mode, where no key is
  * replayed). Lanes read these and the shared logged-key counter to decide when to stop. */
@@ -573,8 +604,21 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
     if (ttl < 0) {
         robj *unlinked = dbUnlinkExpiredInLane(d->db, val, didx);
         if (unlinked) {
-            if (lane_expire_free_inline && (unlinked->refcount > 1 ||
-                                            lazyfreeGetFreeEffort(NULL, unlinked, d->db->id) <= LAZYFREE_THRESHOLD)) {
+            int cheap = unlinked->refcount > 1 ||
+                        lazyfreeGetFreeEffort(NULL, unlinked, d->db->id) <= LAZYFREE_THRESHOLD;
+            if (lane_expire_propagate_only) {
+                /* Only propagation observes the delete: record the key's DEL/UNLINK for main to feed to
+                 * the stream after the phase, then free the value the way free-inline mode does -- cheap
+                 * ones (or a reply-pinned one, dropping its reference) here, expensive ones through main. */
+                sds key = objectGetKey(unlinked);
+                maintLogPropagate(d->tid, sdsdup(key), d->db->id, server.lazyfree_lazy_expire);
+                if (cheap) {
+                    freeValueNeverOnMain(NULL, unlinked, d->db->id);
+                    d->freed++;
+                } else {
+                    maintLogExpiredFreeOnly(d->tid, unlinked, d->db->id, didx);
+                }
+            } else if (lane_expire_free_inline && cheap) {
                 /* No observer and no propagation: the lane frees a cheap value itself, or drops its
                  * reference when an in-flight reply still pins it; main does no per-key work for this key.
                  * A value that is expensive to free goes to main's replay, which frees it off the phase. */
@@ -614,7 +658,7 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
     unsigned long long *cursor = &lane_expire_cursor[db->id * lane_expire_tables + didx];
     laneExpireScanData d = {.db = db, .now = now, .tid = tid};
     monotime start = getMonotonicUs();
-    if (lane_expire_free_inline) beginMaintLaneFree();
+    if (lane_expire_free_inline || lane_expire_propagate_only) beginMaintLaneFree();
     int repeat;
     unsigned long logged_batch = 0; /* keys logged for replay since the last publish */
     /* As one db iteration of activeExpireCycleJob, confined to this table. */
@@ -650,7 +694,7 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
             break;
         }
     } while (repeat);
-    if (lane_expire_free_inline) endMaintLaneFree();
+    if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
 
     laneExpireStats *st = &lane_expire_stats[tid];
     st->sampled += d.sampled;
@@ -675,9 +719,10 @@ void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_u
         freed += lane_expire_stats[t].freed;
         hit |= lane_expire_stats[t].hit_limit;
     }
-    /* Keys the lanes freed themselves get no replay, so main bulk-adds their expired and dirty counts
-     * here (the replay accounts for the rest, one by one). */
-    if (freed) {
+    /* Keys the lanes freed themselves (free-inline mode) get no replay, so main bulk-adds their expired
+     * and dirty counts here. In propagate-only mode the feed owns the count for every key (freed or not),
+     * so the lane does not add it again. */
+    if (freed && !lane_expire_propagate_only) {
         server.stat_expiredkeys += freed;
         server.dirty += freed;
     }

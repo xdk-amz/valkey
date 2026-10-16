@@ -11,6 +11,7 @@
 #include "staged_loop.h"
 #include "cronstats.h"
 #include "kvstore.h"
+#include "io_threads.h"
 
 #include <limits.h>
 #include <stdatomic.h>
@@ -21,11 +22,14 @@ typedef struct {
     int didx;
 } maintUnit;
 
-/* An expired key's value a lane unlinked; main replays its delete after the phase. */
+/* An expired key's value a lane unlinked; main replays its delete after the phase. In propagate-only mode
+ * free_only entries are freed by main without replay (their delete already went to the propagate buffer);
+ * the lane keeps them because the value was too expensive to free in the phase. */
 typedef struct {
     robj *val;
     int dbid;
     int didx;
+    int free_only;
 } maintExpired;
 
 typedef struct {
@@ -33,6 +37,21 @@ typedef struct {
     int len;
     int cap;
 } maintLog;
+
+/* One expired key whose delete main propagates after the phase (propagate-only mode): the lane copied
+ * the key name here and freed the value itself, so main feeds DEL/UNLINK to the AOF and replicas without
+ * touching the keyspace. Kept in the lane's expiry order so the stream matches the serial path. */
+typedef struct {
+    sds key;  /* owned copy; main frees it after feeding */
+    int dbid;
+    int lazy; /* UNLINK when set, DEL otherwise */
+} maintPropagate;
+
+typedef struct {
+    maintPropagate *e;
+    int len;
+    int cap;
+} maintPropLog;
 
 /* Pending requests for the current iteration. */
 static int mt_requested[MAINT_JOB_COUNT];
@@ -69,6 +88,14 @@ static uint64_t mt_replay_us = 0;
 static uint64_t mt_lane_usec[IO_THREADS_MAX_NUM][MAINT_JOB_COUNT];
 static uint64_t mt_lane_work[IO_THREADS_MAX_NUM][MAINT_JOB_COUNT]; /* units where the job did work */
 static maintLog mt_logs[IO_THREADS_MAX_NUM];
+static maintPropLog mt_prop_logs[IO_THREADS_MAX_NUM];
+
+/* EXPIRE propagate-only append cost on main, per key: feeding one DEL/UNLINK to the AOF and replicas.
+ * Measured on phases that fed, moving-averaged. The shared budget uses this instead of the full replay
+ * cost when the only observer is propagation. */
+static double mt_expire_feed_us = 0.3;
+static long mt_fed = 0;
+static uint64_t mt_feed_us = 0;
 
 void maintRequest(int job, uint64_t budget_us) {
     if (job < 0 || job >= MAINT_JOB_COUNT) return;
@@ -96,7 +123,29 @@ void maintLogExpired(int tid, robj *val, int dbid, int didx) {
         l->cap = l->cap ? l->cap * 2 : 1024;
         l->e = zrealloc(l->e, sizeof(maintExpired) * l->cap);
     }
-    l->e[l->len++] = (maintExpired){.val = val, .dbid = dbid, .didx = didx};
+    l->e[l->len++] = (maintExpired){.val = val, .dbid = dbid, .didx = didx, .free_only = 0};
+}
+
+/* Propagate-only mode: the key's delete already went to the propagate buffer, but its value was too
+ * expensive to free in the phase, so main frees it after the phase without replaying any effects. */
+void maintLogExpiredFreeOnly(int tid, robj *val, int dbid, int didx) {
+    maintLog *l = &mt_logs[tid];
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 1024;
+        l->e = zrealloc(l->e, sizeof(maintExpired) * l->cap);
+    }
+    l->e[l->len++] = (maintExpired){.val = val, .dbid = dbid, .didx = didx, .free_only = 1};
+}
+
+/* Propagate-only mode: record an expired key whose DEL/UNLINK main feeds to the AOF and replicas after
+ * the phase. The lane owns and passes a key-name copy; main frees it once fed. */
+void maintLogPropagate(int tid, sds key_copy, int dbid, int lazy) {
+    maintPropLog *l = &mt_prop_logs[tid];
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 1024;
+        l->e = zrealloc(l->e, sizeof(maintPropagate) * l->cap);
+    }
+    l->e[l->len++] = (maintPropagate){.key = key_copy, .dbid = dbid, .lazy = lazy};
 }
 
 /* Return the db's kvstore for slot k (0 keys, 1 expires, 2 keys_with_volatile_items). */
@@ -217,7 +266,8 @@ int maintParallelReady(void) {
     return server.cron_lanes && maintKeyspaceSplit() && stagedApplyReady() && stagedWorkerCount() > 0;
 }
 
-/* Main, after the phase: the effects of every delete the lanes made, thread by thread in log order. */
+/* Main, after the phase: the effects of every delete the lanes made, thread by thread in log order. A
+ * free_only entry (propagate-only mode, expensive value) is just freed; its delete was already fed. */
 static void maintReplay(void) {
     monotime t0 = getMonotonicUs();
     long replayed = 0;
@@ -225,14 +275,55 @@ static void maintReplay(void) {
         maintLog *l = &mt_logs[tid];
         for (int i = 0; i < l->len; i++) {
             maintExpired *e = &l->e[i];
-            replayExpiredKeyUnlinkedInLane(server.db[e->dbid], e->val, e->didx);
+            if (e->free_only) {
+                freeValueNeverOnMain(NULL, e->val, e->dbid);
+            } else {
+                replayExpiredKeyUnlinkedInLane(server.db[e->dbid], e->val, e->didx);
+                replayed++;
+            }
         }
-        replayed += l->len;
         l->len = 0;
     }
     mt_replayed = replayed;
     mt_replay_us = replayed ? getMonotonicUs() - t0 : 0;
     if (replayed) cronStatsRecord(CRON_JOB_MAINT_REPLAY, mt_replay_us);
+}
+
+/* Main, after the phase (propagate-only mode): feed the DEL/UNLINK of every key the lanes logged to the
+ * AOF and the replication stream, in the lanes' expiry order, with the exact framing propagateNow
+ * produces -- feedAppendOnlyFile and replicationFeedReplicas each emit their own SELECT and account for
+ * offsets, one command per key, no MULTI. Bulk-adds stat_expiredkeys and dirty. */
+static void maintFeedPropagation(void) {
+    monotime t0 = getMonotonicUs();
+    long fed = 0;
+    /* Mirror propagateNow's target logic for PROPAGATE_AOF | PROPAGATE_REPL (slot migration is excluded
+     * by maintExpirePropagateOnly): AOF when enabled; replicas when AOF forces it (WAITAOF) or a replica
+     * or backlog is present. */
+    int propagate_to_aof = server.aof_state != AOF_OFF;
+    int propagate_to_repl = 1;
+    if (!propagate_to_aof)
+        propagate_to_repl = server.primary_host == NULL && (server.repl_backlog || listLength(server.replicas) != 0);
+    for (int tid = 0; tid < IO_THREADS_MAX_NUM; tid++) {
+        maintPropLog *l = &mt_prop_logs[tid];
+        for (int i = 0; i < l->len; i++) {
+            maintPropagate *p = &l->e[i];
+            robj *keyobj = createStringObject(p->key, sdslen(p->key));
+            robj *argv[2] = {p->lazy ? shared.unlink : shared.del, keyobj};
+            if (propagate_to_aof) feedAppendOnlyFile(p->dbid, argv, 2);
+            if (propagate_to_repl) replicationFeedReplicas(p->dbid, argv, 2);
+            decrRefCount(keyobj);
+            sdsfree(p->key);
+            fed++;
+        }
+        l->len = 0;
+    }
+    if (fed) {
+        server.stat_expiredkeys += fed;
+        server.dirty += fed;
+    }
+    mt_fed = fed;
+    mt_feed_us = fed ? getMonotonicUs() - t0 : 0;
+    if (fed) cronStatsRecord(CRON_JOB_MAINT_FEED, mt_feed_us);
 }
 
 /* Main: each thread's share of the EXPIRE budget. Threads running for t each expire about
@@ -248,6 +339,10 @@ static uint64_t maintExpireThreadBudget(uint64_t budget_us, int nlanes) {
 }
 
 static void maintExpireUpdateCosts(uint64_t lane_us) {
+    if (mt_fed >= 256) {
+        double feed = (double)mt_feed_us / mt_fed;
+        mt_expire_feed_us = 0.8 * mt_expire_feed_us + 0.2 * feed;
+    }
     if (mt_replayed < 256) return;
     double lane = (double)lane_us / mt_replayed, replay = (double)mt_replay_us / mt_replayed;
     mt_expire_lane_us = 0.8 * mt_expire_lane_us + 0.2 * lane;
@@ -282,16 +377,21 @@ void maintRun(void) {
          * lane can free the value itself. The state it reads is global or db-wide and cannot change in
          * the phase. */
         int replay_needed = maintExpireReplayNeeded();
+        int propagate_only = replay_needed && maintExpirePropagateOnly();
         activeExpireSetFreeInline(!replay_needed);
+        activeExpireSetPropagateOnly(propagate_only);
         uint64_t phase_budget = mt_budget_us[MAINT_JOB_EXPIRE];
+        /* The shared bound charges the per-key cost main pays after the phase: a full replay normally, or
+         * just the propagation feed in propagate-only mode. In free-inline mode nothing is charged. */
+        double per_key_us = propagate_only ? mt_expire_feed_us : mt_expire_replay_us;
         if (server.cron_lanes_split_budget) {
             /* Override: each thread gets a plain slice of the budget, replay bound off. */
             mt_budget_us[MAINT_JOB_EXPIRE] = maintExpireThreadBudget(phase_budget, mt_nlanes);
             activeExpireBudgetBegin(0, 0.0);
         } else {
             /* Shared replay-bounded budget: lanes get the whole-phase budget as a per-thread safety
-             * ceiling and stop on the shared bound (elapsed + logged keys * replay cost). */
-            activeExpireBudgetBegin(phase_budget, mt_expire_replay_us);
+             * ceiling and stop on the shared bound (elapsed + logged keys * per-key cost). */
+            activeExpireBudgetBegin(phase_budget, per_key_us);
         }
         activeExpireLaneBegin();
     }
@@ -314,6 +414,7 @@ void maintRun(void) {
     cronStatsRecord(CRON_JOB_SC_RECONCILE, getMonotonicUs() - rec_t0);
 
     maintReplay();
+    maintFeedPropagation();
     cronStatsRecord(CRON_JOB_SC_MAINT, getMonotonicUs() - phase_t0);
 
     /* Per-job lane time summed across threads, recorded only when a job actually did work so a

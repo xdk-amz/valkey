@@ -76,6 +76,13 @@ int maintExpireReplayNeeded(void);
 /* Main, before a MAINT phase that runs the EXPIRE job: set whether lanes free expired values inline
  * (no observer, no propagation) instead of logging them for replay. */
 void activeExpireSetFreeInline(int free_inline);
+/* Main, before a MAINT phase: would replay be needed ONLY because the delete propagates (AOF or
+ * replica/backlog), with no other observer and no slot exporting? Then lanes record each key's DEL/UNLINK
+ * for main to feed to the stream and free the value themselves. Call only when replay is already needed. */
+int maintExpirePropagateOnly(void);
+/* Main, before a MAINT phase that runs the EXPIRE job: set whether lanes record propagation and free the
+ * value themselves instead of the full per-key replay. */
+void activeExpireSetPropagateOnly(int propagate_only);
 /* Main, before opening the phase: arm the shared replay-bounded budget (whole-phase budget_us and the
  * measured per-key replay cost; pass 0,0 to disable it and use the per-thread split ceiling instead). */
 void activeExpireBudgetBegin(uint64_t budget_us, double replay_us);
