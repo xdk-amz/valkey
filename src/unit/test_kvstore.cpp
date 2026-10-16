@@ -46,6 +46,8 @@ char *stringFromInt(int value) {
 class KvstoreTest : public ::testing::Test {
   protected:
     static void SetUpTestSuite() {
+        monotonicInit();
+
         /* Initialize KvstoreHashtableTestType explicitly by field name to avoid
          * dependency on field order (designated initializers require C++20). */
         memset(&KvstoreHashtableTestType, 0, sizeof(KvstoreHashtableTestType));
@@ -347,5 +349,27 @@ TEST_F(KvstoreTest, kvstoreConcurrentDeferredEmptyFree) {
     ASSERT_EQ(kvstoreNumNonEmptyHashtables(kvs), 3);
     ASSERT_EQ(kvstoreSize(kvs), 150u);
 
+    kvstoreRelease(kvs);
+}
+
+/* A table that finishes one rehash and starts the next inside one concurrent phase stays on the
+ * rehashing list, so the serial cron driver still finds it. */
+TEST_F(KvstoreTest, kvstoreConcurrentRehashRestartKeepsListNode) {
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, 1, 0);
+    int n = 0;
+    while (!kvstoreHashtableRehashingAt(kvs, 0)) ASSERT_TRUE(kvstoreHashtableAdd(kvs, 0, stringFromInt(n++)));
+    ASSERT_EQ(kvstoreHashtableRehashingCount(kvs), 1u);
+
+    kvstoreSetConcurrent(1);
+    kvstoreRehashHashtable(kvs, 0, 1000000);
+    ASSERT_FALSE(kvstoreHashtableRehashingAt(kvs, 0));
+    while (!kvstoreHashtableRehashingAt(kvs, 0)) ASSERT_TRUE(kvstoreHashtableAdd(kvs, 0, stringFromInt(n++)));
+    kvstoreSetConcurrent(0);
+    kvstoreReconcile(kvs);
+
+    ASSERT_EQ(kvstoreHashtableRehashingCount(kvs), 1u);
+    ASSERT_EQ(kvstoreSize(kvs), (unsigned long long)n);
+    while (kvstoreHashtableRehashingCount(kvs)) kvstoreIncrementallyRehash(kvs, 1000000);
+    ASSERT_FALSE(kvstoreHashtableRehashingAt(kvs, 0));
     kvstoreRelease(kvs);
 }
