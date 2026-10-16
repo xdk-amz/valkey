@@ -11,6 +11,7 @@
 #include "connhelpers.h"
 #include "fastpath.h"
 #include "staged_loop.h"
+#include "maint.h"
 #include "repl_apply.h"
 #include "phase_barrier.h"
 
@@ -1294,12 +1295,16 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
     }
 }
 
-/* Drain the private and shared job inboxes; returns the number of jobs run. */
-static int ioThreadDrainInboxes(long id, void **batch_jobs) {
+/* Drain the private and shared job inboxes; returns the number of jobs run. With a nonzero deadline,
+ * jobs are taken one at a time and draining stops once the deadline passes; the rest wait for a later
+ * phase. */
+static int ioThreadDrainInboxesUntil(long id, void **batch_jobs, monotime deadline) {
     int processed = 0;
     size_t batch_count;
+    size_t batch_max = deadline ? 1 : BATCH_SIZE;
     /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+    while ((!deadline || getMonotonicUs() < deadline) &&
+           (batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, batch_max)) > 0) {
         for (size_t i = 0; i < batch_count; i++) {
             void *data;
             int type;
@@ -1326,6 +1331,7 @@ static int ioThreadDrainInboxes(long id, void **batch_jobs) {
     }
 
     for (int shared_n = 0; shared_n < 64; shared_n++) {
+        if (deadline && getMonotonicUs() >= deadline) break;
         void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
         if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
         if (!tagged_job) break;
@@ -1339,21 +1345,33 @@ static int ioThreadDrainInboxes(long id, void **batch_jobs) {
     return processed;
 }
 
-/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Every phase starts
- * by draining the job inboxes, so free offload keeps working while the thread waits on the barrier. */
+static int ioThreadDrainInboxes(long id, void **batch_jobs) {
+    return ioThreadDrainInboxesUntil(id, batch_jobs, 0);
+}
+
+/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Every phase except
+ * MAINT starts by draining the job inboxes, so free offload keeps working while the thread waits on
+ * the barrier; MAINT drains only within its deadline, after its jobs. */
 static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
     phaseBarrier *b = stagedBarrier();
     for (;;) {
         int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
         if (phase == PHASE_BARRIER_EXIT) return;
         monotime start = getMonotonicUs();
-        ioThreadDrainInboxes(id, batch_jobs);
+        /* A MAINT phase serves no client, so its jobs run first and the inboxes only get the time left
+         * before the phase deadline; whatever remains waits for the next phase. */
+        if (phase != STAGED_PHASE_MAINT) ioThreadDrainInboxes(id, batch_jobs);
         if (phase == STAGED_PHASE_READ)
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
             fastpathStagedReplyPhase((int)id);
-        else if (phase == STAGED_PHASE_APPLY || phase == STAGED_PHASE_MAINT)
+        else if (phase == STAGED_PHASE_APPLY)
             stagedRunLane(phase, (int)id);
+        else if (phase == STAGED_PHASE_MAINT) {
+            stagedRunLane(phase, (int)id);
+            monotime deadline = maintPhaseDeadline();
+            if (deadline && getMonotonicUs() < deadline) ioThreadDrainInboxesUntil(id, batch_jobs, deadline);
+        }
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
         atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
