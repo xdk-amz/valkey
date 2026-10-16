@@ -209,6 +209,7 @@ static int fpCaptureAddrs(client *c) {
     if (peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, salen) != C_OK) return C_ERR;
     salen = sizeof(sa);
     if (getsockname(c->conn->fd, (struct sockaddr *)&sa, &salen) != 0) return C_ERR;
+    c->fp_conn_type = (int8_t)connGetType(c->conn); /* MONITOR renders unix-socket origins from it */
     return peerIdentityFromSockaddr(&c->fp_local, (struct sockaddr *)&sa, salen);
 }
 
@@ -293,6 +294,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->origin.authenticated = c->flag.authenticated;
     e->origin.peer = c->fp_peer;
     e->origin.local = c->fp_local;
+    e->origin.conn_type = c->fp_conn_type;
     e->reply_off = e->reply_len = 0;
     e->reply_big = NULL;
     e->reply_big_len = 0;
