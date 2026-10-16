@@ -21,7 +21,6 @@
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
-static_assert(sizeof(cmdEntry) == 160, "cmdEntry layout changed; re-measure before/after for the report");
 static_assert(sizeof(cmdBatch) == offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry),
               "cmdBatch is its header plus IO_BATCH_MAX inline entries");
 

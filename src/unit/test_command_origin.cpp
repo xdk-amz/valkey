@@ -44,8 +44,10 @@ TEST_F(CommandOriginTest, LayoutIsFixedSizeAndByValue) {
     /* No sds, no connection: the identity is plain data that outlives the client.
      * The one pointer is the principal, which main resolves against live ACL state. */
     EXPECT_EQ(sizeof(PeerIdentity), 20u);
-    EXPECT_EQ(sizeof(CommandOrigin), 64u);
-    EXPECT_EQ(sizeof(cmdEntry), 160u);
+    if (sizeof(void *) == 8) {
+        EXPECT_EQ(sizeof(CommandOrigin), 64u);
+        EXPECT_EQ(sizeof(cmdEntry), 160u);
+    }
     EXPECT_EQ(offsetof(cmdEntry, c), 0u);
     EXPECT_EQ(offsetof(cmdEntry, origin) % alignof(CommandOrigin), 0u);
     EXPECT_EQ(sizeof(cmdBatch), offsetof(cmdBatch, e) + IO_BATCH_MAX * sizeof(cmdEntry));
