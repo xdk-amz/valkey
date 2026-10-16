@@ -158,3 +158,34 @@ start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-c
         }
     }
 }
+
+# A replica that connects and disconnects repeatedly under continuous write load races
+# the sender's send against main's Remove; the primary must stay correct and the final
+# dataset must match.
+start_server {tags {"repl external:skip"} overrides {io-threads 2 enable-debug-command yes}} {
+    set master [srv 0 client]
+    set master_host [srv 0 host]
+    set master_port [srv 0 port]
+    $master config set repl-stream-sender append
+    $master config set repl-diskless-sync no
+
+    start_server {overrides {io-threads 2 enable-debug-command yes}} {
+        set replica [srv 0 client]
+        $replica config set repl-stream-sender append
+        test "repl-stream-sender: repeated resync under write load races Remove cleanly" {
+            for {set cycle 0} {$cycle < 10} {incr cycle} {
+                $replica replicaof $master_host $master_port
+                wait_for_sync $replica
+                for {set i 0} {$i < 1000} {incr i} { $master set c${cycle}k$i v }
+                $replica replicaof no one
+            }
+            assert_equal {PONG} [$master ping]
+            # Final steady state: reconnect and the datasets converge with no gap/dupe.
+            $replica replicaof $master_host $master_port
+            wait_for_sync $replica
+            for {set i 0} {$i < 2000} {incr i} { $master set final$i v }
+            wait_for_ofs_sync $master $replica
+            assert_equal [$master debug digest] [$replica debug digest]
+        }
+    }
+}

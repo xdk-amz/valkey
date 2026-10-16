@@ -1403,6 +1403,8 @@ typedef struct ClientReplicationData {
     size_t send_pos;                     /* Sender-owned: position within send_node. */
     _Atomic(long long) sent_offset;      /* Sender -> main: primary_repl_offset put on the wire. */
     _Atomic int send_error;              /* Sender -> main: a write error occurred; main disconnects. */
+    _Atomic int send_busy;               /* 1 while the sender is writing this replica outside the mutex;
+                                          * main waits for 0 before delinking or freeing it. */
 } ClientReplicationData;
 
 typedef struct ClientModuleData {
