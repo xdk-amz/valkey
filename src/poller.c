@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* First-class epoll poller for the staged fast-path loop. See poller.h. */
 
 #include "fmacros.h"

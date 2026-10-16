@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* Staged main event loop. See staged_loop.h and docs/staged-event-loop.md. */
 
 #include "server.h"

@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* Parallel apply of the replication stream on a replica. See repl_apply.h. */
 
 #include "server.h"

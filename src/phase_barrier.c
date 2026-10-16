@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
 /* Phase barrier between main and worker threads. See phase_barrier.h. */
 
 #include "fmacros.h"
