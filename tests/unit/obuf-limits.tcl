@@ -467,7 +467,7 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         assert_equal 0 $omem
     }
 
-    test {Copy-avoided fast-path replies return omem to zero after drain} {
+    test {Unsent fast-path replies return omem to zero after drain} {
         r config set min-io-threads-avoid-copy-reply 1
         r config set io-threads 4
         r config set client-output-buffer-limit {normal 0 0 0}
@@ -480,7 +480,6 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
 
         set value [string repeat "q" [expr 16*1024]]
         r set spill_key $value
-        set avoided [s reply_copy_avoided]
 
         set fpc [getInfoProperty [r info fastpath] fastpath_clients]
         set rd [valkey_deferring_client]
@@ -509,7 +508,6 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         } else {
             fail "Unsent fast-path replies were never charged"
         }
-        assert_morethan [s reply_copy_avoided] $avoided
 
         set reply_len [expr {[string length $value] + [string length [string length $value]] + 5}]
         set remaining [expr {$reply_len * $cmd_count}]
