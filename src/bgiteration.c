@@ -12,6 +12,7 @@
 #include "monotonic.h"
 #include "mutexqueue.h"
 #include "server.h"
+#include "cronstats.h"
 
 
 static bool receiveItemsBackFromOneIterator(bgIterator *it);
@@ -1603,7 +1604,7 @@ static void receiveItemsBackFromIterators(bool blocking) {
 }
 
 
-static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
+static long long bgIteration_feedIterators_taskImpl(struct aeEventLoop *eventLoop,
                                                 long long id,
                                                 void *clientData) {
     UNUSED(eventLoop);
@@ -1664,6 +1665,13 @@ static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop,
 
     lastFeedEndTime = getMonotonicUs();
     return BGITER_CYCLE_DELAY_MS;
+}
+
+static long long bgIteration_feedIterators_task(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    monotime t0 = getMonotonicUs();
+    long long r = bgIteration_feedIterators_taskImpl(eventLoop, id, clientData);
+    cronStatsRecord(CRON_JOB_BGITERATION_FEED, getMonotonicUs() - t0);
+    return r;
 }
 
 

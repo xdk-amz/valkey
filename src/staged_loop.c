@@ -11,6 +11,7 @@
 #include "fastpath.h"
 #include "io_threads.h"
 #include "repl_apply.h"
+#include "cronstats.h"
 
 #ifdef HAVE_FASTPATH_EPOLL
 
@@ -286,10 +287,16 @@ static void stagedReconcile(aeEventLoop *el) {
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
  * accumulated, bounded like aeProcessEvents), the post-sleep hook. */
 static void collectFDs(aeEventLoop *el) {
-    if (el->beforesleep) el->beforesleep(el);
+    if (el->beforesleep) {
+        monotime bs = getMonotonicUs();
+        el->beforesleep(el);
+        cronStatsRecord(CRON_JOB_SL_BEFORE_SLEEP, getMonotonicUs() - bs);
+    }
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
     long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client) ? 0 : aeUsUntilEarliestTimer(el);
+    monotime pl = getMonotonicUs();
     int n = pollerGetNextBatch(sl_poller, timeout);
+    cronStatsRecord(CRON_JOB_SL_POLL, getMonotonicUs() - pl); /* includes sleep when idle */
     if (n < 0) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
         n = 0;
@@ -338,14 +345,25 @@ static void crons(aeEventLoop *el) {
 }
 
 static void stagedLoopIteration(aeEventLoop *el) {
+    monotime t;
     collectFDs(el);
+    t = getMonotonicUs();
     readPhase();
+    cronStatsRecord(CRON_JOB_SL_READ, getMonotonicUs() - t);
+    t = getMonotonicUs();
     writePhase(el);
+    cronStatsRecord(CRON_JOB_SL_WRITE, getMonotonicUs() - t);
     /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
      * commands reach the AOF before the reply phase sends their replies. */
+    t = getMonotonicUs();
     if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) flushAppendOnlyFile(0);
+    cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
+    t = getMonotonicUs();
     replyPhase();
+    cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
+    t = getMonotonicUs();
     crons(el);
+    cronStatsRecord(CRON_JOB_SL_CRONS, getMonotonicUs() - t);
 }
 
 void stagedMain(aeEventLoop *el) {
