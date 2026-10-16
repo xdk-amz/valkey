@@ -534,6 +534,11 @@ typedef enum {
 #define REPL_DISKLESS_LOAD_SWAPDB 2
 #define REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD 3
 
+/* repl-stream-sender mode: when and how the stable offset is published to the sender. */
+#define REPL_STREAM_SENDER_NO 0        /* Sender off; the existing main/ae path sends replicas. */
+#define REPL_STREAM_SENDER_ITERATION 1 /* Publish the stable offset once per staged iteration. */
+#define REPL_STREAM_SENDER_APPEND 2    /* Publish the stable offset per feedReplicationBuffer append. */
+
 /* TLS Client Authentication */
 #define TLS_CLIENT_AUTH_NO 0
 #define TLS_CLIENT_AUTH_YES 1
@@ -2086,7 +2091,8 @@ struct valkeyServer {
     int staged_stream_order;                  /* Staged loop: STREAM execution order, see STAGED_STREAM_ORDER_* */
     int staged_stream_arena_guard;            /* Staged loop: bytes of fresh-line gap left after a published chunk (0 = off). */
     int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
-                                               * dedicated sender thread, off the staged loop. Default off. */
+                                               * dedicated sender thread, off the staged loop. One of
+                                               * REPL_STREAM_SENDER_* (no/iteration/append). Default no. */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
@@ -3662,6 +3668,7 @@ int canFeedReplicaReplBuffer(client *replica);
 void replStreamAccountCursor(client *c, long long sent);
 int replStreamSenderEligible(client *replica);
 void replStreamSenderPublishStable(long long offset);
+void replStreamSenderPublishAppend(long long offset);
 void replStreamSenderAdd(client *replica);
 void replStreamSenderRemove(client *replica);
 void replStreamSenderAccount(void);
