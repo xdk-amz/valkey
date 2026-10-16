@@ -1,6 +1,7 @@
 # Copy-avoiding replies preserve wire bytes, order, lifetime, partial writes, and COB accounting.
 
 proc reply_offload_on {} {
+    r client setname reply-offload ;# a named client stays on the main path, where replies avoid copies
     if {$::ca_mode eq "adaptive"} {
         r config set avoid-copy-reply-mode adaptive
         r debug copy-avoid engage 1
