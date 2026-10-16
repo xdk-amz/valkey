@@ -62,6 +62,7 @@
 #include "util.h"
 #include "forkless.h"
 #include "staged_loop.h"
+#include "repl_apply.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -3573,6 +3574,7 @@ void initListeners(void) {
 void InitServerLast(void) {
     bioInit();
     initIOThreads(1);
+    stagedSetLaneRunner(STAGED_PHASE_APPLY, replApplyRunLane);
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
 
     /* First set initial_memory_usage to zero as baseline for getMemoryOverheadData(). */
