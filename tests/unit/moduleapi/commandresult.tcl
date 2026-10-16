@@ -701,7 +701,7 @@ start_server {tags {"modules"}} {
         r cmdresult.unsubscribe
     }
 
-    test {Module commandresult - speculated reads punt while success subscriber active (F6)} {
+    test {Module commandresult - speculated reads go to main while a success subscriber is active} {
         # Speculation bypasses call(), which would silently drop
         # command-result events. With a SUCCESS subscriber, every GET -- even a
         # deep pipelined batch on an owned client -- must take the stock path

@@ -44,7 +44,7 @@ typedef struct fastGetThreadStats {
 
 extern fastGetThreadStats fastget_thread_stats[FASTGET_MAX_IO_THREADS];
 
-/* --- Component 6: Stats (behind -DIO_LOOKUP_OFFLOAD_STATS) --- */
+/* Stats (with -DIO_LOOKUP_OFFLOAD_STATS) */
 
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 typedef struct {
@@ -74,7 +74,7 @@ uint64_t fastGetStatsSum(size_t field_offset);
  * per-client spec_acl_ok byte inside fastGetSpeculateBatch). */
 void fastGetRecomputeSpecAclOk(struct client *c);
 void fastGetOnAclRulesChanged(void);
-/* F6: called when module command-result SUCCESS listener count transitions. */
+/* Main: the number of modules subscribed to successful command results changed. */
 void fastGetOnCommandResultListenersChanged(int success_listeners);
 void fastGetOnMonitorsChanged(void);
 

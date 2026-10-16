@@ -4339,7 +4339,7 @@ void aclCommand(client *c) {
         sds error = ACLStringSetUser(u, username, temp_argv, c->argc - 3);
         zfree(temp_argv);
         if (error == NULL) {
-            /* Existing clients may point at the mutated user — drain
+            /* Existing clients may point at the mutated user: drain
              * in-flight speculation and recompute their fast GET ACL gates. */
             fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
@@ -4496,7 +4496,7 @@ void aclCommand(client *c) {
         sds errors = ACLLoadFromFile(server.acl_filename);
         if (errors == NULL) {
             /* ACLLoadFromFile swaps c->user pointers directly (not via
-             * clientSetUser) — blanket re-gate + drain. */
+             * clientSetUser): recompute every gate and drain. */
             fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {

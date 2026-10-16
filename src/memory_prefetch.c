@@ -47,7 +47,7 @@ typedef struct PrefetchCommandsBatch {
     void **keys;                    /* Array of keys to prefetch in the current batch */
     client **clients;               /* Array of clients in the current batch */
     robj **key_members;             /* Member to prefetch for each key (NULL = no nested prefetch) */
-    struct serverDb **dbs;          /* Db for each key — tables are resolved LATE (at
+    struct serverDb **dbs;          /* Db for each key; tables are resolved late (at
                                      * prefetch time) because inline (non-batched)
                                      * command execution between add-time and
                                      * prefetch-time can free/replace a slot's
@@ -393,7 +393,7 @@ static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, 
             slot >= 0 ? slot : getKVStoreIndexForKey(objectGetVal(argv[result->keys[i].pos]));
         /* Table resolution is deferred to prefetchCommands(): inline command
          * execution between now and then can free/replace this slot's
-         * hashtable (cluster slot ops / DEL-empties) — a cached pointer here
+         * hashtable (cluster slot ops, DEL of the last key): a cached pointer here
          * segfaults in hashtableIncrementalFindStep. */
         batch->dbs[batch->key_count] = db;
         batch->key_members[batch->key_count] =

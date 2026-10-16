@@ -16,7 +16,7 @@
 
 fastGetThreadStats fastget_thread_stats[FASTGET_MAX_IO_THREADS] = {{0}};
 
-/* --- Component 6: Stats --- */
+/* Stats (with -DIO_LOOKUP_OFFLOAD_STATS) */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
 fastGetStats fastget_stats[FASTGET_MAX_IO_THREADS] = {{0}};
 
@@ -30,23 +30,15 @@ uint64_t fastGetStatsSum(size_t field_offset) {
 }
 #endif
 
-/* --- ACL/AUTH gate for speculation --- */
-
-/* Recompute the per-client speculation ACL gate. MAIN THREAD ONLY.
- * Speculation bypasses processCommand(), so the NOAUTH check and
- * ACLCheckAllPerm never run on the speculative path — this byte is the
- * substitute, computed at every auth-state change (clientSetUser covers
- * AUTH/HELLO/RESET/module-auth/deluser-kick), on SELECT (per-db ACLs), and
- * on ACL admin ops (fastGetOnAclRulesChanged).
+/* Main only. GETs answered on IO threads skip processCommand, so they skip the NOAUTH and ACL checks;
+ * this byte stands in for both. It is recomputed at every auth change (clientSetUser), on SELECT
+ * (per-db ACLs) and when ACL rules change (fastGetOnAclRulesChanged).
  *
- * Condition (graceful give-up, per design): authenticated AND some selector
- * permits GET with UNRESTRICTED key read access (~* / %R~* / allkeys).
- * Key-pattern-restricted users PUNT to the stock main-thread path — per-key
- * pattern matching on workers would race main-mutated user structs.
- * flag.authenticated (sticky, only changed via clientSetUser) is used
- * instead of authRequired(): the latter reads DefaultUser->flags which can
- * change with no per-client event (CONFIG SET requirepass) — conservative
- * punts only, never a bypass. */
+ * A client qualifies when it is authenticated and some selector allows GET on every key (~*, %R~* or
+ * allkeys). Users with key patterns go to main, since matching patterns on IO threads would race main
+ * changing the user. flag.authenticated is used rather than authRequired(), which reads DefaultUser's
+ * flags; those can change with no per-client event, and the flag can only make a client go to main,
+ * never let it skip a check. */
 void fastGetRecomputeSpecAclOk(client *c) {
     uint8_t ok = 0;
     /* ACL LOAD retires the user a fast-path client still points at; its successor holds the rules. */
@@ -59,10 +51,8 @@ void fastGetRecomputeSpecAclOk(client *c) {
             static struct serverCommand *get_cmd = NULL;
             if (!get_cmd) get_cmd = lookupCommandByCString("get");
             if (!get_cmd) goto done; /* sentinel has no GET */
-            /* Synthetic argv: the helper only needs cmd identity + dbid for
-             * the command/db checks; the ALLKEYS-or-%R~* requirement is what
-             * actually gates key access, so a placeholder key can only cause
-             * a (safe) conservative punt, never a false allow. */
+            /* The check needs only the command and db; key access is decided by the unrestricted-key
+             * requirement, so the placeholder key can only make the result stricter. */
             robj *argv[2];
             argv[0] = createStringObject("get", 3);
             argv[1] = createStringObject("k", 1);
@@ -76,9 +66,7 @@ done:
     atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
 }
 
-/* ACL rules changed (ACL SETUSER/DELUSER/LOAD, module SetUserACL).
- * MAIN THREAD ONLY. Recompute every client's gate under the new rules. Rare
- * admin op -- the blanket client walk is deliberate simplicity. */
+/* Main only, after ACL SETUSER, DELUSER, LOAD or a module ACL change: recompute every client's gate. */
 void fastGetOnAclRulesChanged(void) {
     listIter li;
     listNode *ln;
@@ -86,37 +74,27 @@ void fastGetOnAclRulesChanged(void) {
     while ((ln = listNext(&li))) fastGetRecomputeSpecAclOk((client *)listNodeValue(ln));
 }
 
-/* F6: module command-result SUCCESS subscribers require an exact per-command
- * event from call(); speculated GETs bypass call() entirely, so speculation
- * must be off while any such subscriber exists. Speculated GETs can only be
- * SUCCESS events (failures always punt), so only the success listener count
- * matters. Published gate read by workers each batch; transitions are rare
- * module admin ops (subscribe / unload). */
+/* A module subscribed to command results gets one event per command from call(), which GETs answered on
+ * IO threads skip, so those stop while any success subscriber exists. They can only succeed (a failure
+ * goes to main), so only success subscribers count. */
 _Atomic int fastget_module_cmdresult_gate = 0;
 
 void fastGetOnCommandResultListenersChanged(int success_listeners) {
     atomic_store_explicit(&fastget_module_cmdresult_gate, success_listeners > 0, memory_order_release);
 }
 
-/* F1: MONITOR feeds every executed command to attached monitor clients from
- * main (replicationFeedMonitors in call()); speculated GETs bypass call(), so
- * ~all speculative reads are invisible to MONITOR. Monitors are a rare
- * diagnostic feature, so gate speculation OFF while any monitor is attached --
- * MONITOR then observes the exact stock command stream. Zero cost when no
- * monitor (one acquire load of a main-written int per batch). */
+/* MONITOR is fed from call(), which GETs answered on IO threads skip, so those stop while any monitor is
+ * attached. */
 _Atomic int fastget_monitor_gate = 0;
 
 void fastGetOnMonitorsChanged(void) {
     atomic_store_explicit(&fastget_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
 }
 
-/* --- Component 2: Speculative GET — reply helpers --- */
-
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
 static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
-    /* Fast bulk-header formatting: "$<len>\r\n" using ll2string instead of
-     * snprintf (eliminates 2.6% __vfprintf_internal from worker profile). */
+    /* "$<len>\r\n" with ll2string: snprintf is measurably slower here. */
     char hdr[32];
     hdr[0] = '$';
     int numlen = ll2string(hdr + 1, sizeof(hdr) - 3, (long long)vallen);
@@ -125,7 +103,7 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
     int hdrlen = numlen + 3;
     size_t total = hdrlen + vallen + 2; /* trailing \r\n */
     size_t available = c->buf_usable_size - c->bufpos;
-    if (total > available) return 0; /* Won't fit — punt */
+    if (total > available) return 0; /* does not fit: main replies */
 
     memcpy(c->buf + c->bufpos, hdr, hdrlen);
     c->bufpos += hdrlen;
@@ -136,8 +114,6 @@ static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
     if (c->buf_peak < c->bufpos) c->buf_peak = c->bufpos;
     return (int)total;
 }
-
-/* --- Component 2/5: IO-thread batch speculation with batched prefetch --- */
 
 /* Maximum batch depth for prefetch overlap. Matches server.prefetch_batch_max_size default. */
 #define FASTGET_BATCH_DEPTH 16
@@ -167,8 +143,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
     }
     void *entry = NULL;
     if (!hashtableIncrementalFindGetResult(&e->find_state, &entry)) {
-        /* Key not found -- punt on miss (E4): main fires the keymiss notification
-         * and increments stat_keyspace_misses exactly. */
+        /* A miss goes to main, which fires the keymiss notification and counts the miss. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
         FASTGET_STAT_ADD(miss_punts, 1);
 #endif
@@ -231,82 +206,45 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
 int fastGetSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
-    /* Early exit: speculation disabled (single-threaded or cluster mode).
-     * In this tree speculative readers exist only under door-2 ownership: with
-     * ownership off, IO-thread reads belong to the main-thread-offload fast path
-     * and its own free routing, so nothing here may run. */
+    /* Not with a single thread or in cluster mode. */
     if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
 
-    /* ROLE GATE (replica-only deployment): with io-threads-speculation-replica-only
-     * set, a primary or standalone server never speculates and runs the stock
-     * read path. */
+    /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
 
-    /* CLIENT-STATE GUARD: inside MULTI every command must reply +QUEUED and
-     * execute only at EXEC — speculating a GET here would execute it early
-     * and strand it from the transaction (real bug: pipelined MULTI batches
-     * were safe only because MULTI heads the batch; a GET arriving in a
-     * LATER read while flag.multi is set would be speculated). Blocked /
-     * just-unblocked clients must have replies ordered after the unblock
-     * reply. Cheap plain-byte tests, ordered before any atomics.
-     *
-     * BUFFER-STATE GUARD: fastGetWriteBulkReply appends RAW RESP to c->buf.
-     * If the buffer is in copy-avoidance ENCODED mode (header-framed
-     * payloads), raw bytes corrupt the framing — trackBufReferences walks
-     * off the payload chain ('ptr == buf + bufpos' assert; found by the
-     * fork's dataset tests mixing KEYS/HSET-encoded replies with speculated
-     * GETs). A non-empty reply list is equally disqualifying: new reply
-     * data belongs at the list tail, not in buf, or replies reorder. */
+    /* Inside MULTI a GET must be queued, not run. A blocked or just-unblocked client's replies must
+     * follow its unblock reply. The reply is written as plain RESP into c->buf, which would corrupt a
+     * buffer in copy-avoidance encoded mode, and would reorder replies if the reply list is not
+     * empty. */
     if (c->flag.multi || c->flag.blocked || c->flag.unblocked ||
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
 
-    /* CLIENT TRACKING GUARD (E7): speculation bypasses trackingRememberKeys,
-     * so a non-BCAST tracking client could cache a speculatively-read value
-     * WITHOUT being registered in the TrackingTable — a later write would
-     * never invalidate it (stale client cache = correctness violation).
-     * Punt such clients to the stock path. BCAST tracking is unaffected
-     * (invalidation is prefix-based, not registration-based) and keeps
-     * speculating. Safe to test plain flags here: per-client io_read_state
-     * serialization means main cannot be executing this client's CLIENT
-     * TRACKING command while its read is parsed, and a tracking command
-     * inside this batch ends the speculative prefix before any later GET. */
+    /* A tracking client must have its keys remembered, which this path skips, or a later write would
+     * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not
+     * run this client's commands while its read is parsed, so the plain flags are stable here. */
     if (c->flag.tracking && !c->flag.tracking_bcast) return 0;
 
-    /* MODULE COMMAND-RESULT GUARD (F6): a subscribed module expects an exact
-     * success event per executed command; speculation bypasses call() and
-     * would silently drop those events. Global, module-rare gate -- zero cost
-     * when no module subscribes (single acquire load of a main-written int
-     * that changes only on module admin ops). */
+    /* A module subscribed to command results (see fastGetOnCommandResultListenersChanged). */
     if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 0;
 
     /* A module command filter may rewrite or redirect the GET. Filters change only on main, which
      * waits at the barrier while IO threads run this. */
     if (moduleHasCommandFilters()) return 0;
 
-    /* MONITOR GUARD (F1): a monitor feed is produced per executed command in
-     * call() on main; speculation bypasses call() and would hide the read from
-     * every attached monitor. Global, diagnostic-rare gate -- zero cost when no
-     * monitor is attached. */
+    /* An attached monitor (see fastGetOnMonitorsChanged). */
     if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
 
-    /* Lazily cache the GET command pointer -- eliminates repeated case-insensitive
-     * siphash lookups. Only a batch that starts with GET can speculate. */
+    /* Only a read that starts with a GET is answered here. */
     static struct serverCommand *fastget_get_cmd = NULL;
     if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
     if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
 
-    /* ACL/AUTH GUARD: speculation bypasses processCommand, so neither the
-     * NOAUTH check nor ACLCheckAllPerm ever runs on this path. Only clients
-     * pre-cleared on the main thread may speculate; everyone else punts to
-     * the stock path which enforces auth/ACL as usual. The byte is written
-     * only at rare auth-state changes, so this read does not ping-pong the
-     * line. Placed after the GET fast-exit to keep pure-write batches at
-     * zero added cost. */
+    /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
     if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
 
-    /* COMMANDLOG GUARD: with a slow threshold of 0 the commandlog records every command, so every
-     * GET goes to main, which records it. Large requests and replies are checked per GET. */
+    /* With a slow threshold of 0 the commandlog records every command, so every GET goes to main, which
+     * records it. Large requests and replies are checked per GET. */
     if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
@@ -396,39 +334,20 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
 /* --- Phase-1 no-enqueue: IO-thread command consumption --- */
 
-/* Consume speculated commands at the IO thread so they never reach main.
- *
- * After fastGetSpeculateBatch writes replies into c->buf and marks commands
- * with READ_FLAGS_FASTGET_SPECULATED, this function:
- * 1. Frees the first command's argv (c->argv) and clears pending_command state.
- * 2. Advances cmd_queue past all FASTGET_SPECULATED entries, freeing their argv.
- * 3. Increments per-IO-thread command counter (NOT shared stat_numcommands).
- * 4. Increments c->commands_processed directly — safe because the IO thread
- *    owns the client exclusively during the read phase (io_read_state ==
- *    CLIENT_PENDING_IO; main thread will not touch the client until we
- *    set CLIENT_COMPLETED_IO and send to main).
- *
- * After this, c->argc == 0, pending_command is clear, and cmd_queue has no
- * speculated entries. Main-thread processClientIOReadsDone sees nothing to
- * execute. */
+/* IO thread: drop the commands fastGetSpeculateBatch answered, so main never runs them. Frees their argv,
+ * clears pending_command, advances the command queue past them and counts them per thread. The IO thread
+ * owns the client for the whole read phase, so it updates commands_processed itself. Afterwards
+ * c->argc is 0 and the queue holds only commands main still has to run. */
 void fastGetConsumeSpeculated(client *c, int count, int tid) {
     int consumed = 0;
 
     /* --- First command (c->argv / c->parsed_cmd case) --- */
     if (count > 0 && (c->read_flags & READ_FLAGS_FASTGET_SPECULATED)) {
         c->read_flags &= ~READ_FLAGS_FASTGET_SPECULATED;
-        /* CRITICAL: clear pending_command — the parse path set it, and without
-         * clearing it here the main thread's processPendingCommandAndInputBuffer
-         * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
-         * (the removed main-side skip path used to clear this flag). */
+        /* The parser set pending_command; left set, main would run a stale c->cmd with argc 0. */
         c->flag.pending_command = 0;
-        /* Free argv INLINE — do NOT call freeClientArgv() which routes through
-         * tryOffloadFreeArgvToIOThreads(). That function increments the non-atomic
-         * io_jobs_submitted from the IO thread (data race with main) and enqueues
-         * to a SPSC queue potentially owned by this same thread (invariant
-         * violation: SPSC is single-producer = main thread only). The race causes
-         * lost increments -> submitted < finished -> infinite spin in
-         * drainIOThreadsQueue on shutdown. */
+        /* Freed here, not with freeClientArgv(): that may offload the free to an IO thread, which only
+         * main may do (it updates main's job counters and a main-produced queue). */
         for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
         zfree(c->argv);
         c->argv = NULL;
@@ -467,40 +386,19 @@ void fastGetConsumeSpeculated(client *c, int count, int tid) {
 
     /* Accumulate into per-IO-thread counter (no shared-line write). */
     fastget_thread_stats[tid].commands_processed += consumed;
-    /* E3: every consumed speculation is a GET keyspace HIT (valid-nil misses now
-     * punt to main via E4; large/expired/torn also punt). Count them per-thread
-     * so main can fold into stat_keyspace_hits, which the worker path bypasses. */
+    /* Every answered GET is a keyspace hit: misses, expired keys and large values go to main. Main folds
+     * this into stat_keyspace_hits, which lookupKey would have counted. */
     fastget_thread_stats[tid].keyspace_hits += consumed;
 }
 
-/* Aggregate per-IO-thread command counters into server.stat_numcommands.
- * Called from beforeSleep once per event-loop iteration. The main thread
- * is the sole writer of stat_numcommands, so this is a plain add-and-zero
- * with no atomics needed on the server side. The IO threads only increment
- * their own counter (single-writer per slot), so a plain read + zero is
- * safe: worst case we miss a few commands this iteration and catch them
- * next time (bounded lag of one event-loop cycle, ~1ms).
- *
- * BOUNDARY CALLERS (beyond beforeSleep): CONFIG RESETSTAT and INFO
- * commandstats must call this too — otherwise pending per-thread counts
- * survive a reset (stale +N folds in later) or are missing from a read
- * (found by valkey-benchmark.tcl: calls=101 vs 100, calls=10000 vs 10010).
- * For RESETSTAT the settle happens BEFORE the zeroing, absorbing pending
- * counts into the stats about to be cleared. */
+/* Main: fold the per-thread counts of GETs answered on IO threads into stat_numcommands,
+ * stat_keyspace_hits and GET's commandstats. Runs in beforeSleep, and also before CONFIG RESETSTAT
+ * zeroes the stats and before INFO renders them, so a reset clears pending counts and a read includes
+ * them. */
 void fastGetAggregateStats(void) {
-    /* Commandstats parity: speculated GETs bypass call(), which is where
-     * cmd->calls / cmd->microseconds are normally incremented. Fold the
-     * per-thread counters into the GET command here so INFO COMMANDSTATS
-     * (and everything downstream) sees them. Only GET is ever speculated,
-     * so a single target command suffices.
-     *
-     * MONOTONIC-DELTA scheme (NOT add-and-zero): workers increment their
-     * slots concurrently with this fold; zeroing a slot from main races the
-     * worker's read-modify-write and PERMANENTLY loses counts (observed as
-     * calls=99-vs-100 once INFO/RESETSTAT-time folds made folding frequent).
-     * Workers' counters only ever grow; main folds the delta since its own
-     * last_seen snapshot. A racy read can only UNDER-read (missing the very
-     * latest increment), which the next fold picks up — never loses. */
+    /* IO threads only ever increase their counters; main folds the growth since its last snapshot.
+     * Zeroing a counter from main would race an IO thread's increment and lose counts, while a stale
+     * read here only defers counts to the next fold. */
     static long long seen_calls[FASTGET_MAX_IO_THREADS] = {0};
     static long long seen_usec[FASTGET_MAX_IO_THREADS] = {0};
     static long long seen_hits[FASTGET_MAX_IO_THREADS] = {0};
@@ -515,10 +413,7 @@ void fastGetAggregateStats(void) {
             server.stat_numcommands += calls_delta;
             if (get_cmd) get_cmd->calls += calls_delta;
         }
-        /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
-         * bypasses main's lookupKey where this is normally incremented). Same
-         * monotonic-delta scheme: workers only grow their slot, main folds the
-         * delta since its last snapshot; a racy read only under-reads, never loses. */
+        /* Keyspace hits, folded the same way. */
         long long h = fastget_thread_stats[i].keyspace_hits;
         if (h > seen_hits[i]) {
             server.stat_keyspace_hits += h - seen_hits[i];
