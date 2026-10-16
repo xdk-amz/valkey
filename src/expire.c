@@ -475,6 +475,7 @@ static _Atomic unsigned long lane_expire_logged = 0; /* keys logged for replay s
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
 static int lane_expire_tables = 0;
 static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
+static ustime_t lane_expire_fields_us = 0; /* field expiry time on main in the tick that posted the phase */
 static laneExpireStats lane_expire_stats[IO_THREADS_MAX_NUM];
 static long long *lane_ttl_sum = NULL;     /* [tid * dbnum + dbid] */
 static long long *lane_ttl_samples = NULL; /* [tid * dbnum + dbid] */
@@ -700,7 +701,9 @@ void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_u
         *cur = *cur == 0 ? avg : avg + (*cur - avg) * avg_ttl_factor[0];
     }
     server.stat_expire_cycle_time_used += expire_us;
-    ustime_t phase = (ustime_t)phase_us;
+    /* Clients waited for this tick's field expiry on main and the phase back to back. */
+    ustime_t phase = (ustime_t)phase_us + lane_expire_fields_us;
+    lane_expire_fields_us = 0;
     latencyAddSampleIfNeeded("expire-cycle", phase);
 }
 
@@ -769,13 +772,26 @@ ustime_t activeExpireCycle(int type) {
     serverAssert(server.also_propagate.numops == 0);
 
     if (activeExpireInLanes()) {
-        /* Keys expire in the MAINT phase after crons(), every staged thread taking whole tables, each
-         * with this cycle's budget. Hash fields stay here. A fast cycle is requested only when the last
-         * lane run was cut off or the stale estimate is high, as activeExpireCycleJob decides. */
-        elapsed = activeExpireCycleJob(FIELDS, type, timelimit_us);
-        if (type == ACTIVE_EXPIRE_CYCLE_SLOW || lane_expire_hit_limit ||
-            server.stat_expired_keys_stale_perc >= activeExpireAcceptableStale())
-            maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
+        /* Keys expire in the MAINT phase after crons(), every staged thread taking whole tables. Hash
+         * fields stay here. Both share this cycle's budget: no client is served between crons() and the
+         * phase, so the stall is their sum. Fields take at most half when keys may expire too, so neither
+         * starves. A fast cycle is requested only when the last lane run was cut off or the stale
+         * estimate is high, as activeExpireCycleJob decides. */
+        ustime_t fields_limit = timelimit_us;
+        for (int j = 0; j < server.dbnum; j++) {
+            if (server.db[j] && kvstoreSize(server.db[j]->expires)) {
+                fields_limit = timelimit_us / 2;
+                break;
+            }
+        }
+        elapsed = activeExpireCycleJob(FIELDS, type, fields_limit);
+        lane_expire_fields_us = elapsed;
+        if ((type == ACTIVE_EXPIRE_CYCLE_SLOW || lane_expire_hit_limit ||
+             server.stat_expired_keys_stale_perc >= activeExpireAcceptableStale()) &&
+            timelimit_us > elapsed)
+            maintRequest(MAINT_JOB_EXPIRE, timelimit_us - elapsed);
+        else if (elapsed)
+            latencyAddSampleIfNeeded("expire-cycle", elapsed);
         server.stat_expire_cycle_time_used += elapsed;
         return elapsed;
     }

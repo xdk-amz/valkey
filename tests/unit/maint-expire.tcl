@@ -159,6 +159,33 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         assert_equal 0 [s tracking_total_keys]
     }
 
+    test "Active expire with cron-lanes $lanes keeps keys and hash fields within one cycle budget" {
+        r flushdb
+        r config resetstat
+        r latency reset
+        r config set latency-monitor-threshold 1
+        # Enough expiring keys and fields that each alone would use a whole cycle budget.
+        me_load_volatile r bk: 600000 400
+        r eval {
+            for h=1,tonumber(ARGV[1]) do
+                for f=1,tonumber(ARGV[2]) do
+                    redis.call('hsetex', 'bh:'..h, 'px', 400 + f % 50, 'fields', 1, 'f'..f, 'v')
+                end
+            end
+            return 1
+        } 0 400 1000
+        wait_for_condition 400 50 {[r dbsize] == 0} else { fail "keys and fields did not expire: [r dbsize]" }
+        # One expire-cycle sample per tick covers everything clients waited for: field expiry on main
+        # and the phase. It stays within the 25 ms budget plus scheduling slack.
+        set worst 0
+        foreach ev [r latency latest] {
+            if {[lindex $ev 0] eq "expire-cycle"} { set worst [lindex $ev 3] }
+        }
+        assert_morethan $worst 0
+        assert_lessthan $worst 35
+        r config set latency-monitor-threshold 0
+    }
+
     test "Active expire with cron-lanes $lanes frees large values off the MAINT phase" {
         r flushdb
         r config resetstat
