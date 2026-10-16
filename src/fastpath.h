@@ -81,7 +81,7 @@ void fastpathControlReclaim(client *c);
 void fastpathInitThread(int tid);
 void fastpathFreeThread(int tid);
 
-/* Staged loop (driven by staged_loop.c; see docs/staged-event-loop.md). */
+/* Staged loop (driven by staged_loop.c). */
 int fastpathStagedOn(void);
 void fastpathStagedSet(int on);
 void fastpathStagedSetDepth(int depth);

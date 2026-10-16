@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* Staged main event loop. See staged_loop.h and docs/staged-event-loop.md. */
+/* Staged main event loop. See staged_loop.h. */
 
 #include "server.h"
 #include "staged_loop.h"

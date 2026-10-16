@@ -7,11 +7,22 @@
 #ifndef STAGED_LOOP_H
 #define STAGED_LOOP_H
 
-/* Staged main event loop for the IO-thread fast path. See docs/staged-event-loop.md.
+/* Staged main event loop for the IO-thread fast path.
  *
  * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2, no cluster), one
  * main iteration runs collect -> read -> write -> reply -> crons, and IO threads work only inside
- * the read and reply phases. Otherwise the loop is stock ae. Non-epoll builds are always stock. */
+ * the read and reply phases. Otherwise the loop is stock ae. Non-epoll builds are always stock.
+ *
+ * Invariants:
+ * - IO threads read the keyspace only in the read phase; main mutates it only in the write phase
+ *   and crons. The barrier between phases is the only synchronization.
+ * - Within one iteration exactly one IO thread reads a fast-path client, owns its batch entries and
+ *   writes their replies, so a client's replies stay in order. Main touches the client itself only
+ *   at a handoff, between phases.
+ * - A client's leading GETs run in the read phase; its first other command and everything behind it
+ *   run on main in the write phase, so a read never overtakes an earlier write of the same client.
+ * - A fast-path client is freed only after main took it back following the reply phase of every
+ *   iteration that produced entries for it. */
 
 #include "fastpath_no_epoll.h"
 #include <stdint.h>
