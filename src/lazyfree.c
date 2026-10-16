@@ -189,10 +189,7 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
  * may be put into a lazy free list instead of being freed synchronously. The
  * lazy free list will be reclaimed in a different bio.c thread. If the value is
  * composed of a few allocations, to free in a lazy way is actually just
- * slower... So under a certain limit we just free the object synchronously. */
-#define LAZYFREE_THRESHOLD 64
-
-/* Free an object, if the object is huge enough, free it in async way. */
+ * slower... So under LAZYFREE_THRESHOLD we just free the object synchronously. */
 void freeObjAsync(robj *key, robj *obj, int dbid) {
     size_t free_effort = lazyfreeGetFreeEffort(key, obj, dbid);
     /* Note that if the object is shared, to reclaim it now it is not

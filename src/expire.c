@@ -43,6 +43,7 @@
 #include "maint.h"
 #include "module.h"
 #include "staged_loop.h"
+#include "io_threads.h"
 
 #include <stdatomic.h>
 
@@ -496,7 +497,8 @@ int activeExpireInLanes(void) {
  * key this phase expires. Returns 1 (replay) when any of these hold, 0 (free inline) otherwise:
  *   - keyspace `expired` notifications reach a subscriber (notifyKeyspaceEvent) or a module keyspace sub;
  *   - WATCH is active in any db (signalModifiedKey -> touchWatchedKey);
- *   - tracking is active, default or BCAST (signalModifiedKey -> trackingInvalidateKey);
+ *   - tracked keys or BCAST prefixes exist, even with no tracking client left (signalModifiedKey ->
+ *     trackingInvalidateKey removes the expired key's entry from the tracking table);
  *   - a client is blocked on keys (signalDeletedKeyAsReady);
  *   - the delete would propagate to AOF, replicas/backlog or an exporting slot (propagateDeletion).
  * Anything it cannot reproduce exactly keeps the replay path: module data-type/key-event listeners and
@@ -508,7 +510,7 @@ int maintExpireReplayNeeded(void) {
         return 1;
     if (moduleNotifyKeyspaceSubscribersCnt() > 0) return 1;
     /* tracking: default (per-key RESP3 invalidation) or BCAST (prefix). */
-    if (server.tracking_clients > 0 || trackingHasActivePrefixes()) return 1;
+    if (trackingGetTotalKeys() > 0 || trackingHasActivePrefixes()) return 1;
     /* propagation: AOF on, a replica or backlog present, or a slot exporting. */
     if (shouldPropagateExpire()) return 1;
     /* WATCH or a blocked client in any db. */
@@ -570,10 +572,11 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
     if (ttl < 0) {
         robj *unlinked = dbUnlinkExpiredInLane(d->db, val, didx);
         if (unlinked) {
-            if (lane_expire_free_inline) {
-                /* No observer and no propagation: the lane frees the value itself. freeValueNeverOnMain
-                 * drops a reference for a value still pinned by an in-flight reply (refcount > 1) and
-                 * frees it here otherwise; main does no per-key work for this key. */
+            if (lane_expire_free_inline && (unlinked->refcount > 1 ||
+                                            lazyfreeGetFreeEffort(NULL, unlinked, d->db->id) <= LAZYFREE_THRESHOLD)) {
+                /* No observer and no propagation: the lane frees a cheap value itself, or drops its
+                 * reference when an in-flight reply still pins it; main does no per-key work for this key.
+                 * A value that is expensive to free goes to main's replay, which frees it off the phase. */
                 freeValueNeverOnMain(NULL, unlinked, d->db->id);
                 d->freed++;
             } else {
