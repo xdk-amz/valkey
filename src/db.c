@@ -283,6 +283,9 @@ int getKVStoreIndexUsingCachedSlot(sds key) {
  * a different slot, so use keyHashSlot() or getKVStoreIndexForKey() for those. */
 int getCachedKeySlot(sds key) {
     serverAssert(server.cluster_enabled);
+    /* A parallel-apply lane: the slot was computed when the write was queued, and the shared primary
+     * client must not be written from a lane. */
+    if (repl_apply_in_lane && key == repl_apply_key) return repl_apply_shard;
     /* This is performance optimization that uses pre-set slot id from the current command,
      * in order to avoid calculation of the key hash.
      *

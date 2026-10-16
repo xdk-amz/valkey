@@ -39,8 +39,14 @@ static int ra_pending = 0;
 static int ra_main_lane = 1; /* lane 0 runs on main; otherwise lane i runs on IO thread i + 1 */
 static struct serverCommand *ra_set_cmd = NULL;
 
+/* The keyspace is split into tables: by slot in cluster mode, by keyspace-shard-bits otherwise. Lanes
+ * apply writes to disjoint tables. */
+static int replApplySharded(void) {
+    return server.cluster_enabled || server.keyspace_shard_bits;
+}
+
 int replApplyMayDefer(void) {
-    return server.replica_parallel_apply && server.keyspace_shard_bits && stagedApplyReady();
+    return server.replica_parallel_apply && replApplySharded() && stagedApplyReady();
 }
 
 int replApplyPending(void) {
@@ -49,7 +55,7 @@ int replApplyPending(void) {
 
 /* Nothing that observes an individual write may be active: those writes must go through call(). */
 static int replApplyAllowed(client *c) {
-    if (!server.replica_parallel_apply || !server.keyspace_shard_bits) return 0;
+    if (!server.replica_parallel_apply || !replApplySharded()) return 0;
     if (!c->flag.primary || c->flag.multi || !inMainThread()) return 0;
     if (!stagedApplyReady()) return 0;
     if (server.loading || server.aof_state != AOF_OFF || server.maxmemory) return 0;
