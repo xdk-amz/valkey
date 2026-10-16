@@ -241,8 +241,11 @@ TEST_F(FastpathStagedTest, UnsupportedCommandHandsClientBackAfterReplyPhase) {
     writeAndReplyPhases();
     EXPECT_EQ(c->flag.fastpath, 0u);
     EXPECT_EQ(c->control->lifecycle, FP_DETACHED);
-    EXPECT_EQ(recv(peer), ":1\r\n$1\r\nx\r\n");
-    EXPECT_EQ(mainBuf(c), "+OK\r\n"); /* CLIENT SETNAME ran on main */
+    /* The batched replies come first; CLIENT SETNAME ran on main, which may already have written it. */
+    std::string out = recv(peer) + mainBuf(c);
+    EXPECT_EQ(out, ":1\r\n$1\r\nx\r\n+OK\r\n");
+    ASSERT_NE(c->name, nullptr);
+    EXPECT_STREQ((const char *)objectGetVal(c->name), "n");
     close(peer);
     freeClient(c);
 }
