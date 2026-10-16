@@ -59,6 +59,29 @@ jobs:
         run: |
           make test-unit
 
+  test-ubuntu-latest-io-threads:
+    # The default runs keep io-threads at 1, so the IO-thread fast path only runs in the few
+    # tests that turn it on. This job runs the same suites with IO threads.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+      - run: cd libbacktrace && ./configure && make && sudo make install
+      - name: Checkout Valkey
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: make
+        run: make -j4 SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
+      - name: test
+        run: |
+          sudo apt-get install tcl8.6 tclx
+          ./runtest --io-threads --verbose --tags -slow --dump-logs
+      - name: module api test
+        run: CFLAGS='-Werror' ./runtest-moduleapi --io-threads --verbose --dump-logs
+
   test-ubuntu-latest-compatibility:
     runs-on: ubuntu-latest
     strategy:

@@ -28,9 +28,11 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "listpack.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
+#include "dplus.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -55,7 +57,6 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
-
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
  * found in the specified DB. This function implements the functionality of
@@ -230,8 +231,10 @@ static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_
     dbTrackKeyWithVolatileItems(db, val);
     initObjectLRUOrLFU(val);
     kvstoreHashtableAdd(db->keys, dict_index, val);
-    signalKeyAsReady(db, key, val->type);
-    notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    if (!repl_apply_in_lane) {
+        signalKeyAsReady(db, key, val->type);
+        notifyKeyspaceEvent(NOTIFY_NEW, "new", key, db->id);
+    }
     *valref = val;
 }
 
@@ -240,14 +243,39 @@ void dbAdd(serverDb *db, robj *key, robj **valref) {
 }
 
 /* Returns which dict index should be used with kvstore for a given key, computed from the key itself. */
+/* Standalone shard of a key. Nothing depends on it beyond being stable per key, so it skips
+ * hash tags and hashes a word at a time. */
+static int keyspaceShard(sds key) {
+    if (key == repl_apply_key) return repl_apply_shard;
+    const unsigned char *s = (const unsigned char *)key;
+    size_t len = sdslen(key);
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ len;
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, s, 8);
+        h = (h ^ w) * 0xff51afd7ed558ccdULL;
+        h ^= h >> 32;
+        s += 8;
+        len -= 8;
+    }
+    uint64_t w = 0;
+    for (size_t i = 0; i < len; i++) w |= (uint64_t)s[i] << (8 * i);
+    h = (h ^ w) * 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 29;
+    return (int)(h & ((1u << server.keyspace_shard_bits) - 1));
+}
+
 int getKVStoreIndexForKey(sds key) {
-    return server.cluster_enabled ? (int)keyHashSlot(key, (int)sdslen(key)) : 0;
+    if (server.cluster_enabled) return (int)keyHashSlot(key, (int)sdslen(key));
+    if (server.keyspace_shard_bits) return keyspaceShard(key);
+    return 0;
 }
 
 /* Same as getKVStoreIndexForKey(), but reuses the slot cached on the client rather than hashing the key.
  * Only valid for keys the currently executing command declared, since the cached slot is that command's. */
 int getKVStoreIndexUsingCachedSlot(sds key) {
-    return server.cluster_enabled ? getCachedKeySlot(key) : 0;
+    if (server.cluster_enabled) return getCachedKeySlot(key);
+    return server.keyspace_shard_bits ? getKVStoreIndexForKey(key) : 0;
 }
 
 /* Returns the slot cached on the client for the currently executing command, computing it from the key
@@ -344,7 +372,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     robj *old = *oldref;
     robj *new;
 
-    if (overwrite) {
+    if (overwrite && !repl_apply_in_lane) {
         /* VM_StringDMA may call dbUnshareStringValue which may free val, so we
          * need to incr to retain old */
         incrRefCount(old);
@@ -401,14 +429,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
     /* If the new object is a hash with volatile items we need to track it again */
     dbTrackKeyWithVolatileItems(db, new);
 
-    /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
-    if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
-        /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
-        freeObjAsync(key, old, db->id);
-    } else {
-        decrRefCount(old);
-    }
+    freeValueNeverOnMain(key, old, db->id);
     *valref = new;
 }
 
@@ -493,6 +514,9 @@ robj *dbRandomKey(serverDb *db) {
 }
 
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
+    /* D+ (S1.4): keyspace deletes must run on main -- IO threads punt.
+     * See expireIfNeededWithDictIndex for the rationale. */
+    debugServerAssert(inMainThread());
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
@@ -527,11 +551,9 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
             dbUntrackKeyWithVolatileItems(db, val);
         }
 
-        if (async) {
-            freeObjAsync(key, val, db->id);
-        } else {
-            decrRefCount(val);
-        }
+        /* Terminal frees always leave main, whatever `async` asked for. */
+        UNUSED(async);
+        freeValueNeverOnMain(key, val, db->id);
 
         return 1;
     } else {
@@ -954,6 +976,8 @@ void selectCommand(client *c) {
         addReplyError(c, "DB index is out of range");
         return;
     }
+    /* Per-db ACL selectors: the D+ speculation gate is db-dependent. */
+    dplusRecomputeSpecAclOk(c);
 
     if (c->flag.multi) {
         serverAssert(c->mstate != NULL);
@@ -1644,7 +1668,7 @@ void moveCommand(client *c) {
         return;
     }
 
-    incrRefCount(o);           /* ref counter = 2 */
+    incrRefCount(o); /* ref counter = 2 */
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);
@@ -1843,7 +1867,6 @@ int dbSwapDatabases(int id1, int id2) {
     db1->keys_with_volatile_items = db2->keys_with_volatile_items;
     copyDbExpiry(db1, db2);
 
-
     db2->keys = aux.keys;
     db2->expires = aux.expires;
     db2->keys_with_volatile_items = aux.keys_with_volatile_items;
@@ -2038,7 +2061,6 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     server.stat_expiredkeys++;
 }
 
-
 /* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
     int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
@@ -2223,6 +2245,12 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
 
+    /* D+ (S1.4): expiry deletion mutates the keyspace and MUST run on main.
+     * Speculative readers check embedded expiry and punt the whole command
+     * to main (dplus.c) -- they must never reach this point. Checked
+     * invariant so any future IO-thread path that forgets the punt rule
+     * trips immediately in debug builds instead of corrupting silently. */
+    debugServerAssert(inMainThread());
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;
     if (static_key) {
@@ -2304,6 +2332,7 @@ static int dbExpandGeneric(kvstore *kvs, uint64_t db_size, int try_expand) {
         db_size = db_size / slots;
         ret = kvstoreExpand(kvs, db_size, try_expand, dbExpandSkipSlot);
     } else {
+        if (server.keyspace_shard_bits) db_size >>= server.keyspace_shard_bits;
         ret = kvstoreExpand(kvs, db_size, try_expand, NULL);
     }
 

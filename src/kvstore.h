@@ -19,6 +19,8 @@ typedef void (*kvstoreScanFunction)(void *privdata, void *entry, int didx);
 
 #define KVSTORE_INDEX_NOT_FOUND (-1)
 
+/* Allow concurrent mutation of distinct hashtables of a kvstore; see kvs_shared_lock. */
+void kvstoreSetConcurrent(int on);
 kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags);
 void kvstoreEmpty(kvstore *kvs, void(callback)(hashtable *));
 void kvstoreRelease(kvstore *kvs);

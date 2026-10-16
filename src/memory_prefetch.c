@@ -47,6 +47,12 @@ typedef struct PrefetchCommandsBatch {
     void **keys;                    /* Array of keys to prefetch in the current batch */
     client **clients;               /* Array of clients in the current batch */
     robj **key_members;             /* Member to prefetch for each key (NULL = no nested prefetch) */
+    struct serverDb **dbs;          /* Db for each key — tables are resolved LATE (at
+                                     * prefetch time) because inline (non-batched)
+                                     * command execution between add-time and
+                                     * prefetch-time can free/replace a slot's
+                                     * hashtable in cluster mode (stale-pointer
+                                     * SIGSEGV in hashtableIncrementalFindStep). */
     hashtable **keys_tables;        /* Main table for each key */
     KeyPrefetchInfo *prefetch_info; /* Prefetch info for each key */
 } PrefetchCommandsBatch;
@@ -62,6 +68,7 @@ void freePrefetchCommandsBatch(void) {
     zfree(batch->key_members);
     zfree(batch->keys);
     zfree(batch->keys_tables);
+    zfree(batch->dbs);
     zfree(batch->slots);
     zfree(batch->prefetch_info);
     zfree(batch);
@@ -82,6 +89,7 @@ void prefetchCommandsBatchInit(void) {
     batch->key_members = zcalloc(max_prefetch_size * sizeof(robj *));
     batch->keys = zcalloc(max_prefetch_size * sizeof(void *));
     batch->keys_tables = zcalloc(max_prefetch_size * sizeof(hashtable *));
+    batch->dbs = zcalloc(max_prefetch_size * sizeof(struct serverDb *));
     batch->slots = zcalloc(max_prefetch_size * sizeof(int));
     batch->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
 }
@@ -274,6 +282,15 @@ static void hashtablePrefetch(hashtable **tables) {
     }
 }
 
+/* Resolve each key's table only now: a command executed since the key was added
+ * can free or replace a slot's table in cluster mode. A NULL table (slot emptied)
+ * is skipped by initBatchInfo. */
+static void resolveKeyTables(void) {
+    for (size_t i = 0; i < batch->key_count; i++) {
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
+    }
+}
+
 static void resetCommandsBatch(void) {
     batch->cur_idx = 0;
     batch->keys_done = 0;
@@ -312,6 +329,8 @@ static void prefetchCommands(void) {
         batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
     }
 
+    resolveKeyTables();
+
     /* Prefetch hashtable keys for all commands. Prefetching is beneficial only if there are more than one key. */
     if (batch->key_count > 1) {
         server.stat_total_prefetch_batches++;
@@ -343,6 +362,13 @@ void processClientsCommandsBatch(void) {
 
     resetCommandsBatch();
 
+    /* Record peak memory once per drained batch. zmalloc_used_memory() sums
+     * one counter per active thread and those counters are continuously
+     * written by the IO threads (frees and prebuilt objects), so reading it
+     * per command costs a cache miss per thread per command. */
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+
     /* Handle the case where the max prefetch size has been changed. */
     if (batch->max_prefetch_size != (size_t)server.prefetch_batch_max_size) {
         onMaxBatchSizeChange(NULL);
@@ -350,21 +376,30 @@ void processClientsCommandsBatch(void) {
 }
 
 /* Get a command's keys and add them to the current prefetching batch. */
-static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot) {
-    getKeysResult result;
-    initGetKeysResult(&result);
-    int num_keys = getKeysFromCommand(cmd, argv, argc, &result);
+/* Extract the command's keys into the prefetch batch. The caller owns 'result'
+ * and reuses it across every command of a client's queue, so the ~2KB result
+ * struct is set up once per client instead of once per command, and any heap
+ * key array grown for a wide command is reused (and freed once) rather than
+ * allocated and freed per command. getKeysUsingKeySpecs() accumulates onto
+ * result->numkeys, so it is reset here before each extraction. */
+static void addCommandToBatch(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, getKeysResult *result) {
+    result->numkeys = 0;
+    int num_keys = getKeysFromCommand(cmd, argv, argc, result);
     int member_idx = cmd->member_arg_index;
     robj *member = (member_idx > 0 && member_idx < argc) ? argv[member_idx] : NULL;
     for (int i = 0; i < num_keys && batch->key_count < batch->max_prefetch_size; i++) {
-        batch->keys[batch->key_count] = argv[result.keys[i].pos];
-        batch->slots[batch->key_count] = slot >= 0 ? slot : 0;
-        batch->keys_tables[batch->key_count] = kvstoreGetHashtable(db->keys, batch->slots[batch->key_count]);
+        batch->keys[batch->key_count] = argv[result->keys[i].pos];
+        batch->slots[batch->key_count] =
+            slot >= 0 ? slot : getKVStoreIndexForKey(objectGetVal(argv[result->keys[i].pos]));
+        /* Table resolution is deferred to prefetchCommands(): inline command
+         * execution between now and then can free/replace this slot's
+         * hashtable (cluster slot ops / DEL-empties) — a cached pointer here
+         * segfaults in hashtableIncrementalFindStep. */
+        batch->dbs[batch->key_count] = db;
         batch->key_members[batch->key_count] =
-            (result.keys[i].flags & CMD_KEY_OW) && !(result.keys[i].flags & CMD_KEY_ACCESS) ? NULL : member;
+            (result->keys[i].flags & CMD_KEY_OW) && !(result->keys[i].flags & CMD_KEY_ACCESS) ? NULL : member;
         batch->key_count++;
     }
-    getKeysFreeResult(&result);
 }
 
 /* Adds the client's command to the current batch and processes the batch
@@ -376,10 +411,16 @@ int addCommandToBatchAndProcessIfFull(client *c) {
 
     batch->clients[batch->client_count++] = c;
 
+    /* One key-extraction result reused across this client's current command and
+     * every command queued behind it, hoisting per-command init/free to once
+     * per client. */
+    getKeysResult result;
+    initGetKeysResult(&result);
+
     /* Client's next command */
     if (c->parsed_cmd && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
         c->read_flags |= READ_FLAGS_PREFETCHED;
-        addCommandToBatch(c->parsed_cmd, c->argv, c->argc, c->db, c->slot);
+        addCommandToBatch(c->parsed_cmd, c->argv, c->argc, c->db, c->slot, &result);
     }
 
     /* Commands in the queue. */
@@ -389,8 +430,10 @@ int addCommandToBatchAndProcessIfFull(client *c) {
          * skipped because getKeysFromCommand() assumes the arity check has already passed. */
         if (!p->cmd || p->read_flags & READ_FLAGS_BAD_ARITY) continue;
         p->read_flags |= READ_FLAGS_PREFETCHED;
-        addCommandToBatch(p->cmd, p->argv, p->argc, c->db, p->slot);
+        addCommandToBatch(p->cmd, p->argv, p->argc, c->db, p->slot, &result);
     }
+
+    getKeysFreeResult(&result);
 
     /* If the batch is full, process it.
      * We also check the client count to handle cases where
@@ -412,4 +455,41 @@ void removeClientFromPendingCommandsBatch(client *c) {
             return;
         }
     }
+}
+
+/* Command-ring prefetch batches contain commands from unrelated clients. */
+
+int prefetchBatchEnabled(void) {
+    return batch != NULL && batch->max_prefetch_size > 1;
+}
+
+int prefetchBatchAddCommand(struct serverCommand *cmd, robj **argv, int argc, serverDb *db, int slot, void *result) {
+    if (batch->key_count >= batch->max_prefetch_size) return 0;
+    for (int j = 1; j < argc; j++) valkey_prefetch(argv[j]);
+    addCommandToBatch(cmd, argv, argc, db, slot, (getKeysResult *)result);
+    return batch->key_count < batch->max_prefetch_size;
+}
+
+void prefetchBatchRun(void) {
+    /* Client and command batches must not share pending keys. */
+    serverAssert(batch->client_count == 0);
+    if (batch->key_count == 0) return;
+    for (size_t i = 0; i < batch->key_count; i++) {
+        robj *key = (robj *)batch->keys[i];
+        if (key->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(key));
+    }
+    for (size_t i = 0; i < batch->key_count; i++) batch->keys[i] = objectGetVal((robj *)batch->keys[i]);
+    for (size_t i = 0; i < batch->key_count; i++)
+        batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
+    if (batch->key_count > 1) {
+        server.stat_total_prefetch_batches++;
+        hashtablePrefetch(batch->keys_tables);
+    }
+}
+
+void prefetchBatchReset(void) {
+    resetCommandsBatch();
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
+    if (batch->max_prefetch_size != (size_t)server.prefetch_batch_max_size) onMaxBatchSizeChange(NULL);
 }

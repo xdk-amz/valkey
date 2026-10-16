@@ -110,9 +110,8 @@ static uint32_t LFUDecay(uint32_t lfu) {
 /* Increment the freq counter with logarithmic probability.
  * Values closer to 0 are more likely to increment.
  * Values closer to 255 are logarithmically less likely to increment. */
-static uint8_t LFULogIncr(uint8_t freq) {
+static uint8_t LFULogIncr(uint8_t freq, double r) {
     if (freq == 255) return freq;
-    double r = (double)rand() / RAND_MAX;
     double baseval = (int)freq - LFU_INIT_VAL;
     if (baseval < 0) baseval = 0;
     double p = 1.0 / (baseval * lfu_config_log_factor + 1);
@@ -121,11 +120,15 @@ static uint8_t LFULogIncr(uint8_t freq) {
 }
 
 
-uint32_t lfu_touch(uint32_t lfu) {
+static uint32_t lfu_touchWithRandom(uint32_t lfu, double r) {
     lfu = LFUDecay(lfu);
     uint8_t freq = (uint8_t)lfu;
-    freq = LFULogIncr(freq);
+    freq = LFULogIncr(freq, r);
     return (lfu & ~(uint32_t)UINT8_MAX) | freq;
+}
+
+uint32_t lfu_touch(uint32_t lfu) {
+    return lfu_touchWithRandom(lfu, (double)rand() / RAND_MAX);
 }
 
 
@@ -174,6 +177,15 @@ uint32_t lrulfu_getIdleness(uint32_t lrulfu, uint32_t *idleness) {
 uint32_t lrulfu_touch(uint32_t lrulfu) {
     if (lrulfu_isUsingLFU()) {
         return lfu_touch(lrulfu);
+    } else {
+        return lru_import(0);
+    }
+}
+
+
+uint32_t lrulfu_touchWithRandom(uint32_t lrulfu, double r) {
+    if (lrulfu_isUsingLFU()) {
+        return lfu_touchWithRandom(lrulfu, r);
     } else {
         return lru_import(0);
     }

@@ -6,6 +6,13 @@ proc wait_for_io_threads_to_go_idle {} {
         # policy disabled and then restore the original test setting.
         assert_equal {OK} [r config set io-threads-always-active no]
     }
+    set io_threads_strict_offload [dict get [r config get io-threads-strict-offload] io-threads-strict-offload]
+    if {$io_threads_strict_offload eq {yes}} {
+        # Strict offload keeps a floor of active IO threads (main never
+        # touches sockets), so io_threads_active can never reach 0. Observe
+        # the idle transition with strict offload disabled, then restore.
+        assert_equal {OK} [r config set io-threads-strict-offload no]
+    }
 
     set errcode [catch {
         wait_for_condition 1000 50 {
@@ -15,6 +22,9 @@ proc wait_for_io_threads_to_go_idle {} {
         }
     } result]
 
+    if {$io_threads_strict_offload eq {yes}} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+    }
     if {$io_threads_always_active eq {yes}} {
         assert_equal {OK} [r config set io-threads-always-active yes]
     }
@@ -169,5 +179,491 @@ start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overr
         $rd close
 
         assert_equal {PONG} [r ping]
+    }
+
+    # A scale-up resets the active worker count to 1. Strict offload defers
+    # the reply until a worker is active again, and the always-active policy
+    # used to ignite workers only on a socket event. The client waiting on the
+    # reply produces no event, so the reply stalled until unrelated traffic
+    # arrived on another connection.
+    test {Scale-up reply is delivered under strict offload with always-active} {
+        assert_equal {OK} [r config set io-threads-strict-offload yes]
+        assert_equal {OK} [r config set io-threads-always-active yes]
+        assert_equal {OK} [r config set io-threads 1]
+
+        # Read without blocking so a missing reply fails instead of hanging.
+        # Nothing else may touch the server while waiting: any other
+        # connection's event would wake the workers and mask the stall.
+        set rd [valkey_deferring_client]
+        $rd config set io-threads 5
+        $rd flush
+        fconfigure [$rd channel] -blocking 0
+        set reply {}
+        for {set i 0} {$i < 50 && $reply ne "+OK\r\n"} {incr i} {
+            after 100
+            append reply [$rd rawread]
+        }
+        assert_equal "+OK\r\n" $reply
+        $rd close
+
+        assert_equal {io-threads 5} [r config get io-threads]
+    }
+}
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
+    proc fastpath_clients {} {
+        regexp {fastpath_clients:(\d+)} [r info fastpath] -> n
+        return $n
+    }
+    # The default test client selects db 9 first; SELECT leaves the fast path.
+    proc fastpath_client {} {
+        return [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+    }
+    # Fast-path workers open only on a build with the staged loop (epoll); elsewhere clients stay on main.
+    set fp_open 0
+    for {set i 0} {$i < 50 && !$fp_open} {incr i} {
+        if {[getInfoProperty [r info fastpath] fastpath_workers_open] > 0} { set fp_open 1 } else { after 20 }
+    }
+
+    # Clients typically open with a connectivity PING. It carries no key and
+    # used to hand the connection off to the main-thread path for good.
+    if {$fp_open} {
+        test {PING keeps a client on the fast path} {
+            set base [fastpath_clients]
+            set rd [fastpath_client]
+            assert_equal {PONG} [$rd ping]
+            assert_equal {hello} [$rd ping hello]
+            assert_equal {OK} [$rd set fpkey v]
+            assert_equal {v} [$rd get fpkey]
+            after 200
+            assert_equal [expr {$base + 1}] [fastpath_clients]
+            $rd close
+        }
+    }
+
+    # The parser accumulates the request byte count; the fast path never went
+    # through resetClient, so it grew for the life of the connection and every
+    # command was logged as a large request once it passed the threshold.
+    test {Fast-path commands do not accumulate into the large-request log} {
+        r config set commandlog-request-larger-than 200
+        r commandlog reset large-request
+        set rd [fastpath_client]
+        assert_equal {OK} [$rd set fpkey v]
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal {v} [$rd get fpkey]
+        }
+        # A write after the reads runs on main and must not carry their bytes.
+        assert_equal {OK} [$rd set fpkey v]
+        assert_equal 0 [r commandlog len large-request]
+        $rd close
+        r config set commandlog-request-larger-than 1048576
+    }
+
+    # A raw socket that writes several commands in one packet, with nothing
+    # (no SELECT, no HELLO) sent first, so the connection stays on the fast path.
+    proc fastpath_raw_socket {} {
+        wait_for_condition 100 20 { [fastpath_clients] == 0 } else { fail "fast-path clients linger" }
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1
+        return $fd
+    }
+    proc fastpath_raw_read {fd n} {
+        set out {}
+        fconfigure $fd -blocking 0
+        set deadline [expr {[clock milliseconds] + 2000}]
+        while {[llength $out] < $n && [clock milliseconds] < $deadline} {
+            set line [gets $fd]
+            if {$line eq ""} { after 5; continue }
+            lappend out $line
+        }
+        fconfigure $fd -blocking 1
+        return $out
+    }
+
+    # Only the multibulk parser queues pipelined commands; an inline command
+    # after the first one used to sit in the query buffer until the next read.
+    if {$fp_open} {
+        test {Fast path drains inline commands pipelined in one write} {
+            set fd [fastpath_raw_socket]
+            puts -nonewline $fd "SET fpinline old\r\n"
+            flush $fd
+            assert_equal {+OK} [fastpath_raw_read $fd 1]
+            puts -nonewline $fd "SET fpinline new\r\nGET fpinline\r\nGET fpinline\r\n"
+            flush $fd
+            assert_equal {+OK {$3} new {$3} new} [fastpath_raw_read $fd 5]
+            puts -nonewline $fd "PING\r\n"
+            flush $fd
+            assert_equal {+PONG} [fastpath_raw_read $fd 1]
+            assert_equal 1 [fastpath_clients]
+            close $fd
+        }
+    }
+
+    if {$fp_open} {
+        test {Fast path drains an inline command written after a RESP command} {
+            set fd [fastpath_raw_socket]
+            puts -nonewline $fd "*3\r\n\$3\r\nSET\r\n\$8\r\nfpinline\r\n\$3\r\nrsp\r\nGET fpinline\r\n*1\r\n\$4\r\nPING\r\n"
+            flush $fd
+            assert_equal {+OK {$3} rsp +PONG} [fastpath_raw_read $fd 4]
+            assert_equal 1 [fastpath_clients]
+            close $fd
+        }
+    }
+
+    # A packet ending mid-command must wait for more bytes, not spin or leave.
+    if {$fp_open} {
+        test {Fast path holds a trailing partial inline command for the next read} {
+            set fd [fastpath_raw_socket]
+            puts -nonewline $fd "GET fpinline\r\nGET fpin"
+            flush $fd
+            assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+            puts -nonewline $fd "line\r\n"
+            flush $fd
+            assert_equal {{$3} rsp} [fastpath_raw_read $fd 2]
+            assert_equal 1 [fastpath_clients]
+            close $fd
+        }
+    }
+}
+
+# CPU time the server process used, in clock ticks, from /proc/<pid>/stat.
+proc server_cpu_ticks {pid} {
+    set f [open /proc/$pid/stat r]
+    set stat [read $f]
+    close $f
+    # Fields after the parenthesized command: state is field 3, utime 14, stime 15.
+    regexp {\) (.*)$} $stat -> rest
+    set fields [split $rest " "]
+    return [expr {[lindex $fields 11] + [lindex $fields 12]}]
+}
+
+if {[file exists /proc/self/stat]} {
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip"} overrides {io-threads 5}} {
+    set pid [srv 0 pid]
+
+    # An idle thread that never blocks costs a core each, which is 2 seconds of CPU per thread here.
+    proc assert_idle_cpu {pid what} {
+        after 500
+        set before [server_cpu_ticks $pid]
+        after 2000
+        set used [expr {[server_cpu_ticks $pid] - $before}]
+        if {$used > 50} {
+            fail "$what: the idle server used $used CPU ticks in 2 seconds"
+        }
+    }
+
+    proc idle_clients {kind} {
+        set clients {}
+        for {set i 0} {$i < 10} {incr i} {
+            # No SELECT first, so the connection stays offloaded.
+            set rd [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+            assert_equal {} [$rd get idle:$kind:$i]
+            lappend clients $rd
+        }
+        return $clients
+    }
+
+    test {Idle IO threads block when no client is connected} {
+        assert_idle_cpu $pid "no clients"
+    }
+
+    test {Idle server blocks with idle fast-path clients connected} {
+        set base [getInfoProperty [r info fastpath] fastpath_clients]
+        set clients [idle_clients fp]
+        wait_for_condition 50 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] >= $base + 10
+        } else {
+            fail "clients did not join the fast path"
+        }
+        assert_idle_cpu $pid "idle fast-path clients"
+        # A command after the idle period is still served.
+        assert_equal {} [[lindex $clients 0] get idle:after]
+        foreach rd $clients { $rd close }
+    } {} {tls:skip}
+
+    test {Idle server blocks with idle partitioned clients connected} {
+        r config set io-threads-fast-path no
+        set clients [idle_clients part]
+        assert_idle_cpu $pid "idle partitioned clients"
+        assert_equal {} [[lindex $clients 0] get idle:after]
+        foreach rd $clients { $rd close }
+        r config set io-threads-fast-path yes
+    }
+}
+}
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 4 io-threads-fast-path no}} {
+    # A client may send its next command as soon as it reads a reply whose IO thread has not reported the
+    # write yet; that reply is not pending output. The race needs a writer thread other than the one reading
+    # the client, and a varying number of PINGs moves the writer between threads. A large reply is reported
+    # through main, which the next command must wait for.
+    proc ping_rounds {rd n} {
+        for {set p 0} {$p < $n} {incr p} {
+            $rd ping
+            $rd flush
+            assert_equal PONG [$rd read]
+        }
+    }
+    proc set_large_value {} {
+        set c [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+        $c set big [string repeat x 100000]
+        $c close
+    }
+    proc large_reply_round {rd} {
+        $rd get big
+        $rd flush
+        assert_equal 100000 [string length [$rd read]]
+    }
+
+    # The replica would fall back to SYNC and never send acknowledgements. The filter makes PSYNC fail on
+    # its next check, so no replica is created.
+    test {PSYNC does not count a delivered handshake reply as pending output} {
+        set_large_value
+        r debug io-write-done-delay 50000
+        for {set i 0} {$i < 24} {incr i} {
+            set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+            ping_rounds $rd [expr {$i % 3}]
+            $rd replconf rdb-filter-only ""
+            $rd flush
+            assert_equal OK [$rd read]
+            if {$i % 2} { large_reply_round $rd }
+            $rd psync ? -1
+            $rd flush
+            catch {$rd read} err
+            $rd close
+            assert_match {*Filtered replica requires EOF capability*} $err
+        }
+        r debug io-write-done-delay 0
+        assert_equal PONG [r ping]
+    }
+
+    test {SCRIPT DEBUG does not count a delivered reply as pending output} {
+        set_large_value
+        r debug io-write-done-delay 50000
+        for {set i 0} {$i < 24} {incr i} {
+            set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+            ping_rounds $rd [expr {1 + $i % 3}]
+            if {$i % 2} { large_reply_round $rd }
+            $rd script debug yes
+            $rd flush
+            catch {$rd read} reply
+            $rd close
+            assert_equal OK $reply
+        }
+        r debug io-write-done-delay 0
+        assert_equal PONG [r ping]
+    }
+
+    # The resumed command runs while main holds the socket, and SCRIPT DEBUG moves the client off its IO
+    # thread; main then writes the reply itself.
+    test {A paused client whose resumed command leaves its IO thread gets its reply} {
+        set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        ping_rounds $rd 1
+        set start [clock milliseconds]
+        r client pause 300 all
+        $rd script debug yes
+        $rd flush
+        set fd [$rd channel]
+        fconfigure $fd -blocking 0
+        wait_for_condition 100 20 {
+            [string match "+OK*" [gets $fd]]
+        } else {
+            fail "SCRIPT DEBUG reply never arrived after the pause ended"
+        }
+        assert_morethan_equal [expr {[clock milliseconds] - $start}] 250
+        $rd close
+    }
+}
+
+# One IO thread: the commands below reach main through one ring, in arrival order.
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2}} {
+    test {A client unblocked before its in-flight read completes runs its commands once} {
+        r client pause 100000 write
+        set b [valkey_deferring_client]
+        $b set unblocked:k1 v1
+        wait_for_blocked_clients_count 1
+        set u [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, U unpauses and B sends more, so one ring drain unblocks B and then
+        # completes B's read, before main resumes B.
+        $s debug sleep 0.5
+        after 100
+        $u client unpause
+        after 20
+        $b set unblocked:k2 v2
+        assert_equal OK [$s read]
+        assert_equal OK [$u read]
+        assert_equal OK [$b read]
+        assert_equal OK [$b read]
+        assert_equal v1 [r get unblocked:k1]
+        assert_equal v2 [r get unblocked:k2]
+        assert_equal PONG [r ping]
+        $b close
+        $u close
+        $s close
+    }
+}
+
+# Reads one reply line from a deferring client, or "" when none arrives within ms milliseconds.
+proc read_line_within {rd ms} {
+    set fd [$rd channel]
+    fconfigure $fd -blocking 0
+    set line ""
+    set deadline [expr {[clock milliseconds] + $ms}]
+    while {[clock milliseconds] < $deadline} {
+        set line [gets $fd]
+        if {$line ne ""} break
+        after 10
+    }
+    fconfigure $fd -blocking 1
+    return $line
+}
+
+# Ends a busy script from a fresh connection, which main still serves while the script runs.
+proc kill_busy_script {} {
+    set k [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+    catch {$k script kill}
+    $k close
+}
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2 io-threads-fast-path no lua-time-limit 10}} {
+    test {A command read behind a busy script is answered while the script runs} {
+        set a [valkey_deferring_client]
+        set b [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, A starts a script that never ends and B's PING is read right behind it.
+        $s debug sleep 0.5
+        after 100
+        $a eval {while true do end} 0
+        after 20
+        $b ping
+        assert_equal OK [$s read]
+        set reply [read_line_within $b 3000]
+        kill_busy_script
+        assert_match {-BUSY*} $reply
+        catch {$a read}
+        $a close
+        $b close
+        $s close
+    }
+}
+
+start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-debug-command yes io-threads 2 lua-time-limit 10}} {
+    test {A SCRIPT KILL handed to main behind a busy script ends the script} {
+        set a [valkey_deferring_client]
+        set b [valkey_deferring_client]
+        set s [valkey_deferring_client]
+        # While main sleeps, A's EVAL and then B's SCRIPT KILL leave the fast path for main.
+        $s debug sleep 0.5
+        after 100
+        $a eval {while true do end} 0
+        after 20
+        $b script kill
+        assert_equal OK [$s read]
+        set reply [read_line_within $a 3000]
+        if {$reply eq ""} kill_busy_script
+        assert_match {*killed by user*} $reply
+        assert_equal OK [$b read]
+        $a close
+        $b close
+        $s close
+    }
+}
+
+start_server {config "minimal.conf" tags {"external:skip" "valgrind:skip" "tls:skip"} overrides {io-threads 5}} {
+    proc fastpath_count {} {
+        return [getInfoProperty [r info fastpath] fastpath_clients]
+    }
+    # Clients that send no SELECT stay on the fast path; CLIENT ID leaves it and the client rejoins after.
+    proc fastpath_victims {n} {
+        set base [fastpath_count]
+        set clients {}
+        set ids {}
+        for {set i 0} {$i < $n} {incr i} {
+            set v [valkey [srv 0 host] [srv 0 port] 0 $::tls]
+            lappend ids [$v client id]
+            lappend clients $v
+        }
+        wait_for_condition 100 20 {[fastpath_count] >= $base + $n} else { fail "victims did not join the fast path" }
+        return [list $clients $ids]
+    }
+    proc kill_raw_socket {} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation {crlf binary} -blocking 1
+        return $fd
+    }
+    proc kill_raw_read {fd n} {
+        set out {}
+        fconfigure $fd -blocking 0
+        set deadline [expr {[clock milliseconds] + 5000}]
+        while {[llength $out] < $n && [clock milliseconds] < $deadline} {
+            set line [gets $fd]
+            if {$line eq ""} {
+                if {[eof $fd]} break
+                after 5
+                continue
+            }
+            lappend out $line
+        }
+        fconfigure $fd -blocking 1
+        return $out
+    }
+    proc close_all {clients} {
+        foreach v $clients { catch {$v close} }
+    }
+    # An empty CLIENT LIST reply: a RESP2 bulk string, or a RESP3 verbatim string when new
+    # connections default to RESP3 (--force-resp3).
+    proc assert_empty_list {line} {
+        assert {$line eq {$0} || $line eq {=4}}
+    }
+
+    # The IO thread that owns a fast-path client releases it before main frees it. The killer's next
+    # command, pipelined behind CLIENT KILL, must not find the killed clients.
+    test {CLIENT KILL replies once the killed fast-path clients are gone} {
+        lassign [fastpath_victims 5] clients ids
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT KILL ID $ids\r\nCLIENT LIST ID $ids\r\n"
+        flush $fd
+        set reply [kill_raw_read $fd 2]
+        assert_equal :5 [lindex $reply 0]
+        assert_empty_list [lindex $reply 1]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL with the old syntax replies +OK once the killed fast-path client is gone} {
+        lassign [fastpath_victims 1] clients ids
+        set addr [get_field_in_client_info [r client list id $ids] addr]
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT KILL $addr\r\nCLIENT LIST ID $ids\r\n"
+        flush $fd
+        set reply [kill_raw_read $fd 2]
+        assert_equal +OK [lindex $reply 0]
+        assert_empty_list [lindex $reply 1]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL that also kills the caller replies after the other clients are gone} {
+        lassign [fastpath_victims 3] clients ids
+        set fd [kill_raw_socket]
+        puts -nonewline $fd "CLIENT ID\r\n"
+        flush $fd
+        set me [string range [lindex [kill_raw_read $fd 1] 0] 1 end]
+        puts -nonewline $fd "CLIENT KILL ID $me $ids SKIPME NO\r\n"
+        flush $fd
+        assert_equal {:4} [kill_raw_read $fd 2]
+        assert_equal {} [r client list id {*}$ids]
+        close $fd
+        close_all $clients
+    }
+
+    test {CLIENT KILL inside MULTI replies without waiting} {
+        lassign [fastpath_victims 1] clients ids
+        r multi
+        r client kill id $ids
+        assert_equal {1} [r exec]
+        wait_for_condition 100 20 {[r client list id $ids] eq {}} else { fail "killed client still listed" }
+        close_all $clients
     }
 }

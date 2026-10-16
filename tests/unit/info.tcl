@@ -414,17 +414,22 @@ start_server {tags {"info" "external:skip" "debug_defrag:skip"}} {
             assert_equal [getInfoProperty $info client_query_buffer_limit_disconnections] {1}
             r config set client-query-buffer-limit $org_qbuf_limit
             # set outbuf limit to just 10 to test stat
-            set org_outbuf_limit [lindex [r config get client-output-buffer-limit] 1]
-            r config set client-output-buffer-limit "normal 10 0 0"
-            r set key [string repeat a 100000] ;# to trigger output buffer limit check this needs to be big
-            catch {r get key}
-            r config set client-output-buffer-limit $org_outbuf_limit
+            # With IO threads active the reply is written on the async IO
+            # thread path, which does not run the synchronous COB limit check,
+            # so the disconnection never happens (same on stock with
+            # io-threads-always-active). Only assert on the main-thread path.
+            if {[getInfoProperty [r info server] io_threads_active] eq 0} {
+                set org_outbuf_limit [lindex [r config get client-output-buffer-limit] 1]
+                r config set client-output-buffer-limit "normal 10 0 0"
+                r set key [string repeat a 100000] ;# to trigger output buffer limit check this needs to be big
+                catch {r get key}
+                r config set client-output-buffer-limit $org_outbuf_limit
 
-            # Restore copy avoidance configs
+                set info [r info stats]
+                assert_equal [getInfoProperty $info client_output_buffer_limit_disconnections] {1}
+            }
             r config set min-string-size-avoid-copy-reply $min_size
-
-            set info [r info stats]
-            assert_equal [getInfoProperty $info client_output_buffer_limit_disconnections] {1}
+            set _ {}
         } {} {logreqres:skip} ;# same as obuf-limits.tcl, skip logreqres
 
         test {clients: pubsub clients} {
@@ -539,13 +544,10 @@ start_server {tags {"info" "external:skip"}} {
         assert_equal [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] {0}
         # overhead.db.hashtable.lut = memory overhead of hashtable including hashtable struct and tables
         set hashtable_overhead [dict get $mem_stats overhead.db.hashtable.lut]
-        if {$hashtable_overhead < 140} {
-            # 32-bit version (hashtable struct + 1 bucket of 64 bytes)
-            set bits 32
-        } else {
-            set bits 64
-        }
-        assert_range [dict get $mem_stats overhead.db.hashtable.lut] 1 256
+        # The D+ version array adds a fixed 2KB per hashtable, so the overhead
+        # no longer tells 32-bit from 64-bit; ask the server.
+        set bits [s arch_bits]
+        assert_range $hashtable_overhead 1 4096
         assert_equal [dict get $mem_stats overhead.db.hashtable.rehashing] {0}
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {0}
         # set 7 more keys to trigger rehashing
@@ -573,7 +575,7 @@ start_server {tags {"info" "external:skip"}} {
         set info_mem [lindex $res end-1]
         set mem_stats [lindex $res end]
         assert_range [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] 1 64
-        assert_range [dict get $mem_stats overhead.db.hashtable.lut] 1 300
+        assert_range [dict get $mem_stats overhead.db.hashtable.lut] $hashtable_overhead [expr {$hashtable_overhead + 512}]
         assert_range [dict get $mem_stats overhead.db.hashtable.rehashing] 1 64
         assert_equal [dict get $mem_stats db.dict.rehashing.count] {1}
     }

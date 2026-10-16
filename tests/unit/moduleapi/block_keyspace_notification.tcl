@@ -166,3 +166,26 @@ start_server {tags {"modules"}} {
     }
 }
 
+
+start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
+    test {Blocking keyspace notification for a client served by IO threads} {
+        r client setname control ;# named clients stay on the main path
+        set probe [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        wait_for_condition 100 20 {
+            [getInfoProperty [r info fastpath] fastpath_clients] == 1
+        } else {
+            fail "a fresh client did not join the fast path"
+        }
+        $probe close
+
+        # The callback blocks the client that runs the command, and the command runs once.
+        r module load $testmodule
+        set rd [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+        $rd hset fp f v
+        assert_equal 1 [$rd read]
+        $rd ping
+        assert_equal PONG [$rd read]
+        assert_equal {{event hset key fp}} [r b_keyspace.events]
+        $rd close
+    }
+}

@@ -56,6 +56,9 @@ typedef struct {
  * throttler is registered. Idempotent: safe to call more than once. */
 void throttle_init(void);
 
+/* True while any throttler is registered. */
+bool throttle_active(void);
+
 /* Register a new throttler.
  *   criteria_proc - identifies clients whose commands meet the criteria for throttling
  *   priv_data     - private data for passing to the criteria_proc (may be NULL)
@@ -113,6 +116,8 @@ void throttle_removeClient(client *c);
  * command cannot be blocked. Once a client is passed to this function, it will not be
  * throttled again for the same command after unblocking. */
 bool throttle_throttleClientIfNeeded(client *c);
+/* Any throttler is registered. */
+bool throttle_anyThrottlers(void);
 
 /* Get the metrics associated with a given metrics name.
  * The caller provides the metrics structure. */

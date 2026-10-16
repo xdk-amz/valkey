@@ -856,6 +856,7 @@ slotMigrationJob *createSlotImportJob(client *c,
 
     job->state = SLOT_IMPORT_WAIT_ACK;
     job->client = c;
+    unpartitionClient(c); /* slot import links are main-owned, like primaries */
     job->client->slot_migration_job = job;
     if (c && c->conn) {
         /* Upgrade connection to high priority */

@@ -24,10 +24,16 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/release.c
     ${CMAKE_SOURCE_DIR}/src/memory_prefetch.c
     ${CMAKE_SOURCE_DIR}/src/io_threads.c
+    ${CMAKE_SOURCE_DIR}/src/fastpath.c
+    ${CMAKE_SOURCE_DIR}/src/poller.c
+    ${CMAKE_SOURCE_DIR}/src/phase_barrier.c
+    ${CMAKE_SOURCE_DIR}/src/staged_loop.c
+    ${CMAKE_SOURCE_DIR}/src/repl_apply.c
     ${CMAKE_SOURCE_DIR}/src/networking.c
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/object.c
     ${CMAKE_SOURCE_DIR}/src/db.c
+    ${CMAKE_SOURCE_DIR}/src/dplus.c
     ${CMAKE_SOURCE_DIR}/src/replication.c
     ${CMAKE_SOURCE_DIR}/src/rdb.c
     ${CMAKE_SOURCE_DIR}/src/rdb_transcoder.c

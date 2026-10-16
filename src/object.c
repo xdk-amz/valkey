@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "io_threads.h" /* inMainThread() for refcount-discipline asserts */
 #include "ordered_index.h"
 #include "serverassert.h"
 #include "functions.h"
@@ -272,7 +273,6 @@ robj *createRawStringObject(const char *ptr, size_t len) {
     return createObject(OBJ_STRING, sdsnewlen(ptr, len));
 }
 
-
 /* Creates a new embedded string object and copies the content of key, val_ptr
  * and expire to the new object. LRU is set to 0. */
 static robj *createEmbeddedStringObjectWithKeyAndExpire(const char *val_ptr,
@@ -396,6 +396,29 @@ robj *createStringObjectWithKeyAndExpire(const char *ptr, size_t len, const_sds 
     }
 }
 
+/* Build the string representation dbAdd would create, or leave it to the main path. */
+robj *tryPrebuildStringEntry(robj *valobj, const_sds key) {
+    if (objectGetType(valobj) != OBJ_STRING) return NULL;
+    if (!sdsEncodedObject(valobj)) return NULL; /* already INT-encoded: rare for parsed argv */
+    if (objectGetRefcount(valobj) > 1) return NULL;
+
+    sds s = objectGetVal(valobj);
+    size_t len = sdslen(s);
+
+    long value;
+    if (len <= 20 && string2l(s, len, &value)) {
+        robj *o = createUnembeddedObjectWithKeyAndExpire(OBJ_STRING, (void *)value, key, EXPIRY_NONE);
+        objectSetEncoding(o, OBJ_ENCODING_INT);
+        return o;
+    }
+
+    if (shouldEmbedStringObject(len, key, EXPIRY_NONE)) {
+        return createEmbeddedStringObjectWithKeyAndExpire(s, len, key, EXPIRY_NONE);
+    }
+
+    return NULL;
+}
+
 void *objectGetVal(const robj *o) {
     if (o->hasembval) {
         unsigned char *data = objectEmbeddedData(o);
@@ -494,6 +517,17 @@ void objectUnembedVal(robj *o) {
  * the old object's reference counter is decremented and possibly freed. Use the
  * returned object instead of 'o' after calling this function. */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
+    /* T9 fast path: if the object already carries the correct embedded key and
+     * a matching expire, it was built store-ready (e.g. at parse time on an IO
+     * thread) and can be installed with no allocation or copy. */
+    if (o->hasembkey && objectGetRefcount(o) == 1 && objectGetExpire(o) == expire) {
+        sds ekey = objectGetKey(o);
+        if (ekey != NULL && sdslen(ekey) == sdslen(key) &&
+            memcmp(ekey, key, sdslen(key)) == 0) {
+            return o;
+        }
+    }
+
     if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_EMBSTR) {
         robj *new = createStringObjectWithKeyAndExpire(objectGetVal(o), sdslen(objectGetVal(o)), key, expire);
         objectSetLRU(new, objectGetLRU(o));
@@ -757,7 +791,21 @@ void freeStreamObject(robj *o) {
     freeStream(objectGetVal(o));
 }
 
+/* Refcounts stay main-thread-owned except terminal decrements of sole references. */
+#ifdef DEBUG_REFCOUNT_DISCIPLINE
+#define assertIncrRefCountThread(o)                                               \
+    serverAssert(inMainThread() || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT || \
+                 objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
+#define assertDecrRefCountThread(o)                                                                            \
+    serverAssert(inMainThread() || objectGetRefcount(o) == 1 || objectGetRefcount(o) == OBJ_SHARED_REFCOUNT || \
+                 objectGetRefcount(o) == OBJ_STATIC_REFCOUNT)
+#else
+#define assertIncrRefCountThread(o) ((void)0)
+#define assertDecrRefCountThread(o) ((void)0)
+#endif
+
 void incrRefCount(robj *o) {
+    assertIncrRefCountThread(o);
     if (objectGetRefcount(o) < OBJ_FIRST_SPECIAL_REFCOUNT) {
         o->refcount++;
     } else {
@@ -770,7 +818,10 @@ void incrRefCount(robj *o) {
 }
 
 void decrRefCount(robj *o) {
+    assertDecrRefCountThread(o);
     if (objectGetRefcount(o) == 1) {
+        /* Armed callers must route terminal frees off main before this point. */
+        assertNoMainThreadFree();
         if (objectGetVal(o) != NULL) {
             switch (objectGetType(o)) {
             case OBJ_STRING: freeStringObject(o); break;
@@ -1326,7 +1377,6 @@ char *strEncoding(int encoding) {
 }
 
 /* =========================== Memory introspection ========================= */
-
 
 /* Returns the size in bytes consumed by the key's value in RAM.
  * Note that the returned value is just an approximation, especially in the

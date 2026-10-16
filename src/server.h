@@ -64,6 +64,11 @@
 #define static_assert _Static_assert
 #endif
 
+/* C++ has no _Thread_local keyword; map it to thread_local for unit-test inclusion. */
+#ifdef __cplusplus
+#define _Thread_local thread_local
+#endif
+
 #include "ae.h"         /* Event driven programming library */
 #include "sds.h"        /* Dynamic safe strings */
 #include "dict.h"       /* Hash tables (old implementation) */
@@ -128,7 +133,6 @@ typedef struct serverObject dbEntry; // Explicitly a key/value pair
 
 struct hdr_histogram;
 struct ValkeyModule;
-
 
 /* helpers */
 #define numElements(x) (sizeof(x) / sizeof((x)[0]))
@@ -363,6 +367,7 @@ typedef enum blocking_type {
     BLOCKED_POSTPONE, /* Blocked by processCommand, re-try processing later. */
     BLOCKED_SHUTDOWN, /* SHUTDOWN. */
     BLOCKED_INUSE,    /* Key in use by background thread. */
+    BLOCKED_KILL,     /* CLIENT KILL, until IO threads release the clients it killed. */
     BLOCKED_NUM,      /* Number of blocked states. */
     BLOCKED_END       /* End of enumeration */
 } blocking_type;
@@ -449,7 +454,6 @@ typedef enum {
                              * PSYNC FAILOVER request. */
 } failover_state;
 
-
 /* State of replicas from the POV of the primary. Used in client->replstate.
  * In SEND_BULK and ONLINE state the replica receives new updates
  * in its output queue. In the WAIT_BGSAVE states instead the server is waiting
@@ -517,7 +521,6 @@ typedef enum {
 #define SUPERVISED_AUTODETECT 1
 #define SUPERVISED_SYSTEMD 2
 #define SUPERVISED_UPSTART 3
-
 
 /* Append only defines */
 #define REPL_MAX_WRITTEN_BEFORE_FSYNC (1024 * 1024 * 8) /* 8 MB */
@@ -1034,6 +1037,7 @@ typedef struct blockingState {
                            * is > timeout then the operation timed out. */
     int unblock_on_nokey; /* Whether to unblock the client when at least one of the keys
                              is deleted or does not exist anymore */
+    int wait_write;       /* BLOCKED_POSTPONE: resumes once main processes its in-flight write */
     union {
         listNode *client_waiting_acks_list_node; /* list node in server.clients_waiting_acks list. */
         listNode *postponed_list_node;           /* list node in server.postponed_clients */
@@ -1050,6 +1054,11 @@ typedef struct blockingState {
     int numreplicas;      /* Number of replicas we are waiting for ACK. */
     int numlocal;         /* Indication if WAITAOF is waiting for local fsync. */
     long long reploffset; /* Replication offset to reach. */
+
+    /* BLOCKED_KILL */
+    int kill_pending;     /* Killed clients not yet freed. */
+    int kill_close_self;  /* The caller killed itself too: close it after the reply. */
+    long long kill_reply; /* Number of killed clients, or -1 to reply +OK (old syntax). */
 
     /* BLOCKED_MODULE */
     void *module_blocked_handle; /* ValkeyModuleBlockedClient structure.
@@ -1095,6 +1104,13 @@ typedef struct readyList {
 #define USER_FLAG_ROLE (1 << 3)      /* This user entry represents a role, \
                                         not a regular user. Stored in the  \
                                         Roles rax instead of Users. */
+#define USER_FLAG_BOUND (1 << 5)     /* acl-offload: a client has been bound to this  \
+                                        user (or a member, for a role) at least once, \
+                                        so an IO thread may read its rule set. Set    \
+                                        once, never cleared; main-thread only. Gates  \
+                                        the copy-on-write + quiesce discipline. */
+#define USER_FLAG_RETIRED (1 << 4)   /* Removed from Users but still named by \
+                                        fast-path clients; see `successor`. */
 
 #define SELECTOR_FLAG_ROOT (1 << 0)        /* This is the root user permission \
                                             * selector. */
@@ -1104,20 +1120,31 @@ typedef struct readyList {
                                               channel. */
 #define SELECTOR_FLAG_ALLDBS (1 << 4)      /* Allow all databases */
 
-
 typedef struct user {
-    sds name;         /* The username as an SDS string. */
-    uint32_t flags;   /* See USER_FLAG_* */
-    list *passwords;  /* A list of SDS valid passwords for this user (NULL for roles). */
-    list *selectors;  /* A list of selectors this user validates commands
+    sds name;        /* The username as an SDS string. */
+    uint32_t flags;  /* See USER_FLAG_* */
+    list *passwords; /* A list of SDS valid passwords for this user (NULL for roles). */
+    /* acl-offload: selectors and roles are read by an IO thread during admission concurrently with
+     * main-thread publication (ACLCopyUser/ACLStringSetRole swap them by release store, then quiesce
+     * before freeing the old list). They are _Atomic so every concurrent access is a defined C11
+     * atomic op on the same atomic object, not a plain load racing a cast store. A pointer stays 8
+     * bytes, so this does not change sizeof(user). Main-thread-only accesses read/write them as
+     * ordinary lvalues, which the _Atomic qualifier makes implicit seq_cst atomics (correct, and off
+     * the hot path); the publication sites use explicit release stores and the offload reader an
+     * acquire load. */
+    _Atomic(list *) selectors; /* A list of selectors this user validates commands
                          against. This list will always contain at least
                          one selector for backwards compatibility. */
-    list *roles;      /* For users: the roles held by the user, kept in the
-                         order they were assigned. Elements are `user *`
-                         pointers owned by the Roles rax (NULL for roles). */
-    dict *members;    /* For roles: the users holding this role, keyed by their
-                         `user *` pointer (NULL for users). */
-    robj *acl_string; /* cached string represent of ACLs */
+    _Atomic(list *) roles;     /* For users: the roles held by the user, kept in the
+                             order they were assigned. Elements are `user *`
+                             pointers owned by the Roles rax (NULL for roles). */
+    dict *members;             /* For roles: the users holding this role, keyed by their
+                                  `user *` pointer (NULL for users). */
+    robj *acl_string;          /* cached string represent of ACLs */
+    /* Retired only: the user of this name now in Users (NULL if deleted), and the
+     * fast-path clients still pointing here; the struct is freed when they reach zero. */
+    struct user *successor;
+    uint32_t fp_refs;
 } user;
 
 /* With multiplexing we need to take per-client state.
@@ -1184,9 +1211,12 @@ typedef struct {
 #endif
 
 typedef enum {
-    CLIENT_IDLE = 0,        /* Initial state: client is idle. */
-    CLIENT_PENDING_IO = 1,  /* Main-thread sets this state when client is sent to IO-thread for read/write. */
-    CLIENT_COMPLETED_IO = 2 /* IO-thread sets this state after completing IO operation. */
+    CLIENT_IDLE = 0,         /* Initial state: client is idle. */
+    CLIENT_PENDING_IO = 1,   /* Main-thread sets this state when client is sent to IO-thread for read/write. */
+    CLIENT_COMPLETED_IO = 2, /* IO-thread sets this state after completing IO operation. */
+    CLIENT_CLOSING_IO = 3,   /* Main-thread claims a partitioned client for teardown; its IO thread starts no read. */
+    CLIENT_HELD_IO = 4,      /* Main-thread briefly holds a partitioned client's socket (cron buffer work). */
+    CLIENT_ARMING_IO = 5     /* A re-arm is staged: the IO thread will epoll_ctl the socket, then store IDLE. */
 } clientIOState;
 
 typedef struct ClientFlags {
@@ -1214,6 +1244,7 @@ typedef struct ClientFlags {
     uint64_t prevent_prop : 1;             /* Don't propagate to AOF or replicas. */
     uint64_t pending_write : 1;            /* Client has output to send but a write handler is yet not installed. */
     uint64_t pending_read : 1;             /* Client has output to send but a write handler is yet not installed. */
+    uint64_t pending_read_deferred : 1;    /* Strict offload: client is queued on clients_pending_read awaiting IO-thread read dispatch. */
     uint64_t buf_encoded : 1;              /* True if c->buf content is encoded (e.g. for copy avoidance) */
     uint64_t reply_off : 1;                /* Don't send replies to client. */
     uint64_t reply_skip_next : 1;          /* Set CLIENT_REPLY_SKIP for next cmd */
@@ -1276,6 +1307,12 @@ typedef struct ClientFlags {
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
+    uint64_t partitioned : 1;              /* Socket readiness is watched by the IO thread in io_tid, not by the main event loop. */
+    uint64_t ring_epilogue : 1; /* beforeNextClient called from the ring's read epilogue (main thread only) */
+    uint64_t fastpath : 1;       /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
+    uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
+    uint64_t fp_detach_sent : 1; /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
+    uint64_t fp_readmit : 1;     /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1400,6 +1437,32 @@ typedef struct LastWrittenBuf {
 /* Forward declaration of slotMigrationJob */
 typedef struct slotMigrationJob slotMigrationJob;
 
+/* Fixed-size peer address; formats to the same text as getClientPeerId(). */
+typedef struct {
+    uint8_t family; /* AF_INET or AF_INET6 */
+    uint16_t port;
+    union {
+        struct in_addr v4;
+        struct in6_addr v6;
+    } addr;
+} PeerIdentity;
+
+/* Originating-client identity carried by value with every fast-path command.
+ * The IO thread copies fields that only main writes, and only while the client is detached. */
+typedef struct {
+    uint64_t client_id;
+    user *principal; /* The origin's ACL user, captured by value at admission. May be live or (if the
+                      * client was rebound/retired since) RETIRED: fpExecute resolves a retired one
+                      * to its live successor via ACLResolveUser before executing. Any rebind/retire
+                      * that changes what it resolves to also bumps the ACL epoch, so a verdict tagged
+                      * under the old principal is punted rather than trusted against the new one. */
+    PeerIdentity peer;
+    PeerIdentity local;
+    uint8_t authenticated;   /* flag.authenticated of the origin; authRequired() is evaluated live by main. */
+    int8_t conn_type;        /* Origin connection type (CONN_TYPE_*), captured by the IO owner at admission; lets main render transport (MONITOR unix, tracing) without touching the connection. CONN_TYPE_INVALID if unknown. */
+    uint32_t acl_epoch_seen; /* acl-offload: low 32 bits of the ACL epoch this entry's ALLOW verdict was tagged under; main trusts READ_FLAGS_ACL_ALLOWED only while it still matches. Fills the padding hole after conn_type; no struct growth. */
+} CommandOrigin;
+
 typedef struct client {
     /* Basic client information and connection. */
     uint64_t id; /* Client incremental unique ID. */
@@ -1443,11 +1506,17 @@ typedef struct client {
     LastWrittenBuf io_last_written;      /* Track state for last written buffer */
     unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
     listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
+    listNode clients_pending_read_node;  /* list node in clients_pending_read (strict-offload deferred reads) */
     size_t bufpos;
     payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
     robj **original_argv;       /* Arguments of original command if arguments were rewritten. */
     uint32_t redact_arg_bitmap; /* Bitmap of argument indexes that should be redacted in logs. */
+    uint32_t acl_epoch_seen;    /* acl-offload: low 32 bits of the ACL epoch the IO thread observed before
+                                 * tagging this command's ALLOW verdict; on the executor, copied from the
+                                 * entry before processCommand. Main honours READ_FLAGS_ACL_ALLOWED only
+                                 * while this still equals the global epoch. Fills the padding hole next to
+                                 * redact_arg_bitmap; unused when acl-offload is off. */
     /* Client flags and state indicators */
     union {
         struct {
@@ -1461,8 +1530,23 @@ typedef struct client {
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
+    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+                                           * unrestricted key read access, so IO threads may speculate.
+                                           * Written only on main at auth-state changes; read by IO threads. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
     uint8_t cur_tid;                      /* ID of IO thread currently performing IO for this client */
+    uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
+    uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
+    uint32_t fp_inflight;                 /* Fast path: commands of this client batched for main and not yet replied */
+    uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue */
+    sds fp_out;                           /* Fast path: output not yet written */
+    listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
+    listNode fp_stage_node;               /* Staged loop: link in the leaving list of the IO thread that saw the client leave */
+    PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
+    PeerIdentity fp_local;                /* Fast path: local address captured at admission */
+    int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
+    const CommandOrigin *origin;          /* Executor only: origin of the entry being executed, valid until the batch returns */
+    struct ClientControl *control;        /* Fast-path control: allocated at the first fast-path admission, reclaimed at free. NULL until then. */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
      * however we need to remember what was the old contribution of each
@@ -1857,6 +1941,14 @@ typedef enum childInfoType {
     CHILD_INFO_TYPE_REPL_OUTPUT_BYTES
 } childInfoType;
 
+/* Reply copy-avoidance gate mode (avoid-copy-reply-mode config). */
+#define COPY_AVOID_MODE_STATIC 0   /* Fixed size gates (default). */
+#define COPY_AVOID_MODE_ADAPTIVE 1 /* Main-thread pressure drives the size floor. */
+#define COPY_AVOID_MODE_OFF 2      /* Never copy-avoid; always serialize inline. */
+
+/* Adaptive mode: lowest size floor used when the main thread is the constraint. */
+#define COPY_AVOID_ADAPTIVE_FLOOR_MIN 1024
+
 struct valkeyServer {
     /* General */
     pid_t pid;                                        /* Main process pid. */
@@ -1925,6 +2017,8 @@ struct valkeyServer {
     list *clients;                         /* List of active clients */
     list *clients_to_close;                /* Clients to close asynchronously */
     list *clients_pending_write;           /* There is to write or install handler. */
+    list *clients_pending_read;            /* Strict offload: regular clients whose socket read was deferred
+                                            * off the main thread, awaiting re-dispatch to an IO thread (FIFO). */
     list *replicas, *monitors;             /* List of replicas and MONITORs */
     rax *replicas_waiting_psync;           /* Radix tree for tracking replicas awaiting partial synchronization.
                                             * Key: RDB client ID
@@ -1948,6 +2042,7 @@ struct valkeyServer {
                                  * e.g. call(), async module stuff (timers, events, etc.),
                                  * cron stuff (active expire, eviction) */
     rax *clients_index;         /* Active clients dictionary by client ID. */
+    rax *kill_waiters;          /* Killed client ID -> list of IDs of CLIENT KILL callers waiting for its free. */
     uint32_t paused_actions;    /* Bitmask of actions that are currently paused */
     list *postponed_clients;    /* List of postponed clients */
     pause_event client_pause_per_purpose[NUM_PAUSE_PURPOSES];
@@ -1958,7 +2053,20 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
+    int keyspace_shard_bits;    /* Standalone: split each db into 2^bits hashtables by key slot. */
+    int replica_parallel_apply; /* Replica: apply eligible replicated writes on the staged IO threads. */
+    int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
+                                               * client on the main thread: on offload decline the socket op is
+                                               * deferred to a FIFO retry list and re-dispatched to an IO thread. */
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
+    int prefetch_ring_stride;                 /* Command ring: prefetch keys of one command in N (1 = every command) */
+    int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
+    int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
+    int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
+    int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
+    int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
+    int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
+    int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
     long long events_processed_while_blocked; /* processEventsWhileBlocked() */
     int enable_protected_configs;             /* Enable the modification of protected configs, see PROTECTED_ACTION_ALLOWED_* */
     int enable_debug_cmd;                     /* Enable DEBUG commands, see PROTECTED_ACTION_ALLOWED_* */
@@ -1970,6 +2078,12 @@ struct valkeyServer {
     int min_io_threads_copy_avoid;           /* Minimum number of IO threads for copy avoidance in reply construction */
     int min_string_size_copy_avoid_threaded; /* Minimum bulk string size for copy avoidance in reply construction when IO threads enabled */
     int min_string_size_copy_avoid;          /* Minimum bulk string size for copy avoidance in reply construction when IO threads disabled */
+    int copy_avoid_mode;                     /* avoid-copy-reply-mode: COPY_AVOID_MODE_{STATIC,ADAPTIVE,OFF} */
+    int copy_avoid_current_floor;            /* Adaptive: current min RAW value size (bytes) that gets offloaded */
+    int copy_avoid_engaged;                  /* Adaptive: hysteresis state, 1 while offloading aggressively */
+    double copy_avoid_busy_ema;              /* Main-thread busy percent EMA (0..100) driving the adaptive floor */
+    monotime copy_avoid_last_sample_time;    /* Wall clock (us) of last pressure sample */
+    long long copy_avoid_last_active_time;   /* server.stat_active_time captured at last pressure sample */
     /* RDB / AOF loading information */
     volatile sig_atomic_t loading;       /* We are loading data from disk if true */
     volatile sig_atomic_t async_loading; /* We are loading data without blocking the db being served */
@@ -1982,6 +2096,8 @@ struct valkeyServer {
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
     long long stat_numcommands;                    /* Number of processed commands */
+    long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
+    long long stat_repl_apply_phases;              /* APPLY phases run */
     long long stat_numconnections;                 /* Number of connections received */
     long long stat_expiredkeys;                    /* Number of expired keys */
     long long stat_expiredfields;                  /* Number of expired hash fields */
@@ -2020,6 +2136,7 @@ struct valkeyServer {
     struct malloc_stats cron_malloc_stats;         /* sampled in serverCron(). */
     long long stat_net_input_bytes;                /* Bytes read from network. */
     long long stat_net_output_bytes;               /* Bytes written to network. */
+    long long stat_reply_copy_avoided;             /* Count of value replies emitted via copy-avoiding object refs. */
     long long stat_net_repl_input_bytes;           /* Bytes read during replication, added to stat_net_input_bytes in 'info'. */
     /* Bytes written during replication, added to stat_net_output_bytes in 'info'. */
     long long stat_net_repl_output_bytes;
@@ -2051,6 +2168,9 @@ struct valkeyServer {
     long long stat_io_writes_pending;                  /* Number of write events pending in IO threads */
     long long stat_io_freed_objects;                   /* Number of objects freed by IO threads */
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
+    long long stat_io_primary_drain_jobs;              /* IO-thread reads that drained the primary link */
+    long long stat_io_primary_drain_bytes;             /* Bytes read by those drained reads */
+    long long stat_strict_deferred_reads;              /* Strict offload: client reads deferred off main to the retry FIFO */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */
     long long stat_total_writes_processed;             /* Total number of write events processed */
@@ -2117,6 +2237,7 @@ struct valkeyServer {
     clientBufferLimitsConfig client_obuf_limits[CLIENT_TYPE_OBUF_COUNT];
     int extended_redis_compat;                 /* True if extended Redis OSS compatibility is enabled */
     int pause_cron;                            /* Don't run cron tasks (debug) */
+    int debug_io_write_done_delay_us;          /* IO threads sleep this long between writing a reply and reporting it (debug) */
     int dict_resizing;                         /* Whether to allow main dict and expired dict to be resized (debug) */
     int latency_tracking_enabled;              /* 1 if extended latency tracking is enabled, 0 otherwise. */
     double *latency_tracking_info_percentiles; /* Extended latency tracking info output percentile list configuration. */
@@ -2232,54 +2353,55 @@ struct valkeyServer {
     int shutdown_on_sigterm; /* Shutdown flags configured for SIGTERM. */
 
     /* Replication (primary) */
-    char replid[CONFIG_RUN_ID_SIZE + 1];        /* My current replication ID. */
-    char replid2[CONFIG_RUN_ID_SIZE + 1];       /* replid inherited from primary*/
-    long long primary_repl_offset;              /* My current replication offset */
-    long long second_replid_offset;             /* Accept offsets up to this for replid2. */
-    _Atomic(long long) fsynced_reploff_pending; /* Largest replication offset to
-                                                 * potentially have been fsynced, applied to
-                                                   fsynced_reploff only when AOF state is AOF_ON
-                                                   (not during the initial rewrite) */
-    long long fsynced_reploff;                  /* Largest replication offset that has been confirmed to be fsynced */
-    int replicas_eldb;                          /* Last SELECTed DB in replication output */
-    int repl_ping_replica_period;               /* Primary pings the replica every N seconds */
-    replBacklog *repl_backlog;                  /* Replication backlog for partial syncs */
-    long long repl_backlog_size;                /* Backlog circular buffer size */
-    replDataBuf pending_repl_data;              /* Replication data buffer for dual-channel-replication */
-    time_t repl_backlog_time_limit;             /* Time without replicas after the backlog
-                                                   gets released. */
-    time_t repl_no_replicas_since;              /* We have no replicas since that time.
-                                                 Only valid if server.replicas len is 0. */
-    int repl_min_replicas_to_write;             /* Min number of replicas to write. */
-    int repl_min_replicas_max_lag;              /* Max lag of <count> replicas to write. */
-    int repl_good_replicas_count;               /* Number of replicas with lag <= max_lag. */
-    int repl_diskless_sync;                     /* Primary send RDB to replicas sockets directly. */
-    int repl_diskless_load;                     /* Replica parse RDB directly from the socket.
-                                                 * see REPL_DISKLESS_LOAD_* enum */
-    int repl_diskless_sync_delay;               /* Delay to start a diskless repl BGSAVE. */
-    int repl_diskless_sync_max_replicas;        /* Max replicas for diskless repl BGSAVE
-                                                 * delay (start sooner if they all connect). */
-    int dual_channel_replication;               /* Config used to determine if the replica should
-                                                 * use dual channel replication for full syncs. */
-    _Atomic(int) replica_bio_disk_save_state;   /* Flag set by the bio thread to indicate that the
-                                                 * RDB save to disk has completed, or failed */
-    _Atomic(bool) replica_bio_abort_save;       /* Flag set by main thread, used to signal to replica's
-                                                 * disk-saving bio thread to abort the save */
-    long long bio_stat_net_repl_input_bytes;    /* Used to calculate stat_net_repl_input_bytes on the
-                                                 * replica's bio thread without touching main thread vars */
-    off_t bio_repl_transfer_size;               /* Used to calculate bio_repl_transfer_size on the
-                                                 * replica's bio thread without touching main thread vars */
-    off_t bio_repl_transfer_read;               /* Used to calculate bio_repl_transfer_read on the
-                                                 * replica's bio thread without touching main thread vars */
-    int wait_before_rdb_client_free;            /* Grace period in seconds for replica main channel
-                                                 * to establish psync. */
-    int debug_pause_after_fork;                 /* Debug param that pauses the main process
-                                                 * after a replication fork() (for bgsave). */
-    int debug_pause_before_psync;               /* Replica pauses (SIGSTOP) right before
-                                                 * sending PSYNC to its primary. */
-    size_t repl_buffer_mem;                     /* The memory of replication buffer. */
-    list *repl_buffer_blocks;                   /* Replication buffers blocks list
-                                                 * (serving replica clients and repl backlog) */
+    char replid[CONFIG_RUN_ID_SIZE + 1];              /* My current replication ID. */
+    char replid2[CONFIG_RUN_ID_SIZE + 1];             /* replid inherited from primary*/
+    long long primary_repl_offset;                    /* My current replication offset */
+    long long second_replid_offset;                   /* Accept offsets up to this for replid2. */
+    _Atomic(long long) fsynced_reploff_pending;       /* Largest replication offset to
+                                                       * potentially have been fsynced, applied to
+                                                         fsynced_reploff only when AOF state is AOF_ON
+                                                         (not during the initial rewrite) */
+    long long fsynced_reploff;                        /* Largest replication offset that has been confirmed to be fsynced */
+    int replicas_eldb;                                /* Last SELECTed DB in replication output */
+    int repl_ping_replica_period;                     /* Primary pings the replica every N seconds */
+    replBacklog *repl_backlog;                        /* Replication backlog for partial syncs */
+    long long repl_backlog_size;                      /* Backlog circular buffer size */
+    replDataBuf pending_repl_data;                    /* Replication data buffer for dual-channel-replication */
+    time_t repl_backlog_time_limit;                   /* Time without replicas after the backlog
+                                                         gets released. */
+    time_t repl_no_replicas_since;                    /* We have no replicas since that time.
+                                                       Only valid if server.replicas len is 0. */
+    int repl_min_replicas_to_write;                   /* Min number of replicas to write. */
+    int repl_min_replicas_max_lag;                    /* Max lag of <count> replicas to write. */
+    int repl_good_replicas_count;                     /* Number of replicas with lag <= max_lag. */
+    int repl_diskless_sync;                           /* Primary send RDB to replicas sockets directly. */
+    int repl_diskless_load;                           /* Replica parse RDB directly from the socket.
+                                                       * see REPL_DISKLESS_LOAD_* enum */
+    int repl_diskless_sync_delay;                     /* Delay to start a diskless repl BGSAVE. */
+    int repl_diskless_sync_max_replicas;              /* Max replicas for diskless repl BGSAVE
+                                                       * delay (start sooner if they all connect). */
+    int dual_channel_replication;                     /* Config used to determine if the replica should
+                                                       * use dual channel replication for full syncs. */
+    _Atomic(int) replica_bio_disk_save_state;         /* Flag set by the bio thread to indicate that the
+                                                       * RDB save to disk has completed, or failed */
+    _Atomic(bool) replica_bio_abort_save;             /* Flag set by main thread, used to signal to replica's
+                                                       * disk-saving bio thread to abort the save */
+    _Atomic(long long) bio_stat_net_repl_input_bytes; /* Written by the BIO RDB-load thread, read by main.
+                                                       * Used to calculate stat_net_repl_input_bytes on the
+                                                       * replica's bio thread without touching main thread vars */
+    off_t bio_repl_transfer_size;                     /* Used to calculate bio_repl_transfer_size on the
+                                                       * replica's bio thread without touching main thread vars */
+    off_t bio_repl_transfer_read;                     /* Used to calculate bio_repl_transfer_read on the
+                                                       * replica's bio thread without touching main thread vars */
+    int wait_before_rdb_client_free;                  /* Grace period in seconds for replica main channel
+                                                       * to establish psync. */
+    int debug_pause_after_fork;                       /* Debug param that pauses the main process
+                                                       * after a replication fork() (for bgsave). */
+    int debug_pause_before_psync;                     /* Replica pauses (SIGSTOP) right before
+                                                       * sending PSYNC to its primary. */
+    size_t repl_buffer_mem;                           /* The memory of replication buffer. */
+    list *repl_buffer_blocks;                         /* Replication buffers blocks list
+                                                       * (serving replica clients and repl backlog) */
     /* Replication (replica) */
     char *primary_user;     /* AUTH with this user and primary_auth with primary */
     sds primary_auth;       /* AUTH with this password with primary */
@@ -2341,21 +2463,28 @@ struct valkeyServer {
     list *clients_waiting_acks; /* Clients waiting in WAIT or WAITAOF. */
     int get_ack_from_replicas;  /* If true we send REPLCONF GETACK. */
     /* Limits */
-    unsigned int maxclients;                    /* Max number of simultaneous clients */
-    unsigned int maxclients_reserved;           /* Client connection slots reserved for priority subnets */
-    char *priority_subnets;                     /* Raw priority-subnets string config */
-    anetSubnet *priority_subnets_array;         /* Compiled priority subnets array */
-    int priority_subnets_count;                 /* Count of compiled priority subnets */
-    unsigned long long maxmemory;               /* Max number of memory bytes to use */
-    ssize_t maxmemory_clients;                  /* Memory limit for total client buffers */
-    ssize_t maxmemory_scripts;                  /* Memory limit for cached EVAL scripts */
-    int maxmemory_policy;                       /* Policy for key eviction */
-    int maxmemory_samples;                      /* Precision of random sampling */
-    int maxmemory_eviction_tenacity;            /* Aggressiveness of eviction processing */
-    long long proto_max_bulk_len;               /* Protocol bulk length maximum size. */
-    int oom_score_adj_values[CONFIG_OOM_COUNT]; /* Linux oom_score_adj configuration */
-    int oom_score_adj;                          /* If true, oom_score_adj is managed */
-    int disable_thp;                            /* If true, disable THP by syscall */
+    unsigned int maxclients;                           /* Max number of simultaneous clients */
+    unsigned int maxclients_reserved;                  /* Client connection slots reserved for priority subnets */
+    char *priority_subnets;                            /* Raw priority-subnets string config */
+    anetSubnet *priority_subnets_array;                /* Compiled priority subnets array */
+    int priority_subnets_count;                        /* Count of compiled priority subnets */
+    unsigned long long maxmemory;                      /* Max number of memory bytes to use */
+    ssize_t maxmemory_clients;                         /* Memory limit for total client buffers */
+    ssize_t maxmemory_scripts;                         /* Memory limit for cached EVAL scripts */
+    int maxmemory_policy;                              /* Policy for key eviction */
+    int maxmemory_samples;                             /* Precision of random sampling */
+    int maxmemory_eviction_tenacity;                   /* Aggressiveness of eviction processing */
+    int maxmemory_eviction_batch;                      /* If true, run key/client eviction once per event loop
+                                                        * (beforeSleep) with a bounded mid-batch recheck, instead
+                                                        * of before every command. */
+    unsigned long long maxmemory_eviction_batch_slack; /* Max bytes allocated since the last eviction check
+                                                        * before a mid-batch recheck is forced. Effective bound is
+                                                        * capped at 1% of maxmemory. */
+    size_t evict_check_used_memory;                    /* zmalloc_used_memory() at the last eviction check. */
+    long long proto_max_bulk_len;                      /* Protocol bulk length maximum size. */
+    int oom_score_adj_values[CONFIG_OOM_COUNT];        /* Linux oom_score_adj configuration */
+    int oom_score_adj;                                 /* If true, oom_score_adj is managed */
+    int disable_thp;                                   /* If true, disable THP by syscall */
     /* Blocked clients */
     unsigned int blocked_clients; /* # of clients executing a blocking cmd.*/
     unsigned int blocked_clients_by_type[BLOCKED_NUM];
@@ -2545,6 +2674,13 @@ struct valkeyServer {
     int hotkeys_top_k;               /* Number of top keys to track (Space-Saving K); 0 disables detection. */
     int hotkeys_window_seconds;      /* Length of the QPS accounting window in seconds. */
     struct spaceSavingManager *hotkeys_manager;
+    /* acl-offload counters. Appended at the struct tail so their addition shifts
+     * no existing field's offset or cache-line grouping. */
+    long long stat_acl_offload_hits;             /* verdicts consumed without a main-thread ACL evaluation */
+    long long stat_acl_offload_punts;            /* tagged verdicts rejected (epoch/principal moved), re-evaluated on main */
+    long long stat_acl_offload_quiesce_count;    /* waits for in-flight IO jobs before mutating/freeing ACL rule-set memory */
+    long long stat_acl_offload_quiesce_total_us; /* total time spent in those waits */
+    long long stat_acl_offload_quiesce_max_us;   /* longest single wait */
 };
 
 #define MAX_KEYS_BUFFER 256
@@ -3084,6 +3220,19 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
+#define READ_FLAGS_ACL_ALLOWED (1 << 24)      /* acl-offload: an IO thread evaluated this command's ACL    \
+                                                 permissions under client->acl_epoch_seen and it passed.   \
+                                                 Only ALLOW is recorded; a denial leaves the bit clear and \
+                                                 main runs the stock check to produce the exact error. */
+#define READ_FLAGS_DPLUS_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
+#define READ_FLAGS_DRAIN (1 << 26)            /* Read the socket repeatedly before parsing. */
+/* Every parse error flag; also marks a queued command that is complete but bad. */
+#define READ_FLAGS_ERROR_MASK                                                                                        \
+    (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
+     READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN | READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN |                    \
+     READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN | READ_FLAGS_ERROR_BIG_BULK_COUNT |                                     \
+     READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER | READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_REPLICATED_CLIENT |       \
+     READ_FLAGS_ERROR_UNBALANCED_QUOTES | READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL | READ_FLAGS_ERROR_INVALID_CRLF)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3091,10 +3240,12 @@ void dictVanillaFree(void *val);
 /* Unlike a retryable socket write error, a compression error is fatal. The IO
  * thread reports it here for the main thread to disconnect the replica. */
 #define WRITE_FLAGS_COMPRESSION_ERROR (1 << 2)
+#define WRITE_FLAGS_LAZY (1 << 3) /* completion is reconciled lazily by main, no response */
 
 client *createClient(connection *conn);
 int freeClient(client *c);
 void freeClientAsync(client *c);
+void handleQbLimitReached(client *c);
 void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
@@ -3128,6 +3279,7 @@ void addReplyProto(client *c, const char *s, size_t len);
 void AddReplyFromClient(client *c, client *src);
 void commitDeferredReplyBuffer(client *c, int skip_if_blocked);
 void addReplyBulk(client *c, robj *obj);
+void addReplyBulkLen(client *c, robj *obj);
 void addReplyBulkCString(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
 void addWritePreparedReplyBulkCBuffer(writePreparedClient *c, const void *p, size_t len);
@@ -3176,6 +3328,11 @@ void *dupClientReplyValue(void *o);
 char *getClientPeerId(client *c);
 char *getClientSockname(client *c);
 int isClientConnIpV6(client *c);
+int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, socklen_t salen);
+int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len);
+int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port);
+uint64_t getClientOriginId(client *c);
+int getClientConnType(client *c);
 sds catClientInfoString(sds s, client *client, int hide_user_data);
 sds catClientInfoShortString(sds s, client *client, int hide_user_data);
 sds getAllClientsInfoString(int type, int hide_user_data);
@@ -3195,6 +3352,7 @@ char *getClientTypeName(int client_class);
 void flushReplicasOutputBuffers(void);
 void disconnectReplicas(void);
 void evictClients(void);
+size_t getClientEvictionLimit(void);
 int listenToPort(connListener *fds);
 void pauseActions(pause_purpose purpose, mstime_t end, uint32_t actions);
 void unpauseActions(pause_purpose purpose);
@@ -3226,15 +3384,31 @@ client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void clientSetUser(client *c, user *u, int authenticated);
 void putClientInPendingWriteQueue(client *c);
+void unpartitionClient(client *c); /* io_threads.c: return a partitioned client to the main event loop */
+int strictOffloadActive(void);
+int processDeferredReads(void);
 client *createCachedResponseClient(int resp);
 void deleteCachedResponseClient(client *recording_client);
 void waitForClientIO(client *c);
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
 int canParseCommand(client *c);
+bool consumeCommandQueue(client *c);
+bool readToQueryBuf(client *c);
+void parseInputBuffer(client *c);
+void trimClientQueryBuffer(client *c);
+void handleParseError(client *c);
+void ringExecuteOne(client *c);
+extern _Thread_local sds thread_shared_qb;
+int isParsingError(client *c);
+void resetSharedQueryBuf(client *c);
 int processClientIOReadsDone(client *c);
 void processClientIOWriteDone(client *c);
+int settleClientWrite(client *c);
+void debugIOWriteDoneDelay(void);
 void releaseReplyReferences(client *c);
+int clientResizeQueryBuffer(client *c, time_t idletime);
+int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms);
 void resetLastWrittenBuf(client *c);
 int clientConnPostponeMask(client *c);
 
@@ -3275,6 +3449,7 @@ int defragTrackingTable(monotime endtime);
 uint64_t trackingGetTotalItems(void);
 uint64_t trackingGetTotalKeys(void);
 uint64_t trackingGetTotalPrefixes(void);
+int trackingBroadcastPending(void);
 void trackingBroadcastInvalidationMessages(void);
 int checkPrefixCollisionsOrReply(client *c, robj **prefix, size_t numprefix);
 
@@ -3380,6 +3555,7 @@ void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 
 /* Objects with val and/or key embedded */
 robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
+robj *tryPrebuildStringEntry(robj *valobj, const_sds key);
 robj *objectSetExpire(robj *o, long long expire);
 void objectSetVal(robj *o, void *val);
 void objectUnembedVal(robj *o);
@@ -3430,6 +3606,7 @@ void refreshGoodReplicasCount(void);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
 void unblockClientWaitingReplicas(client *c);
+void unblockClientWaitingKills(client *c);
 int replicationCountAcksByOffset(long long offset);
 int replicationCountAOFAcksByOffset(long long offset);
 void replicationSendNewlineToPrimary(void);
@@ -3587,6 +3764,19 @@ void ACLLoadUsersAtStartup(void);
 void addReplyCommandCategories(client *c, struct serverCommand *cmd);
 user *ACLCreateUnlinkedUser(void);
 void ACLFreeUserAndKillClients(user *u);
+user *ACLResolveUser(user *u);
+void ACLFastpathClientReturned(client *c);
+/* acl-offload: IO-thread tagging + main-thread consume, and the copy-on-write/quiesce
+ * lifetime discipline that lets an IO thread read a bound user's rule set safely. */
+void aclOffloadBeginRead(client *c);
+void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int dbid, int *read_flags);
+int aclOffloadShouldStopTagging(struct serverCommand *cmd);
+int aclOffloadConsume(client *c, int *idxptr);
+void aclOffloadBumpEpoch(void);
+void aclOffloadQuiesce(void);
+void aclMarkUserBound(user *u);
+uint32_t aclOffloadEpoch(void);
+int aclReloadRetiresPrincipal(rax *old_users, user *u);
 void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
 sds getAclErrorMessage(int acl_res, user *user, struct serverCommand *cmd, sds errored_val, int verbose);
 void ACLUpdateDefaultUserPassword(sds password);
@@ -3703,6 +3893,7 @@ void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd);
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist);
+void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count);
 int prepareForShutdown(client *c, int flags);
 void replyToClientsBlockedOnShutdown(void);
 int abortShutdown(void);
@@ -3792,7 +3983,6 @@ robj *setTypeDup(robj *o);
 #define HASH_SET_TAKE_VALUE (1 << 1)
 #define HASH_SET_KEEP_EXPIRY (1 << 2)
 #define HASH_SET_COPY 0
-
 
 long long hashTypeVolatileCount(robj *o);                                    /* total volatile fields, incl. expired-unreaped */
 long long hashTypeListpackGetExpiry(unsigned char *zl, unsigned char *vptr); /* expiry of the pair whose value entry is vptr, or EXPIRY_NONE */
@@ -4046,6 +4236,18 @@ size_t lazyfreeGetPendingObjectsCount(void);
 size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
+void freeObjAsyncForce(robj *obj);
+/* Debug hooks for terminal frees routed off main. */
+void armNoMainThreadFree(void);
+void disarmNoMainThreadFree(void);
+int noMainThreadFreeArmed(void);
+int inMainThread(void);
+#ifdef DEBUG_NEVER_FREE_ON_MAIN
+#define assertNoMainThreadFree() serverAssert(!(inMainThread() && noMainThreadFreeArmed()))
+#else
+#define assertNoMainThreadFree() ((void)0)
+#endif
+size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o);

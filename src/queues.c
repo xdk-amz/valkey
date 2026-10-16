@@ -68,6 +68,11 @@ bool mpscEnqueue(mpscQueue *q, void *data, mpscTicket *ticket) {
     return true;
 }
 
+bool mpscConsumerHasItem(mpscQueue *q) {
+    size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    return atomic_load_explicit(&q->tail, memory_order_acquire) != head;
+}
+
 size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     size_t popped_count = 0;
     size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
@@ -84,9 +89,13 @@ size_t mpscDequeueBatch(mpscQueue *q, void **jobs_out, size_t max_jobs) {
     if (limit > max_jobs) limit = max_jobs;
 
     for (size_t i = 0; i < limit; ++i) {
-        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_relaxed);
+        void *data = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)], memory_order_acquire);
 
-        /* Stop if slot is reserved but data not yet written */
+        /* Stop if slot is reserved but data not yet written.
+         * NOTE: acquire ordering above synchronizes with the producer's release
+         * store to this slot, preventing ARM/weak-memory stale-NULL reads that
+         * caused silent command loss (the consumer saw an advanced tail but a
+         * stale buffer slot, breaking out prematurely). */
         if (!data) break;
 
         jobs_out[popped_count++] = data;
@@ -147,6 +156,14 @@ bool spmcIsEmpty(spmcQueue *q) {
 size_t spmcSize(spmcQueue *q) {
     size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
     return (q->tail >= head) ? (q->tail - head) : 0;
+}
+
+bool spmcConsumerHasItem(spmcQueue *q) {
+    size_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    size_t seq = atomic_load_explicit(&q->buffer[head & (q->queue_size - 1)].sequence, memory_order_acquire);
+    /* seq == head: the producer has not filled the head slot yet. A later sequence means the slot holds
+     * an item, or a consumer took it after the head was read. */
+    return (intptr_t)seq - (intptr_t)(head + 1) >= 0;
 }
 
 bool spmcEnqueue(spmcQueue *q, void *data) {
@@ -255,10 +272,25 @@ void spscEnqueue(spscQueue *q, void *data, bool commit) {
     }
 }
 
-void spscCommit(spscQueue *q) {
+bool spscCommit(spscQueue *q) {
     size_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
-    if (q->tail_local == tail) return;
+    if (q->tail_local == tail) return false;
     atomic_store_explicit(&q->tail, q->tail_local, memory_order_release);
+    return true;
+}
+
+/* Producer side: slots available for enqueue right now. Refreshes the cached
+ * head, so the answer is exact at the time of the call and can only grow. */
+size_t spscFreeSlots(spscQueue *q) {
+    q->head_cache = atomic_load_explicit(&q->head, memory_order_acquire);
+    return q->queue_size - (q->tail_local - q->head_cache);
+}
+
+/* Consumer side: entries currently published and not yet dequeued. */
+size_t spscBacklog(spscQueue *q) {
+    size_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    return tail - head;
 }
 
 size_t spscDequeueBatch(spscQueue *q, void **jobs_out, size_t num_jobs) {

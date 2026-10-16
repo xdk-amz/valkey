@@ -69,6 +69,7 @@
 #include "module.h"
 #include "call_reply.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
@@ -3960,8 +3961,13 @@ int modulePopulateClientInfoStructure(void *ci, client *client, int structver) {
     if (client->flag.ever_authenticated) ci1->flags |= VALKEYMODULE_CLIENTINFO_FLAG_EVER_AUTHENTICATED;
     if (client->flag.fake) ci1->flags |= VALKEYMODULE_CLIENTINFO_FLAG_FAKE;
 
-    int port;
-    connAddrPeerName(client->conn, ci1->addr, sizeof(ci1->addr), &port);
+    int port = 0;
+    if (client->flag.fastpath) {
+        /* The socket belongs to an IO thread; the peer was fixed at admission. */
+        if (peerIdentityToIp(&client->fp_peer, ci1->addr, sizeof(ci1->addr), &port) != C_OK) ci1->addr[0] = '\0';
+    } else {
+        connAddrPeerName(client->conn, ci1->addr, sizeof(ci1->addr), &port);
+    }
     ci1->port = port;
     ci1->db = client->db->id;
     ci1->id = client->id;
@@ -10473,6 +10479,10 @@ void revokeClientAuthentication(client *c) {
      * is eventually freed we don't rely on the module to still exist. */
     moduleNotifyUserChanged(c);
 
+    if (c->flag.fastpath) {
+        freeClient(c); /* IO-owned: not rewritten; its queued commands are dropped by main */
+        return;
+    }
     clientSetUser(c, DefaultUser, 0);
     /* We will write replies to this client later, so we can't close it
      * directly even if async. */
@@ -10546,7 +10556,18 @@ int VM_FreeModuleUser(ValkeyModuleUser *user) {
  * Returns VALKEYMODULE_OK on success and VALKEYMODULE_ERR on failure
  * and will set an errno describing why the operation failed. */
 int VM_SetModuleUserACL(ValkeyModuleUser *user, const char *acl) {
-    return ACLSetUser(user->user, acl, -1);
+    /* acl-offload: never mutate a possibly-bound user in place; stage on a copy and
+     * publish through the copy-on-write path (same as ACL SETUSER). */
+    sds acl_sds = sdsnew(acl);
+    sds err = ACLStringSetUser(user->user, NULL, &acl_sds, 1);
+    sdsfree(acl_sds);
+    if (err) {
+        sdsfree(err);
+        return VALKEYMODULE_ERR;
+    }
+    /* Module users can be attached to clients: re-gate IO-thread reads. */
+    dplusOnAclRulesChanged();
+    return VALKEYMODULE_OK;
 }
 
 /* Sets the permission of a user with a complete ACL string, such as one
@@ -10580,6 +10601,8 @@ int VM_SetModuleUserACLString(ValkeyModuleCtx *ctx,
         return VALKEYMODULE_ERR;
     }
 
+    /* Re-gate D+ speculation for clients attached to the mutated user. */
+    dplusOnAclRulesChanged();
     return VALKEYMODULE_OK;
 }
 
@@ -11746,6 +11769,16 @@ int VM_UnregisterCommandFilter(ValkeyModuleCtx *ctx, ValkeyModuleCommandFilter *
     return VALKEYMODULE_OK;
 }
 
+/* True while any module command filter is registered. A filter may rewrite or redirect any
+ * command, so the fast path must route commands through the main path while one is installed. */
+int moduleHasCommandFilters(void) {
+    return moduleCommandFilters != NULL && listLength(moduleCommandFilters) > 0;
+}
+
+int moduleHasKeyspaceSubscribers(void) {
+    return moduleKeyspaceSubscribers != NULL && listLength(moduleKeyspaceSubscribers) > 0;
+}
+
 void moduleCallCommandFilters(client *c) {
     if (listLength(moduleCommandFilters) == 0) return;
 
@@ -11883,7 +11916,7 @@ int VM_CommandFilterArgDelete(ValkeyModuleCommandFilterCtx *fctx, int pos) {
 
 /* Get Client ID for client that issued the command we are filtering */
 unsigned long long VM_CommandFilterGetClientId(ValkeyModuleCommandFilterCtx *fctx) {
-    return fctx->c->id;
+    return getClientOriginId(fctx->c);
 }
 
 /* --------------------------------------------------------------------------
@@ -11939,7 +11972,7 @@ void moduleFireCommandResultEvent(client *c,
         .command_name = cmd ? cmd->fullname : NULL,
         .duration_us = duration,
         .dirty = dirty,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = argc,
         .argv = (ValkeyModuleString **)decoded_argv,
@@ -11971,7 +12004,7 @@ void moduleFireCommandRejectedEvent(client *c, const char *reply_str) {
         .command_name = c->cmd ? c->cmd->fullname : NULL,
         .duration_us = 0,
         .dirty = 0,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = c->argc,
         .argv = (ValkeyModuleString **)c->argv,
@@ -12008,7 +12041,7 @@ void moduleFireCommandACLRejectedEvent(client *c, uint64_t subevent, int errpos)
         .command_name = c->cmd ? c->cmd->fullname : NULL,
         .duration_us = 0,
         .dirty = 0,
-        .client_id = c->id,
+        .client_id = getClientOriginId(c),
         .is_module_client = (c->flag.module ? 1 : 0),
         .argc = c->argc,
         .argv = (ValkeyModuleString **)c->argv,
@@ -13100,9 +13133,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
         if (callback == NULL) {
             listDelNode(ValkeyModule_EventListeners, ln);
             zfree(el);
-            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;
@@ -13122,9 +13156,10 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
     el->event = event;
     el->callback = callback;
     listAddNodeTail(ValkeyModule_EventListeners, el);
-    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+    if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
         commandResultSuccessListeners++;
-    else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+        dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+    } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
         commandResultFailureListeners++;
     else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
         commandResultRejectedListeners++;
@@ -13269,6 +13304,19 @@ void moduleFireServerEvent(uint64_t eid, int subid, void *data) {
     }
 }
 
+/* Returns 1 if a module listens to server event 'eid'. */
+int moduleHasServerEventListener(uint64_t eid) {
+    if (ValkeyModule_EventListeners == NULL) return 0;
+    listIter li;
+    listNode *ln;
+    listRewind(ValkeyModule_EventListeners, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModuleEventListener *el = ln->value;
+        if (el->event.id == eid) return 1;
+    }
+    return 0;
+}
+
 /* Remove all the listeners for this module: this is used before unloading
  * a module. */
 void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
@@ -13280,9 +13328,10 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
     while ((ln = listNext(&li))) {
         el = ln->value;
         if (el->module == module) {
-            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS)
+            if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-            else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
+                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+            } else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
                 commandResultRejectedListeners--;
@@ -15079,6 +15128,24 @@ void moduleCommand(client *c) {
 /* Return the number of registered modules. */
 size_t moduleCount(void) {
     return listLength(modules);
+}
+
+/* Some module sees individual commands or key changes: a command filter, a server event or
+ * keyspace listener, a command result listener, or a module data type that may be unlinked. */
+int moduleObservesWrites(void) {
+    if (listLength(moduleCommandFilters) || listLength(ValkeyModule_EventListeners)) return 1;
+    if (moduleNotifyKeyspaceSubscribersCnt()) return 1;
+    if (commandResultSuccessListeners || commandResultFailureListeners || commandResultRejectedListeners ||
+        commandResultACLRejectedListeners)
+        return 1;
+    listIter li;
+    listNode *ln;
+    listRewind(modules, &li);
+    while ((ln = listNext(&li))) {
+        ValkeyModule *m = listNodeValue(ln);
+        if (listLength(m->types)) return 1;
+    }
+    return 0;
 }
 
 /* --------------------------------------------------------------------------

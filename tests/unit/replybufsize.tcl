@@ -34,6 +34,10 @@ start_server {tags {"replybufsize"}} {
         
         # In order to reduce test time we can set the peak reset time very low
         r debug replybuffer peak-reset-time never
+
+        # Replies grow the client's own buffer only on the main reply path; the fast path writes
+        # them from its batches, so the client goes back to main for this part.
+        r config set io-threads-fast-path no
         
         wait_for_condition 10 100 {
             [$tc get bigval ; get_reply_buffer_size test_client] >= 16384 && [get_reply_buffer_size test_client] < 32768
@@ -44,6 +48,7 @@ start_server {tags {"replybufsize"}} {
    
         # Restore the peak reset time to default
         r debug replybuffer peak-reset-time reset
+        r config set io-threads-fast-path yes
         
         $tc close
     } {0} {needs:debug}

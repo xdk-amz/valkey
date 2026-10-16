@@ -207,6 +207,16 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
     }
 }
 
+/* Sole references always free on bio; shared references only decrement here. */
+void freeObjAsyncForce(robj *obj) {
+    if (obj->refcount == 1) {
+        atomic_fetch_add_explicit(&lazyfree_objects, 1, memory_order_relaxed);
+        bioCreateLazyFreeJob(lazyfreeFreeObject, 1, obj);
+    } else {
+        decrRefCount(obj);
+    }
+}
+
 /* Empty a DB asynchronously. What the function does actually is to
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */
@@ -216,6 +226,8 @@ void emptyDbAsync(serverDb *db) {
     if (server.cluster_enabled) {
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
+    } else {
+        slot_count_bits = server.keyspace_shard_bits;
     }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires, *oldkeyswithexpires = db->keys_with_volatile_items;
     db->keys = kvstoreCreate(&kvstoreKeysHashtableType, slot_count_bits, flags);

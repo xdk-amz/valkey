@@ -34,6 +34,8 @@
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
+#include "io_threads.h"
+#include "fastpath.h"
 #include <math.h>
 
 /* ----------------------------------------------------------------------------
@@ -281,7 +283,24 @@ int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *lev
      * count of used memory. */
     mem_used = mem_reported;
     size_t overhead = freeMemoryGetNotCountedMemory();
+    /* Clients already scheduled to close (e.g. killed by evictClients while
+     * mid-IO) hold buffers that are reclaimed-in-principle; counting them
+     * as pressure would make key eviction chase memory that client eviction
+     * already freed. Mirror of the replica-buffer exclusion above. */
+    if (listLength(server.clients_to_close)) {
+        listIter li;
+        listNode *ln;
+        listRewind(server.clients_to_close, &li);
+        while ((ln = listNext(&li))) {
+            client *dc = listNodeValue(ln);
+            overhead += dc->last_memory_usage;
+        }
+    }
     mem_used = (mem_used > overhead) ? mem_used - overhead : 0;
+
+    /* Pending off-main frees count as reclaimed so eviction does not over-evict. */
+    size_t pending_offload_free = offloadPendingFreeBytes();
+    mem_used = (mem_used > pending_offload_free) ? mem_used - pending_offload_free : 0;
 
     /* Compute the ratio of memory usage. */
     if (level) *level = (float)mem_used / (float)server.maxmemory;
@@ -399,6 +418,8 @@ static long long evictSingleKey(serverDb *db, robj *keyobj, int slot) {
      * the read command on key eviction. */
     enterExecutionUnit(1, 0);
     delta = (long long)zmalloc_used_memory();
+    /* Include newly pending off-main frees in this eviction's reclaimed-byte delta. */
+    size_t offload_pending_before = offloadPendingFreeBytes();
     latencyStartMonitor(eviction_latency);
     int deleted = dbGenericDelete(db, keyobj, server.lazyfree_lazy_eviction, DB_FLAG_KEY_EVICTED);
     serverAssertWithInfo(NULL, keyobj, deleted);
@@ -406,6 +427,7 @@ static long long evictSingleKey(serverDb *db, robj *keyobj, int slot) {
     latencyAddSampleIfNeeded("eviction-del", eviction_latency);
     latencyTraceIfNeeded(db, eviction_del, eviction_latency);
     delta -= (long long)zmalloc_used_memory();
+    delta += (long long)(offloadPendingFreeBytes() - offload_pending_before);
     server.stat_evictedkeys++;
     signalModifiedKey(NULL, db, keyobj);
     notifyKeyspaceEvent(NOTIFY_EVICTED, "evicted", keyobj, db->id);
@@ -598,6 +620,14 @@ int performEvictions(void) {
                  * transmission here inside the loop. */
                 if (replicas) flushReplicasOutputBuffers();
 
+                /* With IO threads active, memory of evicted values and freed
+                 * clients returns asynchronously; getMaxmemoryState already
+                 * discounts it. Commit dispatched jobs so workers start those
+                 * frees now. Responses are not processed here: that would run
+                 * other commands, possibly the same client's, in the middle of
+                 * this one. */
+                if (server.active_io_threads_num > 1) commitIOJobs();
+
                 /* Normally our stop condition is the ability to release
                  * a fixed, pre-computed amount of memory. However when we
                  * are deleting objects in another thread, it's better to
@@ -605,7 +635,7 @@ int performEvictions(void) {
                  * memory, since the "mem_freed" amount is computed only
                  * across the dbAsyncDelete() call, while the thread can
                  * release the memory all the time. */
-                if (server.lazyfree_lazy_eviction) {
+                if (server.lazyfree_lazy_eviction || server.active_io_threads_num > 1) {
                     if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) {
                         break;
                     }

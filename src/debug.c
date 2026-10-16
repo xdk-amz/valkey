@@ -38,6 +38,7 @@
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "sds.h"
 #include "module.h"
 
@@ -513,8 +514,17 @@ void debugCommand(client *c) {
             "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
             "SET-SKIP-CHECKSUM-VALIDATION <0|1>",
             "    Enables or disables checksum checks for RDB files and RESTORE's payload.",
+            "REPLY-RAW <key>",
+            "    Reply with the string value of <key>, routing the value bytes through the",
+            "    copy-avoiding raw reply path (for testing reply offload).",
+            "COPY-AVOID <ENGAGE|RELEASE> [floor]",
+            "    Pin the adaptive reply copy-avoidance floor/engagement (for testing).",
             "SLEEP <seconds>",
             "    Stop the server for <seconds>. Decimals allowed.",
+            "IO-THREADS-FAIL-CREATE <id>",
+            "    Make the next attempt to create IO thread <id> fail (for testing rollback).",
+            "IO-WRITE-DONE-DELAY <microseconds>",
+            "    IO threads wait this long after writing a reply before they report the write done (0 to stop).",
             "STRINGMATCH-TEST",
             "    Run a fuzz tester against the stringmatchlen() function.",
             "STRUCTSIZE",
@@ -588,6 +598,24 @@ void debugCommand(client *c) {
         serverAssertWithInfo(c, c->argv[0], 1 == 2);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char *)objectGetVal(c->argv[2]));
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "io-write-done-delay") && c->argc == 3) {
+        long long us;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &us, NULL) != C_OK) return;
+        if (us < 0 || us > 10000000) {
+            addReplyError(c, "delay out of range");
+            return;
+        }
+        __atomic_store_n(&server.debug_io_write_done_delay_us, (int)us, __ATOMIC_RELAXED);
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "io-threads-fail-create") && c->argc == 3) {
+        long long id;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &id, NULL) != C_OK) return;
+        if (id < 1 || id >= IO_THREADS_MAX_NUM) {
+            addReplyError(c, "IO thread id out of range");
+            return;
+        }
+        ioThreadsDebugFailCreate((int)id);
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "leak") && c->argc == 3) {
         sdsdup(objectGetVal(c->argv[2]));
@@ -933,6 +961,47 @@ void debugCommand(client *c) {
             addReplyError(c, "Wrong protocol type name. Please use one of the following: "
                              "string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "reply-raw") && c->argc == 3) {
+        /* DEBUG REPLY-RAW <key>
+         * Emits the string value of <key> as a normal bulk reply, but routes the
+         * value bytes through addReply()'s raw arm (RAW_STR_REF copy-avoidance)
+         * instead of addReplyBulk(). Used to exercise and verify the raw
+         * reply-offload path end to end. */
+        robj *val;
+        if ((val = dbFind(c->db, objectGetVal(c->argv[2]))) == NULL) {
+            addReplyErrorObject(c, shared.nokeyerr);
+            return;
+        }
+        if (val->type != OBJ_STRING) {
+            addReplyError(c, "value is not a string");
+            return;
+        }
+        addReplyBulkLen(c, val);
+        addReply(c, val);
+        addReplyProto(c, "\r\n", 2);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "copy-avoid") && c->argc >= 3) {
+        /* DEBUG COPY-AVOID <ENGAGE|RELEASE> [floor]
+         * Pins the adaptive reply copy-avoidance hysteresis state so tests can
+         * exercise the adaptive gate deterministically without generating load.
+         * ENGAGE: aggressive offload (floor defaults to COPY_AVOID_ADAPTIVE_FLOOR_MIN).
+         * RELEASE: high floor (defaults to the threaded static gate). */
+        if (!strcasecmp(objectGetVal(c->argv[2]), "engage")) {
+            server.copy_avoid_engaged = 1;
+            server.copy_avoid_busy_ema = 100;
+            server.copy_avoid_current_floor =
+                (c->argc >= 4) ? atoi(objectGetVal(c->argv[3])) : COPY_AVOID_ADAPTIVE_FLOOR_MIN;
+        } else if (!strcasecmp(objectGetVal(c->argv[2]), "release")) {
+            server.copy_avoid_engaged = 0;
+            server.copy_avoid_busy_ema = 0;
+            server.copy_avoid_current_floor =
+                (c->argc >= 4) ? atoi(objectGetVal(c->argv[3])) : server.min_string_size_copy_avoid_threaded;
+        } else {
+            addReplyError(c, "Use DEBUG COPY-AVOID <ENGAGE|RELEASE> [floor]");
+            return;
+        }
+        /* Re-seed the sampler so the pinned state is not immediately overwritten. */
+        server.copy_avoid_last_sample_time = 0;
+        addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "sleep") && c->argc == 3) {
         double dtime = valkey_strtod_sds(objectGetVal(c->argv[2]), NULL);
         long long utime = dtime * 1000000;

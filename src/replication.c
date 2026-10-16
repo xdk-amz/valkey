@@ -975,7 +975,7 @@ void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv,
     cmdrepr = sdscatprintf(cmdrepr, "%ld.%06ld ", (long)tv.tv_sec, (long)tv.tv_usec);
     if (c->flag.script) {
         cmdrepr = sdscatprintf(cmdrepr, "[%d lua] ", dictid);
-    } else if (c->flag.unix_socket) {
+    } else if (c->origin ? c->origin->conn_type == CONN_TYPE_UNIX : c->flag.unix_socket) {
         cmdrepr = sdscatprintf(cmdrepr, "[%d unix:%s] ", dictid, server.unixsocket);
     } else {
         cmdrepr = sdscatprintf(cmdrepr, "[%d %s] ", dictid, getClientPeerId(c));
@@ -1187,6 +1187,7 @@ int primaryTryPartialResynchronization(client *c, long long psync_offset) {
      * 2) Set client state to make it a replica.
      * 3) Inform the client we can continue with +CONTINUE
      * 4) Send the backlog data (from the offset to the end) to the replica. */
+    unpartitionClient(c); /* replication links are main-owned */
     waitForClientIO(c);
     c->flag.replica = 1;
     if (c->repl_data->associated_rdb_client_id && lookupRdbClientByID(c->repl_data->associated_rdb_client_id)) {
@@ -1387,7 +1388,8 @@ void syncCommand(client *c) {
     initClientReplicationData(c);
 
     /* Wait for any IO pending operation to finish before changing the client state to replica */
-    waitForClientIO(c);
+    unpartitionClient(c); /* replication links are main-owned */
+    if (!settleClientWrite(c)) return;
 
     /* Check if this is a failover request to a replica with the same replid and
      * become a primary if so. */
@@ -2658,7 +2660,7 @@ int tryReadBulkPayloadMetadata(connection *conn, char *buf, char *eofmark, char 
         /* nread here is returned by connSyncReadLine(), which calls syncReadLine() and
          * convert "\r\n" to '\0' so 1 byte is lost. */
         if (inBioThread())
-            server.bio_stat_net_repl_input_bytes += nread + 1;
+            atomic_fetch_add_explicit(&server.bio_stat_net_repl_input_bytes, nread + 1, memory_order_relaxed);
         else
             server.stat_net_repl_input_bytes += nread + 1;
     }
@@ -3081,7 +3083,7 @@ int tryReadBulkPayload(connection *conn, char *buf, int usemark, ssize_t *nread_
         return C_ERR;
     }
 
-    server.bio_stat_net_repl_input_bytes += nread;
+    atomic_fetch_add_explicit(&server.bio_stat_net_repl_input_bytes, nread, memory_order_relaxed);
     *nread_out = nread;
     return C_OK;
 }

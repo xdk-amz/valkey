@@ -388,3 +388,59 @@ start_server {tags {"throttle repl external:skip valgrind:skip"}} {
         }
     }
 }
+
+# With IO threads reading, a command can be throttled before the read that carried it completes.
+start_server {tags {"throttle repl external:skip valgrind:skip"}} {
+    set replica [srv 0 client]
+    set replica_pid [srv 0 pid]
+    start_server {overrides {io-threads 4}} {
+        set primary [srv 0 client]
+        set primary_host [srv 0 host]
+        set primary_port [srv 0 port]
+
+        test {A throttled command runs once} {
+            setup_throttle_replication $primary $replica $primary_host $primary_port
+            pause_process $replica_pid
+
+            set writer [valkey_deferring_client]
+            $writer CLIENT ID
+            set wid [$writer read]
+            grow_replica_cob $primary 5000 1000
+            wait_for_condition 50 100 {
+                [throttle_rate $primary] >= 0
+            } else {
+                resume_process $replica_pid
+                fail "throttler never began queueing clients"
+            }
+            if {![wait_throttled_client $primary $writer $wid]} {
+                resume_process $replica_pid
+                fail "client was not throttled while the replica's COB was growing"
+            }
+            # Keep the throttler queue busy so the next write waits behind it.
+            for {set j 0} {$j < 5000} {incr j} {
+                $writer set nudge v
+            }
+
+            set rd [valkey_deferring_client]
+            $rd CLIENT ID
+            set rid [$rd read]
+            $rd incr counter
+            wait_for_condition 50 20 {
+                [client_throttled $primary $rid]
+            } else {
+                resume_process $replica_pid
+                fail "INCR was not throttled"
+            }
+
+            resume_process $replica_pid
+            assert_equal 1 [$rd read]
+            $rd ping
+            assert_equal PONG [$rd read]
+            assert_equal 1 [$primary get counter]
+
+            catch {$rd close}
+            catch {$writer close}
+            teardown_throttle_replication $primary $replica
+        }
+    }
+}

@@ -959,7 +959,6 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_error {WRONGTYPE Operation against a key holding the wrong kind of value} {r set foo "new_value" ifeq "some_set_value"}
     }
 
-
     test "SET with IFEQ conditional - with get" {
         r del foo
 
@@ -1243,5 +1242,111 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
         assert_equal 6 $sds_overhead
     } {} {needs:debug}
 } ; # if jemalloc
+
+    test {SETEX stores value and TTL} {
+        r del k
+        r setex k 100 helloworld
+        assert_equal helloworld [r get k]
+        assert_range [r ttl k] 90 100
+        assert_encoding embstr k
+    } {}
+
+    test {PSETEX stores value and TTL} {
+        r del k
+        r psetex k 100000 helloworld
+        assert_equal helloworld [r get k]
+        assert_range [r pttl k] 90000 100000
+    } {}
+
+    test {SETEX integer value keeps int encoding} {
+        r del k
+        r setex k 100 12345
+        assert_equal 12345 [r get k]
+        assert_encoding int k
+        assert_range [r ttl k] 90 100
+    } {}
+
+    test {SET k v EX n stores value and TTL} {
+        r del k
+        r set k helloworld ex 100
+        assert_equal helloworld [r get k]
+        assert_range [r ttl k] 90 100
+        assert_encoding embstr k
+    } {}
+
+    test {SET k v PXAT stores an absolute expiry} {
+        r del k
+        set future [expr {[clock milliseconds] + 100000}]
+        r set k valuebytes pxat $future
+        assert_equal valuebytes [r get k]
+        assert_range [r pttl k] 90000 100000
+    } {}
+
+    test {bare SET clears an existing TTL} {
+        r del k
+        r setex k 100 first
+        assert_range [r ttl k] 90 100
+        r set k second
+        assert_equal second [r get k]
+        assert_equal -1 [r ttl k]
+    } {}
+
+    test {SETEX, SET, and SET EX preserve encoding parity} {
+        foreach v [list a 12345 [string repeat x 40] [string repeat y 200]] {
+            r del ka kb kc
+            r set ka $v
+            r setex kb 100 $v
+            r set kc $v ex 100
+            set ea [r object encoding ka]
+            assert_equal $ea [r object encoding kb]
+            assert_equal $ea [r object encoding kc]
+            assert_equal [r get ka] [r get kb]
+            assert_equal [r get ka] [r get kc]
+        }
+    } {}
+
+    test {MSET 10 pairs preserves values and encodings} {
+        set keys {}
+        for {set i 0} {$i < 10} {incr i} { lappend keys msk:$i }
+        foreach k $keys { r del $k }
+        r mset msk:0 aaa msk:1 12345 msk:2 [string repeat z 40] \
+               msk:3 hello msk:4 2000000000 msk:5 [string repeat q 200] \
+               msk:6 x msk:7 42 msk:8 world msk:9 [string repeat w 10]
+        assert_equal aaa [r get msk:0]
+        assert_equal 12345 [r get msk:1]
+        assert_encoding int msk:1
+        assert_encoding embstr msk:0
+        assert_encoding embstr msk:2
+        assert_encoding int msk:4
+        assert_encoding raw msk:5
+        # parity: each MSET value encodes identically to the same value via plain SET
+        foreach k $keys {
+            r set cmp [r get $k]
+            assert_equal [r object encoding cmp] [r object encoding $k]
+        }
+    } {}
+
+    test {MSET odd arity leaves no partial state or leak} {
+        r flushdb
+        # even number of key/value tokens -> wrong arity, atomic no-op
+        assert_error "*wrong number*" {r mset lk1 lv1 lk2}
+        assert_equal 0 [r exists lk1]
+        assert_equal 0 [r exists lk2]
+        # server still healthy and serving after the rejected prebuilt command
+        assert_equal PONG [r ping]
+        r set probe ok
+        assert_equal ok [r get probe]
+    } {}
+
+    test {MSETNX aborts all writes on conflict} {
+        r flushdb
+        assert_equal 1 [r msetnx nk1 v1 nk2 22222]
+        assert_equal v1 [r get nk1]
+        assert_encoding int nk2
+        # one key already exists -> whole MSETNX aborts, no new keys created
+        assert_equal 0 [r msetnx nk2 other nk3 v3]
+        assert_equal 0 [r exists nk3]
+        assert_equal 22222 [r get nk2]
+    } {}
 
 }

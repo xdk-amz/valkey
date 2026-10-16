@@ -186,6 +186,48 @@ int rm_call_aclcheck_cmd_default_user(ValkeyModuleCtx *ctx, ValkeyModuleString *
     return res;
 }
 
+/* Authenticate the calling client as a persistent module user that HOLDS a role. The module user
+ * is kept alive in a static pointer (not freed here), so it survives a subsequent runtime ACL LOAD
+ * and remains a live, bound principal -- which is exactly what makes it a "surviving" user whose
+ * roles list ACLRemapSurvivingRoleMembers must remap/drop safely under concurrent admission reads.
+ * usage: aclcheck.auth.module.user.with.role <username> <rolename>  (the role must already exist) */
+static ValkeyModuleUser *aclcheck_persistent_user = NULL;
+int aclcheck_auth_module_user_with_role(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3) return ValkeyModule_WrongArity(ctx);
+    size_t ulen, rlen;
+    const char *uname = ValkeyModule_StringPtrLen(argv[1], &ulen);
+    const char *rname = ValkeyModule_StringPtrLen(argv[2], &rlen);
+    if (aclcheck_persistent_user == NULL) {
+        aclcheck_persistent_user = ValkeyModule_CreateModuleUser(uname);
+        ValkeyModule_SetModuleUserACL(aclcheck_persistent_user, "on");
+        ValkeyModule_SetModuleUserACL(aclcheck_persistent_user, "~h:*");
+        ValkeyModule_SetModuleUserACL(aclcheck_persistent_user, "+@read");
+        ValkeyModule_SetModuleUserACL(aclcheck_persistent_user, "+set");
+    }
+    /* assign/refresh the role via a single ACL op (routes through the COW ACLStringSetUser path) */
+    char rolerule[256];
+    snprintf(rolerule, sizeof(rolerule), "role=%.*s", (int)rlen, rname);
+    ValkeyModule_SetModuleUserACL(aclcheck_persistent_user, rolerule);
+    ValkeyModule_AuthenticateClientWithUser(ctx, aclcheck_persistent_user, NULL, NULL, NULL);
+    ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+    return VALKEYMODULE_OK;
+}
+
+/* Return the persistent module user's current ACL string (includes its role= list), so a test can
+ * verify survivor membership after ACL LOAD without ACL GETUSER (which does not list module users). */
+int aclcheck_get_module_user_acl(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    VALKEYMODULE_NOT_USED(argv);
+    VALKEYMODULE_NOT_USED(argc);
+    if (aclcheck_persistent_user == NULL) {
+        ValkeyModule_ReplyWithError(ctx, "ERR no module user");
+        return VALKEYMODULE_OK;
+    }
+    ValkeyModuleString *s = ValkeyModule_GetModuleUserACLString(aclcheck_persistent_user);
+    ValkeyModule_ReplyWithString(ctx, s);
+    ValkeyModule_FreeString(ctx, s);
+    return VALKEYMODULE_OK;
+}
+
 int rm_call_aclcheck_cmd_module_user(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     /* Create a user and authenticate */
     ValkeyModuleUser *user = ValkeyModule_CreateModuleUser("testuser1");
@@ -385,6 +427,12 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_CreateCommand(ctx,"aclcheck.rm_call.check.cmd.module.user", rm_call_aclcheck_cmd_module_user,"",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
 
+    if (ValkeyModule_CreateCommand(ctx,"aclcheck.auth.module.user.with.role", aclcheck_auth_module_user_with_role,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
+    if (ValkeyModule_CreateCommand(ctx,"aclcheck.get.module.user.acl", aclcheck_get_module_user_acl,"",0,0,0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+
     if (ValkeyModule_CreateCommand(ctx,"aclcheck.rm_call", rm_call_aclcheck,
                                   "write",0,0,0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
@@ -425,5 +473,16 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
     if (ValkeyModule_SetCommandACLCategories(test_add_new_aclcategories, "foocategory") == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     
+    return VALKEYMODULE_OK;
+}
+
+int ValkeyModule_OnUnload(ValkeyModuleCtx *ctx) {
+    VALKEYMODULE_NOT_USED(ctx);
+    /* Free the persistent role-holding module user created for the ACL LOAD race test, so
+     * LeakSanitizer does not report its ValkeyModuleUser at shutdown. */
+    if (aclcheck_persistent_user != NULL) {
+        ValkeyModule_FreeModuleUser(aclcheck_persistent_user);
+        aclcheck_persistent_user = NULL;
+    }
     return VALKEYMODULE_OK;
 }

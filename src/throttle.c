@@ -150,7 +150,8 @@ static long long throttlerTimeProc(struct aeEventLoop *eventLoop, long long id, 
             consumeOtherThrottlers(c, t);
         }
         serverAssert(c->argc > 0 && c->flag.pending_command && !c->flag.throttled);
-        queueClientForReprocessing(c); // Read handler will be installed during reprocessing.
+        unpartitionClient(c); /* throttled clients read on main; the read handler is installed during reprocessing */
+        queueClientForReprocessing(c);
     }
 
     if (listLength(t->client_queue) == 0) {
@@ -195,6 +196,12 @@ void throttle_init(void) {
     if (metrics_table == NULL) {
         metrics_table = hashtableCreate(&metricsHashtableType);
     }
+}
+
+/* True while any throttler is registered, so callers can conservatively route commands through the
+ * main path where the throttle check runs. */
+bool throttle_active(void) {
+    return throttler_list != NULL && listLength(throttler_list) > 0;
 }
 
 /* In most cases, each throttler should have its own independent metrics_name. When the same
@@ -298,6 +305,10 @@ void throttle_removeClient(client *c) {
         t->time_event_id = AE_DELETED_EVENT_ID;
         if (t->cleanup) freeThrottler(t);
     }
+}
+
+bool throttle_anyThrottlers(void) {
+    return throttler_list != NULL && listLength(throttler_list) > 0;
 }
 
 bool throttle_throttleClientIfNeeded(client *c) {

@@ -1,6 +1,8 @@
 start_server {tags {"repl network external:skip cluster:skip"} overrides {save ""}} {
     set primary [srv 0 client]
-    start_server {overrides {save "" io-threads 4 io-threads-always-active yes}} {
+    # The staged loop reads the primary link on an IO thread and drains it there (READ_FLAGS_DRAIN);
+    # this checks the path without it.
+    start_server {overrides {save "" io-threads 4 io-threads-always-active yes io-threads-fast-path no}} {
         set replica [srv 0 client]
         $replica replicaof [srv -1 host] [srv -1 port]
         wait_for_sync $replica

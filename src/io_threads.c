@@ -9,15 +9,142 @@
 #include "cluster.h"
 #include "cluster_legacy.h"
 #include "connhelpers.h"
+#include "fastpath.h"
+#include "staged_loop.h"
+#include "repl_apply.h"
+#include "phase_barrier.h"
+
+extern int ProcessingEventsWhileBlocked; /* networking.c */
+
+/* One spin-wait step; a hint to the core on x86 and arm64, a no-op elsewhere. */
+static inline void cpuRelax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#endif
+}
 #include "cluster_migrateslots.h"
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
 #include <sys/resource.h>
+#include <sys/ioctl.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
 #define IO_SPMC_QUEUE_SIZE 4096
 #define IO_SPSC_QUEUE_SIZE 4096
+#define IO_EPOLL_BATCH 64
+/* Bound response draining so main returns to the event loop under load. */
+#define IO_RESPONSE_BATCHES_PER_CALL 256
+/* Cap on partitioned read completions handled per call, for the same reason. */
+#define IO_PARTITION_COMPLETIONS_PER_CALL 4096
+
+/* io_epoll_seq lets main wait out stale references from the last epoll pass. */
+static int io_epfd[IO_THREADS_MAX_NUM];
+static _Atomic uint64_t io_epoll_seq[IO_THREADS_MAX_NUM];
+static unsigned partition_rr = 0;      /* main-thread only */
+static size_t partitioned_clients = 0; /* main-thread only */
+
+/* Worker lifecycle: main stores RUNNING, QUIESCING and STOPPING; the thread stores STOPPED as its last act. */
+typedef enum {
+    IO_WORKER_ABSENT = 0,
+    IO_WORKER_RUNNING,
+    IO_WORKER_QUIESCING, /* takes no new client or job; hands back what it owns */
+    IO_WORKER_STOPPING,  /* main saw it drained and owns nothing of it; the thread exits at its next loop boundary */
+    IO_WORKER_STOPPED,
+} ioWorkerLifecycle;
+static _Atomic int io_worker_state[IO_THREADS_MAX_NUM];
+static int io_worker_parked[IO_THREADS_MAX_NUM];       /* main only: main holds the thread's mutex */
+static int io_worker_hwm = 1;                          /* main only: 1 + highest slot holding state */
+static int io_ready_num = 1;                           /* main only: 1 + contiguous RUNNING slots; bounds activation, routing and admission */
+static int io_converging = 0;                          /* main only: live workers differ from server.io_threads_num */
+static int io_scale_base = 1;                          /* main only: worker count a failed deferred scale-up falls back to */
+static list *io_partition_clients[IO_THREADS_MAX_NUM]; /* main only: partitioned clients watched by each thread */
+static int io_debug_fail_create = 0;                   /* main only: DEBUG injects one thread creation failure for this slot */
+
+int ioThreadsReadyNum(void) {
+    return io_ready_num;
+}
+
+static inline int ioWorkerState(int tid) {
+    return atomic_load_explicit(&io_worker_state[tid], memory_order_acquire);
+}
+
+/* Outside the staged loop an idle IO thread, and main with only offloaded clients, block instead of
+ * polling. A sleeper announces it, rechecks everything it consumes, then blocks; a publisher fences
+ * after publishing and wakes a sleeper it sees announced, so one of the two always sees the other. */
+typedef struct ioSleepSlot {
+    _Alignas(CACHE_LINE_SIZE) _Atomic int sleeping;
+    int fd; /* eventfd, readable while a wake is pending; in the thread's epoll set */
+} ioSleepSlot;
+static ioSleepSlot io_sleep[IO_THREADS_MAX_NUM];
+static ioSleepSlot main_sleep = {.sleeping = 0, .fd = -1};
+static monotime main_io_work_at = 0; /* main only: last time IO results were processed */
+
+static void ioSleepDrain(ioSleepSlot *s) {
+    uint64_t v;
+    while (read(s->fd, &v, sizeof(v)) > 0) {
+    }
+}
+
+static void ioSleepSignal(ioSleepSlot *s) {
+    if (!atomic_exchange_explicit(&s->sleeping, 0, memory_order_relaxed)) return; /* another publisher woke it */
+    uint64_t one = 1;
+    ssize_t n = write(s->fd, &one, sizeof(one));
+    UNUSED(n); /* EAGAIN means a wake is already pending */
+}
+
+/* After publishing work only thread tid consumes. */
+void ioThreadWake(int tid) {
+    atomic_thread_fence(memory_order_seq_cst);
+    ioSleepSlot *s = &io_sleep[tid];
+    if (s->fd >= 0 && atomic_load_explicit(&s->sleeping, memory_order_relaxed)) ioSleepSignal(s);
+}
+
+/* After publishing work any thread may take, or before main waits for one: wakes every sleeper. */
+void ioThreadsWakeAll(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
+        ioSleepSlot *s = &io_sleep[tid];
+        if (s->fd >= 0 && atomic_load_explicit(&s->sleeping, memory_order_relaxed)) ioSleepSignal(s);
+    }
+}
+
+/* IO thread, after publishing results for main. */
+void ioThreadsWakeMain(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    if (main_sleep.fd >= 0 && atomic_load_explicit(&main_sleep.sleeping, memory_order_relaxed))
+        ioSleepSignal(&main_sleep);
+}
+
+static void mainWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(privdata);
+    UNUSED(mask);
+    ioSleepDrain(&main_sleep);
+}
+
+static void mainWakeInit(void) {
+    if (main_sleep.fd >= 0 || server.el == NULL) return;
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) return;
+    if (aeCreateFileEvent(server.el, fd, AE_READABLE, mainWakeHandler, NULL) == AE_ERR) {
+        close(fd);
+        return;
+    }
+    main_sleep.fd = fd;
+}
+
+/* Main has processed no IO result for io-threads-idle-us. */
+static int mainIOIdle(void) {
+    return main_sleep.fd >= 0 && getMonotonicUs() - main_io_work_at >= (monotime)server.io_threads_idle_us;
+}
 
 /* QoS Swim Lanes for I/O threads
  * High priority queues: reserved for critical internal communication such as
@@ -40,6 +167,19 @@ static _Thread_local mpscTicket io_thread_ticket[JOB_PRIORITY_COUNT] = {0};
 static _Thread_local list *pending_io_responses[JOB_PRIORITY_COUNT] = {NULL, NULL};
 static pthread_t io_threads[IO_THREADS_MAX_NUM] = {0};
 static pthread_mutex_t io_threads_mutex[IO_THREADS_MAX_NUM];
+
+/* The parked flag is the only record of who holds a thread's mutex. */
+static void ioWorkerPark(int tid) {
+    if (io_worker_parked[tid]) return;
+    pthread_mutex_lock(&io_threads_mutex[tid]);
+    io_worker_parked[tid] = 1;
+}
+
+static void ioWorkerUnpark(int tid) {
+    if (!io_worker_parked[tid]) return;
+    pthread_mutex_unlock(&io_threads_mutex[tid]);
+    io_worker_parked[tid] = 0;
+}
 static int cur_epoll_thread = 0;
 // Main -> IO: Shared Queue (Single Producer Multi Consumer) where all IO threads pull jobs from
 static spmcQueue io_shared_inbox[JOB_PRIORITY_COUNT] = {0};
@@ -47,6 +187,16 @@ static spmcQueue io_shared_inbox[JOB_PRIORITY_COUNT] = {0};
 static mpscQueue io_shared_outbox[JOB_PRIORITY_COUNT] = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
+/* Each IO thread publishes parsed commands and one read epilogue to its SPSC ring. */
+static spscQueue io_cmd_ring[IO_THREADS_MAX_NUM] = {0};
+/* A full command ring falls back to the per-client completion path. */
+#define IO_CMD_RING_SIZE 16384
+#define RING_CMD ((uintptr_t)1)
+#define RING_END ((uintptr_t)2)
+#define RING_TAGS ((uintptr_t)3)
+#define RING_BATCH 64
+#define JOB_BATCH_SIZE (16)
+static void handleReadJobs(client **read_jobs, int read_count);
 static size_t io_jobs_submitted;
 static _Atomic(size_t) io_jobs_finished;
 static size_t cluster_io_pending_responses;
@@ -77,6 +227,7 @@ static inline void untagJob(void *tagged_ptr, void **ptr, int *type) {
 /* Handler prototypes */
 void ioThreadReadQueryFromClient(client *c);
 void ioThreadWriteToClient(client *c);
+int ioThreadWriteClientNoSignal(client *c, int publish);
 void ioThreadFreeArgv(robj **argv);
 void ioThreadPoll(aeEventLoop *el);
 static void ioThreadAccept(client *c);
@@ -85,13 +236,650 @@ int inMainThread(void) {
     return thread_id == 0;
 }
 
+/* Full IO queues park terminal frees rather than falling back to main. */
+
+/* Main batches terminal frees into tagged slabs drained by IO threads. */
+#define FREE_SLAB_CAPACITY 1022 /* header + entries ~= one 8KB allocation */
+#define FREE_ENTRY_OBJ_BIT ((uintptr_t)1)
+
+typedef struct freeSlab {
+    size_t count;
+    void *entries[];
+} freeSlab;
+
+static freeSlab *cur_free_slab = NULL;       /* accumulating; main-thread only */
+static mstime_t cur_free_slab_ms = 0; /* server.mstime when the current slab was opened */
+static freeSlab **pending_free_slabs = NULL; /* full slabs the ring rejected */
+static size_t pending_free_slabs_len = 0;
+static size_t pending_free_slabs_cap = 0;
+
+size_t pendingMainFreesLen(void) {
+    size_t n = cur_free_slab ? cur_free_slab->count : 0;
+    for (size_t i = 0; i < pending_free_slabs_len; i++) n += pending_free_slabs[i]->count;
+    return n;
+}
+
+/* Pending-free bytes leave maxmemory pressure until physical reclamation completes. */
+static _Atomic size_t offload_pending_free_bytes = 0;
+
+/* Estimates never exceed physical frees, so maxmemory cannot under-evict. */
+static inline size_t offloadObjFreeBytes(robj *o) {
+    size_t sz = zmalloc_size(o);
+    if (o->type == OBJ_STRING && o->encoding == OBJ_ENCODING_RAW && !o->hasembval)
+        sz += sdsAllocSize(objectGetVal(o));
+    return sz;
+}
+
+static inline void offloadFreeAccountAdd(size_t bytes) {
+    atomic_fetch_add_explicit(&offload_pending_free_bytes, bytes, memory_order_relaxed);
+}
+
+static inline void offloadFreeAccountSub(size_t bytes) {
+    atomic_fetch_sub_explicit(&offload_pending_free_bytes, bytes, memory_order_relaxed);
+}
+
+/* Client eviction reclaims inline so its next pressure check sees the freed bytes. */
+static int inline_reclaim_depth = 0;
+void beginInlineReclaim(void) {
+    inline_reclaim_depth++;
+}
+void endInlineReclaim(void) {
+    serverAssert(inline_reclaim_depth > 0);
+    inline_reclaim_depth--;
+}
+
+size_t offloadPendingFreeBytes(void) {
+    return atomic_load_explicit(&offload_pending_free_bytes, memory_order_relaxed);
+}
+
+#ifdef DEBUG_NEVER_FREE_ON_MAIN
+/* A fired debug guard means a routed terminal free fell back to main. */
+static _Thread_local int never_free_armed = 0;
+void armNoMainThreadFree(void) { never_free_armed = 1; }
+void disarmNoMainThreadFree(void) { never_free_armed = 0; }
+int noMainThreadFreeArmed(void) { return never_free_armed; }
+#else
+void armNoMainThreadFree(void) {}
+void disarmNoMainThreadFree(void) {}
+int noMainThreadFreeArmed(void) { return 0; }
+#endif
+
+/* Full private inboxes park whole free slabs for the next beforeSleep pass. */
+/* Free slabs use private SPSC inboxes because the shared job tag space is full. */
+static int submitSlabJob(void *slab, int spsc_type) {
+    static unsigned slab_rr = 0;
+    if (server.active_io_threads_num <= 1) return 0;
+    int tid = 1 + (int)(slab_rr++ % (unsigned)(server.active_io_threads_num - 1));
+    if (spscIsFull(&io_private_inbox[tid])) return 0;
+    spscEnqueue(&io_private_inbox[tid], tagJob(slab, spsc_type), true);
+    io_jobs_submitted++;
+    ioThreadWake(tid);
+    return 1;
+}
+
+static void submitFreeSlab(freeSlab *slab) {
+    if (submitSlabJob(slab, JOB_SPSC_FREE_SLAB)) return;
+    if (pending_free_slabs_len == pending_free_slabs_cap) {
+        size_t newcap = pending_free_slabs_cap ? pending_free_slabs_cap * 2 : 8;
+        pending_free_slabs = zrealloc(pending_free_slabs, newcap * sizeof(freeSlab *));
+        pending_free_slabs_cap = newcap;
+    }
+    pending_free_slabs[pending_free_slabs_len++] = slab;
+}
+
+static void slabAppendFree(void *ptr, int is_obj) {
+    if (cur_free_slab == NULL) {
+        cur_free_slab = zmalloc(sizeof(freeSlab) + FREE_SLAB_CAPACITY * sizeof(void *));
+        cur_free_slab->count = 0;
+        cur_free_slab_ms = server.mstime;
+    }
+    freeSlab *s = cur_free_slab;
+    s->entries[s->count++] = (void *)((uintptr_t)ptr | (is_obj ? FREE_ENTRY_OBJ_BIT : 0));
+    if (s->count == FREE_SLAB_CAPACITY) {
+        cur_free_slab = NULL;
+        submitFreeSlab(s);
+    }
+}
+
+/* Slab publication releases client fences and IO state before tagged write/rearm work becomes visible. */
+#define SLAB_FLUSH_THRESHOLD 128
+#define WRITE_SLAB_CAPACITY SLAB_FLUSH_THRESHOLD /* a slab is flushed once it holds this many entries */
+#define SLAB_WRITE ((uint8_t)1)
+#define SLAB_REARM ((uint8_t)2)
+#define SLAB_LAZY ((uint8_t)4)   /* completion needs no response unless something went wrong */
+#define SLAB_NOTIFY ((uint8_t)8) /* set by the IO thread: this entry does need main */
+/* Tags are kept beside the clients: zmalloc guarantees only 8-byte alignment, too few spare bits for them. */
+typedef struct writeSlab {
+    size_t count;
+    client *clients[WRITE_SLAB_CAPACITY];
+    uint8_t tags[WRITE_SLAB_CAPACITY];
+} writeSlab;
+
+static writeSlab *cur_write_slab = NULL;   /* accumulating; main-thread only */
+static writeSlab *spare_write_slab = NULL; /* recycled after a round trip; main-thread only */
+
+static writeSlab *allocWriteSlab(void) {
+    writeSlab *s = spare_write_slab;
+    if (s) {
+        spare_write_slab = NULL;
+    } else {
+        s = zmalloc(sizeof(writeSlab));
+    }
+    s->count = 0;
+    return s;
+}
+
+static void recycleWriteSlab(writeSlab *s) {
+    if (spare_write_slab == NULL) {
+        spare_write_slab = s;
+    } else {
+        zfree(s);
+    }
+}
+
+static void unstageWriteClient(client *c, int lazy) {
+    c->io_write_state = CLIENT_IDLE;
+    connSetPostponeUpdateState(c->conn, 0);
+    c->write_flags = 0;
+    c->io_last_reply_block = NULL;
+    c->io_last_bufpos = 0;
+    if (!lazy) server.stat_io_writes_pending--;
+}
+
+static void unstageRearmClient(client *c) {
+    c->flag.pending_read = 0;
+    server.stat_io_reads_pending--;
+    c->io_read_state = CLIENT_IDLE;
+}
+
+/* Failed slab submission restores writes and rearms to their retry paths. */
+void flushWriteSlab(void) {
+    writeSlab *s = cur_write_slab;
+    if (s == NULL) return;
+    cur_write_slab = NULL;
+    if (s->count == 0) {
+        recycleWriteSlab(s);
+        return;
+    }
+    if (likely(submitSlabJob(s, JOB_SPSC_WRITE_SLAB))) return;
+    for (size_t i = 0; i < s->count; i++) {
+        client *c = s->clients[i];
+        if (s->tags[i] & SLAB_WRITE) {
+            unstageWriteClient(c, s->tags[i] & SLAB_LAZY);
+            putClientInPendingWriteQueue(c);
+        }
+        if (s->tags[i] & SLAB_REARM) unstageRearmClient(c);
+    }
+    recycleWriteSlab(s);
+}
+
+static void stageSlabEntry(client *c, uint8_t tag) {
+    if (cur_write_slab == NULL) cur_write_slab = allocWriteSlab();
+    writeSlab *s = cur_write_slab;
+    /* One entry preserves write-before-rearm ordering for the same client. */
+    if (s->count > 0 && s->clients[s->count - 1] == c) {
+        s->tags[s->count - 1] |= tag;
+        return;
+    }
+    s->clients[s->count] = c;
+    s->tags[s->count] = tag;
+    s->count++;
+    /* Early flush keeps IO completions concurrent with main-thread work. */
+    if (s->count >= SLAB_FLUSH_THRESHOLD) flushWriteSlab();
+}
+
+static void stageWriteClient(client *c) {
+    stageSlabEntry(c, SLAB_WRITE);
+}
+
+static int clientIsPartitionable(client *c) {
+    if (!c->conn || c->flag.fake) return 0;
+    if (!strictOffloadActive()) return 0;
+    if (server.io_threads_num < 2) return 0;
+    if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
+    if (c->flag.lua_debug || c->slot_migration_job) return 0;
+    if (getClientType(c) == CLIENT_TYPE_REPLICA || isReplicatedClient(c)) return 0;
+    return 1;
+}
+
+/* Flags that describe the command held in argv; processCommand() needs them if it runs again. */
+#define READ_FLAGS_CURRENT_COMMAND                                                                  \
+    (READ_FLAGS_PARSING_COMPLETED | READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY | READ_FLAGS_NO_KEYS | \
+     READ_FLAGS_CROSSSLOT)
+
+static void setClientReadFlagsForOffload(client *c) {
+    /* A blocked command stays in argv and re-executes after unblock with its parse-time slot outcome. */
+    int keep = c->flag.pending_command ? c->read_flags & (READ_FLAGS_NO_KEYS | READ_FLAGS_CROSSSLOT) : 0;
+    /* Commands still queued are parsed again only after they ran. */
+    c->read_flags = canParseCommand(c) && c->cmd_queue.len == 0 ? 0 : READ_FLAGS_DONT_PARSE;
+    c->read_flags |= keep;
+    c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+    c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+}
+
+/* One-shot readiness serializes IO-thread reads against main-thread command drains. */
+int tryPartitionClient(client *c) {
+    if (stagedLoopActive()) return C_ERR; /* IO threads only run staged phases */
+    if (!clientIsPartitionable(c)) return C_ERR;
+    if (io_ready_num < 2) return C_ERR;
+    int tid = 1 + (int)(partition_rr++ % (unsigned)(io_ready_num - 1));
+    if (io_epfd[tid] <= 0) return C_ERR; /* 0 is a never-initialized slot */
+    setClientReadFlagsForOffload(c);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
+    if (epoll_ctl(io_epfd[tid], EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
+        c->read_flags = 0;
+        return C_ERR;
+    }
+    c->io_tid = tid;
+    c->flag.partitioned = 1;
+    c->flag.pending_read = 1;
+    server.stat_io_reads_pending++;
+    partitioned_clients++;
+    listInitNode(&c->io_owner_node, c);
+    listLinkNodeTail(io_partition_clients[tid], &c->io_owner_node);
+    return C_OK;
+}
+
+/* Main is the only party linking partitioned clients, so it also unlinks them. */
+static void partitionRegistryRemove(client *c) {
+    listUnlinkNode(io_partition_clients[c->io_tid], &c->io_owner_node);
+    c->flag.partitioned = 0;
+    c->io_tid = 0;
+    partitioned_clients--;
+}
+
+void armPartitionedClientRead(client *c) {
+    if (!c->flag.partitioned) return;
+    if (c->flag.pending_read) return; /* armed, or a read is in flight */
+    if (c->io_read_state != CLIENT_IDLE) return;
+    if (c->flag.close_asap || c->flag.protected || c->flag.close_after_reply) return;
+    if (c->flag.unblocked) return; /* main is about to resume it and re-arms then */
+    if (!c->flag.blocked) {
+        /* Blocked clients keep reading without parsing so partial commands can complete. */
+        if (c->cmd_queue.off < c->cmd_queue.len) return; /* commands still to execute */
+        if (c->flag.pending_command) return;            /* a complete command still in argv */
+    }
+    if (server.active_io_threads_num <= 1) return;   /* threads mid-scale; clientsCron retries */
+    setClientReadFlagsForOffload(c);
+    c->flag.pending_read = 1;
+    server.stat_io_reads_pending++;
+    /* CLIENT_ARMING_IO prevents teardown before the IO thread touches the socket. */
+    c->io_read_state = CLIENT_ARMING_IO;
+    stageSlabEntry(c, SLAB_REARM);
+}
+
+/* Wait out any epoll event array that may still reference the client. */
+static void waitPartitionPass(int tid) {
+    if (tid <= 0 || io_threads[tid] == 0) return;
+    if (io_worker_parked[tid]) return; /* a parked thread is between passes */
+    int st = ioWorkerState(tid);
+    if (st != IO_WORKER_RUNNING && st != IO_WORKER_QUIESCING) return;
+    uint64_t seq = atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire);
+    while (atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire) == seq) {
+        if (io_threads[tid] == 0) break;
+        ioThreadWake(tid); /* a sleeping thread finishes its pass only when woken */
+    }
+}
+
+/* A read in flight keeps teardown asynchronous until its completion lands. */
+void partitionedClientDetach(client *c) {
+    if (!c->flag.partitioned) return;
+    int tid = c->io_tid;
+    if (io_epfd[tid] > 0 && c->conn) epoll_ctl(io_epfd[tid], EPOLL_CTL_DEL, c->conn->fd, NULL);
+    /* Publish a staged rearm before claiming the client. */
+    if (c->io_read_state == CLIENT_ARMING_IO) {
+        flushWriteSlab();
+        while (c->io_read_state == CLIENT_ARMING_IO) atomic_thread_fence(memory_order_acquire);
+    }
+    uint8_t expected = CLIENT_IDLE;
+    int claimed = __atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_CLOSING_IO, 0,
+                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    if (!claimed && expected != CLIENT_CLOSING_IO) return; /* read in flight or landed, not ours yet */
+    waitPartitionPass(tid);
+    if (c->flag.pending_read) {
+        /* Armed but no readiness ever fired: the expected completion will not come. */
+        c->flag.pending_read = 0;
+        server.stat_io_reads_pending--;
+    }
+    partitionRegistryRemove(c);
+}
+
+void unpartitionClient(client *c) {
+    if (!c->flag.partitioned) return;
+    int tid = c->io_tid;
+    if (io_epfd[tid] > 0 && c->conn) epoll_ctl(io_epfd[tid], EPOLL_CTL_DEL, c->conn->fd, NULL);
+    if (c->io_read_state == CLIENT_ARMING_IO) flushWriteSlab();
+    waitPartitionPass(tid);
+    while (c->io_read_state == CLIENT_ARMING_IO || c->io_read_state == CLIENT_PENDING_IO)
+        atomic_thread_fence(memory_order_acquire);
+    if (c->io_read_state == CLIENT_HELD_IO) c->io_read_state = CLIENT_IDLE; /* a command run under main's hold */
+    if (c->flag.pending_read && c->io_read_state == CLIENT_IDLE) {
+        c->flag.pending_read = 0;
+        server.stat_io_reads_pending--;
+    }
+    partitionRegistryRemove(c);
+    if (c->conn && !c->flag.close_asap) connSetReadHandler(c->conn, readQueryFromClient);
+}
+
+/* Moves the sockets one thread watches to a remaining thread, or to the main event loop. */
+static void unpartitionWorkerClients(int tid) {
+    list *l = io_partition_clients[tid];
+    if (!l) return;
+    while (listLength(l) > 0) {
+        client *c = listNodeValue(listFirst(l));
+        unpartitionClient(c);
+        if (c->io_read_state != CLIENT_IDLE || c->flag.pending_read || c->flag.close_asap) continue;
+        if (c->cmd_queue.off < c->cmd_queue.len || c->flag.pending_command) continue;
+        if (tryPartitionClient(c) == C_OK) connSetReadHandler(c->conn, NULL);
+    }
+}
+
+void unpartitionAllClients(void) {
+    if (partitioned_clients == 0) return;
+    for (int tid = 1; tid < io_worker_hwm; tid++) unpartitionWorkerClients(tid);
+}
+
+/* A re-arm still staged for the IO thread lands before main tries to hold the socket. */
+void partitionedClientWaitArm(client *c) {
+    if (!c->flag.partitioned || c->io_read_state != CLIENT_ARMING_IO) return;
+    flushWriteSlab();
+    while (c->io_read_state == CLIENT_ARMING_IO) atomic_thread_fence(memory_order_acquire);
+}
+
+/* Holding the socket prevents clientsCron from racing reads; release restores consumed readiness. */
+int partitionedClientHold(client *c) {
+    if (!c->flag.partitioned || !c->flag.pending_read) return 1; /* main already owns it */
+    uint8_t expected = CLIENT_IDLE;
+    return __atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_HELD_IO, 0,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+/* Returns 1 if the client's socket holds input its IO thread has not read yet. */
+int partitionedClientInputWaiting(client *c) {
+    int pending = 0;
+    return c->conn && ioctl(c->conn->fd, FIONREAD, &pending) == 0 && pending > 0;
+}
+
+void partitionedClientRelease(client *c) {
+    if (!c->flag.partitioned || c->io_read_state != CLIENT_HELD_IO) return;
+    setClientReadFlagsForOffload(c); /* commands run under the hold may have blocked it or queued more */
+    __atomic_store_n(&c->io_read_state, CLIENT_IDLE, __ATOMIC_RELEASE);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
+    if (io_epfd[c->io_tid] > 0 && c->conn) epoll_ctl(io_epfd[c->io_tid], EPOLL_CTL_MOD, c->conn->fd, &ev);
+}
+
+/* An armed partitioned client's IO thread starts a read whenever data arrives, so main reads its query
+ * buffer and parsed arguments only after this: a read in flight has finished, and no new one can start
+ * until partitionedClientRelease. Returns 1 if main took the hold. */
+int partitionedClientHoldReads(client *c) {
+    if (!c->flag.partitioned) return 0;
+    partitionedClientWaitArm(c);
+    for (;;) {
+        if (!c->flag.pending_read) return 0; /* not armed: no read can start */
+        uint8_t expected = CLIENT_IDLE;
+        if (__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_HELD_IO, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE))
+            return 1;
+        if (expected != CLIENT_PENDING_IO) return 0; /* completed, held or closing: no read starts */
+        while (c->io_read_state == CLIENT_PENDING_IO) atomic_thread_fence(memory_order_acquire);
+    }
+}
+
+/* Claims a readable partitioned client's read for the calling IO thread. An IO thread rearming the client
+ * registers its socket again before it stores IDLE, so the readiness can arrive while the client is still
+ * arming; the one-shot event does not repeat, so the claim waits for the rearm instead of dropping it. */
+int partitionedClientClaimRead(client *c) {
+    uint8_t expected = CLIENT_IDLE;
+    while (!__atomic_compare_exchange_n(&c->io_read_state, &expected, CLIENT_PENDING_IO, 0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+        if (expected != CLIENT_ARMING_IO) return 0;
+        expected = CLIENT_IDLE;
+    }
+    return 1;
+}
+
+/* One-shot readiness keeps a partitioned client idle until main rearms it. With a timeout the thread
+ * sleeps here, after announcing it; wakes arrive as its eventfd. */
+static int ioThreadPollPartition(int id, int timeout_ms) {
+    /* Empty polls back off briefly while inbox work continues. */
+    static _Thread_local monotime next_poll_at = 0;
+    if (timeout_ms == 0 && next_poll_at) {
+        if (getMonotonicUs() < next_poll_at) return 0;
+        next_poll_at = 0;
+    }
+    struct epoll_event evs[IO_EPOLL_BATCH];
+    int n = epoll_wait(io_epfd[id], evs, IO_EPOLL_BATCH, timeout_ms);
+    if (timeout_ms != 0) atomic_store_explicit(&io_sleep[id].sleeping, 0, memory_order_relaxed);
+    if (n == 0 && timeout_ms == 0 && server.io_poll_backoff_us > 0)
+        next_poll_at = getMonotonicUs() + server.io_poll_backoff_us;
+    int processed = 0;
+    for (int i = 0; i < n; i++) {
+        if (evs[i].data.ptr == &io_sleep[id]) {
+            ioSleepDrain(&io_sleep[id]);
+            continue;
+        }
+        client *c = (client *)evs[i].data.ptr;
+        if (!partitionedClientClaimRead(c)) continue;
+        ioThreadReadQueryFromClient(c);
+        processed++;
+    }
+    if (processed && spscCommit(&io_cmd_ring[id])) ioThreadsWakeMain();
+    atomic_fetch_add_explicit(&io_epoll_seq[id], 1, memory_order_release);
+    return processed;
+}
+
+/* Clean reads publish commands then RING_END; ring pressure falls back to per-client completion. */
+void ioThreadQueueReadCompletion(client *c) {
+    int id = thread_id;
+    spscQueue *q = &io_cmd_ring[id];
+    if (id <= 0 || q->buffer == NULL) {
+        sendToMainThread(c, JOB_RES_READ_CLIENT);
+        return;
+    }
+    size_t ncmd = 0;
+    if (c->nread > 0 && !(c->read_flags & (READ_FLAGS_DONT_PARSE | READ_FLAGS_QB_LIMIT_REACHED | READ_FLAGS_REPLICATED)) &&
+        !isParsingError(c) && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && c->argc > 0) {
+        ncmd = 1;
+        for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
+
+            if (!(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_PARSING_COMPLETED) &&
+                !(c->cmd_queue.cmds[i].read_flags & READ_FLAGS_ERROR_MASK))
+                break;
+            ncmd++;
+        }
+    }
+    size_t free_slots = spscFreeSlots(q);
+    if (free_slots == 0) {
+        sendToMainThread(c, JOB_RES_READ_CLIENT);
+        return;
+    }
+    if (free_slots < ncmd + 1) ncmd = 0;
+    for (size_t i = 0; i < ncmd; i++) spscEnqueue(q, (void *)((uintptr_t)c | RING_CMD), false);
+    spscEnqueue(q, (void *)((uintptr_t)c | RING_END), false);
+}
+
+static void accountRingRead(client *c) {
+    server.stat_total_reads_processed++;
+    c->last_interaction = server.unixtime;
+    c->net_input_bytes += c->nread;
+    server.stat_net_input_bytes += c->nread;
+}
+
+/* RING_END releases read ownership after every ringed command has executed. */
+static void ringReadEnd(client *c) {
+    serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
+    server.stat_io_reads_pending--;
+    server.stat_io_reads_processed++;
+    if (c->flag.close_after_reply) {
+
+        c->flag.pending_read = 0;
+        c->io_read_state = CLIENT_IDLE;
+        if (c->flag.protected) return;
+        accountRingRead(c);
+        beforeNextClient(c); /* frees a client marked close_asap, as the per-client path does */
+        return;
+    }
+
+    if (c->argc > 0 || c->nread <= 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED) ||
+        (c->read_flags & (READ_FLAGS_DONT_PARSE | READ_FLAGS_QB_LIMIT_REACHED | READ_FLAGS_ERROR_MASK))) {
+        processClientIOReadsDone(c);
+        return;
+    }
+    c->flag.pending_read = 0;
+    c->io_read_state = CLIENT_IDLE;
+    if (c->flag.protected) return;
+    accountRingRead(c);
+
+    if (!c->flag.close_asap &&
+        (c->cmd_queue.off < c->cmd_queue.len || (c->querybuf && c->qb_pos < sdslen(c->querybuf)))) {
+        if (processPendingCommandAndInputBuffer(c) != C_OK) return;
+    }
+    if (c->flag.close_asap) {
+        beforeNextClient(c); /* frees the client */
+        return;
+    }
+    c->flag.ring_epilogue = 1;
+    beforeNextClient(c);
+    c->flag.ring_epilogue = 0;
+}
+
+/* Command-ring drains stop at the prefetch budget or RING_BATCH. */
+#define RING_CHUNK 8
+static size_t ringAddChunkToPrefetch(uintptr_t *ents, size_t from, size_t to, getKeysResult *result, int *room) {
+    /* prefetch-ring-stride trades key extraction cost for cache-miss coverage. */
+    static unsigned stride_pos = 0;
+    int stride = server.prefetch_ring_stride;
+    for (size_t i = from; i < to && *room; i++) {
+        if (!(ents[i] & RING_CMD)) continue;
+        client *c = (client *)(ents[i] & ~RING_TAGS);
+        if (c->io_read_state != CLIENT_COMPLETED_IO) continue;
+        int k = c->ring_seen++;
+        if (stride > 1 && (stride_pos++ % (unsigned)stride) != 0) continue;
+        struct serverCommand *cmd;
+        robj **argv;
+        int argc, slot, flags;
+        if (c->argc > 0 && k == 0) {
+            cmd = c->parsed_cmd, argv = c->argv, argc = c->argc, slot = c->slot, flags = c->read_flags;
+        } else {
+            int idx = c->cmd_queue.off + k - (c->argc > 0 ? 1 : 0);
+            if (idx >= c->cmd_queue.len) continue;
+            parsedCommand *p = &c->cmd_queue.cmds[idx];
+            cmd = p->cmd, argv = p->argv, argc = p->argc, slot = p->slot, flags = p->read_flags;
+            p->read_flags |= READ_FLAGS_PREFETCHED;
+        }
+        if (!cmd || (flags & READ_FLAGS_BAD_ARITY)) continue;
+        *room = prefetchBatchAddCommand(cmd, argv, argc, c->db, slot, result);
+    }
+    return to;
+}
+
+static void ringPrefetchClients(uintptr_t *ents, size_t from, size_t to) {
+    for (size_t i = from; i < to; i++) {
+        client *c = (client *)(ents[i] & ~RING_TAGS);
+        valkey_prefetch(c);
+        valkey_prefetch(&c->cmd_queue);
+        valkey_prefetch((const void *)&c->io_read_state);
+    }
+}
+
+/* Thin ring backlogs wait briefly to amortize main-loop fixed costs. */
+static void ringCoalesce(void) {
+    int budget_us = server.io_ring_coalesce_us;
+    if (budget_us <= 0 || partitioned_clients == 0) return;
+    size_t backlog = 0;
+    for (int t = 1; t < io_worker_hwm; t++)
+        if (io_cmd_ring[t].buffer) backlog += spscBacklog(&io_cmd_ring[t]);
+    if (backlog == 0 || backlog >= RING_BATCH / 2) return;
+    monotime deadline = getMonotonicUs() + budget_us;
+    do {
+        for (int i = 0; i < 64; i++) cpuRelax();
+        backlog = 0;
+        for (int t = 1; t < io_worker_hwm; t++)
+            if (io_cmd_ring[t].buffer) backlog += spscBacklog(&io_cmd_ring[t]);
+        if (backlog >= RING_BATCH / 2) return;
+    } while (getMonotonicUs() < deadline);
+}
+
+/* Entries taken off a command ring and not yet run. A command run from here can start a busy script,
+ * whose event processing must still serve the entries behind it, so they are kept here, off the stack. */
+static uintptr_t ring_taken[RING_BATCH];
+static size_t ring_taken_pos = 0, ring_taken_len = 0;
+
+static int ringRunTaken(void) {
+    int ran = 0;
+    while (ring_taken_pos < ring_taken_len) {
+        uintptr_t e = ring_taken[ring_taken_pos++];
+        client *c = (client *)(e & ~RING_TAGS);
+        c->ring_seen = 0;
+        if (e & RING_CMD) {
+            ringExecuteOne(c);
+        } else {
+            ringReadEnd(c);
+        }
+        ran++;
+    }
+    ring_taken_pos = ring_taken_len = 0;
+    return ran;
+}
+
+/* Drains one thread's ring up to RING_BATCH entries; returns how many it executed. */
+static int processCommandRingOne(int t, int use_prefetch) {
+    int ran = ringRunTaken(); /* entries a busy command left behind run before newer ones */
+    uintptr_t *ents = ring_taken;
+    spscQueue *q = &io_cmd_ring[t];
+    if (q->buffer == NULL) return ran;
+    size_t n = 0;
+    if (use_prefetch) {
+        /* Prefetch client state before extracting keys from each chunk. */
+        getKeysResult result;
+        initGetKeysResult(&result);
+        int room = 1;
+        while (room && n < RING_BATCH) {
+            size_t want = RING_BATCH - n < RING_CHUNK ? RING_BATCH - n : RING_CHUNK;
+            size_t got = spscDequeueBatch(q, (void **)(ents + n), want);
+            if (got == 0) break;
+            ringPrefetchClients(ents, n, n + got);
+            ringAddChunkToPrefetch(ents, n, n + got, &result, &room);
+            n += got;
+        }
+        getKeysFreeResult(&result);
+        prefetchBatchRun();
+        prefetchBatchReset();
+    } else {
+        n = spscDequeueBatch(q, (void **)ents, RING_BATCH);
+    }
+    if (n == 0) return ran;
+    ring_taken_pos = 0;
+    ring_taken_len = n;
+    ran += ringRunTaken();
+    processClientsCommandsBatch();
+    return ran;
+}
+
+static int processCommandRing(void) {
+    int total = 0;
+    int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
+    ringCoalesce();
+    while (total < IO_PARTITION_COMPLETIONS_PER_CALL) {
+        int got_any = 0;
+        for (int t = 1; t < io_worker_hwm; t++) {
+            int n = processCommandRingOne(t, use_prefetch);
+            if (n == 0) continue;
+            got_any = 1;
+            total += n;
+        }
+        if (!got_any) break;
+    }
+    return total;
+}
+
 int getCurTid(void) {
     return thread_id;
 }
 
 void commitIOJobs(void) {
     for (int i = 1; i < server.active_io_threads_num; i++) {
-        spscCommit(&io_private_inbox[i]);
+        if (spscCommit(&io_private_inbox[i])) ioThreadWake(i);
     }
 }
 
@@ -105,19 +893,70 @@ static size_t getPendingIOResponsesCount(void) {
     return server.stat_io_writes_pending + server.stat_io_reads_pending + cluster_io_pending_responses;
 }
 
+/* The staged loop may start only when no stock IO job, response or offloaded poll is outstanding:
+ * staged workers take jobs only at a phase start, so nothing may wait on one in between. */
+int ioThreadsStagedIdle(void) {
+    return getPendingIOThreadsJobs() == 0 && getPendingIOResponsesCount() == 0 &&
+           server.io_poll_state == AE_IO_STATE_NONE && partitioned_clients == 0;
+}
+
+/* Jobs queued for staged workers that a read phase should pick up even with no ready client. */
+int ioThreadsInboxPending(void) {
+    for (int i = 1; i < io_ready_num; i++)
+        if (!spscIsEmpty(&io_private_inbox[i])) return 1;
+    return !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_HIGH]) || !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
+}
+
+/* Main: CPU mask of IO thread tid into a cpu_set_t of cpusetsize bytes; 0 on success. */
+int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize) {
+#ifdef __linux__
+    if (tid <= 0 || tid >= IO_THREADS_MAX_NUM || io_threads[tid] == 0) return -1;
+    return pthread_getaffinity_np(io_threads[tid], cpusetsize, (cpu_set_t *)cpuset) == 0 ? 0 : -1;
+#else
+    UNUSED(tid);
+    UNUSED(cpuset);
+    UNUSED(cpusetsize);
+    return -1;
+#endif
+}
+
+/* Staged workers are never parked on their mutex; every ready thread counts as active. */
+void ioThreadsStagedUnpark(void) {
+    for (int i = 1; i < io_ready_num; i++) ioWorkerUnpark(i);
+    server.active_io_threads_num = io_ready_num;
+    ioThreadsWakeAll(); /* a sleeping thread enrolls only once it wakes */
+}
+
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
  * This function must be called from the main thread. */
 void drainIOThreadsQueue(void) {
     serverAssert(inMainThread());
+    flushWriteSlab();
     commitIOJobs();
+    if (stagedLoopActive()) {
+        /* Staged workers take jobs only at a phase start. */
+        while (getPendingIOThreadsJobs()) stagedDrainWorkers();
+        return;
+    }
     while (getPendingIOThreadsJobs()) {
+        ioThreadsWakeAll(); /* the job may wait in the shared inbox for a sleeping thread */
         atomic_thread_fence(memory_order_acquire);
     }
 }
 
+/* Lazy writes reconcile only when main next depends on their state. */
+void reconcileLazyWrite(client *c) {
+    if (c->io_write_state != CLIENT_COMPLETED_IO || !(c->write_flags & WRITE_FLAGS_LAZY)) return;
+    atomic_thread_fence(memory_order_acquire);
+    server.stat_io_writes_processed++;
+    processClientIOWriteDone(c);
+}
+
 /* Returns if there is an IO operation in progress for the given client. */
 int clientHasPendingIO(client *c) {
-    return c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE;
+    /* CLOSING is the main thread's own claim on a partitioned client, not IO in flight. */
+    return (c->io_read_state != CLIENT_IDLE && c->io_read_state != CLIENT_CLOSING_IO) ||
+           c->io_write_state != CLIENT_IDLE;
 }
 
 /* Wait until the IO-thread is done with the client */
@@ -125,7 +964,22 @@ void waitForClientIO(client *c) {
     /* No need to wait if the client was not offloaded to the IO thread. */
     if (c->io_read_state == CLIENT_IDLE && c->io_write_state == CLIENT_IDLE) return;
 
-    /* Wait for read operation to complete if pending. */
+    /* A staged write only reaches an IO thread once its slab is published. */
+    if (inMainThread()) flushWriteSlab();
+
+    /* Staged workers take jobs only at a phase start: run phases until this client's IO is done. */
+    if (inMainThread() && stagedLoopActive()) {
+        commitIOJobs();
+        while (c->io_read_state == CLIENT_PENDING_IO || c->io_write_state == CLIENT_PENDING_IO) stagedDrainWorkers();
+        atomic_thread_fence(memory_order_acquire);
+        return;
+    }
+
+    /* Wait for read operation to complete if pending. A sleeping thread takes a queued job once woken. */
+    if (inMainThread() && (c->io_read_state == CLIENT_PENDING_IO || c->io_write_state == CLIENT_PENDING_IO)) {
+        commitIOJobs();
+        ioThreadsWakeAll();
+    }
     while (c->io_read_state == CLIENT_PENDING_IO) {
         atomic_thread_fence(memory_order_acquire);
     }
@@ -143,15 +997,17 @@ void IOThreadsBeforeSleep(long long current_time) {
     if (server.io_threads_num == 1) return;
     serverAssert(inMainThread());
 
+    flushWriteSlab();
     commitIOJobs();
+    ioThreadsWakeAll(); /* shared-inbox jobs queued this iteration wake a sleeping thread */
+
+    if (stagedLoopActive()) return; /* staged workers wait on the phase barrier; no park policy */
 
     if (server.io_threads_always_active) {
         /* active_all_io_threads state is for debug purposes: deactivate all threads before sleep if no pending jobs,
          * and reactivate all after sleep. We can't leave it active all the time as it will consume much CPU that will interfere with tests */
-        if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0) {
-            for (int i = 1; i < server.active_io_threads_num; i++) {
-                pthread_mutex_lock(&io_threads_mutex[i]);
-            }
+        if (server.active_io_threads_num > 1 && getPendingIOThreadsJobs() == 0 && !strictOffloadActive()) {
+            for (int i = 1; i < server.active_io_threads_num; i++) ioWorkerPark(i);
             server.active_io_threads_num = 1;
         }
     }
@@ -178,13 +1034,16 @@ void IOThreadsBeforeSleep(long long current_time) {
 void IOThreadsAfterSleep(int numevents) {
     if (server.io_threads_num == 1) return;
     serverAssert(inMainThread());
+    if (stagedLoopActive()) {
+        ioThreadsStagedUnpark();
+        return;
+    }
     /* Always Active Policy */
     if (server.io_threads_always_active) {
-        if (numevents > 0 && server.active_io_threads_num < server.io_threads_num) {
-            for (int i = server.active_io_threads_num; i < server.io_threads_num; i++) {
-                pthread_mutex_unlock(&io_threads_mutex[i]);
-            }
-            server.active_io_threads_num = server.io_threads_num;
+
+        if ((numevents > 0 || strictOffloadActive()) && server.active_io_threads_num < io_ready_num) {
+            for (int i = server.active_io_threads_num; i < io_ready_num; i++) ioWorkerUnpark(i);
+            server.active_io_threads_num = io_ready_num;
         }
         return;
     }
@@ -192,14 +1051,26 @@ void IOThreadsAfterSleep(int numevents) {
     mstime_t now = server.mstime;
     static long long last_scale_time = 0;
 
+    /* Parked threads would stall the partitioned sockets they own. */
+    if (strictOffloadActive()) {
+        if (server.active_io_threads_num < io_ready_num) {
+            for (int i = server.active_io_threads_num; i < io_ready_num; i++) ioWorkerUnpark(i);
+            server.active_io_threads_num = io_ready_num;
+            last_scale_time = now;
+        }
+        return;
+    }
+
     /* Ignition Policy */
     if (server.active_io_threads_num == 1) {
         int should_ignite = 0;
         float main_thread_active_time = (float)getInstantaneousMetric(STATS_METRIC_MAIN_THREAD_ACTIVE_TIME) / 10000.0;
         /* Ignite IO threads when main-thread active time exceeds the threshold (30%) */
         should_ignite = (main_thread_active_time > (float)IO_IGNITION_MAIN_THREAD_ACTIVE_PERCENT);
-        if (should_ignite) {
-            pthread_mutex_unlock(&io_threads_mutex[1]);
+
+        if (strictOffloadActive()) should_ignite = 1;
+        if (should_ignite && io_ready_num > 1) {
+            ioWorkerUnpark(1);
             server.active_io_threads_num++;
             last_scale_time = now;
             serverLog(LL_DEBUG, "IO threads ignition: increased to %d", server.active_io_threads_num);
@@ -229,17 +1100,17 @@ void IOThreadsAfterSleep(int numevents) {
     size_t target = active;
 
     /* Calculate Target */
-    if (avg_q_size > 1 && active < (size_t)server.io_threads_num) {
+    if (avg_q_size > 1 && active < (size_t)io_ready_num) {
         target++;
     } else if (avg_q_size == 0 && (now - last_scale_time > IO_COOLDOWN_MS)) {
-        if (target > 1) target--;
+
+        size_t min_active = strictOffloadActive() ? 2 : 1;
+        if (target > min_active) target--;
     }
 
     /* Scale Up */
     if (target > active) {
-        for (size_t i = active; i < target; i++) {
-            pthread_mutex_unlock(&io_threads_mutex[i]);
-        }
+        for (size_t i = active; i < target; i++) ioWorkerUnpark((int)i);
         last_scale_time = now;
         server.active_io_threads_num = target;
         serverLog(LL_DEBUG, "IO threads increased from %zu to %zu", active, target);
@@ -253,7 +1124,7 @@ void IOThreadsAfterSleep(int numevents) {
         /* ...or if we are dropping to 1 thread but the global queue still has work */
         if (target == 1 && (!spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_NORMAL]) || !spmcIsEmpty(&io_shared_inbox[JOB_PRIORITY_HIGH]))) return;
 
-        pthread_mutex_lock(&io_threads_mutex[tid]);
+        ioWorkerPark(tid);
         server.active_io_threads_num--;
         serverLog(LL_DEBUG, "IO threads decreased from %zu to %d", active, server.active_io_threads_num);
     }
@@ -290,6 +1161,7 @@ static void flushPendingIOResponsesList(list **pending_list, mpscQueue *outbox, 
 
         if (pushed) {
             listDelNode(*pending_list, ln);
+            ioThreadsWakeMain();
         } else {
             return;
         }
@@ -309,8 +1181,9 @@ static void flushPendingIOResponses(int blocking) {
 void cleanupThreadResources(void *dummy) {
     UNUSED(dummy);
 
-    /* Blocking flush: ensure all pending jobs are sent before thread dies */
-    flushPendingIOResponses(1);
+    /* Blocking flush: ensure all pending jobs are sent before thread dies. A process
+     * exit needs none of them and main is not draining, so it must not wait. */
+    if (!atomic_load_explicit(&io_threads_exiting, memory_order_acquire)) flushPendingIOResponses(1);
 
     /* Release response lists left when the flush stops early. */
     for (int i = 0; i < JOB_PRIORITY_COUNT; i++) {
@@ -322,6 +1195,51 @@ void cleanupThreadResources(void *dummy) {
 
     /* Free the shared query buffer */
     freeSharedQueryBuf();
+}
+
+static void ioThreadWriteSlab(writeSlab *slab) {
+    int notify = 0;
+    for (size_t j = 0; j < slab->count; j++) {
+        uint8_t e = slab->tags[j];
+        client *c = slab->clients[j];
+        /* Publish write completion only after write and rearm state. */
+        int needs_main = 0;
+        if (e & SLAB_WRITE) needs_main = ioThreadWriteClientNoSignal(c, 0);
+        if (e & SLAB_REARM) {
+            struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
+            epoll_ctl(io_epfd[c->io_tid], EPOLL_CTL_MOD, c->conn->fd, &ev);
+            atomic_thread_fence(memory_order_release);
+            c->io_read_state = CLIENT_IDLE;
+        }
+        if (e & SLAB_WRITE) {
+            atomic_thread_fence(memory_order_release);
+            c->io_write_state = CLIENT_COMPLETED_IO;
+            if (needs_main) {
+                if (e & SLAB_LAZY) slab->tags[j] = e | SLAB_NOTIFY;
+                notify = 1;
+            }
+        }
+    }
+    if (notify) {
+        sendToMainThread(slab, JOB_RES_WRITE_SLAB);
+    } else {
+        zfree(slab);
+    }
+}
+
+static void ioThreadFreeSlab(freeSlab *slab) {
+    for (size_t j = 0; j < slab->count; j++) {
+        uintptr_t e = (uintptr_t)slab->entries[j];
+        void *p = (void *)(e & ~FREE_ENTRY_OBJ_BIT);
+        if (e & FREE_ENTRY_OBJ_BIT) {
+            offloadFreeAccountSub(offloadObjFreeBytes((robj *)p));
+            decrRefCount(p);
+        } else {
+            offloadFreeAccountSub(zmalloc_size(p));
+            zfree(p);
+        }
+    }
+    zfree(slab);
 }
 
 static inline void processTaggedSPMCJob(void *tagged_job) {
@@ -337,6 +1255,7 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
         ioThreadWriteToClient((client *)data);
         break;
     case JOB_REQ_FREE_OBJ:
+        offloadFreeAccountSub(offloadObjFreeBytes((robj *)data));
         decrRefCount(data);
         break;
     case JOB_REQ_ACCEPT:
@@ -359,6 +1278,124 @@ static inline void processTaggedSPMCJob(void *tagged_job) {
     }
 }
 
+/* Drain the private and shared job inboxes; returns the number of jobs run. */
+static int ioThreadDrainInboxes(long id, void **batch_jobs) {
+    int processed = 0;
+    size_t batch_count;
+    /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
+    while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
+        for (size_t i = 0; i < batch_count; i++) {
+            void *data;
+            int type;
+            untagJob(batch_jobs[i], &data, &type);
+
+            switch (type) {
+            case JOB_SPSC_FREE_ARGV:
+                ioThreadFreeArgv((robj **)data);
+                break;
+            case JOB_SPSC_POLL:
+                ioThreadPoll((aeEventLoop *)data);
+                break;
+            case JOB_SPSC_WRITE_SLAB:
+                ioThreadWriteSlab((writeSlab *)data);
+                break;
+            case JOB_SPSC_FREE_SLAB:
+                ioThreadFreeSlab((freeSlab *)data);
+                break;
+            default:
+                serverPanic("Invalid SPSC job type: %d", type);
+            }
+        }
+        processed += batch_count;
+    }
+
+    for (int shared_n = 0; shared_n < 64; shared_n++) {
+        void *tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH]);
+        if (!tagged_job) tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL]);
+        if (!tagged_job) break;
+        processTaggedSPMCJob(tagged_job);
+        processed++;
+    }
+
+    if (processed) {
+        atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
+    }
+    return processed;
+}
+
+/* Staged loop worker: run each phase main opens until a SYNC phase or shutdown. Every phase starts
+ * by draining the job inboxes, so free offload keeps working while the thread waits on the barrier. */
+static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
+    phaseBarrier *b = stagedBarrier();
+    for (;;) {
+        int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
+        if (phase == PHASE_BARRIER_EXIT) return;
+        monotime start = getMonotonicUs();
+        ioThreadDrainInboxes(id, batch_jobs);
+        if (phase == STAGED_PHASE_READ)
+            fastpathStagedReadPhase((int)id);
+        else if (phase == STAGED_PHASE_REPLY)
+            fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_APPLY)
+            replApplyRunLane((int)id);
+        if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
+            flushPendingIOResponses(0);
+        atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
+        phaseBarrierDone(b);
+        if (phase == STAGED_PHASE_SYNC) return;
+    }
+}
+
+#define IO_SLEEP_MAX_MS 100
+
+/* Nothing the thread consumes is waiting, so only a socket event or a wake gives it work. */
+static int ioThreadMaySleep(int id) {
+    if (ioWorkerState(id) != IO_WORKER_RUNNING) return 0; /* a retiring thread keeps handing back */
+    if (stagedLoopActive()) return 0;                     /* staged workers wait at the barrier instead */
+    if (spscBacklog(&io_private_inbox[id]) > 0) return 0;
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+        if (pending_io_responses[p]) return 0;
+        if (spmcConsumerHasItem(&io_shared_inbox[p])) return 0;
+    }
+    return 1;
+}
+
+/* Blocks until a socket event, a wake or the timeout; returns the events handled. */
+static int ioThreadSleep(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    if (s->fd < 0) return 0; /* no wake channel: keep polling */
+    atomic_store_explicit(&s->sleeping, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!ioThreadMaySleep(id)) {
+        atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+        return 0;
+    }
+    if (io_epfd[id] > 0) return ioThreadPollPartition(id, IO_SLEEP_MAX_MS);
+    struct pollfd pfd = {.fd = s->fd, .events = POLLIN};
+    poll(&pfd, 1, IO_SLEEP_MAX_MS);
+    atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+    ioSleepDrain(s);
+    return 0;
+}
+
+static void ioSleepSlotInit(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+    s->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (s->fd < 0 || io_epfd[id] < 0) return;
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = s};
+    if (epoll_ctl(io_epfd[id], EPOLL_CTL_ADD, s->fd, &ev) != 0) {
+        close(s->fd);
+        s->fd = -1;
+    }
+}
+
+static void ioSleepSlotFree(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+}
+
 static void *IOThreadMain(void *myid) {
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
@@ -374,10 +1411,20 @@ static void *IOThreadMain(void *myid) {
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
+    uint64_t staged_seen = 0;
+    uint32_t staged_gen = 0;
+    monotime idle_since = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
-        size_t batch_count = 0;
+        /* A stop lands between iterations, after every dequeued job has run. */
+        if (ioWorkerState((int)id) == IO_WORKER_STOPPING) break;
+        if (ioWorkerState((int)id) == IO_WORKER_RUNNING && stagedWorkerEnrolled((int)id, &staged_seen, &staged_gen)) {
+            ioThreadStagedLoop(id, batch_jobs, &staged_seen);
+            processed = 0;
+            work_start_time = getMonotonicUs();
+            continue;
+        }
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
         if (processed != 0) {
@@ -385,44 +1432,9 @@ static void *IOThreadMain(void *myid) {
                                       work_start_time - prev_work_start_time,
                                       memory_order_relaxed);
         }
-        processed = 0;
-        /* PRIORITY 1: Drain Private SPSC Queue (Batch Processing) */
-        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch_jobs, BATCH_SIZE)) > 0) {
-            for (size_t i = 0; i < batch_count; i++) {
-                void *data;
-                int type;
-                untagJob(batch_jobs[i], &data, &type);
+        processed = ioThreadDrainInboxes(id, batch_jobs);
 
-                switch (type) {
-                case JOB_SPSC_FREE_ARGV:
-                    ioThreadFreeArgv((robj **)data);
-                    break;
-                case JOB_SPSC_POLL:
-                    ioThreadPoll((aeEventLoop *)data);
-                    break;
-                default:
-                    serverPanic("Invalid SPSC job type: %d", type);
-                }
-            }
-            processed += batch_count;
-        }
-
-        /* PRIORITY 2: Shared Global Queue (SPMC)
-         * Only checked after SPSC is drained. */
-        void *tagged_job;
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_HIGH])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
-        }
-
-        if ((tagged_job = spmcDequeue(&io_shared_inbox[JOB_PRIORITY_NORMAL])) != NULL) {
-            processTaggedSPMCJob(tagged_job);
-            processed++;
-        }
-
-        if (processed) {
-            atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
-        }
+        if (io_epfd[id] > 0) processed += ioThreadPollPartition(id, 0);
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
@@ -436,10 +1448,21 @@ static void *IOThreadMain(void *myid) {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
                 pthread_mutex_unlock(&io_threads_mutex[id]);
+                monotime now = getMonotonicUs();
+                if (idle_since == 0) {
+                    idle_since = now;
+                } else if (now - idle_since >= (monotime)server.io_threads_idle_us) {
+                    processed = ioThreadSleep((int)id);
+                    idle_since = 0;
+                    work_start_time = getMonotonicUs(); /* the sleep is not active time */
+                }
             }
+        } else {
+            idle_since = 0;
         }
     }
-    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(1);
+    atomic_store_explicit(&io_worker_state[id], IO_WORKER_STOPPED, memory_order_release);
     return NULL;
 }
 
@@ -447,16 +1470,52 @@ long long getIOThreadActiveTimeMicroseconds(int id) {
     return atomic_load_explicit(&used_active_time_io_thread[id], memory_order_relaxed);
 }
 
-static void createIOThread(int id) {
-    serverAssert(server.io_threads_num > 0);
-    serverAssert(id > 0 && id < server.io_threads_num);
+static void freeIOThreadSlot(int id) {
+    spscFree(&io_private_inbox[id]);
+    spscFree(&io_cmd_ring[id]);
+    fastpathFreeThread(id);
+    ioSleepSlotFree(id);
+    if (io_epfd[id] >= 0) {
+        close(io_epfd[id]);
+        io_epfd[id] = -1;
+    }
+    if (io_partition_clients[id]) {
+        listRelease(io_partition_clients[id]);
+        io_partition_clients[id] = NULL;
+    }
+    io_threads[id] = 0;
+    atomic_store_explicit(&io_worker_state[id], IO_WORKER_ABSENT, memory_order_release);
+    while (io_worker_hwm > 1 && ioWorkerState(io_worker_hwm - 1) == IO_WORKER_ABSENT) io_worker_hwm--;
+}
+
+/* A new thread starts parked and RUNNING; the activation policy unparks it. */
+static int createIOThread(int id) {
+    serverAssert(id > 0 && id < IO_THREADS_MAX_NUM);
+    serverAssert(ioWorkerState(id) == IO_WORKER_ABSENT);
+
+    if (io_debug_fail_create == id) {
+        io_debug_fail_create = 0;
+        serverLog(LL_WARNING, "IO thread %d: creation failure injected by DEBUG", id);
+        return C_ERR;
+    }
 
     /* Initialize the private SPSC queue for this thread */
     spscInit(&io_private_inbox[id], IO_SPSC_QUEUE_SIZE);
+    spscInit(&io_cmd_ring[id], IO_CMD_RING_SIZE);
+    fastpathInitThread(id);
+    io_partition_clients[id] = listCreate();
+
+    io_epfd[id] = epoll_create1(EPOLL_CLOEXEC);
+    if (io_epfd[id] < 0) serverLog(LL_WARNING, "IO thread %d: epoll_create1 failed (%s); no clients will be partitioned to it", id, strerror(errno));
+    ioSleepSlotInit(id);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
     pthread_mutex_lock(&io_threads_mutex[id]); /* Thread will be stopped. */
+    /* Publish a safe lifecycle state before the new thread can run. */
+    io_worker_parked[id] = 1;
+    atomic_store_explicit(&io_worker_state[id], IO_WORKER_RUNNING, memory_order_release);
+    if (id + 1 > io_worker_hwm) io_worker_hwm = id + 1;
 
     pthread_attr_t attr;
     serverInitThreadAttribute(&attr);
@@ -464,23 +1523,28 @@ static void createIOThread(int id) {
     int err = pthread_create(&tid, &attr, IOThreadMain, (void *)(long)id);
     pthread_attr_destroy(&attr);
     if (err) {
-        serverLog(LL_WARNING, "Fatal: Can't initialize IO thread, pthread_create failed with: %s", strerror(err));
-        exit(1);
+        serverLog(LL_WARNING, "Can't initialize IO thread %d, pthread_create failed with: %s", id, strerror(err));
+        pthread_mutex_unlock(&io_threads_mutex[id]);
+        io_worker_parked[id] = 0;
+        pthread_mutex_destroy(&io_threads_mutex[id]);
+        freeIOThreadSlot(id);
+        return C_ERR;
     }
     io_threads[id] = tid;
+    if (id == io_ready_num) {
+        while (io_ready_num < io_worker_hwm && ioWorkerState(io_ready_num) == IO_WORKER_RUNNING) io_ready_num++;
+    }
+    return C_OK;
 }
 
-/* Terminates the IO thread specified by id. */
+/* Terminates the IO thread specified by id. Crash path only: nothing is drained or handed back. */
 static void shutdownIOThread(int id) {
     int err;
     pthread_t tid = io_threads[id];
     if (tid == pthread_self()) return;
     if (tid == 0) return;
 
-    /* Only unlock mutex for inactive threads. Active threads are already unlocked. */
-    if (id >= server.active_io_threads_num) {
-        pthread_mutex_unlock(&io_threads_mutex[id]);
-    }
+    ioWorkerUnpark(id);
     pthread_cancel(tid);
 
     if ((err = pthread_join(tid, NULL)) != 0) {
@@ -489,94 +1553,219 @@ static void shutdownIOThread(int id) {
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
-
-    /* The joined worker's inbox may contain uncommitted JOB_SPSC_FREE_ARGV jobs. */
-    if (!server.crashed) {
-        spscCommit(&io_private_inbox[id]);
-        void *batch[BATCH_SIZE];
-        size_t batch_count;
-        size_t drained = 0;
-        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch, BATCH_SIZE)) > 0) {
-            for (size_t i = 0; i < batch_count; i++) {
-                void *data;
-                int type;
-                untagJob(batch[i], &data, &type);
-                switch (type) {
-                case JOB_SPSC_FREE_ARGV:
-                    ioThreadFreeArgv((robj **)data);
-                    break;
-                case JOB_SPSC_POLL:
-                    serverAssert(atomic_load_explicit(&io_threads_exiting, memory_order_acquire));
-                    break;
-                default:
-                    serverPanic("Invalid SPSC job type: %d", type);
-                }
-            }
-            drained += batch_count;
-        }
-        if (drained) atomic_fetch_add_explicit(&io_jobs_finished, drained, memory_order_release);
+    io_threads[id] = 0;
+    ioSleepSlotFree(id);
+    if (io_epfd[id] >= 0) {
+        close(io_epfd[id]);
+        io_epfd[id] = -1;
     }
-
-    spscFree(&io_private_inbox[id]);
 }
 
 void killIOThreads(void) {
     /* The main thread does not consume responses while joining workers. */
     atomic_store_explicit(&io_threads_exiting, 1, memory_order_release);
-    for (int j = 1; j < server.io_threads_num; j++) { /* We don't kill thread 0, which is the main thread. */
+    for (int j = 1; j < io_worker_hwm; j++) { /* We don't kill thread 0, which is the main thread. */
         shutdownIOThread(j);
     }
     server.active_io_threads_num = 1;
 }
 
-int updateIOThreads(const char **err) {
+/* Process exit: every thread stops at its next loop boundary and is joined, so no thread
+ * touches server memory while exit handlers run. Clients are not handed back. */
+void ioThreadsStopForExit(void) {
     serverAssert(inMainThread());
+    atomic_store_explicit(&io_threads_exiting, 1, memory_order_release);
+    int any = 0;
+    for (int id = 1; id < io_worker_hwm; id++) {
+        if (io_threads[id] == 0) continue;
+        int st = ioWorkerState(id);
+        if (st == IO_WORKER_RUNNING || st == IO_WORKER_QUIESCING) {
+            atomic_store_explicit(&io_worker_state[id], IO_WORKER_STOPPING, memory_order_release);
+        }
+        ioWorkerUnpark(id);
+        ioThreadWake(id);
+        any = 1;
+    }
+    if (!any) return;
+    stagedStopWorkers(); /* staged workers wait on the barrier, not on their mutex */
+    monotime deadline = getMonotonicUs() + 2000000;
+    for (int id = 1; id < io_worker_hwm; id++) {
+        if (io_threads[id] == 0) continue;
+        while (ioWorkerState(id) != IO_WORKER_STOPPED && getMonotonicUs() < deadline) cpuRelax();
+        if (ioWorkerState(id) != IO_WORKER_STOPPED) {
+            serverLog(LL_WARNING, "IO thread %d did not stop before exit", id);
+            continue;
+        }
+        pthread_t tid = io_threads[id];
+        int err = pthread_join(tid, NULL);
+        if (err) {
+            serverLog(LL_WARNING, "IO thread(tid:%lu) can not be joined: %s", (unsigned long)tid, strerror(err));
+        } else {
+            serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
+        }
+        io_threads[id] = 0;
+    }
+}
 
-    int prev_threads_num = 1;
-    for (int i = IO_THREADS_MAX_NUM - 1; i > 0; i--) {
-        if (io_threads[i]) {
-            prev_threads_num = i + 1;
+/* Retirement begins: admission and routing exclude the slot from here on; the thread keeps
+ * running so it can hand back what it owns. Idempotent. */
+static void ioWorkerRetire(int tid) {
+    if (ioWorkerState(tid) != IO_WORKER_RUNNING) return;
+    flushWriteSlab(); /* staged work goes to a thread that is still routable */
+    if (io_ready_num > tid) io_ready_num = tid;
+    if (io_ready_num > server.io_threads_num) io_ready_num = server.io_threads_num; /* every slot above retires */
+    if (server.active_io_threads_num > io_ready_num) server.active_io_threads_num = io_ready_num;
+    spscCommit(&io_private_inbox[tid]); /* the last jobs main batched for it */
+    ioWorkerUnpark(tid);
+    atomic_store_explicit(&io_worker_state[tid], IO_WORKER_QUIESCING, memory_order_release);
+    ioThreadWake(tid);
+    unpartitionWorkerClients(tid);
+}
+
+/* Preconditions for STOPPING: nothing main owns still names the thread and nothing can reach it. */
+static int ioWorkerDrained(int tid) {
+    if (listLength(io_partition_clients[tid]) > 0) return 0;
+    while (processCommandRingOne(tid, 0) > 0) { /* completions a partitioned client left behind */
+    }
+    if (spscBacklog(&io_cmd_ring[tid]) > 0) return 0;
+    if (!spscIsEmpty(&io_private_inbox[tid])) return 0;
+    /* The shared inbox is drained by whichever threads remain; the last one finishes it. */
+    if (io_ready_num <= 1 && getPendingIOThreadsJobs() > 0) return 0;
+    return 1;
+}
+
+static void ioThreadsInitShared(void) {
+    if (io_threads_initialized) return;
+    server.active_io_threads_num = 1; /* We start with threads not active. */
+    server.io_poll_state = AE_IO_STATE_NONE;
+    server.io_ae_fired_events = 0;
+    for (int i = 0; i < IO_THREADS_MAX_NUM; i++) {
+        io_epfd[i] = -1;
+        io_sleep[i].fd = -1;
+    }
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+        spmcInit(&io_shared_inbox[p], IO_SPMC_QUEUE_SIZE);
+        mpscInit(&io_shared_outbox[p], IO_MPSC_QUEUE_SIZE);
+    }
+    io_jobs_submitted = 0;
+    atomic_init(&io_jobs_finished, 0);
+    cluster_io_pending_responses = 0;
+    prefetchCommandsBatchInit();
+    mainWakeInit();
+    io_threads_initialized = 1;
+}
+
+/* One reconciliation pass of the live worker set towards server.io_threads_num: slots above the
+ * target retire top down and are destroyed once drained; slots below it are created in order,
+ * a retiring slot being recreated only after its thread is gone. Returns C_ERR when creating a
+ * thread failed; the target is then lowered to the last contiguous running slot. Teardown steps
+ * run commands left in a thread's ring, so they are for beforeSleep, not for a CONFIG SET. */
+static int ioThreadsConvergeOnce(int teardown) {
+    int target = server.io_threads_num;
+    int pending = 0;
+    int rc = C_OK;
+
+    /* Slots below the target still finish a retirement a lowered target started, or they are
+     * never freed and never recreated. */
+    for (int tid = io_worker_hwm - 1; tid >= 1; tid--) {
+        int st = ioWorkerState(tid);
+        if (st == IO_WORKER_ABSENT) continue;
+        if (tid < target && st == IO_WORKER_RUNNING) continue;
+        if (st == IO_WORKER_RUNNING) {
+            ioWorkerRetire(tid);
+            st = IO_WORKER_QUIESCING;
+        }
+        if (!teardown) {
+            pending = 1;
+            continue;
+        }
+        if (st == IO_WORKER_QUIESCING) {
+            if (ioWorkerDrained(tid)) {
+                atomic_store_explicit(&io_worker_state[tid], IO_WORKER_STOPPING, memory_order_release);
+                ioThreadWake(tid);
+            }
+            pending = 1;
+            continue;
+        }
+        if (st == IO_WORKER_STOPPING) {
+            pending = 1;
+            continue;
+        }
+        serverAssert(st == IO_WORKER_STOPPED);
+        pthread_join(io_threads[tid], NULL);
+        pthread_mutex_destroy(&io_threads_mutex[tid]);
+        serverLog(LL_NOTICE, "IO thread %d retired", tid);
+        freeIOThreadSlot(tid);
+    }
+
+    for (int tid = 1; tid < target; tid++) {
+        int st = ioWorkerState(tid);
+        if (st == IO_WORKER_RUNNING) continue;
+        if (st != IO_WORKER_ABSENT) {
+            pending = 1; /* a slot still retiring below the target is recreated once free */
+            break;
+        }
+        if (createIOThread(tid) != C_OK) {
+            /* Everything this scale-up started retires again with the lowered target. */
+            serverLog(LL_WARNING, "IO thread %d could not be created; keeping %d IO threads", tid, io_scale_base);
+            server.io_threads_num = io_scale_base;
+            rc = C_ERR;
+            pending = 1;
             break;
         }
     }
-    if (prev_threads_num == server.io_threads_num) return 1;
 
-    /* DEADLOCK PREVENTION:
-     * Check if the pending workload fits in the return queue.
-     * If the number of pending jobs is greater than the capacity of the Global MPSC queue,
-     * the worker threads might fill the queue and block. If we enter drainIOThreadsQueue
-     * in that state, we will deadlock (Main thread waits for worker, Worker waits for queue space). */
-    size_t pending = getPendingIOResponsesCount();
+    io_converging = pending;
+    return rc;
+}
 
-    /* Since pending is the sum of all in-flight read/write jobs, in the worst-case scenario where
-     * 100% of the traffic happens to be on one priority lane, that outbox will receive at most pending
-     * responses. If pending fits within each queue's capacity, neither queue can ever overflow or cause
-     * workers to block while draining*/
-    if (pending > io_shared_outbox[JOB_PRIORITY_NORMAL].queue_size ||
-        pending > io_shared_outbox[JOB_PRIORITY_HIGH].queue_size) {
-        if (err) *err = "Can't update IO threads under load, try again later";
+void ioThreadsConverge(void) {
+    if (!io_converging) return;
+    ioThreadsConvergeOnce(1);
+}
+
+int ioThreadsRunningNum(void) {
+    return io_ready_num - 1;
+}
+
+int ioThreadsRetiringNum(void) {
+    int n = 0;
+    for (int tid = 1; tid < io_worker_hwm; tid++) {
+        int st = ioWorkerState(tid);
+        if (st != IO_WORKER_ABSENT && st != IO_WORKER_RUNNING) n++;
+    }
+    return n;
+}
+
+void ioThreadsDebugFailCreate(int tid) {
+    io_debug_fail_create = tid;
+}
+
+/* CONFIG SET io-threads: the first pass runs now, so free slots start immediately and a creation
+ * failure is the command's error; retirement and deferred creation continue from beforeSleep. */
+int updateIOThreads(const char **err) {
+    serverAssert(inMainThread());
+    ioThreadsInitShared();
+    if (server.io_threads_num > io_ready_num && !io_converging) io_scale_base = io_ready_num;
+    if (server.io_threads_num != io_ready_num || io_converging) {
+        serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", io_ready_num, server.io_threads_num);
+    }
+    io_converging = 1;
+    if (ioThreadsConvergeOnce(0) != C_OK) {
+        if (err) *err = "Can't create IO threads, check the server logs";
         return 0;
     }
+    return 1;
+}
 
-    serverLog(LL_NOTICE, "Changing number of IO threads from %d to %d.", prev_threads_num, server.io_threads_num);
-    drainIOThreadsQueue();
-
-    /* Set active threads to 1, will be adjusted based on workload later. */
-    for (int i = 1; i < server.active_io_threads_num; i++) {
-        pthread_mutex_lock(&io_threads_mutex[i]);
-    }
-    server.active_io_threads_num = 1;
-
-    if (server.io_threads_num > prev_threads_num) {
-        initIOThreads(prev_threads_num);
-    } else {
-        for (int i = prev_threads_num - 1; i >= server.io_threads_num; i--) {
-            /* Unblock inactive thread. */
-            pthread_mutex_unlock(&io_threads_mutex[i]);
-            shutdownIOThread(i);
-            io_threads[i] = 0;
-        }
-    }
+/* Fast-path and strict-offload toggles: every running thread's role follows the new configuration. */
+int applyIOThreadsFastpathConfig(const char **err) {
+    UNUSED(err);
+    serverAssert(inMainThread());
+    if (!server.io_threads_strict_offload) unpartitionAllClients();
+    if (!io_threads_initialized) return 1;
+    io_converging = 1;
+    ioThreadsConvergeOnce(0);
     return 1;
 }
 
@@ -587,25 +1776,14 @@ void initIOThreads(int prev_threads_num) {
     if (server.io_threads_num == 1) return;
 
     serverAssert(server.io_threads_num <= IO_THREADS_MAX_NUM);
-
-    if (!io_threads_initialized) {
-        server.active_io_threads_num = 1; /* We start with threads not active. */
-        server.io_poll_state = AE_IO_STATE_NONE;
-        server.io_ae_fired_events = 0;
-        for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
-            spmcInit(&io_shared_inbox[p], IO_SPMC_QUEUE_SIZE);
-            mpscInit(&io_shared_outbox[p], IO_MPSC_QUEUE_SIZE);
-        }
-        io_jobs_submitted = 0;
-        atomic_init(&io_jobs_finished, 0);
-        cluster_io_pending_responses = 0;
-        prefetchCommandsBatchInit();
-        io_threads_initialized = 1;
-    }
+    ioThreadsInitShared();
 
     /* Spawn and initialize the I/O threads. */
     for (int i = prev_threads_num; i < server.io_threads_num; i++) {
-        createIOThread(i);
+        if (createIOThread(i) != C_OK) {
+            serverLog(LL_WARNING, "Fatal: Can't initialize IO thread %d", i);
+            exit(1);
+        }
     }
 }
 
@@ -657,6 +1835,20 @@ size_t testOnlyGetClusterIOPendingResponses(void) {
     return cluster_io_pending_responses;
 }
 
+/* Unit tests drive one fast-path thread inline; admission needs it ready and pollable. */
+void testOnlySetIOThreadReady(int tid, int epfd) {
+    io_epfd[tid] = epfd;
+    atomic_store_explicit(&io_worker_state[tid], IO_WORKER_RUNNING, memory_order_release);
+    if (io_worker_hwm <= tid) io_worker_hwm = tid + 1;
+    if (io_ready_num <= tid) io_ready_num = tid + 1;
+}
+
+/* Unit tests run IO-thread code on their own threads; this makes the calling thread IO thread tid. */
+void testOnlySetCurTid(int tid) {
+    thread_id = tid;
+}
+static int sendReadToIOThreads(client *c, int read_flags);
+
 /* This function attempts to offload the client's read to an I/O thread.
  * Returns C_OK if the read was offloaded, or if an I/O thread is already reading
  * or writing for this client, so the main thread must not read now.
@@ -664,6 +1856,15 @@ size_t testOnlyGetClusterIOPendingResponses(void) {
  * is full, and the main thread should read the client itself. */
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    if (stagedLoopActive()) return stagedDeferRead(c) ? C_OK : C_ERR;
+    return sendReadToIOThreads(c, 0);
+}
+
+int ioThreadsSendStagedRead(client *c) {
+    return sendReadToIOThreads(c, READ_FLAGS_DRAIN);
+}
+
+static int sendReadToIOThreads(client *c, int read_flags) {
     /* Fake/teardown clients may have no connection; never offload those. */
     if (!c->conn) return C_ERR;
     /* If IO thread is still reading, return C_OK so the main thread does not race it. */
@@ -676,8 +1877,9 @@ int trySendReadToIOThreads(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA) return C_ERR;
     /* Keep the primary link on the main thread: readQueryFromClient drains multiple
      * full reads per event before serving other clients, and the IO-thread read path
-     * does not decode the replication stream. */
-    if (c->flag.primary) return C_ERR;
+     * does not decode the replication stream. The staged loop's primary read drains the
+     * socket the same way (READ_FLAGS_DRAIN), so only a stream that needs decoding stays. */
+    if (c->flag.primary && (server.repl_stream_reader || !(read_flags & READ_FLAGS_DRAIN))) return C_ERR;
     /* With Lua debug client we may call connWrite directly in the main thread */
     if (c->flag.lua_debug) return C_ERR;
     /* For simplicity let the main-thread handle the blocked clients */
@@ -687,9 +1889,10 @@ int trySendReadToIOThreads(client *c) {
      * During this phase, the main thread writes snapshot data directly via connWrite(). */
     if (c->slot_migration_job && !clusterSlotMigrationShouldInstallWriteHandler(c)) return C_ERR;
 
-    c->read_flags = canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE;
+    c->read_flags = read_flags | (canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE);
     c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+    c->read_flags |= c->flag.primary ? READ_FLAGS_DRAIN : 0;
 
     c->io_read_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, clientConnPostponeMaskFromIOState(c));
@@ -713,7 +1916,11 @@ int trySendReadToIOThreads(client *c) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
+    if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;
+    reconcileLazyWrite(c);
+    if (c->flag.close_asap) return C_ERR;
     /* The I/O thread is already writing for this client. */
     if (c->io_write_state != CLIENT_IDLE) return C_OK;
     if (c->io_read_state == CLIENT_PENDING_IO) return C_ERR;
@@ -755,19 +1962,20 @@ int trySendWriteToIOThreads(client *c) {
     c->write_flags = is_replica ? WRITE_FLAGS_IS_REPLICA : 0;
     c->io_write_state = CLIENT_PENDING_IO;
     connSetPostponeUpdateState(c->conn, clientConnPostponeMaskFromIOState(c));
-    void *job = tagJob(c, JOB_REQ_WRITE_CLIENT);
 
     jobPriority qidx = getJobPriority(c);
-    if (unlikely(spmcEnqueue(&io_shared_inbox[qidx], job) == false)) {
-        c->io_write_state = CLIENT_IDLE;
-        connSetPostponeUpdateState(c->conn, 0);
-        c->write_flags = 0;
-        c->io_last_reply_block = NULL;
-        c->io_last_bufpos = 0;
-        return C_ERR;
+    if (qidx == JOB_PRIORITY_HIGH) {
+        void *job = tagJob(c, JOB_REQ_WRITE_CLIENT);
+        if (unlikely(spmcEnqueue(&io_shared_inbox[qidx], job) == false)) {
+            c->io_write_state = CLIENT_IDLE;
+            connSetPostponeUpdateState(c->conn, 0);
+            c->write_flags = 0;
+            c->io_last_reply_block = NULL;
+            c->io_last_bufpos = 0;
+            return C_ERR;
+        }
     }
-    /* Force new header after successful enqueue so the main thread doesn't
-     * extend a header the I/O thread is currently reading. */
+    /* Published writes cannot share a mutable payload header with main. */
     if (!is_replica) {
         if (block) {
             if (block->flag.buf_encoded) block->last_header = NULL;
@@ -779,9 +1987,22 @@ int trySendWriteToIOThreads(client *c) {
         listUnlinkNode(server.clients_pending_write, &c->clients_pending_write_node);
         c->flag.pending_write = 0;
     }
+    if (qidx == JOB_PRIORITY_HIGH) {
+        io_jobs_submitted++;
+        server.stat_io_writes_pending++;
+        return C_OK;
+    }
 
-    io_jobs_submitted++;
-    server.stat_io_writes_pending++;
+    /* Successful plain partitioned writes reconcile lazily without an outbox response. */
+    int lazy = c->flag.partitioned && !is_replica && block == NULL && !c->flag.buf_encoded &&
+               !c->flag.close_after_reply;
+    if (lazy) {
+        c->write_flags |= WRITE_FLAGS_LAZY;
+        stageSlabEntry(c, SLAB_WRITE | SLAB_LAZY);
+    } else {
+        server.stat_io_writes_pending++;
+        stageWriteClient(c);
+    }
     return C_OK;
 }
 
@@ -1027,9 +2248,7 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     return C_OK;
 }
 
-/* This function attempts to offload the free of an object to an IO thread.
- * Returns C_OK if the object was successfully offloaded to an IO thread,
- * C_ERR otherwise.*/
+/* Only sole-reference strings and object-local aggregates may free on IO threads. */
 int tryOffloadFreeObjToIOThreads(robj *obj) {
     if (server.active_io_threads_num <= 1) {
         return C_ERR;
@@ -1037,13 +2256,103 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 
     if (obj->refcount > 1) return C_ERR;
 
-    if (obj->encoding != OBJ_ENCODING_RAW || obj->type != OBJ_STRING) return C_ERR;
+    switch (obj->type) {
+    case OBJ_STRING:
+        break;
+    case OBJ_LIST:
+    case OBJ_SET:
+    case OBJ_ZSET:
+    case OBJ_HASH:
+        break;
+    default:
+        /* Module callbacks and stream teardown remain on bio. */
+        return C_ERR;
+    }
 
-    void *job = tagJob(obj, JOB_REQ_FREE_OBJ);
-    if (unlikely(spmcEnqueue(&io_shared_inbox[JOB_PRIORITY_NORMAL], job) == false)) return C_ERR;
-    io_jobs_submitted++;
+    offloadFreeAccountAdd(offloadObjFreeBytes(obj));
+    slabAppendFree(obj, 1);
     server.stat_io_freed_objects++;
     return C_OK;
+}
+
+/* Full IO queues park raw buffers; disabled IO threads return them to the caller. */
+int tryOffloadFreePtrToIOThreads(void *ptr) {
+    if (ptr == NULL) return C_OK;
+    if (inline_reclaim_depth) return C_ERR; /* emergency reclaim frees inline */
+    if (server.active_io_threads_num <= 1) return C_ERR;
+
+    offloadFreeAccountAdd(zmalloc_size(ptr));
+    slabAppendFree(ptr, 0);
+    return C_OK;
+}
+
+/* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
+void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
+    if (inline_reclaim_depth || repl_apply_in_lane) { /* emergency reclaim frees inline */
+        if (val) decrRefCount(val);
+        return;
+    }
+    if (val->refcount > 1) {
+        decrRefCount(val);
+        return;
+    }
+
+    if (server.active_io_threads_num > 1) {
+        armNoMainThreadFree();
+        if (tryOffloadFreeObjToIOThreads(val) == C_OK) {
+            disarmNoMainThreadFree();
+            return;
+        }
+        freeObjAsyncForce(val);
+        disarmNoMainThreadFree();
+        return;
+    }
+
+    /* Single-threaded mode preserves freeObjAsync behavior. */
+    freeObjAsync(key, val, dbid);
+}
+
+void drainPendingMainFrees(void) {
+    /* Partial slabs wait up to one millisecond to avoid tiny free jobs. */
+    if (cur_free_slab && (cur_free_slab->count >= 256 || cur_free_slab_ms != server.mstime)) {
+        freeSlab *s = cur_free_slab;
+        cur_free_slab = NULL;
+        submitFreeSlab(s);
+    }
+    if (pending_free_slabs_len == 0) return;
+
+    if (server.active_io_threads_num > 1) {
+        size_t kept = 0;
+        for (size_t i = 0; i < pending_free_slabs_len; i++) {
+            freeSlab *s = pending_free_slabs[i];
+            if (!submitSlabJob(s, JOB_SPSC_FREE_SLAB)) pending_free_slabs[kept++] = s;
+        }
+        pending_free_slabs_len = kept;
+        return;
+    }
+
+    for (size_t i = 0; i < pending_free_slabs_len; i++) {
+        freeSlab *s = pending_free_slabs[i];
+        for (size_t j = 0; j < s->count; j++) {
+            uintptr_t e = (uintptr_t)s->entries[j];
+            void *ptr = (void *)(e & ~FREE_ENTRY_OBJ_BIT);
+            if (e & FREE_ENTRY_OBJ_BIT) {
+                robj *o = ptr;
+                offloadFreeAccountSub(offloadObjFreeBytes(o));
+                if (o->refcount == 1) {
+                    freeObjAsyncForce(o);
+                } else {
+                    decrRefCount(o);
+                }
+            } else {
+                /* bio has no generic raw-buffer free. */
+                offloadFreeAccountSub(zmalloc_size(ptr));
+                zfree(ptr);
+            }
+        }
+        zfree(s);
+    }
+    pending_free_slabs_len = 0;
 }
 
 /* This function retrieves the results of the IO Thread poll.
@@ -1068,7 +2377,7 @@ static int getIOThreadPollResults(aeEventLoop *eventLoop) {
 }
 
 void trySendPollJobToIOThreads(void) {
-    if (server.active_io_threads_num <= 1) {
+    if (server.active_io_threads_num <= 1 || stagedLoopActive()) {
         return;
     }
 
@@ -1076,6 +2385,9 @@ void trySendPollJobToIOThreads(void) {
     if (getPendingIOResponsesCount() == 0) {
         return;
     }
+
+    /* An idle main blocks in its own poll; the threads wake it when results land. */
+    if (mainIOIdle()) return;
 
     /* If the IO thread is already processing poll events, don't send another job. */
     if (server.io_poll_state != AE_IO_STATE_NONE) {
@@ -1123,7 +2435,9 @@ void sendToMainThread(void *data, int type) {
             pending_io_responses[qidx] = listCreate();
         }
         listAddNodeTail(pending_io_responses[qidx], job);
+        return;
     }
+    ioThreadsWakeMain();
 }
 
 static void ioThreadAccept(client *c) {
@@ -1145,7 +2459,7 @@ static void ioThreadAccept(client *c) {
  *   conn - The connection object to perform the accept operation on
  */
 int trySendAcceptToIOThreads(connection *conn) {
-    if (server.io_threads_num <= 1) {
+    if (server.io_threads_num <= 1 || stagedLoopActive()) {
         return C_ERR;
     }
 
@@ -1186,8 +2500,6 @@ int trySendAcceptToIOThreads(connection *conn) {
     io_jobs_submitted++;
     return C_OK;
 }
-
-#define JOB_BATCH_SIZE (16)
 
 /* Function to handle read jobs */
 static void handleReadJobs(client **read_jobs, int read_count) {
@@ -1264,6 +2576,32 @@ static int processOutboxBatch(mpscQueue *outbox) {
                 client *c = (client *)data;
                 serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
                 write_jobs[write_count++] = c;
+            } else if (job_type == JOB_RES_WRITE_SLAB) {
+
+                if (write_count) {
+                    handleWriteJobs(write_jobs, write_count);
+                    write_count = 0;
+                }
+                writeSlab *slab = (writeSlab *)data;
+                size_t written = 0;
+                for (size_t j = 0; j < slab->count; j++) {
+                    uint8_t e = slab->tags[j];
+                    if (!(e & SLAB_WRITE)) continue;
+                    client *wc = slab->clients[j];
+                    if (e & SLAB_LAZY) {
+
+                        if (e & SLAB_NOTIFY) {
+                            serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
+                            server.stat_io_writes_processed++;
+                            processClientIOWriteDone(wc);
+                        }
+                        continue;
+                    }
+                    serverAssert(wc->io_write_state == CLIENT_COMPLETED_IO);
+                    slab->clients[written++] = wc;
+                }
+                if (written) handleWriteJobs(slab->clients, (int)written);
+                recycleWriteSlab(slab);
             } else if (job_type == JOB_RES_CLUSTER_READ) {
                 serverAssert(cluster_io_pending_responses > 0);
                 cluster_io_pending_responses--;
@@ -1290,18 +2628,23 @@ static int processOutboxBatch(mpscQueue *outbox) {
     return received_responses;
 }
 
-/* Process completed IO jobs from worker threads back onto the main thread.
- * Drains the high-priority outbox first to guarantee control-plane responsiveness,
- * and performs periodic preemptive polling of QoS events while consuming normal jobs. */
+/* Response draining is bounded so main returns to the event loop under sustained load. */
+static int io_responses_depth = 0;
+
+/* True while main is executing commands drained from IO thread responses. */
+int inIOThreadsResponses(void) {
+    return io_responses_depth > 0;
+}
+
 int processIOThreadsResponses(void) {
     /* We don't check for threads number since some threads may return jobs then deactivate/shut-down */
 
-    /* Quick check if any pending operations exist across any priority level */
     if (getPendingIOResponsesCount() == 0) return 0;
 
-    int total_processed = 0;
-    /* Loop until we consume all pending jobs */
-    while (1) {
+    io_responses_depth++;
+    int total_processed = processCommandRing();
+    int batches = 0;
+    while (batches++ < IO_RESPONSE_BATCHES_PER_CALL) {
         /* 1. Strict Priority: First, drain high-priority events (cluster bus, replication, and slot migration jobs) */
         int processed = processOutboxBatch(&io_shared_outbox[JOB_PRIORITY_HIGH]);
         if (processed == 0) {
@@ -1312,6 +2655,40 @@ int processIOThreadsResponses(void) {
         /* 3. Drain normal client events */
         processed += processOutboxBatch(&io_shared_outbox[JOB_PRIORITY_NORMAL]);
         total_processed += processed;
-        if (processed == 0) return total_processed;
+        if (processed == 0) break;
     }
+    flushWriteSlab();
+    io_responses_depth--;
+    if (total_processed) main_io_work_at = getMonotonicUs();
+    return total_processed;
+}
+
+static int ioThreadsMainHasWork(void) {
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++)
+        if (mpscConsumerHasItem(&io_shared_outbox[p])) return 1;
+    for (int tid = 1; tid < io_worker_hwm; tid++)
+        if (io_cmd_ring[tid].buffer && spscBacklog(&io_cmd_ring[tid]) > 0) return 1;
+    return 0;
+}
+
+/* beforeSleep, as the last step outside the staged loop: whether the event loop must poll without
+ * blocking because IO threads may publish results it does not watch. After io-threads-idle-us without
+ * results main announces sleep instead, and a thread that publishes for it then wakes it. */
+int ioThreadsMainMustPoll(void) {
+    if (stagedLoopActive() || getPendingIOResponsesCount() == 0) return 0;
+    if (!mainIOIdle() || server.io_poll_state != AE_IO_STATE_NONE) return 1;
+    /* Reads and writes that could not be offloaded are retried on the next pass. */
+    if (listLength(server.clients_pending_read) || listLength(server.clients_pending_write)) return 1;
+    atomic_store_explicit(&main_sleep.sleeping, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (ioThreadsMainHasWork()) {
+        atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+/* afterSleep */
+void ioThreadsMainAwake(void) {
+    atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
 }

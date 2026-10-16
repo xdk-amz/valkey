@@ -48,8 +48,10 @@
 #include "syscheck.h"
 #include "threads_mngr.h"
 #include "fmtargs.h"
+#include "dplus.h"
 #include "io_threads.h"
 #include "compression.h"
+#include "fastpath.h"
 #include "tls.h"
 #include "sds.h"
 #include "module.h"
@@ -58,6 +60,7 @@
 #include "throttle_repl.h"
 #include "util.h"
 #include "forkless.h"
+#include "staged_loop.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -678,10 +681,6 @@ hashtableType zsetHashtableType = {
     .keyCompare = zsetKeyCompare,
 };
 
-uint64_t hashtableSdsHash(const void *key) {
-    return hashtableGenHashFunction((const char *)key, sdslen((char *)key));
-}
-
 const void *hashtableObjectGetKey(const void *entry) {
     return objectGetKey(entry);
 }
@@ -982,10 +981,14 @@ long long getInstantaneousMetric(int metric) {
  *
  * The function always returns 0 as it never terminates the client. */
 int clientsCronResizeQueryBuffer(client *c) {
+    return clientResizeQueryBuffer(c, server.unixtime - c->last_interaction);
+}
+
+/* The policy itself, for whichever thread owns the client's query buffer. */
+int clientResizeQueryBuffer(client *c, time_t idletime) {
     /* If the client query buffer is NULL, it is using the shared query buffer and there is nothing to do. */
     if (c->querybuf == NULL) return 0;
     size_t querybuf_size = sdsalloc(c->querybuf);
-    time_t idletime = server.unixtime - c->last_interaction;
 
     /* Only resize the query buffer if the buffer is actually wasting at least a
      * few kbytes */
@@ -1047,10 +1050,10 @@ int clientsCronResizeOutputBuffer(client *c, mstime_t now_ms) {
 
     if (buffer_target_shrink_size >= PROTO_REPLY_MIN_BYTES && c->buf_peak < buffer_target_shrink_size) {
         new_buffer_size = max(PROTO_REPLY_MIN_BYTES, c->buf_peak + 1);
-        server.stat_reply_buffer_shrinks++;
+        __atomic_fetch_add(&server.stat_reply_buffer_shrinks, 1, __ATOMIC_RELAXED);
     } else if (buffer_target_expand_size < PROTO_REPLY_CHUNK_BYTES * 2 && c->buf_peak == c->buf_usable_size) {
         new_buffer_size = min(PROTO_REPLY_CHUNK_BYTES, buffer_target_expand_size);
-        server.stat_reply_buffer_expands++;
+        __atomic_fetch_add(&server.stat_reply_buffer_expands, 1, __ATOMIC_RELAXED);
     }
 
     serverAssertWithInfo(c, NULL, (!new_buffer_size) || (new_buffer_size >= (size_t)c->bufpos));
@@ -1158,7 +1161,6 @@ int clientEvictionAllowed(client *c) {
     int type = getClientType(c);
     return (type == CLIENT_TYPE_NORMAL || type == CLIENT_TYPE_PUBSUB);
 }
-
 
 /* This function is used to cleanup the client's previously tracked memory usage.
  * This is called during incremental client memory usage tracking as well as
@@ -1292,6 +1294,17 @@ static void clientsCron(int clients_this_cycle) {
         head = listFirst(server.clients);
         c = listNodeValue(head);
         listRotateHeadToTail(server.clients);
+        if (c->flag.fastpath) {
+            /* Crons run between staged phases, so the idle timeout may close a staged client, and its
+             * memory, unwritten replies included, is accounted for maxmemory-clients; a close takes effect
+             * after the next reply phase. Nothing else here applies to it. */
+            if (fastpathStagedOn()) {
+                if (clientsCronHandleTimeout(c, now)) continue;
+                updateClientMemUsageAndBucket(c);
+            }
+            continue;
+        }
+        reconcileLazyWrite(c); /* a silent client's last write is settled here at the latest */
         if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) continue;
 
         /* The following functions do different service checks on the client.
@@ -1299,6 +1312,22 @@ static void clientsCron(int clients_this_cycle) {
          * terminated. */
         if (clientsCronHandleTimeout(c, now)) continue;
         if (clientsCronTcpIsClosing(c)) continue;
+        if (c->flag.partitioned) {
+            /* An armed read can start as soon as the hold is released, so every check that reads the query
+             * buffer or the parsed arguments runs under it; none of them frees the client. A client whose
+             * read is starting is checked on a later pass, and so is one whose input is waiting: holding it
+             * makes its IO thread pass over the readiness and read it after clients whose input came later. */
+            if (c->flag.pending_read && partitionedClientInputWaiting(c)) continue;
+            if (!partitionedClientHold(c)) continue;
+            clientsCronResizeQueryBuffer(c);
+            clientsCronResizeOutputBuffer(c, now);
+            clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot);
+            if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
+            partitionedClientRelease(c);
+            if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
+            armPartitionedClientRead(c);
+            continue;
+        }
         if (clientsCronResizeQueryBuffer(c)) continue;
         if (clientsCronResizeOutputBuffer(c, now)) continue;
         if (clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot)) continue;
@@ -1617,12 +1646,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
         trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
                                  server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes, current_time,
                                  factor);
-        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes, current_time,
+        trackInstantaneousMetric(STATS_METRIC_NET_INPUT_REPLICATION, server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed), current_time,
                                  factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT_REPLICATION, server.stat_net_repl_output_bytes, current_time,
                                  factor);
@@ -1834,7 +1863,6 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     return 1000 / server.hz;
 }
 
-
 void blockingOperationStarts(void) {
     if (!server.blocking_op_nesting++) {
         updateCachedTime(0);
@@ -1937,6 +1965,50 @@ static bool processPendingReplStreamDecode(void) {
  *
  * The most important is freeClientsInAsyncFreeQueue but we also
  * call some other low-risk functions. */
+/* Separate engage/release thresholds keep the adaptive copy-avoidance floor from flapping. */
+#define COPY_AVOID_PRESSURE_WINDOW_US 100000 /* Resample main-thread busy % every 100ms. */
+#define COPY_AVOID_ENGAGE_PCT 75             /* Engage aggressive offload above this busy EMA. */
+#define COPY_AVOID_RELEASE_PCT 50            /* Release back to the high floor below this busy EMA. */
+#define COPY_AVOID_EMA_ALPHA_PCT 30          /* EMA smoothing factor (0.30). */
+
+static void updateCopyAvoidPressure(monotime current_time) {
+    if (server.copy_avoid_last_sample_time == 0) {
+        server.copy_avoid_last_sample_time = current_time;
+        server.copy_avoid_last_active_time = server.stat_active_time;
+        return;
+    }
+
+    monotime elapsed = current_time - server.copy_avoid_last_sample_time;
+    if (elapsed < COPY_AVOID_PRESSURE_WINDOW_US) return;
+
+    long long active_delta = server.stat_active_time - server.copy_avoid_last_active_time;
+    server.copy_avoid_last_sample_time = current_time;
+    server.copy_avoid_last_active_time = server.stat_active_time;
+    if (active_delta < 0) active_delta = 0;
+
+    double busy_pct = (double)active_delta * 100.0 / (double)elapsed;
+    if (busy_pct > 100.0) busy_pct = 100.0;
+
+    server.copy_avoid_busy_ema += ((double)COPY_AVOID_EMA_ALPHA_PCT / 100.0) * (busy_pct - server.copy_avoid_busy_ema);
+
+    if (!server.copy_avoid_engaged) {
+        if (server.copy_avoid_busy_ema > COPY_AVOID_ENGAGE_PCT) {
+            server.copy_avoid_engaged = 1;
+            server.copy_avoid_current_floor = COPY_AVOID_ADAPTIVE_FLOOR_MIN;
+        }
+    } else {
+        if (server.copy_avoid_busy_ema < COPY_AVOID_RELEASE_PCT) {
+            server.copy_avoid_engaged = 0;
+            server.copy_avoid_current_floor = server.min_string_size_copy_avoid_threaded;
+        }
+    }
+}
+
+/* Keep the main execution loop together in the compiler hot section as adjacent subsystems grow. */
+void beforeSleep(struct aeEventLoop *eventLoop) __attribute__((hot, aligned(64)));
+void call(client *c, int flags) __attribute__((hot, aligned(64)));
+int processCommand(client *c) __attribute__((hot, aligned(64)));
+
 void beforeSleep(struct aeEventLoop *eventLoop) {
     UNUSED(eventLoop);
 
@@ -1972,8 +2044,13 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
+    /* D+: fold per-IO-thread speculated command counters into stat_numcommands. */
+    dplusAggregateStats();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
+
+    /* Full IO queues leave terminal frees parked for the next beforeSleep pass. */
+    drainPendingMainFrees();
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
     int conn_pending = connTypeProcessPendingData();
@@ -2009,6 +2086,13 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     ustime_t expire_cycle_time = 0;
     if (server.active_expire_enabled && !server.import_mode && iAmPrimary()) {
         expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
+    }
+
+    /* Batched eviction runs before AOF flush and tracking assertions. */
+    if (server.maxmemory_eviction_batch && server.maxmemory && !isInsideYieldingLongCommand()) {
+        server.pre_command_oom_state = (performEvictions() == EVICT_FAIL);
+        trackingHandlePendingKeyInvalidations();
+        server.evict_check_used_memory = zmalloc_used_memory();
     }
 
     if (moduleCount()) {
@@ -2077,8 +2161,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;
 
-    /* Try to process more IO reads that are ready to be processed. */
-    if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
+    /* Try to process more IO reads that are ready to be processed. Not when a module listens to the
+     * event loop: its before-sleep event has fired, and no command runs until its after-sleep event. */
+    if (server.aof_fsync != AOF_FSYNC_ALWAYS && !moduleHasServerEventListener(VALKEYMODULE_EVENT_EVENTLOOP)) {
         int io_responses_after = processIOThreadsResponses();
         if (io_responses_after > 0) {
             server.el_iteration_active = true;
@@ -2131,10 +2216,21 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* Don't sleep at all before the next beforeSleep() if needed (e.g. a
-     * connection has pending data) */
+     * connection has pending data). Fast-path batches arrive on rings the
+     * event loop knows nothing about, so main polls while such clients exist;
+     * the staged loop waits on its poller instead. */
     aeSetDontWait(server.el, dont_sleep);
 
+    updateCopyAvoidPressure(current_time);
+
+    if (strictOffloadActive()) processDeferredReads();
+
+    ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
+
+    /* Outside the staged loop, results of offloaded clients arrive on rings the event loop does not
+     * watch, so main polls without blocking until it has been idle a while; then the IO threads wake it. */
+    if (ioThreadsMainMustPoll()) aeSetDontWait(server.el, 1);
 
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
@@ -2172,6 +2268,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         }
         /* Set the eventloop start time. */
         server.el_start = getMonotonicUs();
+        ioThreadsMainAwake();
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
@@ -2927,7 +3024,10 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
+    dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     server.stat_numcommands = 0;
+    server.stat_repl_parallel_applied = 0;
+    server.stat_repl_apply_phases = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
     server.stat_expiredfields = 0;
@@ -2962,6 +3062,8 @@ void resetServerStats(void) {
     server.stat_io_writes_processed = 0;
     server.stat_io_freed_objects = 0;
     server.stat_io_accept_offloaded = 0;
+    server.stat_io_primary_drain_jobs = 0;
+    server.stat_io_primary_drain_bytes = 0;
     server.stat_poll_processed_by_io_threads = 0;
     server.stat_total_writes_processed = 0;
     server.stat_client_qbuf_limit_disconnections = 0;
@@ -2977,26 +3079,38 @@ void resetServerStats(void) {
     server.stat_aofrw_consecutive_failures = 0;
     server.stat_net_input_bytes = 0;
     server.stat_net_output_bytes = 0;
+    server.stat_reply_copy_avoided = 0;
     server.stat_net_repl_input_bytes = 0;
-    server.bio_stat_net_repl_input_bytes = 0;
+    atomic_store_explicit(&server.bio_stat_net_repl_input_bytes, 0, memory_order_relaxed);
     server.stat_net_repl_output_bytes = 0;
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
     server.stat_unexpected_error_replies = 0;
     server.stat_total_error_replies = 0;
+    server.stat_acl_offload_hits = 0;
+    server.stat_acl_offload_punts = 0;
+    server.stat_acl_offload_quiesce_count = 0;
+    server.stat_acl_offload_quiesce_total_us = 0;
+    server.stat_acl_offload_quiesce_max_us = 0;
     server.stat_dump_payload_sanitizations = 0;
     server.aof_delayed_fsync = 0;
-    server.stat_reply_buffer_shrinks = 0;
+    __atomic_store_n(&server.stat_reply_buffer_shrinks, 0, __ATOMIC_RELAXED);
     server.stat_cluster_threaded_reads_processed = 0;
     server.stat_cluster_threaded_writes_processed = 0;
     server.stat_cluster_threaded_accepts_processed = 0;
     server.stat_cluster_io_main_thread_fallbacks = 0;
-    server.stat_reply_buffer_expands = 0;
+    __atomic_store_n(&server.stat_reply_buffer_expands, 0, __ATOMIC_RELAXED);
     memset(server.duration_stats, 0, sizeof(durationStats) * EL_DURATION_TYPE_NUM);
     server.el_cmd_cnt_max = 0;
     server.priority_el_cmd_cnt_max = 0;
     server.priority_el_cmd_cnt_prev = 0;
     server.stat_active_time = 0;
+
+    server.copy_avoid_engaged = 0;
+    server.copy_avoid_busy_ema = 0;
+    server.copy_avoid_current_floor = server.min_string_size_copy_avoid_threaded;
+    server.copy_avoid_last_sample_time = 0;
+    server.copy_avoid_last_active_time = 0;
     server.el_iteration_active = false;
     server.stat_total_prefetch_batches = 0;
     server.stat_total_prefetch_entries = 0;
@@ -3036,6 +3150,8 @@ serverDb *createDatabase(int id) {
     if (server.cluster_enabled) {
         flags |= KVSTORE_FREE_EMPTY_HASHTABLES;
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
+    } else {
+        slot_count_bits = server.keyspace_shard_bits;
     }
 
     serverDb *db = zmalloc(sizeof(serverDb));
@@ -3095,6 +3211,7 @@ void initServer(void) {
     server.replicas_waiting_psync = raxNew();
     server.wait_before_rdb_client_free = DEFAULT_WAIT_BEFORE_RDB_CLIENT_FREE;
     server.clients_pending_write = listCreate();
+    server.clients_pending_read = listCreate();
     server.clients_timeout_table = raxNew();
     server.replication_allowed = 1;
     server.replicas_eldb = -1; /* Force to emit the first SELECT command. */
@@ -3976,12 +4093,17 @@ void preventCommandReplication(client *c) {
  * The latency unit is nano-seconds.
  * If needed it will allocate the histogram memory and trim the duration to the upper/lower tracking limits*/
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist) {
+    updateCommandLatencyHistogramCount(latency_histogram, duration_hist, 1);
+}
+
+/* Records 'count' commands that took duration_hist nanoseconds each. */
+void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count) {
     if (duration_hist < LATENCY_HISTOGRAM_MIN_VALUE) duration_hist = LATENCY_HISTOGRAM_MIN_VALUE;
     if (duration_hist > LATENCY_HISTOGRAM_MAX_VALUE) duration_hist = LATENCY_HISTOGRAM_MAX_VALUE;
     if (*latency_histogram == NULL)
         hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
                  latency_histogram);
-    hdr_record_value(*latency_histogram, duration_hist);
+    hdr_record_values(*latency_histogram, duration_hist, count);
 }
 
 /* Handle the alsoPropagate() API to handle commands that want to propagate
@@ -4268,7 +4390,7 @@ void call(client *c, int flags) {
     else
         duration = ustime() - call_timer;
 
-    valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
+    valkey_commands_trace(valkey_commands, command_call, getClientConnType(c), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;
     dirty = server.dirty - dirty;
     if (dirty < 0) dirty = 0;
@@ -4407,11 +4529,6 @@ void call(client *c, int flags) {
         }
         server.stat_numcommands++;
     }
-
-    /* Record peak memory after each command and before the eviction that runs
-     * before the next command. */
-    size_t zmalloc_used = zmalloc_used_memory();
-    if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
 
     /* Do some maintenance job and cleanup */
     afterCommand(c);
@@ -4572,6 +4689,26 @@ uint64_t getCommandFlags(client *c) {
     return cmd_flags;
 }
 
+/* Prebuilt values replace only parser-owned argv entries and remain idempotent across prepare retries. */
+static inline void prebuildArgvEntry(robj **argv, int key_idx, int val_idx) {
+    if (argv[val_idx]->hasembkey) return;
+    robj *pb = tryPrebuildStringEntry(argv[val_idx], objectGetVal(argv[key_idx]));
+    if (pb) {
+        decrRefCount(argv[val_idx]);
+        argv[val_idx] = pb;
+    }
+}
+
+/* Only argc-5 SET expire forms store argv[2] unchanged and apply TTL separately. */
+static int setIsPureExpireForm(robj **argv) {
+    if (!sdsEncodedObject(argv[3])) return 0;
+    sds opt = objectGetVal(argv[3]);
+    size_t n = sdslen(opt);
+    if (n == 2) return !strncasecmp(opt, "EX", 2) || !strncasecmp(opt, "PX", 2);
+    if (n == 4) return !strncasecmp(opt, "EXAT", 4) || !strncasecmp(opt, "PXAT", 4);
+    return 0;
+}
+
 /* Helper for prepareCommand() and prepareCommandQueue(). Prepares a command for
  * processing, including looking up the command, checking arity and calculating
  * cluster slot. This should be done before calling processCommand() and can be
@@ -4590,6 +4727,20 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
                           !(*read_flags & READ_FLAGS_CROSSSLOT) &&
                           !(*read_flags & READ_FLAGS_NO_KEYS));
         *slot = clusterSlotByCommand(*cmd, argv, argc, read_flags);
+    }
+
+    /* Prebuild only request-determined values whose keys cannot change. */
+    if (*cmd && !(*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
+        serverCommandProc *p = (*cmd)->proc;
+        if (argc == 3 && (p == setCommand || p == setnxCommand || p == getsetCommand)) {
+            prebuildArgvEntry(argv, 1, 2);
+        } else if (argc == 4 && (p == setexCommand || p == psetexCommand)) {
+            prebuildArgvEntry(argv, 1, 3);
+        } else if (argc == 5 && p == setCommand && setIsPureExpireForm(argv)) {
+            prebuildArgvEntry(argv, 1, 2);
+        } else if ((p == msetCommand || p == msetnxCommand) && (argc & 1) == 1) {
+            for (int j = 1; j + 1 < argc; j += 2) prebuildArgvEntry(argv, j, j + 1);
+        }
     }
 }
 
@@ -4613,7 +4764,8 @@ void prepareCommandQueue(client *c) {
 /* Undo prepareCommand(), to allow prepareCommand() again after applying command filters. */
 void unprepareCommand(client *c) {
     c->parsed_cmd = NULL;
-    c->read_flags &= ~(READ_FLAGS_COMMAND_NOT_FOUND |
+    c->read_flags &= ~(READ_FLAGS_ACL_ALLOWED | /* acl-offload: argv may have been rewritten by a filter */
+                       READ_FLAGS_COMMAND_NOT_FOUND |
                        READ_FLAGS_BAD_ARITY |
                        READ_FLAGS_CROSSSLOT |
                        READ_FLAGS_NO_KEYS);
@@ -4746,8 +4898,8 @@ int processCommand(client *c) {
 
     /* Check if the user can run this command according to the current
      * ACLs. */
-    int acl_errpos;
-    int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
+    int acl_errpos = 0;
+    int acl_retval = aclOffloadConsume(c, &acl_errpos);
     if (acl_retval != ACL_OK) {
         addACLLogEntry(c, acl_retval, (c->flag.multi) ? ACL_LOG_CTX_MULTI : ACL_LOG_CTX_TOPLEVEL, acl_errpos, NULL,
                        NULL);
@@ -4852,11 +5004,16 @@ int processCommand(client *c) {
 
     /* Disconnect some clients if total clients memory is too high. We do this
      * before key eviction, after the last command was executed and consumed
-     * some client output buffer memory. */
-    evictClients();
-    if (server.current_client == NULL) {
-        /* If we evicted ourself then abort processing the command */
-        return C_ERR;
+     * some client output buffer memory.
+     *
+     * When maxmemory-eviction-batch is enabled, client output-buffer eviction
+     * is consolidated into beforeSleep (runs once per event loop) instead of
+     * before every command. */
+    if (!server.maxmemory_eviction_batch) {
+        evictClients();
+        if (server.current_client == NULL) {
+            return C_ERR;
+        }
     }
 
     /* Handle the maxmemory directive.
@@ -4866,17 +5023,36 @@ int processCommand(client *c) {
      * condition, to avoid mixing the propagation of scripts with the
      * propagation of DELs due to eviction. */
     if (server.maxmemory && !isInsideYieldingLongCommand()) {
-        int out_of_memory = (performEvictions() == EVICT_FAIL);
+        int out_of_memory;
 
-        /* performEvictions may evict keys, so we need flush pending tracking
-         * invalidation keys. If we don't do this, we may get an invalidation
-         * message after we perform operation on the key, where in fact this
-         * message belongs to the old value of the key before it gets evicted.*/
-        trackingHandlePendingKeyInvalidations();
+        /* Batched eviction bounds overshoot to the configured slack plus one command allocation. */
+        int run_eviction = 1;
+        if (server.maxmemory_eviction_batch) {
+            size_t used = zmalloc_used_memory();
+            size_t slack = server.maxmemory_eviction_batch_slack;
+            size_t cap = server.maxmemory / 100; /* 1% of maxmemory */
+            if (cap && cap < slack) slack = cap;
+            if (used <= server.evict_check_used_memory + slack) run_eviction = 0;
+        }
 
-        /* performEvictions may flush replica output buffers. This may result
-         * in a replica, that may be the active client, to be freed. */
-        if (server.current_client == NULL) return C_ERR;
+        if (run_eviction) {
+            out_of_memory = (performEvictions() == EVICT_FAIL);
+
+            /* performEvictions may evict keys, so we need flush pending tracking
+             * invalidation keys. If we don't do this, we may get an invalidation
+             * message after we perform operation on the key, where in fact this
+             * message belongs to the old value of the key before it gets evicted.*/
+            trackingHandlePendingKeyInvalidations();
+
+            /* performEvictions may flush replica output buffers. This may result
+             * in a replica, that may be the active client, to be freed. */
+            if (server.current_client == NULL) return C_ERR;
+
+            server.evict_check_used_memory = zmalloc_used_memory();
+        } else {
+            /* Within slack of the last check: reuse the cached OOM verdict. */
+            out_of_memory = server.pre_command_oom_state;
+        }
 
         if (out_of_memory && is_denyoom_command) {
             if (c->slot_migration_job != NULL) {
@@ -5336,7 +5512,7 @@ int finishShutdown(void) {
     moduleUnloadAllModules();
 
     /* Module unloading may drain IO queues, so stop workers afterward. */
-    killIOThreads();
+    ioThreadsStopForExit();
 
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
@@ -6538,6 +6714,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "executable:%s\r\n", server.executable ? server.executable : "",
                 "config_file:%s\r\n", server.configfile ? server.configfile : "",
                 "io_threads_active:%i\r\n", server.active_io_threads_num > 1,
+                "io_threads_running:%i\r\n", ioThreadsRunningNum(),
+                "io_threads_retiring:%i\r\n", ioThreadsRetiringNum(),
                 "availability_zone:%s\r\n", server.availability_zone));
 
         /* Conditional properties */
@@ -6857,10 +7035,19 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
                 "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
+                "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
-                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes + server.stat_net_cluster_slot_import_bytes,
+                "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
-                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + server.bio_stat_net_repl_input_bytes,
+                "reply_copy_avoided:%lld\r\n", server.stat_reply_copy_avoided,
+                "copy_avoid_mode:%s\r\n",
+                (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE ? "adaptive"
+                 : server.copy_avoid_mode == COPY_AVOID_MODE_OFF    ? "off"
+                                                                    : "static"),
+                "copy_avoid_current_floor:%d\r\n", server.copy_avoid_current_floor,
+                "main_thread_busy_pct:%d\r\n", (int)(server.copy_avoid_busy_ema + 0.5),
+                "total_net_repl_input_bytes:%lld\r\n", server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed),
                 "total_net_repl_output_bytes:%lld\r\n", server.stat_net_repl_output_bytes,
                 "total_net_cluster_slot_import_bytes:%lld\r\n", server.stat_net_cluster_slot_import_bytes,
                 "total_net_cluster_slot_export_bytes:%lld\r\n", server.stat_net_cluster_slot_export_bytes,
@@ -6880,6 +7067,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
                 "expire_cycle_cpu_milliseconds:%lld\r\n", server.stat_expire_cycle_time_used / 1000,
                 "evicted_keys:%lld\r\n", server.stat_evictedkeys,
+                "acl_offload_hits:%lld\r\n", server.stat_acl_offload_hits,
+                "acl_offload_punts:%lld\r\n", server.stat_acl_offload_punts,
+                "acl_offload_quiesce_count:%lld\r\n", server.stat_acl_offload_quiesce_count,
+                "acl_offload_quiesce_total_us:%lld\r\n", server.stat_acl_offload_quiesce_total_us,
+                "acl_offload_quiesce_max_us:%lld\r\n", server.stat_acl_offload_quiesce_max_us,
                 "evicted_clients:%lld\r\n", server.stat_evictedclients,
                 "evicted_scripts:%lld\r\n", server.stat_evictedscripts,
                 "total_eviction_exceeded_time:%lld\r\n", (server.stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
@@ -6912,12 +7104,14 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "io_threaded_freed_objects:%lld\r\n", server.stat_io_freed_objects,
                 "io_threaded_accept_processed:%lld\r\n", server.stat_io_accept_offloaded,
                 "io_threaded_poll_processed:%lld\r\n", server.stat_poll_processed_by_io_threads,
+                "io_threaded_primary_drain_jobs:%lld\r\n", server.stat_io_primary_drain_jobs,
+                "io_threaded_primary_drain_bytes:%lld\r\n", server.stat_io_primary_drain_bytes,
                 "io_threaded_total_prefetch_batches:%lld\r\n", server.stat_total_prefetch_batches,
                 "io_threaded_total_prefetch_entries:%lld\r\n", server.stat_total_prefetch_entries,
                 "client_query_buffer_limit_disconnections:%lld\r\n", server.stat_client_qbuf_limit_disconnections,
                 "client_output_buffer_limit_disconnections:%lld\r\n", server.stat_client_outbuf_limit_disconnections,
-                "reply_buffer_shrinks:%lld\r\n", server.stat_reply_buffer_shrinks,
-                "reply_buffer_expands:%lld\r\n", server.stat_reply_buffer_expands,
+                "reply_buffer_shrinks:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_shrinks, __ATOMIC_RELAXED),
+                "reply_buffer_expands:%lld\r\n", __atomic_load_n(&server.stat_reply_buffer_expands, __ATOMIC_RELAXED),
                 "eventloop_cycles:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].cnt,
                 "eventloop_duration_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_EL].sum,
                 "eventloop_duration_cmd_sum:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_CMD].sum,
@@ -7114,6 +7308,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "commandstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
+        dplusAggregateStats(); /* speculated replies already sent must count before rendering */
         info = genValkeyInfoStringCommandStats(info, server.commands);
     }
 
@@ -7201,6 +7396,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
+    if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = dplusInfoString(info);
+    }
+
     /* Get info from modules.
      * Returned when the user asked for "everything", "modules", or a specific module section.
      * We're not aware of the module section names here, and we rather avoid the search when we can.
@@ -7227,10 +7427,17 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "eventloop_priority_duration_max:%llu\r\n", server.duration_stats[EL_DURATION_TYPE_PRIORITY_EL].max,
                 "eventloop_priority_cmd_per_cycle_max:%lld\r\n", server.priority_el_cmd_cnt_max,
                 "io_threaded_reads_pending:%lld\r\n", server.stat_io_reads_pending,
-                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending));
+                "io_threaded_writes_pending:%lld\r\n", server.stat_io_writes_pending,
+                "strict_offload_deferred_reads:%lld\r\n", server.stat_strict_deferred_reads));
 
         info = forkless_catDebugInfo(info);
         info = throttleRepl_sdscatInfoDebugMetrics(info);
+    }
+
+    if (all_sections || (dictFind(section_dict, "fastpath") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = sdscat(info, "# Fastpath\r\n");
+        fastpathInfo(&info);
     }
 
     return info;
@@ -7266,9 +7473,11 @@ void monitorCommand(client *c) {
 
     initClientReplicationData(c);
 
+    unpartitionClient(c); /* monitors are main-owned */
     c->flag.replica = 1;
     c->flag.monitor = 1;
     listAddNodeTail(server.monitors, c);
+    dplusOnMonitorsChanged(); /* gate speculation off while a monitor is attached */
     addReply(c, shared.ok);
 }
 
@@ -8250,7 +8459,7 @@ __attribute__((weak)) int main(int argc, char **argv) {
     serverSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
+    stagedMain(server.el);
     aeDeleteEventLoop(server.el);
     return 0;
 }

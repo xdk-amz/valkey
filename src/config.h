@@ -430,7 +430,19 @@ void setcpuaffinity(const char *cpulist);
 #define HAVE_ARM_NEON 0
 #endif
 
-#if defined(__linux__) && defined(__GLIBC__) && (defined(__GNUC__) && (__GNUC__ > 4) || defined(__clang__) && (__clang_major__) > 5)
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define VALKEY_SANITIZER_BUILD 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define VALKEY_SANITIZER_BUILD 1
+#endif
+
+/* An ifunc resolver runs before the sanitizer runtime is initialized, so sanitizer builds skip ifunc. */
+#if defined(VALKEY_SANITIZER_BUILD)
+#define HAVE_IFUNC 0
+#elif defined(__linux__) && defined(__GLIBC__) && (defined(__GNUC__) && (__GNUC__ > 4) || defined(__clang__) && (__clang_major__) > 5)
 #define HAVE_IFUNC 1
 #else
 #define HAVE_IFUNC 0

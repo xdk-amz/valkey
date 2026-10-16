@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "repl_apply.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -37,13 +38,16 @@
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
+#include "dplus.h"
 #include "compression_stream.h"
+#include "fastpath.h"
 #include "throttle.h"
 #include "throttle_repl.h"
 #include "stat_calc.h"
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "staged_loop.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -110,8 +114,13 @@ typedef struct {
  * by bulk string references */
 typedef enum {
     PLAIN_REPLY = 0, /* plain reply */
-    BULK_STR_REF     /* bulk string references */
+    BULK_STR_REF,    /* bulk string references, serialized with $<len>\r\n...\r\n framing */
+    RAW_STR_REF      /* raw string references, serialized as bare object bytes (no framing) */
 } payloadType;
+
+static inline int isStrRefPayload(uint8_t type) {
+    return type == BULK_STR_REF || type == RAW_STR_REF;
+}
 
 /* Encoded reply buffers consist from chunks
  * Each chunk contains header followed by payload
@@ -121,9 +130,9 @@ typedef struct __attribute__((__packed__)) payloadHeader {
     size_t payload_len;       /* payload length in a reply buffer */
     size_t reply_len;         /* actual reply length for non-plain payloads */
     int16_t slot;             /* to report network-bytes-out for BULK_STR_REF chunks */
-    uint8_t payload_type : 1; /* one of payloadType */
+    uint8_t payload_type : 2; /* one of payloadType */
     uint8_t track_bytes : 1;  /* 1 if net bytes tracking was enabled when reply was added */
-    uint8_t reserved : 6;     /* reserved */
+    uint8_t reserved : 5;     /* reserved */
     /* tracked_for_cob is placed after the bitfield byte so it is byte aligned.
      * _Atomic(uint8_t) has alignment 1, this is safe inside __packed__
      * because the compiler will not insert padding before it */
@@ -142,9 +151,12 @@ static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
 static void trackBufReferences(char *buf, size_t bufpos, client *c);
 static void releaseBufReferences(char *buf, size_t bufpos, client *c);
 int postponeClientRead(client *c);
+static int clientStrictDeferEligible(client *c);
+static void deferClientRead(client *c);
 char *getClientSockname(client *c);
 static int parseClientFiltersOrReply(client *c, int index, clientFilter *filter);
 static int clientMatchesFilter(client *client, clientFilter *client_filter);
+static void clientKillVictimGone(uint64_t id);
 static int validateClientFlagFilter(sds flag_filter);
 static int validateClientCapaFilter(sds capa);
 static sds getAllFilteredClientsInfoString(clientFilter *client_filter, int hide_user_data);
@@ -152,7 +164,6 @@ static int clientMatchesFlagFilter(client *c, sds flag_filter);
 static int clientMatchesIpFilter(client *c, sds ip);
 static int clientMatchesCapaFilter(client *c, sds capa_filter);
 static void freeClientFilter(clientFilter *filter);
-static bool consumeCommandQueue(client *c);
 static int parseMultibulk(client *c,
                           int *argc,
                           robj ***argv,
@@ -224,6 +235,8 @@ void *dupClientReplyValue(void *o) {
 
 void freeClientReplyValue(void *o) {
     if (!o) return;
+    /* Reply blocks free off main while IO threads are active. */
+    if (tryOffloadFreePtrToIOThreads(o) == C_OK) return;
     zfree_with_size(o, clientReplyAllocSize((clientReplyBlock *)o));
 }
 
@@ -257,10 +270,23 @@ static void clientSetDefaultAuth(client *c) {
  * it will also set the ever_authenticated flag on the client in order to avoid low level
  * limiting of the client output buffer.*/
 void clientSetUser(client *c, user *u, int authenticated) {
+    /* acl-offload: rebinding a fast-path client to a different user can leave a verdict
+     * that was tagged under the old binding waiting on an in-flight entry. Main must not
+     * read IO-owned pending state to detect it, so bump conservatively on any real user
+     * change of a fast-path client; the client's own AUTH/HELLO never reaches here as a
+     * fast-path client (authRequired clients are ineligible). Rare. */
+    if (c->flag.fastpath && c->user != u) aclOffloadBumpEpoch();
+    /* From here on an IO thread may read u's rule set (and its roles'). Record it once;
+     * the guard keys off USER_FLAG_BOUND. Written only on the first bind so steady-state
+     * binds never dirty the cache line IO threads read. */
+    if (u) aclMarkUserBound(u);
     c->user = u;
     c->flag.authenticated = authenticated;
     if (authenticated)
         c->flag.ever_authenticated = authenticated;
+    /* D+ speculation ACL gate follows auth state (AUTH/HELLO/RESET/module
+     * auth/deluser-kick all funnel through here). Main thread only. */
+    dplusRecomputeSpecAclOk(c);
 }
 
 static int clientEverAuthenticated(client *c) {
@@ -300,7 +326,8 @@ static int shouldDeferPushMessage(client *c) {
  * Copy avoidance can be allowed only for regular Valkey clients
  * that use _writeToClient handler to write replies to client connection */
 static int isCopyAvoidPreferred(client *c, robj *obj) {
-    if (c->flag.fake || isDeferredReplyEnabled(c)) return 0;
+    if (server.copy_avoid_mode == COPY_AVOID_MODE_OFF) return 0;
+    if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
@@ -310,6 +337,12 @@ static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (obj) {
         if (obj->encoding != OBJ_ENCODING_RAW) return 0;
         if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
+    }
+
+    if (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE) {
+        /* NULL asks whether plain reply buffers may carry references. */
+        if (!obj) return server.copy_avoid_engaged;
+        return sdslen(objectGetVal(obj)) >= (size_t)server.copy_avoid_current_floor;
     }
 
     /* Copy avoidance is preferred for any string size starting certain number of I/O threads  */
@@ -404,6 +437,10 @@ client *createClient(connection *conn) {
     c->mstate = NULL;
     c->woff = 0;
     c->peerid = NULL;
+    c->origin = NULL;
+    c->control = NULL;
+    memset(&c->fp_peer, 0, sizeof(c->fp_peer));
+    memset(&c->fp_local, 0, sizeof(c->fp_local));
     c->sockname = NULL;
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
@@ -413,6 +450,7 @@ client *createClient(connection *conn) {
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
     listInitNode(&c->clients_pending_write_node, c);
+    listInitNode(&c->clients_pending_read_node, c);
     c->mem_usage_bucket = NULL;
     c->mem_usage_bucket_node = NULL;
     if (conn) linkClient(c);
@@ -427,6 +465,8 @@ client *createClient(connection *conn) {
     c->io_last_written.buf = NULL;
     c->io_last_written.bufpos = 0;
     c->io_last_written.data_len = 0;
+    c->io_tid = 0;
+    c->ring_seen = 0;
     return c;
 }
 
@@ -495,8 +535,9 @@ void putClientInPendingWriteQueue(client *c) {
  * data should be appended to the output buffers. */
 int prepareClientToWrite(client *c) {
     /* If it's the Lua client we always return ok without installing any
-     * handler since there is no socket at all. */
-    if (c->flag.script || c->flag.module) return C_OK;
+     * handler since there is no socket at all. The fast-path executor client
+     * has no socket either: its replies land in a batch arena. */
+    if (c->flag.script || c->flag.module || c->flag.executor) return C_OK;
 
     /* If CLIENT_CLOSE_ASAP flag is set, we need not write anything. */
     if (c->flag.close_asap) return C_ERR;
@@ -515,9 +556,20 @@ int prepareClientToWrite(client *c) {
     if (c->flag.fake && c->id != CLIENT_ID_CACHED_RESPONSE) return C_ERR;
     serverAssert(c->conn);
 
+    if (c->io_write_state == CLIENT_COMPLETED_IO) {
+        reconcileLazyWrite(c);
+        if (c->flag.close_asap) return C_ERR;
+    }
+
     /* Schedule the client to write the output buffers to the socket, unless
-     * it should already be setup to do so (it has already pending data). */
-    if (!clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
+     * it should already be setup to do so (it has already pending data).
+     * A partitioned client whose read is being drained from the command ring
+     * is skipped: its read epilogue stages the write, so the list link and
+     * unlink would be pure overhead. Not with appendfsync always, where the
+     * epilogue leaves the write to beforeSleep, after the fsync. */
+    if (!clientHasPendingReplies(c) && !(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO &&
+                                         server.aof_fsync != AOF_FSYNC_ALWAYS))
+        putClientInPendingWriteQueue(c);
 
     if (!isDeferredReplyEnabled(c)) c->flag.buffered_reply = 1;
     /* Authorize the caller to queue in the output buffer of this client. */
@@ -599,8 +651,7 @@ static size_t upsertPayloadHeader(char *buf,
                                   int slot,
                                   int track_bytes,
                                   size_t available) {
-    /* Enforce min len for BULK_STR_REF chunks as whole pointers must be written to the buffer */
-    size_t min_len = (type == BULK_STR_REF ? len : 1);
+    size_t min_len = (isStrRefPayload(type) ? len : 1);
     if (min_len > available) return 0;
     size_t allowed_len = min(available, len);
 
@@ -673,24 +724,20 @@ static size_t _addReplyToBuffer(client *c, const char *s, size_t len) {
     return _addReplyPayloadToBuffer(c, s, len, PLAIN_REPLY);
 }
 
-/* Adds bulk string reference (i.e. pointer to object and pointer to string itself) to static buffer
- * Returns non-zero value if succeeded to add */
-static size_t _addBulkStrRefToBuffer(client *c, const void *payload, size_t len) {
+static size_t _addBulkStrRefToBuffer(client *c, const void *payload, size_t len, uint8_t payload_type) {
     if (!c->flag.buf_encoded) {
         /* If buffer is plain and not empty then can't add bulk string reference to it */
         if (c->bufpos) return 0;
         c->flag.buf_encoded = 1;
     }
-    return _addReplyPayloadToBuffer(c, payload, len, BULK_STR_REF);
+    return _addReplyPayloadToBuffer(c, payload, len, payload_type);
 }
 
-/* Adds the payload to the reply linked list.
- * Note: some edits to this function need to be relayed to AddReplyFromClient. */
 static void _addReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
     listNode *ln = listLast(reply_list);
     clientReplyBlock *tail = ln ? listNodeValue(ln) : NULL;
     /* Determine if encoded buffer is required */
-    int encoded = payload_type == BULK_STR_REF || isCopyAvoidPreferred(c, NULL);
+    int encoded = isStrRefPayload(payload_type) || isCopyAvoidPreferred(c, NULL);
 
     /* Note that 'tail' may be NULL even if we have a tail node, because when
      * addReplyDeferredLen() is used, it sets a dummy node to NULL just
@@ -751,9 +798,8 @@ void _addReplyProtoToList(client *c, list *reply_list, const char *s, size_t len
     _addReplyPayloadToList(c, reply_list, s, len, PLAIN_REPLY);
 }
 
-/* Adds bulk string reference (i.e. pointer to object and pointer to string itself) to reply list */
-static void _addBulkStrRefToToList(client *c, const void *payload, size_t len) {
-    _addReplyPayloadToList(c, c->reply, payload, len, BULK_STR_REF);
+static void _addStrRefToList(client *c, const void *payload, size_t len, uint8_t payload_type) {
+    _addReplyPayloadToList(c, c->reply, payload, len, payload_type);
 }
 
 void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
@@ -800,20 +846,20 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     }
 }
 
-/* Increment reference to object and add pointer to object and
- * pointer to string itself to current reply buffer */
-static void _addBulkStrRefToBufferOrList(client *c, robj *obj) {
+/* payload_type selects RESP-framed or raw object bytes. */
+static void _addStrRefToBufferOrList(client *c, robj *obj, uint8_t payload_type) {
     if (c->flag.close_after_reply) return;
 
     /* Refcount will be decremented in write completion handler by the main thread */
     incrRefCount(obj);
+    server.stat_reply_copy_avoided++;
 
     bulkStrRef str_ref = {.obj = obj, .str = objectGetVal(obj)};
-    if (!_addBulkStrRefToBuffer(c, (void *)&str_ref, sizeof(str_ref))) {
+    if (!_addBulkStrRefToBuffer(c, (void *)&str_ref, sizeof(str_ref), payload_type)) {
         /* Content spilled to reply list. Clear c->last_header since
          * it points into c->buf and should not be reused. */
         c->last_header = NULL;
-        _addBulkStrRefToToList(c, (void *)&str_ref, sizeof(str_ref));
+        _addStrRefToList(c, (void *)&str_ref, sizeof(str_ref), payload_type);
     }
 }
 
@@ -827,7 +873,13 @@ void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
     if (sdsEncodedObject(obj)) {
-        _addReplyToBufferOrList(c, objectGetVal(obj), sdslen(objectGetVal(obj)));
+        if (isCopyAvoidPreferred(c, obj)) {
+            _addStrRefToBufferOrList(c, obj, RAW_STR_REF);
+            if (server.commandlog[COMMANDLOG_TYPE_LARGE_REPLY].threshold != -1)
+                c->net_output_bytes_curr_cmd += sdslen(objectGetVal(obj));
+        } else {
+            _addReplyToBufferOrList(c, objectGetVal(obj), sdslen(objectGetVal(obj)));
+        }
     } else if (obj->encoding == OBJ_ENCODING_INT) {
         /* For integer encoded strings we just convert it into a string
          * using our optimized function, and attach the resulting string
@@ -1524,7 +1576,7 @@ static int tryAvoidBulkStrCopyToReply(client *c, robj *obj) {
     if (!isCopyAvoidPreferred(c, obj)) return C_ERR;
     if (prepareClientToWrite(c) != C_OK) return C_ERR;
 
-    _addBulkStrRefToBufferOrList(c, obj);
+    _addStrRefToBufferOrList(c, obj, BULK_STR_REF);
 
     return C_OK;
 }
@@ -1900,6 +1952,12 @@ void clientAcceptHandler(connection *conn) {
 
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
+
+    if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
+        connSetReadHandler(conn, NULL);
+    } else if (!c->flag.close_asap && tryPartitionClient(c) == C_OK) {
+        connSetReadHandler(conn, NULL);
+    }
 }
 
 /* ====================================================================
@@ -2142,8 +2200,7 @@ void freeClientOriginalArgv(client *c) {
     /* We didn't rewrite this client */
     if (!c->original_argv) return;
 
-    /* Client does not own the original argv, it just borrowed it. */
-    if (c->flag.argv_borrowed) {
+    if (c->flag.argv_borrowed || c->flag.executor) {
         c->original_argv = NULL;
         c->original_argc = 0;
         return;
@@ -2159,16 +2216,16 @@ void freeClientOriginalArgv(client *c) {
 }
 
 void freeClientArgv(client *c) {
-    if (c->flag.argv_borrowed && !c->original_argv) {
-        /* Client does not own the argv, and there is no original argv, so just clear the fields. */
+    if ((c->flag.argv_borrowed || c->flag.executor) && !c->original_argv) {
         goto clear;
     }
 
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
     if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {
-        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-        zfree(c->argv);
+        /* Shared arguments decrement here; terminal frees use the configured off-main path. */
+        for (int j = 0; j < c->argc; j++) freeValueNeverOnMain(NULL, c->argv[j], -1);
+        if (tryOffloadFreePtrToIOThreads(c->argv) == C_ERR) zfree(c->argv);
     }
 clear:
     c->argc = 0;
@@ -2213,6 +2270,7 @@ void unlinkClient(client *c) {
             raxRemove(server.clients_index, (unsigned char *)&id, sizeof(id), NULL);
             listDelNode(server.clients, c->client_list_node);
             c->client_list_node = NULL;
+            if (server.kill_waiters && raxSize(server.kill_waiters)) clientKillVictimGone(c->id);
 
             /* Decrement active client counters. Fake clients (where c->conn is NULL)
              * and unlinked clients (c->client_list_node is NULL) do not increment these
@@ -2274,6 +2332,12 @@ void unlinkClient(client *c) {
         c->flag.pending_write = 0;
     }
 
+    if (c->flag.pending_read_deferred) {
+        serverAssert(server.clients_pending_read->len > 0);
+        listUnlinkNode(server.clients_pending_read, &c->clients_pending_read_node);
+        c->flag.pending_read_deferred = 0;
+    }
+
     serverAssert(c->io_read_state != CLIENT_PENDING_IO && c->io_write_state != CLIENT_PENDING_IO);
 
     /* When client was just unblocked because of a blocking operation,
@@ -2307,6 +2371,7 @@ void clearClientConnectionState(client *c) {
 
         c->flag.monitor = 0;
         c->flag.replica = 0;
+        dplusOnMonitorsChanged(); /* re-enable speculation when the last monitor detaches */
     }
 
     serverAssert(!(c->flag.replica || c->flag.primary || c->slot_migration_job));
@@ -2347,6 +2412,20 @@ void clearClientConnectionState(client *c) {
  * asynchronous freeing, and 1 if the client was freed immediately. */
 int freeClient(client *c) {
     listNode *ln;
+
+    /* A staged client is freed once main took it back after a reply barrier. */
+    if (c->flag.fastpath) {
+        freeClientAsync(c);
+        return 0;
+    }
+    /* A recorded close not yet applied: the pointer must stay valid until main unmapped the client. */
+    if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) {
+        freeClientAsync(c);
+        return 0;
+    }
+
+    reconcileLazyWrite(c);
+    partitionedClientDetach(c);
 
     /* If a client is protected, yet we need to free it right now, make sure
      * to at least use asynchronous freeing. */
@@ -2478,6 +2557,7 @@ int freeClient(client *c) {
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
     sdsfree(c->peerid);
     sdsfree(c->sockname);
+    fastpathControlReclaim(c);
     zfree(c);
     return 1;
 }
@@ -2487,6 +2567,9 @@ int freeClient(client *c) {
  * a context where calling freeClient() is not possible, because the client
  * should be valid for the continuation of the flow of the program. */
 void freeClientAsync(client *c) {
+    debugServerAssert(inMainThread());
+    /* A staged client needs the close recorded, or it stays on the fast path and is never freed. */
+    if (c->flag.fastpath) fastpathRequestDetach(c);
     if (c->flag.close_asap || c->flag.script) return;
     c->flag.close_asap = 1;
     debugServerAssertWithInfo(c, NULL, listSearchKey(server.clients_to_close, c) == NULL);
@@ -2507,7 +2590,6 @@ void freeClientOrCloseLater(client *c, int async) {
         }
     }
 }
-
 
 /* Log errors for invalid use and free the client in async way.
  * We will add additional information about the client to the message. */
@@ -2610,12 +2692,15 @@ void beforeNextClient(client *c) {
         return;
     }
 
-    updateClientMemUsageAndBucket(c);
+    if (!c->flag.ring_epilogue) updateClientMemUsageAndBucket(c);
+    if (c->flag.fp_readmit && fastpathReadmitAuthenticated(c)) return;
     /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
      * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
         trySendWriteToIOThreads(c);
     }
+
+    armPartitionedClientRead(c);
 }
 
 /* Free the clients marked as CLOSE_ASAP, return the number of clients
@@ -2649,6 +2734,11 @@ int freeClientsInAsyncFreeQueue(void) {
             c->flag.protected_rdb_channel = 0;
         }
 
+        if (c->flag.fastpath) continue; /* main unmaps it after the reply phase */
+        if (c->flag.fp_detach_sent && !fastpathDetachConsumed(c)) continue;
+
+        reconcileLazyWrite(c);
+        partitionedClientDetach(c);
         if (c->flag.protected || clientHasPendingIO(c)) continue;
 
         c->flag.close_asap = 0;
@@ -3062,6 +3152,16 @@ static void addBulkStringToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, 
     }
 }
 
+/* RAW_STR_REF emits object bytes without RESP bulk framing. */
+static void addRawStrRefToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, bufWriteMetadata *metadata) {
+    bulkStrRef *str_ref = (bulkStrRef *)buf;
+    while (buf_len > 0 && !reply->limit_reached) {
+        addPlainBufferToReplyIOV(str_ref->str, sdslen(str_ref->str), reply, metadata);
+        str_ref++;
+        buf_len -= sizeof(bulkStrRef);
+    }
+}
+
 static void addEncodedBufferToReplyIOV(char *buf, size_t bufpos, replyIOV *reply, bufWriteMetadata *metadata) {
     char *ptr = buf;
     while (ptr < buf + bufpos && !reply->limit_reached) {
@@ -3071,7 +3171,11 @@ static void addEncodedBufferToReplyIOV(char *buf, size_t bufpos, replyIOV *reply
             addPlainBufferToReplyIOV(ptr, header->payload_len, reply, metadata);
         } else {
             uint64_t data_len = metadata->data_len;
-            addBulkStringToReplyIOV(ptr, header->payload_len, reply, metadata);
+            if (header->payload_type == BULK_STR_REF) {
+                addBulkStringToReplyIOV(ptr, header->payload_len, reply, metadata);
+            } else {
+                addRawStrRefToReplyIOV(ptr, header->payload_len, reply, metadata);
+            }
             /* Store actual reply len for cluster slot stats */
             header->reply_len = metadata->data_len - data_len;
         }
@@ -3321,7 +3425,7 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
         payloadHeader *header = (payloadHeader *)ptr;
         ptr += sizeof(payloadHeader);
 
-        if (header->payload_type == BULK_STR_REF) {
+        if (isStrRefPayload(header->payload_type)) {
             uint8_t expected = 0;
             if (atomic_compare_exchange_strong_explicit(&header->tracked_for_cob, &expected, 1,
                                                         memory_order_acq_rel, memory_order_acquire)) {
@@ -3331,9 +3435,12 @@ static void trackBufReferences(char *buf, size_t bufpos, client *c) {
                 size_t total_reply_len = 0;
                 while (len > 0) {
                     size_t str_len = sdslen(str_ref->str);
-                    uint32_t num_len = digits10(str_len);
-                    /* RESP encodes bulk strings as $<length>\r\n<data>\r\n */
-                    total_reply_len += (num_len + 3) + str_len + 2;
+                    if (header->payload_type == BULK_STR_REF) {
+                        uint32_t num_len = digits10(str_len);
+                        total_reply_len += (num_len + 3) + str_len + 2;
+                    } else {
+                        total_reply_len += str_len;
+                    }
                     str_ref++;
                     len -= sizeof(bulkStrRef);
                 }
@@ -3357,7 +3464,7 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
         payloadHeader *header = (payloadHeader *)ptr;
         ptr += sizeof(payloadHeader);
 
-        if (header->payload_type == BULK_STR_REF) {
+        if (isStrRefPayload(header->payload_type)) {
             /* Decrement tracked reply size only if it was previously tracked.
              * Use atomic exchange to ensure we only decrement once. */
             if (c && atomic_exchange_explicit(&header->tracked_for_cob, 0, memory_order_acq_rel)) {
@@ -3375,7 +3482,8 @@ static void releaseBufReferences(char *buf, size_t bufpos, client *c) {
             bulkStrRef *str_ref = (bulkStrRef *)ptr;
             size_t len = header->payload_len;
             while (len > 0) {
-                decrRefCount(str_ref->obj);
+                /* Last reply references free off main; shared references only decrement here. */
+                freeValueNeverOnMain(NULL, str_ref->obj, -1);
                 str_ref++;
                 len -= sizeof(bulkStrRef);
             }
@@ -3508,8 +3616,8 @@ int postWriteToClient(client *c) {
             return C_ERR;
         }
     }
-    /* Update client's memory usage after writing.*/
-    updateClientMemUsageAndBucket(c);
+
+    if (!(c->flag.partitioned && c->io_read_state == CLIENT_COMPLETED_IO)) updateClientMemUsageAndBucket(c);
     return C_OK;
 }
 
@@ -3519,6 +3627,8 @@ int postWriteToClient(client *c) {
  *
  * This function is called by main-thread only */
 int writeToClient(client *c) {
+    reconcileLazyWrite(c);
+    if (c->flag.close_asap) return C_OK;
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return C_OK;
 
     c->nwritten = 0;
@@ -3537,6 +3647,12 @@ int writeToClient(client *c) {
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     if (trySendWriteToIOThreads(c) == C_OK) return;
+
+    if (strictOffloadActive() && clientStrictDeferEligible(c) && clientHasPendingReplies(c)) {
+        connSetWriteHandler(c->conn, NULL);
+        putClientInPendingWriteQueue(c);
+        return;
+    }
     writeToClient(c);
 }
 
@@ -3607,7 +3723,6 @@ int handleReadResult(client *c) {
     return C_OK;
 }
 
-
 void handleParseError(client *c) {
     int flags = c->read_flags;
     if (flags & READ_FLAGS_ERROR_BIG_INLINE_REQUEST) {
@@ -3659,12 +3774,7 @@ void handleParseError(client *c) {
 }
 
 int isParsingError(client *c) {
-    return c->read_flags & (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK |
-                            READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN |
-                            READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN | READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN |
-                            READ_FLAGS_ERROR_BIG_BULK_COUNT | READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER |
-                            READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_REPLICATED_CLIENT | READ_FLAGS_ERROR_UNBALANCED_QUOTES |
-                            READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL | READ_FLAGS_ERROR_INVALID_CRLF);
+    return c->read_flags & READ_FLAGS_ERROR_MASK;
 }
 
 /* This function is called after the query-buffer was parsed.
@@ -3710,6 +3820,7 @@ void processClientIOWriteDone(client *c) {
     if (c->io_write_state == CLIENT_IDLE) return; /* Already handled */
     serverAssert(c->io_write_state == CLIENT_COMPLETED_IO);
     c->io_write_state = CLIENT_IDLE;
+    if (c->flag.blocked && c->bstate->btype == BLOCKED_POSTPONE && c->bstate->wait_write) unblockClient(c, 1);
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
     if (c->flag.close_asap) return;
@@ -3745,6 +3856,19 @@ void processClientIOWriteDone(client *c) {
     }
 }
 
+/* Main: wait out an offloaded write of the client's earlier replies, so the reply buffers show only what
+ * is still unsent although the client may have received those replies. Returns 0 when that write's
+ * completion is still on its way to main: the client is postponed and re-runs its command once main
+ * has processed it. */
+int settleClientWrite(client *c) {
+    waitForClientIO(c);
+    reconcileLazyWrite(c);
+    if (c->io_write_state == CLIENT_IDLE || c->flag.deny_blocking) return 1;
+    blockPostponeClient(c);
+    c->bstate->wait_write = 1;
+    return 0;
+}
+
 /* This function is called just before entering the event loop, in the hope
  * we can just write the replies to the client output buffer without any
  * need to use a syscall in order to install the writable event handler,
@@ -3757,15 +3881,16 @@ int handleClientsWithPendingWrites(void) {
     listIter li;
     listNode *ln;
     listRewind(server.clients_pending_write, &li);
-    while ((ln = listNext(&li))) {
+    /* Requeued clients wait for the next pass. */
+    int budget = pending_writes;
+    while (budget-- > 0 && (ln = listNext(&li))) {
         client *c = listNodeValue(ln);
         serverAssert(c->flag.pending_write);
 
         /* If a client is protected, don't do anything,
          * that may trigger write error or recreate handler. */
         if (c->flag.protected) continue;
-
-        /* Don't write to clients that are going to be closed anyway. */
+        reconcileLazyWrite(c);
         if (c->flag.close_asap) continue;
 
         if (c->io_read_state == CLIENT_PENDING_IO) continue;
@@ -3781,6 +3906,11 @@ int handleClientsWithPendingWrites(void) {
         /* We can't write to the client while IO operation is in progress. */
         if (c->io_write_state != CLIENT_IDLE) continue;
 
+        if (strictOffloadActive() && clientStrictDeferEligible(c)) {
+            putClientInPendingWriteQueue(c);
+            continue;
+        }
+
         processed++;
 
         /* Try to write buffers to the client socket. */
@@ -3792,6 +3922,7 @@ int handleClientsWithPendingWrites(void) {
             installClientWriteHandler(c);
         }
     }
+    flushWriteSlab();
     return processed;
 }
 
@@ -3896,7 +4027,14 @@ void unprotectClient(client *c) {
     if (c->flag.protected) {
         c->flag.protected = 0;
         if (c->conn) {
-            connSetReadHandler(c->conn, readQueryFromClient);
+            if (c->flag.partitioned) {
+                if (!c->flag.pending_command && c->io_read_state == CLIENT_IDLE && !c->flag.pending_read) {
+                    if (processPendingCommandAndInputBuffer(c) == C_ERR) return;
+                    beforeNextClient(c);
+                }
+            } else {
+                connSetReadHandler(c->conn, readQueryFromClient);
+            }
             if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
         }
     }
@@ -4065,6 +4203,8 @@ void parseMultibulkBuffer(client *c) {
     /* Try parsing pipelined commands. */
     cmdQueue *queue = &c->cmd_queue;
     serverAssert(queue->len == 0);
+    /* A drained primary read parses everything it read, so main does not parse the rest. */
+    uint16_t max_grow = (c->read_flags & READ_FLAGS_DRAIN) ? 8192 : 512;
     while ((flag & READ_FLAGS_PARSING_COMPLETED) &&
            sdslen(c->querybuf) > c->qb_pos &&
            c->querybuf[c->qb_pos] == '*') {
@@ -4073,7 +4213,7 @@ void parseMultibulkBuffer(client *c) {
         if (queue->len == queue->cap) {
             if (queue->cap == 0) {
                 queue->cap = COMMAND_QUEUE_MIN_CAPACITY;
-            } else if (queue->cap <= 512) {
+            } else if (queue->cap <= max_grow) {
                 queue->cap *= 2;
             } else {
                 break; /* Limit the length of the command queue. */
@@ -4399,14 +4539,16 @@ int processCommandAndResetClient(client *c) {
     return deadclient ? C_ERR : C_OK;
 }
 
-
 /* This function will execute any fully parsed commands pending on
  * the client. Returns C_ERR if the client is no longer valid after executing
  * the command, and C_OK for all other cases. */
 int processPendingCommandAndInputBuffer(client *c) {
-    /* Blocked clients are resumed via processUnblockedClients(); skip them here
-     * to avoid re-entering processCommand() while pending_command is intentionally left set. */
-    if (c->flag.blocked) return C_OK;
+    /* Blocked, throttled and just-unblocked clients are resumed via processUnblockedClients(); skip them
+     * here to avoid re-entering processCommand() while pending_command is intentionally left set. A read
+     * that completes before processUnblockedClients() reaches an unblocked client must not run it early,
+     * and a throttled command was already checked, so processCommand() would run it now and again when
+     * the throttler releases it. */
+    if (c->flag.blocked || c->flag.unblocked || c->flag.throttled) return C_OK;
 
     /* Notice, this code is also called from 'processUnblockedClients'.
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
@@ -4414,7 +4556,10 @@ int processPendingCommandAndInputBuffer(client *c) {
      * blocked client as well */
     if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
-        if (processCommandAndResetClient(c) == C_ERR) {
+        if (c->flag.primary && replApplyDefer(c)) {
+            c->flag.pending_command = 0;
+            commandProcessed(c);
+        } else if (processCommandAndResetClient(c) == C_ERR) {
             return C_ERR;
         }
     }
@@ -4428,6 +4573,7 @@ int processPendingCommandAndInputBuffer(client *c) {
     if ((c->querybuf && sdslen(c->querybuf) > 0) || c->cmd_queue.off < c->cmd_queue.len) {
         return processInputBuffer(c);
     }
+    replApplyFlush(c);
     return C_OK;
 }
 
@@ -4522,7 +4668,7 @@ int canParseCommand(client *c) {
 
 /* Pops a command from the command queue and sets it as the client's current
  * command. Returns true on success and false if the queue was empty. */
-static bool consumeCommandQueue(client *c) {
+bool consumeCommandQueue(client *c) {
     cmdQueue *queue = &c->cmd_queue;
     if (queue->off >= queue->len) return false;
     parsedCommand *p = &queue->cmds[queue->off++];
@@ -4579,12 +4725,13 @@ static int addKeysToIncrFindBatch(client *c,
             kvstore_idx = keyHashSlot(objectGetVal(first_key), sdslen(objectGetVal(first_key)));
         }
         hashtable *ht = kvstoreGetHashtable(c->db->keys, kvstore_idx);
-        if (ht != NULL) {
-            for (int i = 0; i < numkeys && num < max; i++) {
-                hashtableIncrementalFindState *incr_state = &incr_states[num++];
-                robj *keyobj = argv[result.keys[i].pos];
-                hashtableIncrementalFindInit(incr_state, ht, objectGetVal(keyobj));
-            }
+        for (int i = 0; i < numkeys && num < max; i++) {
+            robj *keyobj = argv[result.keys[i].pos];
+            /* Standalone shards hold keys by their own hash, not by the first key's. */
+            if (!server.cluster_enabled && server.keyspace_shard_bits)
+                ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(keyobj)));
+            if (ht == NULL) continue;
+            hashtableIncrementalFindInit(&incr_states[num++], ht, objectGetVal(keyobj));
         }
     }
     getKeysFreeResult(&result);
@@ -4597,13 +4744,14 @@ static int addKeysToIncrFindBatch(client *c,
  * is used with I/O threading. */
 static void prefetchCommandQueueKeys(client *c) {
     if (c->read_flags & READ_FLAGS_PREFETCHED) return;
+    if (c->flag.primary && replApplyMayDefer()) return; /* the lanes, not main, touch these keys */
     c->read_flags |= READ_FLAGS_PREFETCHED;
 
     /* Prefetching states */
     const int max_keys = server.prefetch_batch_max_size;
+    if (max_keys <= 1) return; /* No point to prefetch a single key */
     int num_keys = 0;
     hashtableIncrementalFindState key_incr_states[max_keys];
-    if (max_keys <= 1) return; /* No point to prefetch a single key */
 
     /* If the command is valid, add keys to incremental find batch. */
     if (c->parsed_cmd != NULL && !(c->read_flags & READ_FLAGS_BAD_ARITY)) {
@@ -4658,7 +4806,19 @@ static void prefetchCommandQueueKeys(client *c) {
     }
 }
 
+static int processInputBufferLoop(client *c);
+
+/* Held replicated writes are applied before the caller sees the buffer's effects. */
 int processInputBuffer(client *c) {
+    int rc = processInputBufferLoop(c);
+    if (rc == C_OK)
+        replApplyFlush(c);
+    else
+        serverAssert(!replApplyPending());
+    return rc;
+}
+
+static int processInputBufferLoop(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
@@ -4704,6 +4864,14 @@ int processInputBuffer(client *c) {
             resetSharedQueryBuf(c);
         }
 
+        if (c->flag.primary) {
+            if (replApplyDefer(c)) {
+                commandProcessed(c);
+                continue;
+            }
+            replApplyFlush(c);
+        }
+
         /* We are finally ready to execute the command. */
         c->flag.pending_command = 1;
         if (processCommandAndResetClient(c) == C_ERR) {
@@ -4717,11 +4885,29 @@ int processInputBuffer(client *c) {
     return C_OK;
 }
 
+/* Ring commands execute only while the client remains runnable and IO-owned. */
+void ringExecuteOne(client *c) {
+    if (c->io_read_state != CLIENT_COMPLETED_IO) return; /* its END already ran (re-entrancy) */
+    if (c->flag.protected) return;                       /* left queued; unprotectClient resumes it */
+    reconcileLazyWrite(c);
+    if (!canParseCommand(c)) return;
+    if (c->argc == 0) {
+        c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+        c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+        if (!consumeCommandQueue(c)) return;
+    }
+    parseResult res = handleParseResults(c);
+    if (res != PARSE_OK || c->argc == 0) return;
+    if (c->querybuf == thread_shared_qb) resetSharedQueryBuf(c);
+    c->flag.pending_command = 1;
+    processCommandAndResetClient(c);
+}
+
 /* This function can be called from the main-thread or from the IO-thread.
  * The function allocates query-buf for the client if required and reads to it from the network.
  * It will set c->nread to the bytes read from the network.
  * Returns true if the buffer was filled (more data may be available). */
-static bool readToQueryBuf(client *c) {
+bool readToQueryBuf(client *c) {
     int big_arg = 0;
     size_t qblen, readlen;
 
@@ -4832,6 +5018,11 @@ void readQueryFromClient(connection *conn) {
     /* Check if we can send the client to be handled by the IO-thread */
     if (postponeClientRead(c)) return;
 
+    if (strictOffloadActive() && clientStrictDeferEligible(c)) {
+        deferClientRead(c);
+        return;
+    }
+
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
 
     bool repeat = false;
@@ -4888,6 +5079,14 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
     connFormatAddr(client->conn, addr, addr_len, remote);
 }
 
+/* An executor reports the identity of the entry it is running. */
+static char *originAddrString(const PeerIdentity *id, sds *cache) {
+    char buf[CONN_ADDR_STR_LEN];
+    if (peerIdentityFormat(id, buf, sizeof(buf)) < 0) memcpy(buf, "?:0", 4);
+    *cache = *cache ? sdscpy(*cache, buf) : sdsnew(buf);
+    return *cache;
+}
+
 /* This function returns the client peer id, by creating and caching it
  * if client->peerid is NULL, otherwise returning the cached value.
  * The Peer ID never changes during the life of the client, however it
@@ -4895,11 +5094,68 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
 char *getClientPeerId(client *c) {
     char peerid[CONN_ADDR_STR_LEN] = {0};
 
+    if (c->origin) return originAddrString(&c->origin->peer, &c->peerid);
     if (c->peerid == NULL) {
         genClientAddrString(c, peerid, sizeof(peerid), 1);
         c->peerid = sdsnew(peerid);
     }
     return c->peerid;
+}
+
+/* Returns C_ERR for an address family the fast path cannot represent. */
+int peerIdentityFromSockaddr(PeerIdentity *peer, const struct sockaddr *sa, socklen_t salen) {
+    memset(peer, 0, sizeof(*peer));
+    switch (sa->sa_family) {
+    case AF_INET: {
+        if (salen < sizeof(struct sockaddr_in)) return C_ERR;
+        const struct sockaddr_in *s = (const struct sockaddr_in *)sa;
+        peer->family = AF_INET;
+        peer->port = ntohs(s->sin_port);
+        peer->addr.v4 = s->sin_addr;
+        return C_OK;
+    }
+    case AF_INET6: {
+        if (salen < sizeof(struct sockaddr_in6)) return C_ERR;
+        const struct sockaddr_in6 *s = (const struct sockaddr_in6 *)sa;
+        peer->family = AF_INET6;
+        peer->port = ntohs(s->sin6_port);
+        peer->addr.v6 = s->sin6_addr;
+        return C_OK;
+    }
+    default: return C_ERR;
+    }
+}
+
+int peerIdentityToIp(const PeerIdentity *peer, char *ip, size_t ip_len, int *port) {
+    const void *src;
+    switch (peer->family) {
+    case AF_INET: src = &peer->addr.v4; break;
+    case AF_INET6: src = &peer->addr.v6; break;
+    default: return C_ERR;
+    }
+    if (!inet_ntop(peer->family, src, ip, ip_len)) return C_ERR;
+    if (port) *port = peer->port;
+    return C_OK;
+}
+
+/* Same text as getClientPeerId() for the connection the identity was taken from. */
+int peerIdentityFormat(const PeerIdentity *peer, char *buf, size_t buf_len) {
+    char ip[NET_IP_STR_LEN];
+    if (peerIdentityToIp(peer, ip, sizeof(ip), NULL) != C_OK) return -1;
+    if (peer->family == AF_INET6) return snprintf(buf, buf_len, "[%s]:%d", ip, peer->port);
+    return snprintf(buf, buf_len, "%s:%d", ip, peer->port);
+}
+
+/* Identity of the client a command came from: the origin while an executor runs a fast-path entry. */
+uint64_t getClientOriginId(client *c) {
+    return c->origin ? c->origin->client_id : c->id;
+}
+
+/* Transport of the client a command came from: the origin's captured type while an executor runs a
+ * fast-path entry (its own conn is NULL), otherwise the live connection. Lets MONITOR and tracing
+ * render the real transport without touching the IO-owned connection. */
+int getClientConnType(client *c) {
+    return c->origin ? c->origin->conn_type : connGetType(c->conn);
 }
 
 /* This function returns the client bound socket name, by creating and caching
@@ -4909,6 +5165,7 @@ char *getClientPeerId(client *c) {
 char *getClientSockname(client *c) {
     char sockname[CONN_ADDR_STR_LEN] = {0};
 
+    if (c->origin) return originAddrString(&c->origin->local, &c->sockname);
     if (c->sockname == NULL) {
         genClientAddrString(c, sockname, sizeof(sockname), 0);
         c->sockname = sdsnew(sockname);
@@ -4924,6 +5181,7 @@ int isClientConnIpV6(client *c) {
         c = server.current_client;
     }
 
+    if (c->origin) return c->origin->peer.family == AF_INET6;
     if (c->flag.fake || !c->conn) {
         /* If we still don't have a client with a real connection (e.g., called
          * from module timer with no real current client), default to IPv4 to
@@ -4938,6 +5196,7 @@ int isClientConnIpV6(client *c) {
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
+    int held_reads = !server.crashed && partitionedClientHoldReads(client);
     char flags[32], events[3], capa[9], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
@@ -4973,7 +5232,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
 
     p = events;
     if (client->conn) {
-        if (connHasReadHandler(client->conn)) *p++ = 'r';
+        if (connHasReadHandler(client->conn) || client->flag.partitioned) *p++ = 'r';
         if (connHasWriteHandler(client->conn)) *p++ = 'w';
     }
     *p = '\0';
@@ -4994,7 +5253,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     sds ret = sdscatfmt(
         s,
         FMTARGS(
-            "id=%U", (unsigned long long)client->id,
+            "id=%U", (unsigned long long)getClientOriginId(client),
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
@@ -5029,6 +5288,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
             " tot-net-in=%U", client->net_input_bytes,
             " tot-net-out=%U", client->net_output_bytes,
             " tot-cmds=%U", client->commands_processed));
+    if (held_reads) partitionedClientRelease(client);
     return ret;
 }
 
@@ -5044,7 +5304,7 @@ sds catClientInfoShortString(sds s, client *client, int hide_user_data) {
     sds ret = sdscatfmt(
         s,
         FMTARGS(
-            "id=%U", (unsigned long long)client->id,
+            "id=%U", (unsigned long long)getClientOriginId(client),
             " addr=%s", getClientPeerId(client),
             " laddr=%s", getClientSockname(client),
             " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
@@ -5506,7 +5766,6 @@ static int validateClientFlagFilter(sds flag_filter) {
     return C_OK;
 }
 
-
 static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     /* Check each filter condition and return false if the client does not match. */
     if (client_filter->addr && strcmp(getClientPeerId(client), client_filter->addr) != 0) return 0;
@@ -5587,7 +5846,6 @@ static int clientMatchesCapaFilter(client *c, sds capa_filter) {
     /* If the loop completes, the client matches the capa filter */
     return 1;
 }
-
 
 static int clientMatchesFlagFilter(client *c, sds flag_filter) {
     /* Iterate through the provided flag filter string */
@@ -5683,7 +5941,6 @@ static int clientMatchesFlagFilter(client *c, sds flag_filter) {
     /* If the loop completes, the client matches the flag filter */
     return 1;
 }
-
 
 void clientHelpCommand(client *c) {
     const char *help[] = {
@@ -5870,6 +6127,55 @@ void clientNoEvictCommand(client *c) {
     }
 }
 
+/* A killed client that an IO thread still owns is freed once that thread releases it, and CLIENT KILL replies
+ * only then. The caller must be able to block, and its ID must find it when its last victim goes. */
+static int clientKillMayWait(client *c) {
+    return !c->flag.deny_blocking && c->conn && !isReplicatedClient(c) && lookupClientByID(c->id) == c;
+}
+
+static void clientKillAwait(uint64_t victim, uint64_t killer) {
+    uint64_t key = htonu64(victim);
+    void *waiters = NULL;
+    if (!server.kill_waiters) server.kill_waiters = raxNew();
+    if (!raxFind(server.kill_waiters, (unsigned char *)&key, sizeof(key), &waiters)) {
+        waiters = listCreate();
+        raxInsert(server.kill_waiters, (unsigned char *)&key, sizeof(key), waiters, NULL);
+    }
+    listAddNodeTail(waiters, (void *)(uintptr_t)killer);
+}
+
+static void clientKillReply(client *c, long long killed) {
+    if (killed < 0)
+        addReply(c, shared.ok);
+    else
+        addReplyLongLong(c, killed);
+}
+
+/* Called as a client leaves the client list: its waiting killers reply once their last victim is gone. */
+static void clientKillVictimGone(uint64_t id) {
+    uint64_t key = htonu64(id);
+    void *v = NULL;
+    if (!raxRemove(server.kill_waiters, (unsigned char *)&key, sizeof(key), &v)) return;
+    list *waiters = v;
+    listIter li;
+    listNode *ln;
+    listRewind(waiters, &li);
+    while ((ln = listNext(&li))) {
+        client *k = lookupClientByID((uint64_t)(uintptr_t)listNodeValue(ln));
+        if (!k || !k->flag.blocked || k->bstate->btype != BLOCKED_KILL) continue; /* the killer is gone */
+        if (--k->bstate->kill_pending > 0) continue;
+        clientKillReply(k, k->bstate->kill_reply);
+        if (k->bstate->kill_close_self) k->flag.close_after_reply = 1;
+        unblockClient(k, 1);
+    }
+    listRelease(waiters);
+}
+
+void unblockClientWaitingKills(client *c) {
+    c->bstate->kill_pending = 0;
+    updateStatsOnUnblock(c, 0, 0, 0);
+}
+
 void clientKillCommand(client *c) {
     /* CLIENT KILL <ip:port>
      * CLIENT KILL <option> [value] ... <option> [value] */
@@ -5905,6 +6211,8 @@ void clientKillCommand(client *c) {
     }
 
     /* Iterate clients killing all the matching clients. */
+    int may_wait = clientKillMayWait(c), nawait = 0, cap = 0;
+    uint64_t *awaited = NULL;
     listRewind(server.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *client = listNodeValue(ln);
@@ -5914,20 +6222,46 @@ void clientKillCommand(client *c) {
         if (c == client) {
             close_this_client = 1;
         } else {
-            freeClient(client);
+            uint64_t id = client->id;
+            /* Still listed after freeClient: freed later, once an IO thread releases it. */
+            if (!freeClient(client) && may_wait && client->client_list_node && !client->flag.protected &&
+                !client->flag.protected_rdb_channel) {
+                if (nawait == cap) {
+                    cap = cap ? cap * 2 : 8;
+                    awaited = zrealloc(awaited, cap * sizeof(*awaited));
+                }
+                awaited[nawait++] = id;
+            }
         }
         killed++;
     }
 
-    /* Reply according to old/new format. */
-    if (c->argc == 3) {
-        if (killed == 0)
-            addReplyError(c, "No such client");
-        else
-            addReply(c, shared.ok);
-    } else {
-        addReplyLongLong(c, killed);
+    /* A later free in the loop may have released an earlier victim; only the ones still listed are waited for. */
+    int pending = 0;
+    for (int j = 0; j < nawait; j++) {
+        if (!lookupClientByID(awaited[j])) continue;
+        clientKillAwait(awaited[j], c->id);
+        pending++;
     }
+    zfree(awaited);
+
+    long long reply = (c->argc == 3) ? -1 : killed;
+    if (pending > 0) {
+        initClientBlockingState(c);
+        c->bstate->timeout = 0;
+        c->bstate->kill_pending = pending;
+        c->bstate->kill_reply = reply;
+        c->bstate->kill_close_self = close_this_client;
+        c->flag.pending_command = 0;
+        blockClient(c, BLOCKED_KILL);
+        goto client_kill_done;
+    }
+
+    /* Reply according to old/new format. */
+    if (c->argc == 3 && killed == 0)
+        addReplyError(c, "No such client");
+    else
+        clientKillReply(c, reply);
 
     /* If this client has to be closed, flag it as CLOSE_AFTER_REPLY
      * only after we queued the reply to its output buffers. */
@@ -5987,7 +6321,6 @@ static void freeClientFilter(clientFilter *filter) {
         filter->not_lib_ver = NULL;
     }
 }
-
 
 void clientUnblockCommand(client *c) {
     /* CLIENT UNBLOCK <id> [timeout|error] */
@@ -6629,6 +6962,8 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
     }
 
     usage += atomic_load_explicit(&c->io_tracked_reply_len, memory_order_relaxed);
+    /* A staged fast-path client's unwritten replies, read by main between phases. */
+    if (c->flag.fastpath && c->fp_out) usage += sdslen(c->fp_out);
 
     return usage;
 }
@@ -6785,6 +7120,7 @@ int checkClientOutputBufferLimits(client *c) {
  * Returns 1 if client was (flagged) closed. */
 int closeClientOnOutputBufferLimitReached(client *c, int async) {
     if (c->flag.fake) return 0; /* It is unsafe to free fake clients. */
+    if (c->flag.executor) return fastpathExecutorOutputLimitReached(c);
     serverAssert(c->conn);
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
@@ -7030,6 +7366,9 @@ void processEventsWhileBlocked(void) {
         if (!events) break;
     }
 
+    /* Fast-path clients are not on ae: give them one nested staged pass. */
+    stagedNestedIteration();
+
     whileBlockedCron();
 
     ProcessingEventsWhileBlocked--;
@@ -7043,12 +7382,79 @@ void processEventsWhileBlocked(void) {
 int postponeClientRead(client *c) {
     if (ProcessingEventsWhileBlocked) return 0;
 
+    if (c->flag.pending_read_deferred) {
+        if (strictOffloadActive()) return 1;
+        c->flag.pending_read_deferred = 0;
+        listUnlinkNode(server.clients_pending_read, &c->clients_pending_read_node);
+    }
+
     return (trySendReadToIOThreads(c) == C_OK);
+}
+
+/* Strict offload retries regular client IO instead of falling back to main. */
+int strictOffloadActive(void) {
+    /* Re-entrant event processing cannot drain deferred reads. */
+    if (ProcessingEventsWhileBlocked) return 0;
+    /* The staged loop serves every non-fast-path client on main in its write phase. */
+    if (stagedLoopActive()) return 0;
+    return server.io_threads_strict_offload && server.io_threads_num >= 2;
+}
+
+/* Only regular clients whose offload failed transiently enter the retry FIFO. */
+static int clientStrictDeferEligible(client *c) {
+    if (!c->conn) return 0;                                /* fake/AOF-loading client */
+    if (c->flag.close_asap) return 0;                      /* being torn down */
+    if (c->flag.lua_debug) return 0;                       /* main may connWrite directly */
+    if (c->flag.blocked || c->flag.unblocked) return 0;    /* blocked-client path is main-owned */
+    if (getClientType(c) == CLIENT_TYPE_REPLICA) return 0; /* replication link (excluded scope) */
+    if (isReplicatedClient(c)) return 0;                   /* primary link / slot import (excluded scope) */
+    if (c->slot_migration_job) return 0;                   /* cluster slot-migration export */
+    return 1;
+}
+
+/* A client appears at most once in the deferred-read FIFO. */
+static void deferClientRead(client *c) {
+    if (c->flag.pending_read_deferred) return;
+    c->flag.pending_read_deferred = 1;
+    listLinkNodeTail(server.clients_pending_read, &c->clients_pending_read_node);
+    server.stat_strict_deferred_reads++;
+}
+
+/* Deferred reads retain FIFO order and are attempted at most once per pass. */
+int processDeferredReads(void) {
+    int dispatched = 0;
+    int budget = listLength(server.clients_pending_read);
+    if (budget == 0) return 0;
+
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients_pending_read, &li);
+    while (budget-- > 0 && (ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+
+        if (!clientStrictDeferEligible(c)) {
+            c->flag.pending_read_deferred = 0;
+            listUnlinkNode(server.clients_pending_read, ln);
+            continue;
+        }
+
+        if (trySendReadToIOThreads(c) == C_OK) {
+            c->flag.pending_read_deferred = 0;
+            listUnlinkNode(server.clients_pending_read, ln);
+            dispatched++;
+        }
+    }
+    return dispatched;
 }
 
 /* Returns non-zero if connUpdateState must run again after processClientsCommandsBatch(). */
 int processClientIOReadsDone(client *c) {
     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
+
+    if (c->read_flags & READ_FLAGS_DRAIN) {
+        server.stat_io_primary_drain_jobs++;
+        if (c->nread > 0) server.stat_io_primary_drain_bytes += c->nread;
+    }
 
     if (ProcessingEventsWhileBlocked) {
         /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
@@ -7102,7 +7508,9 @@ int processClientIOReadsDone(client *c) {
         }
     }
 
-    if (c->argc > 0) {
+    /* A blocked client's argv is the command that blocked it, and its block type already chose whether
+     * that command runs again on unblock. Partitioned clients finish reads while blocked. */
+    if (c->argc > 0 && !c->flag.blocked) {
         c->flag.pending_command = 1;
     }
 
@@ -7165,7 +7573,10 @@ void evictClients(void) {
             sdsfree(ci);
             server.stat_evictedclients++;
 
-            if (freeClient(c) == 0) {
+            beginInlineReclaim();
+            int freed = freeClient(c);
+            endInlineReclaim();
+            if (freed == 0) {
                 /* Client was only scheduled for asynchronous free (e.g. protected
                  * or has pending IO) - its memory won't drop from the stats above
                  * until that completes. Count it as freed here so we don't keep
@@ -7182,7 +7593,9 @@ void evictClients(void) {
             listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
         }
     }
+
 }
+
 
 /* IO threads functions */
 
@@ -7190,7 +7603,20 @@ void ioThreadReadQueryFromClient(client *c) {
     serverAssert(c->io_read_state == CLIENT_PENDING_IO);
 
     /* Read */
-    readToQueryBuf(c);
+    if (c->read_flags & READ_FLAGS_DRAIN) {
+        /* As main reads a primary link: several reads per event, parsed together. A later read's
+         * EOF or error is seen by the next read. */
+        ssize_t total = 0;
+        for (int i = 0; i < REPL_MAX_READS_PER_IO_EVENT; i++) {
+            int full = readToQueryBuf(c);
+            if (c->nread <= 0) break;
+            total += c->nread;
+            if (!full || c->flag.close_asap) break;
+        }
+        if (total > 0) c->nread = total;
+    } else {
+        readToQueryBuf(c);
+    }
 
     if (c->flag.close_asap) {
         goto done;
@@ -7234,10 +7660,15 @@ done:
 
     c->io_read_state = CLIENT_COMPLETED_IO;
     c->cur_tid = getCurTid();
-    sendToMainThread(c, JOB_RES_READ_CLIENT);
+
+    if (c->flag.partitioned) {
+        ioThreadQueueReadCompletion(c);
+    } else {
+        sendToMainThread(c, JOB_RES_READ_CLIENT);
+    }
 }
 
-void ioThreadWriteToClient(client *c) {
+int ioThreadWriteClientNoSignal(client *c, int publish) {
     serverAssert(c->io_write_state == CLIENT_PENDING_IO);
     c->nwritten = 0;
     if (c->write_flags & WRITE_FLAGS_IS_REPLICA) {
@@ -7246,7 +7677,31 @@ void ioThreadWriteToClient(client *c) {
         _writeToClient(c);
     }
 
-    c->io_write_state = CLIENT_COMPLETED_IO;
+    /* Publish lazy completion only after clearing failures that require an outbox response. */
+    int needs_main = 1;
+    if (c->write_flags & WRITE_FLAGS_LAZY) {
+        if ((c->write_flags & WRITE_FLAGS_WRITE_ERROR) || c->io_last_written.data_len != c->io_last_bufpos) {
+            c->write_flags &= ~WRITE_FLAGS_LAZY;
+        } else {
+            needs_main = 0;
+        }
+    }
+    if (publish) {
+        debugIOWriteDoneDelay();
+        atomic_thread_fence(memory_order_release);
+        c->io_write_state = CLIENT_COMPLETED_IO;
+    }
+    return needs_main;
+}
+
+/* DEBUG IO-WRITE-DONE-DELAY: the reply is on the socket, the write is not reported done yet. */
+void debugIOWriteDoneDelay(void) {
+    int delay_us = __atomic_load_n(&server.debug_io_write_done_delay_us, __ATOMIC_RELAXED);
+    if (delay_us) usleep(delay_us);
+}
+
+void ioThreadWriteToClient(client *c) {
+    (void)ioThreadWriteClientNoSignal(c, 1);
     sendToMainThread(c, JOB_RES_WRITE_CLIENT);
 }
 
@@ -7279,7 +7734,7 @@ size_t testOnlyAddReplyPayloadToBuffer(client *c, const void *payload, size_t le
 }
 
 size_t testOnlyAddBulkStrRefToBuffer(client *c, const void *payload, size_t len) {
-    return _addBulkStrRefToBuffer(c, payload, len);
+    return _addBulkStrRefToBuffer(c, payload, len, BULK_STR_REF);
 }
 
 void testOnlyAddReplyPayloadToList(client *c, list *reply_list, const char *payload, size_t len, uint8_t payload_type) {
@@ -7287,11 +7742,11 @@ void testOnlyAddReplyPayloadToList(client *c, list *reply_list, const char *payl
 }
 
 void testOnlyAddBulkStrRefToToList(client *c, const void *payload, size_t len) {
-    _addBulkStrRefToToList(c, payload, len);
+    _addStrRefToList(c, payload, len, BULK_STR_REF);
 }
 
 void testOnlyAddBulkStrRefToBufferOrList(client *c, robj *obj) {
-    _addBulkStrRefToBufferOrList(c, obj);
+    _addStrRefToBufferOrList(c, obj, BULK_STR_REF);
 }
 
 void testOnlyInitReplyIOV(client *c, int iovsize, struct iovec *iov_arr, char (*prefixes)[BULK_STR_LEN_PREFIX_MAX_SIZE], char *crlf, replyIOV *reply) {

@@ -544,6 +544,7 @@ int scriptingEngineDebuggerEnable(client *c, scriptingEngine *engine, sds *err) 
         return C_ERR;
     }
     ds.engine = engine;
+    unpartitionClient(c); /* debug session writes to the socket from main */
     c->flag.lua_debug = 1;
     debugScriptFlushLog(ds.logs);
     ds.conn = c->conn;

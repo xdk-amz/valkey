@@ -83,5 +83,6 @@ fo = "fo"
 ake = "ake"
 
 [type.tcl.extend-words]
+als = "als"
 fo = "fo"
 tre = "tre"

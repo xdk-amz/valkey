@@ -236,7 +236,11 @@ start_cluster 2 2 [list config_lines $modules] {
         $master2 set count_dels_{4oi} 1
         $master2 del count_dels_{4oi}
         assert_equal 1 [$master2 keyspace.get_dels]
-        assert_equal 1 [$replica2 keyspace.get_dels]
+        wait_for_condition 50 100 {
+            [$replica2 keyspace.get_dels] eq 1
+        } else {
+            fail "replica did not apply the DEL"
+        }
         $master2 set count_dels_{4oi} 1
 
         set repl [attach_to_replication_stream_on_connection -3]
@@ -492,6 +496,31 @@ start_cluster 2 0 {overrides {cluster-node-timeout 1000}} {
         assert_equal {OK} [R 0 MODULE UNLOAD cluster]
     }
 
+}
+
+set modules [list loadmodule $testmodule_nokey loadmodule $testmodule_auth]
+start_cluster 1 0 [list config_lines $modules] {
+    test "Module-blocked command runs once after it is released" {
+        R 0 config resetstat
+        set rd [valkey_deferring_client 0]
+        $rd block.block 0
+        $rd flush
+        wait_for_blocked_clients_count 1 50 100 0
+        R 0 block.release 0
+        assert_equal {0} [$rd read]
+        wait_for_blocked_clients_count 0 50 100 0
+        assert_match {*calls=1,*} [cmdrstat block.block [srv 0 client]]
+        $rd close
+    }
+
+    test "Blocking module AUTH completes after unblock" {
+        R 0 acl setuser foo >pwd on ~* &* +@all
+        assert_equal {OK} [R 0 testmoduleone.rm_register_blocking_auth_cb]
+        set rc [valkey_client 0]
+        assert_equal {OK} [$rc AUTH foo block_allow]
+        assert_equal {foo} [$rc acl whoami]
+        $rc close
+    }
 }
 
 } ;# end tag
