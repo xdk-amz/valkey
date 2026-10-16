@@ -110,7 +110,9 @@ static int stagedInit(void) {
  * main. With io-threads 1 there is none, so staged mode stays off (logged once) instead of starting
  * a thread the configuration did not ask for. */
 static int stagedWanted(void) {
-    if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.cluster_enabled) return 0;
+    if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.cluster_enabled ||
+        server.sentinel_mode)
+        return 0;
     if (server.io_threads_num < 2 || ioThreadsReadyNum() < 2) {
         if (server.io_threads_num < 2 && !sl_warned) {
             serverLog(LL_NOTICE, "io-threads-fast-path needs io-threads >= 2; the staged event loop stays off");

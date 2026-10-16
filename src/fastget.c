@@ -58,6 +58,7 @@ void fastGetRecomputeSpecAclOk(client *c) {
         } else {
             static struct serverCommand *get_cmd = NULL;
             if (!get_cmd) get_cmd = lookupCommandByCString("get");
+            if (!get_cmd) goto done; /* sentinel has no GET */
             /* Synthetic argv: the helper only needs cmd identity + dbid for
              * the command/db checks; the ALLKEYS-or-%R~* requirement is what
              * actually gates key access, so a placeholder key can only cause
@@ -71,6 +72,7 @@ void fastGetRecomputeSpecAclOk(client *c) {
             decrRefCount(argv[1]);
         }
     }
+done:
     atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
 }
 
