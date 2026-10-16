@@ -641,6 +641,20 @@ int fastpathExecutorOutputLimitReached(client *ec) {
     return 1;
 }
 
+/* Conditions under which a fast-path command must run as a real client on main. Each can change only
+ * on main, so checking them as each entry executes is exact. */
+static int fpMustRunOnMain(void) {
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 1; /* main postpones it */
+    if (server.failover_state != NO_FAILOVER) return 1;                                 /* coordinated failover owns writes */
+    if (moduleHasCommandFilters()) return 1;                                            /* a filter may rewrite argv, which the executor borrows */
+    if (bgIteration_iterationActive()) return 1;                                        /* a forkless save may block it on a key in use */
+    if (throttle_anyThrottlers()) return 1;                                             /* a throttler may hold the command */
+    if (server.busy_module_yield_flags != BUSY_MODULE_YIELD_NONE &&
+        !(server.busy_module_yield_flags & BUSY_MODULE_YIELD_CLIENTS))
+        return 1; /* a yielding module postpones commands until it returns */
+    return 0;
+}
+
 /* The executor borrows argv and writes replies into the batch arena. */
 static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     char *saved_buf = ec->buf;
@@ -648,16 +662,8 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     user *principal = e->origin.principal;
 
     if (fpControlDetaching(e->control)) goto release_argv; /* no reply: the IO thread is closing it */
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) {
-        e->requeued = 1; /* the main path postpones it like any other client's command */
-        return;
-    }
-    if (bgIteration_iterationActive()) {
-        e->requeued = 1; /* a forkless save may block it on a key in use, which only a real client can wait for */
-        return;
-    }
-    if (throttle_anyThrottlers()) {
-        e->requeued = 1; /* a throttler may hold the command, which only a real client can wait for */
+    if (fpMustRunOnMain()) {
+        e->requeued = 1; /* handed back for the main path */
         return;
     }
 

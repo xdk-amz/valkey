@@ -9,6 +9,7 @@
 #include "server.h"
 #include "fastget.h"
 #include "io_threads.h"
+#include "module.h"
 
 #include <string.h>
 #include <stdatomic.h>
@@ -276,6 +277,10 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * when no module subscribes (single acquire load of a main-written int
      * that changes only on module admin ops). */
     if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 0;
+
+    /* A module command filter may rewrite or redirect the GET. Filters change only on main, which
+     * waits at the barrier while IO threads run this. */
+    if (moduleHasCommandFilters()) return 0;
 
     /* MONITOR GUARD (F1): a monitor feed is produced per executed command in
      * call() on main; speculation bypasses call() and would hide the read from

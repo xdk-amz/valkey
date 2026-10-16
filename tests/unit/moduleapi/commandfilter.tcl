@@ -188,7 +188,6 @@ start_server {} {
 
 test {Filtering based on the fast-path origin client id} {
     start_server {tags {"modules external:skip tls:skip"} overrides {io-threads 2}} {
-        r module load $testmodule log-key 0
         r client setname control ;# named clients stay on the main path
         r select 0
 
@@ -199,6 +198,17 @@ test {Filtering based on the fast-path origin client id} {
         } else {
             fail "client did not attach to the fast path"
         }
+        # Plain GETs from this client are answered on its IO thread before the filter is registered.
+        r set @replaceme raw
+        r set --replaced-- filtered
+        set engaged 0
+        for {set round 0} {$round < 20 && !$engaged} {incr round} {
+            set before [getInfoProperty [r info fastget] fastget_speculated_commands]
+            for {set i 0} {$i < 10} {incr i} { $early get @replaceme }
+            for {set i 0} {$i < 10} {incr i} { assert_equal raw [$early read] }
+            if {[getInfoProperty [r info fastget] fastget_speculated_commands] > $before} { set engaged 1 }
+        }
+        assert {$engaged}
         r module load $testmodule log-key 0
         set late [valkey [srv 0 host] [srv 0 port] 1 $::tls]
 
@@ -216,11 +226,17 @@ test {Filtering based on the fast-path origin client id} {
             assert_equal 3 [$rr read]
             assert_equal {elem1 @replaceme elem2} [r lrange mylist 0 -1]
         }
-        # A filter may rewrite any command, so while one is registered every client runs on main.
-        wait_for_condition 100 20 {
-            [getInfoProperty [r info fastpath] fastpath_clients] == 0
-        } else {
-            fail "a client stayed on the fast path with a command filter registered"
+        # Clients still on the fast path have their commands filtered, reads included.
+        r unfilter_clientid 0
+        foreach rr [list $early $late] {
+            r del mylist
+            $rr rpush mylist elem1 @delme elem2
+            assert_equal 2 [$rr read]
+            assert_equal {elem1 elem2} [r lrange mylist 0 -1]
+        }
+        foreach rr [list $early $late] {
+            for {set i 0} {$i < 10} {incr i} { $rr get @replaceme }
+            for {set i 0} {$i < 10} {incr i} { assert_equal filtered [$rr read] }
         }
         $early close
         $late close
