@@ -444,6 +444,11 @@ static int fpFlushOut(fpThread *t, client *c) {
         t->writes++;
         sdsrange(c->fp_out, n, -1);
     }
+    /* A drained buffer is given back, so a burst of replies does not stay charged to the client. */
+    if (c->fp_out && sdsalloc(c->fp_out) > PROTO_REPLY_CHUNK_BYTES) {
+        sdsfree(c->fp_out);
+        c->fp_out = NULL;
+    }
     return 1;
 }
 
