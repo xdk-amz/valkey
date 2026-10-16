@@ -1,8 +1,6 @@
-# Fast-path clients under AOF appendfsync always: the reply-publication barrier holds a write's
-# reply until the beforeSleep fsync, so this asserts that fast-path DB0 connections stay correct
-# and keep write/read ordering under that policy. The sub-millisecond timing of the barrier is
-# proven deterministically by the C++ unit tests (test_fastpath_aof_barrier.cpp); here we assert
-# functional correctness end to end.
+# Fast-path clients under AOF appendfsync always: a write's reply leaves only after its write is
+# fsynced, so this asserts that fast-path DB0 connections stay correct and keep write/read ordering
+# under that policy. staged-loop-overlap checks the durability itself.
 
 # A deferring client that sends nothing before its first command, so it stays on the fast path
 # (a SELECT would move it to the main path).
@@ -46,9 +44,6 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
         assert_equal 2 [$rd read]
         assert_equal 3 [$rd read]
         assert_equal v1z [$rd read]
-
-        # Once every reply is read the writes were released past the fsync, so nothing stays held.
-        assert_equal 0 [getInfoProperty [r info fastpath] fastpath_pending_durable_batches]
         $rd close
     }
 
@@ -71,7 +66,6 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
         assert_equal 200 [llength $got]
         assert_equal item:0 [lindex $got 0]
         assert_equal item:199 [lindex $got 199]
-        assert_equal 0 [getInfoProperty [r info fastpath] fastpath_pending_durable_batches]
         $rd close
     }
 }
@@ -81,7 +75,9 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
     waitForBgrewriteaof r
     proc fpa_speculated {} { getInfoProperty [r info fastpath] fastpath_speculated }
 
-    test {Fast path appendfsync always: IO-thread reads stop while every reply must wait for the fsync} {
+    # A read in the read phase sees only writes of earlier iterations, which were fsynced before their
+    # reply phase, so IO-thread reads stay on and stay correct under appendfsync always.
+    test {Fast path appendfsync always: IO-thread reads return committed values} {
         r set k v
         set rd [fp_client]
         fp_wait_fastpath_clients 1
@@ -93,10 +89,14 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
         assert_morethan [fpa_speculated] $before
 
         r config set appendfsync always
-        set before [fpa_speculated]
-        for {set i 0} {$i < 200} {incr i} { $rd get k }
-        for {set i 0} {$i < 200} {incr i} { assert_equal v [$rd read] }
-        assert_equal $before [fpa_speculated]
+        for {set i 0} {$i < 200} {incr i} {
+            $rd set k v$i
+            $rd get k
+        }
+        for {set i 0} {$i < 200} {incr i} {
+            assert_equal OK [$rd read]
+            assert_equal v$i [$rd read]
+        }
         $rd close
         r config set appendfsync everysec
     }
