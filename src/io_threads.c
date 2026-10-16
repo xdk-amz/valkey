@@ -1358,6 +1358,7 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
         int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
         if (phase == PHASE_BARRIER_EXIT) return;
         monotime start = getMonotonicUs();
+        uint64_t start_ns = stagedNowNs();
         /* A MAINT phase serves no client, so its jobs run first and the inboxes only get the time left
          * before the phase deadline; whatever remains waits for the next phase. */
         if (phase != STAGED_PHASE_MAINT) ioThreadDrainInboxes(id, batch_jobs);
@@ -1375,6 +1376,7 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
         atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
+        stagedWorkerPhaseTime((int)id, phase, stagedNowNs() - start_ns);
         phaseBarrierDone(b);
         if (phase == STAGED_PHASE_SYNC) return;
     }

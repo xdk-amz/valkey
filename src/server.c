@@ -3091,6 +3091,7 @@ void resetServerStats(void) {
     int j;
 
     fastGetAggregateStats(); /* settle speculated counts into the stats about to be cleared */
+    stagedResetStats();
     server.stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
@@ -7536,6 +7537,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscat(info, "# Fastpath\r\n");
         fastpathInfo(&info);
+        stagedInfo(&info);
     }
 
     return info;

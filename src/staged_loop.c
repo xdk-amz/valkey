@@ -13,6 +13,80 @@
 #include "repl_apply.h"
 #include "cronstats.h"
 #include "maint.h"
+#include <time.h>
+
+/* Phase timing. Main's wall time per part of a staged iteration; per phase id, every worker's busy
+ * time and, summed over phases, the slowest worker's busy time (the phase's critical path; the rest
+ * of main's wait is barrier overhead). A worker writes its own slots before it reports the phase
+ * done, so main reads them after the barrier. */
+enum {
+    SL_T_BEFORESLEEP,
+    SL_T_POLL,
+    SL_T_READ,
+    SL_T_EXEC,
+    SL_T_EVENTS,
+    SL_T_AOF,
+    SL_T_REPLY,
+    SL_T_FINISH,
+    SL_T_CRONS,
+    SL_T_COUNT
+};
+static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll", "read", "exec", "events",
+                                                   "aof", "reply", "finish", "crons"};
+static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none", "read", "reply", "sync", "drain", "apply", "maint"};
+static uint64_t sl_main_ns[SL_T_COUNT];
+static uint64_t sl_iterations;
+static uint64_t sl_phases[STAGED_PHASE_KINDS];
+static uint64_t sl_crit_ns[STAGED_PHASE_KINDS];
+static _Atomic uint64_t sl_worker_ns[IO_THREADS_MAX_NUM][STAGED_PHASE_KINDS];
+static uint64_t sl_worker_last_ns[IO_THREADS_MAX_NUM];
+
+uint64_t stagedNowNs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+void stagedWorkerPhaseTime(int tid, int phase, uint64_t ns) {
+    if (tid <= 0 || tid >= IO_THREADS_MAX_NUM || phase <= 0 || phase >= STAGED_PHASE_KINDS) return;
+    atomic_fetch_add_explicit(&sl_worker_ns[tid][phase], ns, memory_order_relaxed);
+    sl_worker_last_ns[tid] = ns;
+}
+
+/* Main, after the barrier of a phase that workers 1..nworkers ran. */
+static void stagedAccountPhase(int phase, int nworkers) {
+    if (phase <= 0 || phase >= STAGED_PHASE_KINDS) return;
+    uint64_t max = 0;
+    for (int tid = 1; tid <= nworkers && tid < IO_THREADS_MAX_NUM; tid++)
+        if (sl_worker_last_ns[tid] > max) max = sl_worker_last_ns[tid];
+    sl_phases[phase]++;
+    sl_crit_ns[phase] += max;
+}
+
+void stagedInfo(char **info) {
+    sds s = *info;
+    s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
+    for (int i = 0; i < SL_T_COUNT; i++)
+        s = sdscatprintf(s, "staged_main_%s_us:%llu\r\n", sl_t_names[i], (unsigned long long)(sl_main_ns[i] / 1000));
+    for (int p = 1; p < STAGED_PHASE_KINDS; p++) {
+        uint64_t busy = 0;
+        for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++)
+            busy += atomic_load_explicit(&sl_worker_ns[tid][p], memory_order_relaxed);
+        s = sdscatprintf(s, "staged_%s_phases:%llu\r\nstaged_%s_worker_us:%llu\r\nstaged_%s_critical_us:%llu\r\n",
+                         sl_phase_names[p], (unsigned long long)sl_phases[p], sl_phase_names[p],
+                         (unsigned long long)(busy / 1000), sl_phase_names[p], (unsigned long long)(sl_crit_ns[p] / 1000));
+    }
+    *info = s;
+}
+
+void stagedResetStats(void) {
+    memset(sl_main_ns, 0, sizeof(sl_main_ns));
+    sl_iterations = 0;
+    memset(sl_phases, 0, sizeof(sl_phases));
+    memset(sl_crit_ns, 0, sizeof(sl_crit_ns));
+    for (int tid = 0; tid < IO_THREADS_MAX_NUM; tid++)
+        for (int p = 0; p < STAGED_PHASE_KINDS; p++) atomic_store_explicit(&sl_worker_ns[tid][p], 0, memory_order_relaxed);
+}
 
 #ifdef HAVE_FASTPATH_EPOLL
 
@@ -93,6 +167,7 @@ static void stagedRunPhase(int phase) {
     else if (sl_main_lane && phase == STAGED_PHASE_REPLY)
         fastpathStagedReplyPhase(0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    stagedAccountPhase(phase, sl_workers);
 }
 
 /* Main-affinity handler. Never called: main checks whether ae's fd fired and runs ae itself. */
@@ -288,11 +363,13 @@ static void stagedReconcile(aeEventLoop *el) {
 /* Collect: the pre-sleep hook, the next ready batch from the epoll thread (waiting only when none
  * accumulated, bounded like aeProcessEvents), the post-sleep hook. */
 static void collectFDs(aeEventLoop *el) {
+    uint64_t t0 = stagedNowNs();
     if (el->beforesleep) {
         monotime bs = getMonotonicUs();
         el->beforesleep(el);
         cronStatsRecord(CRON_JOB_SL_BEFORE_SLEEP, getMonotonicUs() - bs);
     }
+    uint64_t t1 = stagedNowNs();
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
     long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client) ? 0 : aeUsUntilEarliestTimer(el);
     monotime pl = getMonotonicUs();
@@ -302,7 +379,10 @@ static void collectFDs(aeEventLoop *el) {
         serverLog(LL_WARNING, "Staged event loop: poll failed: %s", strerror(errno));
         n = 0;
     }
+    uint64_t t2 = stagedNowNs();
     if (el->aftersleep) el->aftersleep(el, n);
+    sl_main_ns[SL_T_BEFORESLEEP] += (t1 - t0) + (stagedNowNs() - t2);
+    sl_main_ns[SL_T_POLL] += t2 - t1;
 }
 
 /* Main, at the start of a read phase: hand the waiting read to whichever worker drains first, which
@@ -325,39 +405,58 @@ static void readPhase(void) {
 /* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
+    uint64_t t0 = stagedNowNs();
     if (sl_read_queued) {
         sl_read_queued = 0;
         processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
     }
     fastpathStagedExecute();
-    if (ae_ready) aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
+    uint64_t t1 = stagedNowNs();
+    sl_main_ns[SL_T_EXEC] += t1 - t0;
+    if (ae_ready) {
+        aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
+        sl_main_ns[SL_T_EVENTS] += stagedNowNs() - t1;
+    }
 }
 
 /* Reply: IO threads write the replies of their own batches and any main-path write jobs; the barrier
  * closes the phase, then main takes back the clients that left and unmaps the ones it closed. */
 static void replyPhase(void) {
+    uint64_t t0 = stagedNowNs();
     if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
+    uint64_t t1 = stagedNowNs();
     fastpathStagedFinish();
+    sl_main_ns[SL_T_REPLY] += t1 - t0;
+    sl_main_ns[SL_T_FINISH] += stagedNowNs() - t1;
 }
 
 /* Crons: timers, main only. beforeSleep runs at the head of the next collect, as in ae. */
 static void crons(aeEventLoop *el) {
+    uint64_t t0 = stagedNowNs();
     aeProcessTimeEvents(el);
+    sl_main_ns[SL_T_CRONS] += stagedNowNs() - t0;
 }
 
 static void stagedLoopIteration(aeEventLoop *el) {
     monotime t;
+    sl_iterations++;
     collectFDs(el);
+    uint64_t t0 = stagedNowNs();
     t = getMonotonicUs();
     readPhase();
     cronStatsRecord(CRON_JOB_SL_READ, getMonotonicUs() - t);
+    sl_main_ns[SL_T_READ] += stagedNowNs() - t0;
     t = getMonotonicUs();
     writePhase(el);
     cronStatsRecord(CRON_JOB_SL_WRITE, getMonotonicUs() - t);
     /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
      * commands reach the AOF before the reply phase sends their replies. */
     t = getMonotonicUs();
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) flushAppendOnlyFile(0);
+    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) {
+        uint64_t t1 = stagedNowNs();
+        flushAppendOnlyFile(0);
+        sl_main_ns[SL_T_AOF] += stagedNowNs() - t1;
+    }
     cronStatsRecord(CRON_JOB_SL_AOF_ALWAYS, getMonotonicUs() - t);
     t = getMonotonicUs();
     replyPhase();
@@ -445,6 +544,7 @@ void stagedRunLanePhase(int phase, int with_workers) {
     sl_opens++;
     if (sl_main_lane) stagedRunLane(phase, 0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    stagedAccountPhase(phase, sl_workers);
 }
 
 void stagedRunApplyPhase(int with_workers) {

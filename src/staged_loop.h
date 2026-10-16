@@ -36,6 +36,7 @@
 #define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
 #define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
 #define STAGED_PHASE_MAINT 6 /* workers run their lane of due table maintenance (rehash, resize, expire) */
+#define STAGED_PHASE_KINDS 7 /* phase ids are below this */
 
 struct aeEventLoop;
 struct poller;
@@ -88,6 +89,13 @@ struct phaseBarrier *stagedBarrier(void);
 /* IO thread tid: returns 1 when main enrolled it in the staged loop, adopting the barrier sequence to
  * wait from on a new enrollment. *seen and *gen are the thread's own, kept across calls. */
 int stagedWorkerEnrolled(int tid, uint64_t *seen, uint32_t *gen);
+
+/* Phase timing for INFO fastpath. A monotonic clock in nanoseconds; a worker's busy time in one
+ * phase, recorded by the worker before it reports the phase done; the INFO fields; RESETSTAT. */
+uint64_t stagedNowNs(void);
+void stagedWorkerPhaseTime(int tid, int phase, uint64_t ns);
+void stagedInfo(char **info);
+void stagedResetStats(void);
 
 /* Unit tests: turn staged fast-path admission on and off without enrolling workers; 0 on success. */
 int testOnlyStagedStart(void);
