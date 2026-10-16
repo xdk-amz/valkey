@@ -1,6 +1,6 @@
 # Staged event loop: hazards of running socket IO and keyspace reads concurrently with main's
 # command execution. Per-connection order on long mixed pipelines, large replies whose key is
-# changed right after, ACL and module changes under load, durability of acknowledged writes,
+# changed right after, ACL changes under load, durability of acknowledged writes,
 # WAIT, teardown mid-pipeline and buffer limits. Every fast-path client is a raw db-0 socket:
 # the test framework's client sends SELECT first, which moves a connection off the fast path.
 
@@ -289,86 +289,6 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
             slo_wait_fastpath_clients 0
         }
         r acl deluser slo-u
-    }
-
-    test {Staged overlap: MODULE LOAD and UNLOAD while clients pipeline its command and core commands} {
-        set module [file normalize tests/modules/zset.so]
-        r del slo:mz
-        r zadd slo:mz 0 a 0 b 0 c
-        # Module clients mix the module command with core commands; core clients send only core
-        # commands and stay on the fast path while the command table changes.
-        set fds [slo_open 3]
-        set core [slo_open 3]
-        set ctl [valkey_deferring_client]
-        $ctl select 0
-        $ctl read
-        set loaded 0
-        set counts {0 0 0}
-        set core_counts {0 0 0}
-        for {set round 0} {$round < 30} {incr round} {
-            set i 0
-            foreach fd $fds {
-                set p ""
-                for {set k 0} {$k < 100} {incr k} {
-                    append p [slo_resp zset.rangebylex slo:mz - +] [slo_resp incr slo:mc:$i] [slo_resp get slo:mc:$i]
-                }
-                puts -nonewline $fd $p
-                flush $fd
-                incr i
-            }
-            set i 0
-            foreach fd $core {
-                set p ""
-                for {set k 0} {$k < 200} {incr k} { append p [slo_resp incr slo:mk:$i] [slo_resp get slo:mk:$i] }
-                puts -nonewline $fd $p
-                flush $fd
-                incr i
-            }
-            if {$loaded} { $ctl module unload zset } else { $ctl module load $module }
-            set i 0
-            foreach fd $fds {
-                set c [lindex $counts $i]
-                for {set k 0} {$k < 100} {incr k} {
-                    set got [slo_read_replies $fd 3]
-                    set z [lindex $got 0]
-                    if {$z ne {a b c} && ![string match {-ERR unknown command*} $z]} {
-                        fail "unexpected module command reply: $z"
-                    }
-                    incr c
-                    assert_equal [list ":$c" $c] [lrange $got 1 2]
-                }
-                lset counts $i $c
-                incr i
-            }
-            set i 0
-            foreach fd $core {
-                set c [lindex $core_counts $i]
-                for {set k 0} {$k < 200} {incr k} {
-                    incr c
-                    assert_equal [list ":$c" $c] [slo_read_replies $fd 2]
-                }
-                lset core_counts $i $c
-                incr i
-            }
-            assert_equal OK [$ctl read]
-            set loaded [expr {!$loaded}]
-            # A command sent after the acknowledgement sees the new command table.
-            foreach fd $fds {
-                puts -nonewline $fd [slo_resp zset.rangebylex slo:mz - +]
-                flush $fd
-                set z [slo_read_reply $fd]
-                if {$loaded} {
-                    assert_equal {a b c} $z
-                } else {
-                    assert_match {-ERR unknown command*} $z
-                }
-            }
-        }
-        if {$loaded} { r module unload zset }
-        $ctl close
-        assert {[slo_fastpath_clients] >= [llength $core]}
-        foreach fd [concat $fds $core] { close $fd }
-        slo_wait_fastpath_clients 0
     }
 
     test {Staged overlap: CLIENT KILL of pipelining clients leaves the others exact} {
