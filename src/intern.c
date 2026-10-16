@@ -974,7 +974,7 @@ static int pendingGrow(void **arr, uint32_t n, uint32_t *cap, size_t entry) {
 }
 
 /* Each IO thread selects one eligible argument in 2^level, the main sampling
- * level, but no more than one in INTERN_IO_MIN_PERIOD. */
+ * rate, and hashes it, since the main thread does not have its bytes in cache. */
 static __thread uint32_t io_sel_tick = 1;
 
 static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int argi) {
@@ -982,8 +982,7 @@ static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int arg
     /* The command name and, usually, the key come first; values follow. */
     int sampled = 0;
     if (argi >= 2 && --io_sel_tick == 0) {
-        uint32_t period = 1u << __atomic_load_n(&intern_level, __ATOMIC_RELAXED);
-        io_sel_tick = period > INTERN_IO_MIN_PERIOD ? period : INTERN_IO_MIN_PERIOD;
+        io_sel_tick = 1u << __atomic_load_n(&intern_level, __ATOMIC_RELAXED);
         sampled = 1;
     }
     uint64_t m = hotMix(buf, len);

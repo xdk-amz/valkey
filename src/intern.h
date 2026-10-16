@@ -100,11 +100,6 @@ static inline sds internAdmitDue(sds s) {
     return internAdmitSlow(s);
 }
 
-/* An IO thread selects eligible arguments for admission at the main sampling
- * rate, but at most one in INTERN_IO_MIN_PERIOD, and hashes them, since the
- * main thread does not have their bytes in cache. See internParseArg(). */
-#define INTERN_IO_MIN_PERIOD 8
-
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. */
 void internInit(void);

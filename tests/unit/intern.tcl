@@ -189,6 +189,21 @@ start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-a
         for {set i 0} {$i < 3000} {incr i 97} {assert_equal $v [r get k$i]}
     }
 
+    test {Values parsed by IO threads are shared when they differ only in the middle} {
+        r flushall
+        # Same length and same first and last bytes, so they map to one hot slot.
+        set vals {}
+        for {set j 0} {$j < 50} {incr j} {
+            lappend vals "[string repeat a 100][format %03d $j][string repeat z 100]"
+        }
+        for {set pass 0} {$pass < 2} {incr pass} {
+            for {set i 0} {$i < 3000} {incr i} {r set k$i [lindex $vals [expr {($i * 7 + $pass) % 50}]]}
+        }
+        assert_morethan [s io_threaded_reads_processed] 1000
+        assert_morethan [intern_stat intern_refs] 2900
+        for {set i 0} {$i < 3000} {incr i 97} {assert_equal [lindex $vals [expr {($i * 7 + 1) % 50}]] [r get k$i]}
+    }
+
     test {Values shared by IO threads are released on overwrite and flush} {
         set w [string repeat z 300]
         for {set i 0} {$i < 3000} {incr i} {r set k$i $w}
