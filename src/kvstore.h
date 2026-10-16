@@ -61,6 +61,13 @@ bool kvstoreIteratorNext(kvstoreIterator *kvs_it, void **next);
 /* Rehashing */
 void kvstoreTryResizeHashtables(kvstore *kvs, int limit);
 uint64_t kvstoreIncrementallyRehash(kvstore *kvs, uint64_t threshold_us);
+/* Per-table variants, safe to call from one thread inside a lane phase (they touch only this
+ * table, not the shared resize cursor or rehashing list). */
+void kvstoreTryResizeHashtable(kvstore *kvs, int didx);
+uint64_t kvstoreRehashHashtable(kvstore *kvs, int didx, uint64_t us);
+/* Main, after a lane phase: fold the per-table deltas recorded in concurrent mode into the
+ * kvstore-wide counts, Fenwick index, rehashing list and overhead. */
+void kvstoreReconcile(kvstore *kvs);
 size_t kvstoreOverheadHashtableLut(kvstore *kvs);
 size_t kvstoreOverheadHashtableRehashing(kvstore *kvs);
 unsigned long kvstoreHashtableRehashingCount(kvstore *kvs);

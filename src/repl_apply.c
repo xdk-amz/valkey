@@ -148,6 +148,13 @@ void replApplyFlush(client *c) {
     kvstoreSetConcurrent(1);
     stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
     kvstoreSetConcurrent(0);
+    /* Fold each thread's per-table changes into the kvstore-wide bookkeeping. */
+    for (int i = 0; i < server.dbnum; i++) {
+        serverDb *db = server.db[i];
+        kvstoreReconcile(db->keys);
+        kvstoreReconcile(db->expires);
+        kvstoreReconcile(db->keys_with_volatile_items);
+    }
     server.current_client = old;
 
     monotime usec = 0;
