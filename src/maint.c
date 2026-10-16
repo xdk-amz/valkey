@@ -181,6 +181,10 @@ static void maintBuildUnits(void) {
         if (!db) continue;
         int n = kvstoreNumHashtables(db->keys);
         for (int didx = 0; didx < n; didx++) {
+            /* A cluster node allocates tables only for the slots it holds. */
+            if (!kvstoreGetHashtable(db->keys, didx) && !kvstoreGetHashtable(db->expires, didx) &&
+                !kvstoreGetHashtable(db->keys_with_volatile_items, didx))
+                continue;
             int due = mt_requested[MAINT_JOB_RESIZE];
             if (!due && mt_requested[MAINT_JOB_REHASH])
                 due = kvstoreHashtableRehashingAt(db->keys, didx) || kvstoreHashtableRehashingAt(db->expires, didx) ||
@@ -199,8 +203,12 @@ static void maintBuildUnits(void) {
     if (mt_start >= mt_units_len) mt_start = 0;
 }
 
+int maintKeyspaceSplit(void) {
+    return server.cluster_enabled || server.keyspace_shard_bits > 0;
+}
+
 int maintParallelReady(void) {
-    return server.cron_lanes && server.keyspace_shard_bits > 0 && stagedApplyReady() && stagedWorkerCount() > 0;
+    return server.cron_lanes && maintKeyspaceSplit() && stagedApplyReady() && stagedWorkerCount() > 0;
 }
 
 /* Main, after the phase: the effects of every delete the lanes made, thread by thread in log order. */

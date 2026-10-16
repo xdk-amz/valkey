@@ -1430,7 +1430,7 @@ void databasesCron(void) {
         /* When the MAINT phase handles table work, post a rightsize request for every table and a
          * rehash request with the stock budget; maintRun runs them after crons(), in parallel when
          * it can and inline on main otherwise. Falls back to today's code when lanes are off. */
-        if (server.cron_lanes && server.keyspace_shard_bits > 0 && stagedLoopActive()) {
+        if (server.cron_lanes && maintKeyspaceSplit() && stagedLoopActive()) {
             maintRequest(MAINT_JOB_RESIZE, 0);
             if (server.activerehashing) maintRequest(MAINT_JOB_REHASH, 1 * 1000000 / server.hz / 100);
         } else {
