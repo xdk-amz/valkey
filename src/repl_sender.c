@@ -34,6 +34,7 @@ static list *repl_sender_replicas = NULL; /* client* of streamed replicas */
 static int repl_sender_running = 0;
 static int repl_sender_stop = 0;
 static _Atomic(long long) repl_sender_wake_offset; /* stable offset last published */
+static _Atomic(long long) repl_sender_last_wake_offset; /* stable offset at the sender's last append-mode wake */
 static _Atomic int repl_sender_idle;               /* 1 while the sender is parked in cond_wait */
 
 /* True if this replica can be streamed by the sender thread (prototype subset). */
@@ -155,6 +156,7 @@ static void *replStreamSenderMain(void *arg) {
     while (!repl_sender_stop) {
         long long stable = atomic_load_explicit(&server.repl_stable_offset, memory_order_acquire);
         atomic_fetch_add_explicit(&server.stat_repl_sender_wakeups, 1, memory_order_relaxed);
+        atomic_store_explicit(&repl_sender_last_wake_offset, stable, memory_order_release);
 
         /* Snapshot the replica set under the mutex and mark each busy, then release the
          * mutex and write outside it: main's per-iteration tick (account) and add never
@@ -224,6 +226,10 @@ void replStreamSenderPublishStable(long long offset) {
     if (!repl_sender_running) return;
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
+    /* Signal only a parked sender: a running sender rereads the stable offset on its next
+     * loop pass, so an unconditional signal would be a wasted futex wake per iteration. */
+    if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
+    atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
     pthread_cond_signal(&repl_sender_cond);
 }
 
@@ -231,16 +237,22 @@ void replStreamSenderPublishStable(long long offset) {
  * finishes an append, so the sender streams this append rather than waiting for the next
  * staged iteration's tick. The release store publishes every prior block write; the sender
  * reads it with acquire and sends only bytes strictly below it, so it never reads a block
- * main is still filling. We never make a syscall per append: the cond_signal is issued only
- * when the sender is parked (repl_sender_idle), so a busy sender just picks up the newer
- * offset on its next loop pass. No-op unless the sender is running in append mode. Under
+ * main is still filling. We never make a syscall per append: a cond_signal is issued only
+ * when the sender is parked (repl_sender_idle) AND at least repl-stream-sender-wake-bytes
+ * have been published since the sender's last wake, so a stream of small appends coalesces
+ * into one wake. The per-iteration tick (replStreamSenderPublishStable) always signals, so
+ * a sub-threshold tail is never stranded. No-op unless the sender runs in append mode. Under
  * appendfsync always this is NOT called (the tick publishes the fsync-bounded offset), so
  * no byte is streamed before it is on disk. */
 void replStreamSenderPublishAppend(long long offset) {
     if (!repl_sender_running || server.repl_stream_sender != REPL_STREAM_SENDER_APPEND) return;
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
-    if (atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) pthread_cond_signal(&repl_sender_cond);
+    if (!atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) return;
+    long long since = atomic_load_explicit(&repl_sender_last_wake_offset, memory_order_acquire);
+    if (offset - since < server.repl_stream_sender_wake_bytes) return;
+    atomic_fetch_add_explicit(&server.stat_repl_sender_main_wakes, 1, memory_order_relaxed);
+    pthread_cond_signal(&repl_sender_cond);
 }
 
 /* Main: reclaim a replica from the sender (state change, close, or disable).

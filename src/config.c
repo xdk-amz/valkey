@@ -3535,6 +3535,7 @@ standardConfig static_configs[] = {
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
     createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),
+    createIntConfig("repl-stream-sender-wake-bytes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.repl_stream_sender_wake_bytes, 16384, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
 
