@@ -144,6 +144,40 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         $rd_redir close
     }
 
+    test "Active expire with cron-lanes $lanes removes tracked keys after their client disconnects" {
+        r flushdb
+        set rt [valkey_client]
+        $rt select 0
+        $rt client tracking on
+        me_load_volatile r st: 1000 300
+        for {set i 1} {$i <= 1000} {incr i} { $rt get st:$i }
+        assert_morethan_equal [s tracking_total_keys] 1000
+        $rt close
+        wait_for_condition 50 20 {[s tracking_clients] == 0} else { fail "tracking client still connected" }
+        me_wait_empty r
+        # With no client left, the tracking table still drops each expired key's entry.
+        assert_equal 0 [s tracking_total_keys]
+    }
+
+    test "Active expire with cron-lanes $lanes frees large values off the MAINT phase" {
+        r flushdb
+        r config resetstat
+        # One value whose free takes far longer than an expire cycle's budget.
+        r eval {for i=1,tonumber(ARGV[1]) do redis.call('hset', KEYS[1], i, i) end return 1} 1 bigh 1000000
+        for {set i 0} {$i < 50} {incr i} { r hset smallh:$i f v }
+        r pexpire bigh 100
+        for {set i 0} {$i < 50} {incr i} { r pexpire smallh:$i 100 }
+        me_wait_empty r
+        assert_equal 51 [s expired_keys]
+        if {$lanes eq "yes"} {
+            # The large value went to main's replay, which hands it to a free off the phase, so no phase
+            # ran for the length of its free.
+            assert_morethan [me_cron_calls r maint_replay] 0
+            regexp {max_usec=(\d+)} [getInfoProperty [r info cronstats] cron_maint] -> maxus
+            assert_lessthan $maxus 100000
+        }
+    }
+
     test "Active expire with cron-lanes $lanes keeps a value pinned by an in-flight large reply" {
         r flushdb
         r config set lazyfree-lazy-expire no

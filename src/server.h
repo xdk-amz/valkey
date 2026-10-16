@@ -4255,6 +4255,8 @@ int inMainThread(void);
 #else
 #define assertNoMainThreadFree() ((void)0)
 #endif
+/* Free effort above which a value is freed off the calling thread. */
+#define LAZYFREE_THRESHOLD 64
 size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
