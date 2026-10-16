@@ -262,7 +262,9 @@ static void stagedReconcile(aeEventLoop *el) {
     }
     stagedSetWorkers(ioThreadsReadyNum() - 1);
     if (!sl_on) {
-        if (pollerStart(sl_poller) != 0)
+        if (1) {
+            serverLog(LL_NOTICE, "Staged event loop: epoll thread off (experiment); main waits on epoll itself");
+        } else if (pollerStart(sl_poller) != 0)
             serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
         __atomic_store_n(&sl_on, 1, __ATOMIC_RELAXED);
         fastpathStagedSet(1);
