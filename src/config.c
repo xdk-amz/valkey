@@ -122,6 +122,13 @@ configEnum staged_stream_order_enum[] = {
     {"chunk", STAGED_STREAM_ORDER_CHUNK},
     {NULL, 0}};
 
+configEnum repl_stream_sender_enum[] = {
+    {"no", REPL_STREAM_SENDER_NO},
+    {"iteration", REPL_STREAM_SENDER_ITERATION},
+    {"append", REPL_STREAM_SENDER_APPEND},
+    {"yes", REPL_STREAM_SENDER_ITERATION}, /* yes is an alias for iteration */
+    {NULL, 0}};
+
 configEnum shutdown_on_sig_enum[] = {
     {"default", SHUTDOWN_NOFLAGS},
     {"save", SHUTDOWN_SAVE},
@@ -3530,7 +3537,7 @@ standardConfig static_configs[] = {
     createBoolConfig("cron-lanes-split-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes_split_budget, 0, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
-    createBoolConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.repl_stream_sender, 0, NULL, NULL),
+    createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
 

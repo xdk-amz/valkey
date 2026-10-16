@@ -34,6 +34,7 @@ static list *repl_sender_replicas = NULL; /* client* of streamed replicas */
 static int repl_sender_running = 0;
 static int repl_sender_stop = 0;
 static _Atomic(long long) repl_sender_wake_offset; /* stable offset last published */
+static _Atomic int repl_sender_idle;               /* 1 while the sender is parked in cond_wait */
 
 /* True if this replica can be streamed by the sender thread (prototype subset). */
 int replStreamSenderEligible(client *replica) {
@@ -63,7 +64,13 @@ static int replStreamSendOne(client *replica, long long stable) {
     long long sent = atomic_load_explicit(&rd->sent_offset, memory_order_relaxed);
     if (stable <= sent) return C_OK; /* nothing new to send */
 
-    /* Build an iovec of [send_node:send_pos .. offset `stable`]. */
+    /* Build an iovec of [send_node:send_pos .. offset `stable`]. The end of each block's
+     * contribution is derived only from `stable` (acquire-loaded, immutable below it) and
+     * b->size (set once at allocation, immutable), never from b->used: main mutates b->used
+     * and b->buf on the tail block concurrently, and the design guarantees only that bytes
+     * strictly below stable are stable. A non-tail block is always full (feedReplicationBuffer
+     * allocates a new block only after filling the current tail), so b->size is its byte count;
+     * the block that holds the stable boundary contributes up to stable and the walk stops. */
     struct iovec iov_arr[IOV_MAX];
     int iovcnt = 0;
     long long span_end = stable;
@@ -76,18 +83,18 @@ static int replStreamSendOne(client *replica, long long stable) {
          * absolute offset (b->repl_offset - 1) + i. */
         long long block_start = b->repl_offset - 1;
         size_t start = (ln == rd->send_node) ? pos : 0;
-        /* End within this block: either the block's used, or where stable falls. */
-        long long block_end_off = block_start + (long long)b->used;
-        size_t end = b->used;
-        if (span_end < block_end_off) end = (size_t)(span_end - block_start);
+        /* Where this block ends for the sender: stable if it falls inside, else the whole
+         * (immutable, full) block by its allocated size. */
+        int stable_in_block = (span_end <= block_start + (long long)b->size);
+        size_t end = stable_in_block ? (size_t)(span_end - block_start) : b->size;
         if (end <= start) {
-            if (span_end <= block_end_off) break;
+            if (stable_in_block) break;
             continue;
         }
         iov_arr[iovcnt].iov_base = b->buf + start;
         iov_arr[iovcnt].iov_len = end - start;
         iovcnt++;
-        if (span_end <= block_end_off) break;
+        if (stable_in_block) break;
     }
     if (iovcnt == 0) return C_OK;
 
@@ -101,25 +108,33 @@ static int replStreamSendOne(client *replica, long long stable) {
     atomic_fetch_add_explicit(&server.stat_repl_sender_writes, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&server.stat_repl_sender_bytes, nwritten, memory_order_relaxed);
 
-    /* Advance the sender position by nwritten and publish sent_offset. */
+    /* Advance the sender position by nwritten. Bound each block by stable (not b->used), and
+     * only step to listNextNode when stable is strictly beyond this block: such a block is
+     * full and its successor is already linked, so the sender never reads a next pointer main
+     * is concurrently writing when it links a new tail block. */
     size_t remaining = (size_t)nwritten;
     ln = rd->send_node;
     pos = rd->send_pos;
     while (remaining > 0 && ln != NULL) {
         replBufBlock *b = listNodeValue(ln);
-        size_t avail = b->used - pos;
+        long long block_start = b->repl_offset - 1;
+        int stable_in_block = (span_end <= block_start + (long long)b->size);
+        size_t block_end = stable_in_block ? (size_t)(span_end - block_start) : b->size;
+        size_t avail = block_end - pos;
         if (remaining < avail) {
             pos += remaining;
             remaining = 0;
             break;
         }
-        remaining -= avail;
-        listNode *next = listNextNode(ln);
-        if (next == NULL) {
-            pos = b->used;
+        /* Consumed to this block's end. If stable is in this block it is the tail: stop here
+         * without touching its next pointer. Otherwise the block is full and committed, so a
+         * linked successor exists and reading it does not race main. */
+        if (stable_in_block) {
+            pos = block_end;
             break;
         }
-        ln = next;
+        remaining -= avail;
+        ln = listNextNode(ln);
         pos = 0;
     }
     rd->send_node = ln;
@@ -153,7 +168,9 @@ static void *replStreamSenderMain(void *arg) {
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 1000000; /* 1ms backstop so partial writes retry */
             if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+            atomic_store_explicit(&repl_sender_idle, 1, memory_order_release);
             pthread_cond_timedwait(&repl_sender_cond, &repl_sender_mutex, &ts);
+            atomic_store_explicit(&repl_sender_idle, 0, memory_order_release);
         }
     }
     pthread_mutex_unlock(&repl_sender_mutex);
@@ -167,6 +184,22 @@ void replStreamSenderPublishStable(long long offset) {
     atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
     atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
     pthread_cond_signal(&repl_sender_cond);
+}
+
+/* Main, append mode: release-store the stable offset the instant feedReplicationBuffer
+ * finishes an append, so the sender streams this append rather than waiting for the next
+ * staged iteration's tick. The release store publishes every prior block write; the sender
+ * reads it with acquire and sends only bytes strictly below it, so it never reads a block
+ * main is still filling. We never make a syscall per append: the cond_signal is issued only
+ * when the sender is parked (repl_sender_idle), so a busy sender just picks up the newer
+ * offset on its next loop pass. No-op unless the sender is running in append mode. Under
+ * appendfsync always this is NOT called (the tick publishes the fsync-bounded offset), so
+ * no byte is streamed before it is on disk. */
+void replStreamSenderPublishAppend(long long offset) {
+    if (!repl_sender_running || server.repl_stream_sender != REPL_STREAM_SENDER_APPEND) return;
+    atomic_store_explicit(&server.repl_stable_offset, offset, memory_order_release);
+    atomic_store_explicit(&repl_sender_wake_offset, offset, memory_order_release);
+    if (atomic_load_explicit(&repl_sender_idle, memory_order_acquire)) pthread_cond_signal(&repl_sender_cond);
 }
 
 /* Main: reclaim a replica from the sender (state change, close, or disable).
@@ -338,6 +371,7 @@ void replStreamSenderStop(void) {
 
 int replStreamSenderEligible(client *replica) { UNUSED(replica); return 0; }
 void replStreamSenderPublishStable(long long offset) { UNUSED(offset); }
+void replStreamSenderPublishAppend(long long offset) { UNUSED(offset); }
 void replStreamSenderAdd(client *replica) { UNUSED(replica); }
 void replStreamSenderRemove(client *replica) { UNUSED(replica); }
 void replStreamSenderAccount(void) {}

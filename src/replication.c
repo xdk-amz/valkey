@@ -821,6 +821,14 @@ void feedReplicationBuffer(char *s, size_t len) {
             incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
         }
     }
+
+    /* repl-stream-sender append mode: publish the stable offset now, so the sender streams
+     * this append in the current iteration instead of the next tick. Skipped under
+     * appendfsync always (the tick publishes only the fsynced offset, so no byte is sent
+     * before it is on disk). No-op in no/iteration mode or when the sender is off. */
+    if (server.repl_stream_sender == REPL_STREAM_SENDER_APPEND &&
+        !(server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS))
+        replStreamSenderPublishAppend(server.primary_repl_offset);
 }
 
 /* Bulk values larger than this threshold bypass the staging buffer in
