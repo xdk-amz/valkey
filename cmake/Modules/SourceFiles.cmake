@@ -29,6 +29,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/phase_barrier.c
     ${CMAKE_SOURCE_DIR}/src/staged_loop.c
     ${CMAKE_SOURCE_DIR}/src/repl_apply.c
+    ${CMAKE_SOURCE_DIR}/src/maint.c
     ${CMAKE_SOURCE_DIR}/src/networking.c
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/object.c
