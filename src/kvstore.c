@@ -124,8 +124,6 @@ typedef struct {
     long long bucket_delta;             /* net bucket_count change */
     ssize_t overhead_lut_delta;         /* net overhead_hashtable_lut change */
     ssize_t overhead_rehashing_delta;   /* net overhead_hashtable_rehashing change */
-    int rehash_started;                 /* started rehashing this phase (needs a rehashing list node) */
-    int rehash_completed;               /* finished rehashing this phase (drop its rehashing list node) */
     int alloc_delta;                    /* net allocated_hashtables change (table created this phase) */
     int defer_free;                     /* became empty under FREE_EMPTY_HASHTABLES; main frees it */
 } kvstoreHashtableMetadata;
@@ -295,7 +293,6 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
     if (kvstoreConcurrent()) {
-        metadata->rehash_started = 1;
         metadata->bucket_delta += (long long)to;
         metadata->overhead_rehashing_delta += (ssize_t)(from * HASHTABLE_BUCKET_SIZE);
         metadata->dirty = 1;
@@ -317,7 +314,6 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
     if (kvstoreConcurrent()) {
-        metadata->rehash_completed = 1;
         metadata->bucket_delta -= (long long)from;
         metadata->overhead_rehashing_delta -= (ssize_t)(from * HASHTABLE_BUCKET_SIZE);
         metadata->dirty = 1;
@@ -856,12 +852,13 @@ void kvstoreReconcile(kvstore *kvs) {
         kvstoreHashtableMetadata *m = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
         if (!m->dirty) continue;
 
-        /* Rehashing list membership. A table that both started and completed in the same phase
-         * needs no node; otherwise started adds one and completed drops the existing one. */
-        if (m->rehash_started && !m->rehash_completed) {
+        /* Rehashing list membership follows the table's state now: within one phase a table can
+         * finish a rehash and start the next one, or start and finish one. */
+        int rehashing = hashtableIsRehashing(ht);
+        if (rehashing && !m->rehashing_node) {
             listAddNodeTail(kvs->rehashing, ht);
             m->rehashing_node = listLast(kvs->rehashing);
-        } else if (m->rehash_completed && m->rehashing_node) {
+        } else if (!rehashing && m->rehashing_node) {
             listDelNode(kvs->rehashing, m->rehashing_node);
             m->rehashing_node = NULL;
         }
@@ -898,8 +895,6 @@ void kvstoreReconcile(kvstore *kvs) {
         m->bucket_delta = 0;
         m->overhead_lut_delta = 0;
         m->overhead_rehashing_delta = 0;
-        m->rehash_started = 0;
-        m->rehash_completed = 0;
         m->alloc_delta = 0;
         m->defer_free = 0;
 
