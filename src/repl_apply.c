@@ -148,9 +148,11 @@ void replApplyFlush(client *c) {
     kvstoreSetConcurrent(1);
     stagedRunApplyPhase(ra_nlanes > 1 || !ra_main_lane);
     kvstoreSetConcurrent(0);
-    /* Fold each thread's per-table changes into the kvstore-wide bookkeeping. */
+    /* Fold each thread's per-table changes into the kvstore-wide bookkeeping. Databases are created
+     * lazily, so an unused slot is NULL and skipped. */
     for (int i = 0; i < server.dbnum; i++) {
         serverDb *db = server.db[i];
+        if (!db) continue;
         kvstoreReconcile(db->keys);
         kvstoreReconcile(db->expires);
         kvstoreReconcile(db->keys_with_volatile_items);
