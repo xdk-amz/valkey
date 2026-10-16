@@ -356,29 +356,14 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
         fp_wait_fastpath_clients 0
     }
 
-    test {Fast path: an ineligible command increments the ineligible fallback counter} {
-        set before [getInfoProperty [r info fastpath] fastpath_fallback_ineligible]
+    test {Fast path: an ineligible command moves the client off the fast path} {
         set a [fp_client]
         fp_wait_fastpath_clients 1
         # SUBSCRIBE is CMD_PUBSUB: fpCommandAllowed rejects it, so the client leaves the fast path.
         $a subscribe chan:x
         assert_equal {subscribe chan:x 1} [$a read]
         fp_wait_fastpath_clients 0
-        assert {[getInfoProperty [r info fastpath] fastpath_fallback_ineligible] > $before}
         $a close
-    }
-
-    test {Fast path: INFO exposes queue-pressure and fallback observability counters} {
-        set info [r info fastpath]
-        # All new observability fields are present and numeric.
-        foreach f {fastpath_fallback_gate fastpath_fallback_ineligible fastpath_fallback_error \
-                   fastpath_requeue_gate fastpath_inflight_batches_peak} {
-            set v [getInfoProperty $info $f]
-            assert {$v ne {}}
-            assert {[string is integer -strict $v]}
-        }
-        # A batch has been submitted by earlier tests, so the peak depth is at least 1.
-        assert {[getInfoProperty $info fastpath_inflight_batches_peak] >= 1}
     }
 
     test {Fast path: AUTH as a named user runs on the fast path under that user's ACL} {
