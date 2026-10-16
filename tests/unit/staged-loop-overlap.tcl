@@ -124,7 +124,7 @@ proc slo_check_big_reply {reply size} {
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname slo-control
     r select 0
 
@@ -445,7 +445,7 @@ proc slo_write_acl {path rules} {
 }
 slo_write_acl $slo_acl_file "~* &* +@all"
 
-start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3] tags {"staged-loop external:skip tls:skip"}] {
+start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3] tags {"staged-loop external:skip tls:skip logreqres:skip"}] {
     r select 0
 
     test {Staged overlap: ACL LOAD narrowing a pipelining user refuses every later command} {
@@ -501,7 +501,7 @@ start_server [list overrides [list dir $slo_acl_dir aclfile slo.acl io-threads 3
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 appendonly yes appendfsync always enable-debug-command yes}} {
     r select 0
 
     test {Staged overlap: with appendfsync always a reply never leaves before its write reaches the AOF} {
@@ -562,7 +562,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]

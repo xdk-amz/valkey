@@ -93,7 +93,7 @@ proc ss_incr_round {fds prefix start rounds} {
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname ss-control
     r select 0
 
@@ -350,7 +350,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
@@ -392,7 +392,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 16 io-threads-always-active yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 16 io-threads-always-active yes}} {
     test {Staged stress: raising io-threads while lowered slots still retire converges} {
         # Lowered to 1 and raised to 5 before any retiring thread stopped: the slots below the
         # new target must finish retiring and be recreated instead of blocking the server.
@@ -414,7 +414,7 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
     test {Staged stress: clients handed back when staged mode stops rejoin when it resumes} {
         r client setname ss-control
         r select 0

@@ -45,7 +45,7 @@ proc sl_wait_fastpath_clients {n} {
     }
 }
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3 enable-debug-command yes}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3 enable-debug-command yes}} {
     r client setname sl-control
     r select 0
 
@@ -234,7 +234,7 @@ proc sl_affinity {tid} {
 }
 
 if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}]} {
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 3}} {
+start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrides {io-threads 3}} {
     test {Staged loop: main and an IO thread pinned to its CPU sleep at the barrier instead of spinning} {
         set pid [srv 0 pid]
         set io1 [sl_thread_tid $pid io_thd_1]
