@@ -2161,6 +2161,11 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     int client_writes = handleClientsWithPendingWrites();
     if (client_writes > 0) server.el_iteration_active = true;
 
+    /* repl-stream-sender: follow the config, account for what the sender streamed, and
+     * publish the next stable offset. Also called from the staged loop iteration, which
+     * does not run beforeSleep. */
+    replStreamSenderTick();
+
     /* Try to process more IO reads that are ready to be processed. Not when a module listens to the
      * event loop: its before-sleep event has fired, and no command runs until its after-sleep event. */
     if (server.aof_fsync != AOF_FSYNC_ALWAYS && !moduleHasServerEventListener(VALKEYMODULE_EVENT_EVENTLOOP)) {
@@ -5367,6 +5372,10 @@ int finishShutdown(void) {
     bool save = (server.shutdown_flags & SHUTDOWN_SAVE) != 0;
     bool nosave = (server.shutdown_flags & SHUTDOWN_NOSAVE) != 0;
     bool force = (server.shutdown_flags & SHUTDOWN_FORCE) != 0;
+
+    /* Stop the replication stream sender before tearing replication down, so it
+     * holds no reference to a replica or a backlog block when they are freed. */
+    if (replStreamSenderActive()) replStreamSenderStop();
     bool safe = (server.shutdown_flags & SHUTDOWN_SAFE) != 0;
     bool failover = (server.shutdown_flags & SHUTDOWN_FAILOVER) != 0;
 

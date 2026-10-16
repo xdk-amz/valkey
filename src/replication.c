@@ -679,6 +679,39 @@ void freeReplicaReferencedReplBuffer(client *replica) {
     replica->repl_data->ref_block_pos = 0;
 }
 
+/* repl-stream-sender, main only: advance replica `c`'s replication-buffer cursor
+ * (ref_repl_buf_node / ref_block_pos) to the absolute replication offset `sent`
+ * that the sender thread reported, dropping the refcount on each fully-sent block.
+ * This is the accounting half of the sender design: the sender puts bytes on the
+ * wire and publishes sent_offset; this moves the cursor and releases blocks so
+ * trimming can reclaim them. All refcount/list mutation stays on main. */
+void replStreamAccountCursor(client *c, long long sent) {
+    listNode *node = c->repl_data->ref_repl_buf_node;
+    if (node == NULL) return;
+    replBufBlock *block = listNodeValue(node);
+    /* block->repl_offset is 1-based; sent is a 0-based byte count. The 0-based absolute
+     * offset of byte index i in this block is (block->repl_offset - 1) + i. */
+    long long cur = (block->repl_offset - 1) + (long long)c->repl_data->ref_block_pos;
+    if (sent <= cur) return;
+    size_t remaining = (size_t)(sent - (block->repl_offset - 1));
+
+    while (remaining >= block->used) {
+        listNode *next_node = listNextNode(node);
+        if (!next_node) break; /* End of list: cannot pass the last block's used */
+        remaining -= block->used;
+        block->refcount--;
+        node = next_node;
+        block = listNodeValue(node);
+        block->refcount++;
+    }
+    serverAssert(remaining <= block->used);
+    c->repl_data->ref_repl_buf_node = node;
+    c->repl_data->ref_block_pos = remaining;
+    /* Account the bytes the sender put on the wire into the replica output metric, on
+     * main, so the counter is never written from the sender thread. */
+    server.stat_net_repl_output_bytes += (sent - cur);
+}
+
 /* Replication: Primary side.
  * Append bytes into the global replication buffer list, replication backlog and
  * all replica clients use replication buffers collectively, this function replace
@@ -1942,6 +1975,13 @@ int replicaPutOnline(client *replica) {
     replica->repl_data->repl_state = REPLICA_STATE_ONLINE;
     replica->repl_data->repl_ack_time = server.unixtime; /* Prevent false timeout. */
 
+    /* repl-stream-sender: hand this replica to the sender at the ONLINE transition. For
+     * the deferred diskless/ack path this runs before the command stream starts (cursor
+     * may be unset); replStreamSenderAdd is idempotent and re-seeds from the cursor once
+     * it is set, and replicaStartCommandStream calls it again at stream start. No-op when
+     * the sender is off or the replica is not eligible. */
+    replStreamSenderAdd(replica);
+
     refreshGoodReplicasCount();
     /* Fire the replica change modules event. */
     moduleFireServerEvent(VALKEYMODULE_EVENT_REPLICA_CHANGE, VALKEYMODULE_SUBEVENT_REPLICA_CHANGE_ONLINE, NULL);
@@ -2403,6 +2443,12 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
                  * after such final EOF. So we don't want to glue the end of
                  * the RDB transfer with the start of the other replication
                  * data. */
+                /* repl-stream-sender prototype: diskless (socket) RDB transfer glues the end
+                 * of the RDB to the start of the command stream through a deferred ack-driven
+                 * handoff the sender does not yet model, so keep these replicas on the main
+                 * path. Set before replicaPutOnline so the sender never even briefly registers
+                 * this replica. */
+                replica->repl_data->stream_ineligible = 1;
                 if (!replicaPutOnline(replica)) {
                     freeClientAsync(replica);
                     continue;
