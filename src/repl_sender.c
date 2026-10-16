@@ -147,20 +147,47 @@ static int replStreamSendOne(client *replica, long long stable) {
 static void *replStreamSenderMain(void *arg) {
     UNUSED(arg);
     valkey_set_thread_title("repl_sender");
+    /* Scratch for one pass's snapshot, grown as the replica set grows. The sender is the
+     * only user, so no locking on it. */
+    client **snapshot = NULL;
+    size_t snapshot_cap = 0;
     pthread_mutex_lock(&repl_sender_mutex);
     while (!repl_sender_stop) {
         long long stable = atomic_load_explicit(&server.repl_stable_offset, memory_order_acquire);
         atomic_fetch_add_explicit(&server.stat_repl_sender_wakeups, 1, memory_order_relaxed);
+
+        /* Snapshot the replica set under the mutex and mark each busy, then release the
+         * mutex and write outside it: main's per-iteration tick (account) and add never
+         * block on a socket write. send_busy pins each replica against Remove/free until
+         * this pass finishes with it. */
+        size_t n = 0;
         listIter li;
         listNode *ln;
         listRewind(repl_sender_replicas, &li);
         while ((ln = listNext(&li))) {
+            if (n == snapshot_cap) {
+                snapshot_cap = snapshot_cap ? snapshot_cap * 2 : 16;
+                snapshot = zrealloc(snapshot, snapshot_cap * sizeof(client *));
+            }
             client *replica = listNodeValue(ln);
+            atomic_store_explicit(&replica->repl_data->send_busy, 1, memory_order_release);
+            snapshot[n++] = replica;
+        }
+        pthread_mutex_unlock(&repl_sender_mutex);
+
+        /* Writes happen with the mutex dropped. send_node/send_pos are sender-owned and
+         * only mutated here; main seeds them under the mutex but only while send_busy is 0
+         * (it waits), so there is no concurrent writer. */
+        for (size_t i = 0; i < n; i++) {
+            client *replica = snapshot[i];
             if (replStreamSendOne(replica, stable) == C_ERR) {
                 atomic_fetch_add_explicit(&server.stat_repl_sender_write_errors, 1, memory_order_relaxed);
                 atomic_store_explicit(&replica->repl_data->send_error, 1, memory_order_release);
             }
+            atomic_store_explicit(&replica->repl_data->send_busy, 0, memory_order_release);
         }
+
+        pthread_mutex_lock(&repl_sender_mutex);
         /* Wait for main to publish a newer stable offset, or a stop. */
         long long wake = atomic_load_explicit(&repl_sender_wake_offset, memory_order_acquire);
         if (!repl_sender_stop && wake <= stable) {
@@ -174,7 +201,21 @@ static void *replStreamSenderMain(void *arg) {
         }
     }
     pthread_mutex_unlock(&repl_sender_mutex);
+    zfree(snapshot);
     return NULL;
+}
+
+/* Main: block until the sender is not mid-write on this replica. Called before main
+ * mutates or frees a replica's sender state. The sender clears send_busy at the end of
+ * each per-replica write; the wait is a brief spin because a single connWritev is short
+ * and Remove is rare. Must be called with repl_sender_mutex held so no new pass can mark
+ * this replica busy while we wait. */
+static void replStreamSenderWaitQuiescent(client *replica) {
+    while (atomic_load_explicit(&replica->repl_data->send_busy, memory_order_acquire)) {
+        pthread_mutex_unlock(&repl_sender_mutex);
+        sched_yield();
+        pthread_mutex_lock(&repl_sender_mutex);
+    }
 }
 
 /* Main: publish a newer stable offset and wake the sender. Called from
@@ -208,6 +249,8 @@ void replStreamSenderRemove(client *replica) {
     if (!repl_sender_running) return;
     pthread_mutex_lock(&repl_sender_mutex);
     if (replica->repl_data->stream_via_sender) {
+        /* Do not delink while the sender is mid-write on this replica. */
+        replStreamSenderWaitQuiescent(replica);
         listNode *ln = listSearchKey(repl_sender_replicas, replica);
         if (ln) listDelNode(repl_sender_replicas, ln);
         replica->repl_data->stream_via_sender = 0;
@@ -266,6 +309,7 @@ void replStreamSenderAccount(void) {
     while ((ln = listNext(&li))) {
         client *replica = listNodeValue(ln);
         if (!replStreamSenderEligible(replica)) {
+            replStreamSenderWaitQuiescent(replica);
             replica->repl_data->stream_via_sender = 0;
             replica->repl_data->send_node = NULL;
             replica->repl_data->send_pos = 0;
@@ -289,10 +333,14 @@ void replStreamSenderAccount(void) {
         /* Seed the sender's own position from main's cursor the first time a cursor
          * exists (main owns ref_repl_buf_node; reading it here is safe because this runs
          * on main). After this the sender advances send_node itself and never reads the
-         * main-owned cursor, so there is no cross-thread race on it. */
+         * main-owned cursor, so there is no cross-thread race on it. Wait for the sender
+         * to finish any in-flight write before writing its send_node/send_pos. */
         if (rd->send_node == NULL && rd->ref_repl_buf_node) {
-            rd->send_node = rd->ref_repl_buf_node;
-            rd->send_pos = rd->ref_block_pos;
+            replStreamSenderWaitQuiescent(replica);
+            if (rd->send_node == NULL) {
+                rd->send_node = rd->ref_repl_buf_node;
+                rd->send_pos = rd->ref_block_pos;
+            }
         }
     }
     pthread_mutex_unlock(&repl_sender_mutex);
