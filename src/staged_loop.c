@@ -349,6 +349,9 @@ void stagedNestedIteration(void) {
     if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
     fastpathStagedSetDepth(0);
     sl_depth = 0;
+    /* Clients that left for a command only main runs, such as SCRIPT KILL behind a busy script, are
+     * handed back now: no outer reply phase finishes until the blocking command ends. */
+    fastpathStagedFinish();
 }
 
 void stagedDrainWorkers(void) {
