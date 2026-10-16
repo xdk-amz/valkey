@@ -140,10 +140,22 @@ typedef struct dplusBatchEntry {
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } dplusBatchEntry;
 
+/* The commandlog threshold of a type, or -1 while that log records nothing. */
+static long long dplusCommandlogThreshold(int type) {
+    if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
+    return server.commandlog[type].threshold;
+}
+
 /* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
  * written), 0 on punt. The keyspace is quiescent while IO threads read: main
  * mutates it only outside the read phase. */
 static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
+    /* A GET the large-request commandlog would record goes to main, which records it. */
+    long long request_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    if (request_threshold >= 0) {
+        size_t in = e->is_first_cmd ? c->net_input_bytes_curr_cmd : c->cmd_queue.cmds[e->queue_idx].input_bytes;
+        if ((long long)in >= request_threshold) return 0;
+    }
     void *entry = NULL;
     if (!hashtableIncrementalFindGetResult(&e->find_state, &entry)) {
         /* Key not found -- punt on miss (E4): main fires the keymiss notification
@@ -187,6 +199,10 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
     } else {
         return 0;
     }
+
+    /* A reply the large-reply commandlog would record goes to main, which records it. */
+    long long reply_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
     if (dplusWriteBulkReply(c, val, vallen) <= 0) return 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
@@ -275,6 +291,10 @@ int dplusSpeculateBatch(client *c, int tid) {
      * line. Placed after the GET fast-exit to keep pure-write batches at
      * zero added cost. */
     if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
+
+    /* COMMANDLOG GUARD: with a slow threshold of 0 the commandlog records every command, so every
+     * GET goes to main, which records it. Large requests and replies are checked per GET. */
+    if (dplusCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
      * so their duration must be accumulated per-thread and folded into the
