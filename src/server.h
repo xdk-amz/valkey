@@ -1386,6 +1386,18 @@ typedef struct ClientReplicationData {
     sds replica_nodeid;                  /* Node id in cluster mode. */
 
     replicaCompressionState *repl_compression; /* Primary-side compression state for this link, or NULL for plaintext. */
+
+    /* repl-stream-sender: set when main has handed this ONLINE plaintext replica to the
+     * dedicated sender thread. The sender owns send_node/send_pos; main owns the cursor
+     * (ref_repl_buf_node/ref_block_pos) and advances it from sent_offset for accounting. */
+    int stream_via_sender;               /* 1 while the sender streams this replica. */
+    int stream_ineligible;               /* 1 to keep this replica on the main path (diskless/socket
+                                          * RDB transfer): the prototype streams only disk/inline-sync
+                                          * replicas. */
+    listNode *send_node;                 /* Sender-owned: block the sender is sending from. */
+    size_t send_pos;                     /* Sender-owned: position within send_node. */
+    _Atomic(long long) sent_offset;      /* Sender -> main: primary_repl_offset put on the wire. */
+    _Atomic int send_error;              /* Sender -> main: a write error occurred; main disconnects. */
 } ClientReplicationData;
 
 typedef struct ClientModuleData {
@@ -2073,6 +2085,8 @@ struct valkeyServer {
     int staged_stream_chunk;                  /* Staged loop: entries main executes between executed publishes while streaming. */
     int staged_stream_order;                  /* Staged loop: STREAM execution order, see STAGED_STREAM_ORDER_* */
     int staged_stream_arena_guard;            /* Staged loop: bytes of fresh-line gap left after a published chunk (0 = off). */
+    int repl_stream_sender;                   /* Hidden: stream the backlog to ONLINE plaintext replicas from a
+                                               * dedicated sender thread, off the staged loop. Default off. */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
@@ -2366,6 +2380,9 @@ struct valkeyServer {
     char replid[CONFIG_RUN_ID_SIZE + 1];              /* My current replication ID. */
     char replid2[CONFIG_RUN_ID_SIZE + 1];             /* replid inherited from primary*/
     long long primary_repl_offset;                    /* My current replication offset */
+    _Atomic(long long) repl_stable_offset;            /* repl-stream-sender: bytes of backlog main has finished
+                                                       * appending (and fsynced under appendfsync always) that the
+                                                       * sender thread may stream. Published with release. */
     long long second_replid_offset;                   /* Accept offsets up to this for replid2. */
     _Atomic(long long) fsynced_reploff_pending;       /* Largest replication offset to
                                                        * potentially have been fsynced, applied to
@@ -3632,6 +3649,19 @@ void replicationCachePrimaryUsingMyself(void);
 void feedReplicationBacklog(void *ptr, size_t len);
 void incrementalTrimReplicationBacklog(size_t blocks);
 int canFeedReplicaReplBuffer(client *replica);
+
+/* repl-stream-sender (repl_sender.c + replication.c). */
+void replStreamAccountCursor(client *c, long long sent);
+int replStreamSenderEligible(client *replica);
+void replStreamSenderPublishStable(long long offset);
+void replStreamSenderAdd(client *replica);
+void replStreamSenderRemove(client *replica);
+void replStreamSenderAccount(void);
+int replStreamSenderActive(void);
+void replStreamSenderTick(void);
+void replStreamSenderInit(void);
+void replStreamSenderStop(void);
+
 void rebaseReplicationBuffer(long long base_repl_offset);
 void showLatestBacklog(void);
 void rdbPipeReadHandler(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);

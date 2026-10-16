@@ -1929,6 +1929,8 @@ int trySendWriteToIOThreads(client *c) {
     /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
     if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;
+    /* repl-stream-sender owns the send for this replica; do not offload a write job. */
+    if (c->repl_data && c->repl_data->stream_via_sender) return C_ERR;
     reconcileLazyWrite(c);
     if (c->flag.close_asap) return C_ERR;
     /* The I/O thread is already writing for this client. */

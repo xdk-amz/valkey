@@ -498,6 +498,10 @@ static void stagedLoopIteration(aeEventLoop *el) {
         sl_main_ns[SL_T_AOF] += stagedNowNs() - t1;
     }
     replyPhase();
+    /* repl-stream-sender: the staged loop does not run beforeSleep, so service the sender
+     * here: account for last iteration's sends and publish this iteration's new data as the
+     * next stable offset. No-op when the sender is off. */
+    replStreamSenderTick();
     crons(el);
 }
 
