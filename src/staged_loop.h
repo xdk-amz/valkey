@@ -35,7 +35,8 @@
 #define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
 #define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
 #define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
-#define STAGED_PHASE_KINDS 6 /* phase ids are below this */
+#define STAGED_PHASE_STREAM 6 /* workers deliver completed runs while main still executes */
+#define STAGED_PHASE_KINDS 7 /* phase ids are below this */
 
 struct aeEventLoop;
 struct poller;
