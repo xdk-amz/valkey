@@ -7593,7 +7593,6 @@ void evictClients(void) {
             listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
         }
     }
-
 }
 
 

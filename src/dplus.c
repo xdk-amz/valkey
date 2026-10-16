@@ -539,16 +539,16 @@ sds dplusInfoString(sds info) {
     info = sdscatprintf(info, "# Dplus\r\ndplus_speculated_commands:%lld\r\n", speculated);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
-        "dplus_speculative_attempts:%llu\r\n"
-        "dplus_speculative_hits:%llu\r\n"
-        "dplus_large_value_punts:%llu\r\n"
-        "dplus_expired_replies:%llu\r\n"
-        "dplus_miss_punts:%llu\r\n",
-        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
-        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
-        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
-        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-        (unsigned long long)DPLUS_STAT_SUM(miss_punts));
+                        "dplus_speculative_attempts:%llu\r\n"
+                        "dplus_speculative_hits:%llu\r\n"
+                        "dplus_large_value_punts:%llu\r\n"
+                        "dplus_expired_replies:%llu\r\n"
+                        "dplus_miss_punts:%llu\r\n",
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
+                        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
+                        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
+                        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
+                        (unsigned long long)DPLUS_STAT_SUM(miss_punts));
 #endif
     return info;
 }

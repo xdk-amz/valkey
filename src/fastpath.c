@@ -98,9 +98,9 @@ static _Atomic int fp_depth = 0;
 static list *fp_staged_closing = NULL;
 static list fp_staged_clients;
 static _Thread_local int fp_cur_tid = 0; /* IO thread running the current staged phase */
-static size_t fastpath_clients = 0;                 /* main thread only */
-static int fp_slots = 0;                            /* main thread only: 1 + highest initialized thread */
-static long long fp_retired[6]; /* main thread only: counters of threads since retired */
+static size_t fastpath_clients = 0;      /* main thread only */
+static int fp_slots = 0;                 /* main thread only: 1 + highest initialized thread */
+static long long fp_retired[6];          /* main thread only: counters of threads since retired */
 
 size_t fastpathClientCount(void) {
     return fastpath_clients;
@@ -185,8 +185,8 @@ static int fpSessionEligible(client *c) {
     if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
     if (server.cluster_enabled) return 0;
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
-    if (bgIteration_iterationActive()) return 0; /* a forkless save may block commands on keys in use */
-    if (throttle_active()) return 0;             /* a throttler may hold a command; main runs the check */
+    if (bgIteration_iterationActive()) return 0;                                        /* a forkless save may block commands on keys in use */
+    if (throttle_active()) return 0;                                                    /* a throttler may hold a command; main runs the check */
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
@@ -237,7 +237,7 @@ void fastpathControlReclaim(client *c) {
 }
 
 static int fpCommandAllowed(struct serverCommand *cmd) {
-    if (!cmd) return 0; /* unknown command: the main path replies (and runs the host:/post check) */
+    if (!cmd) return 0;                     /* unknown command: the main path replies (and runs the host:/post check) */
     if (cmd->proc == pingCommand) return 1; /* fast-path clients are never in pubsub mode */
     if (!(cmd->flags & (CMD_WRITE | CMD_READONLY))) return 0;
     if (cmd->flags & (CMD_BLOCKING | CMD_PUBSUB | CMD_ADMIN | CMD_NOSCRIPT | CMD_NO_MULTI | CMD_NO_ASYNC_LOADING |
@@ -271,8 +271,7 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
     listLinkNodeTail(&t->staged_leaving, &c->fp_stage_node);
 }
 
-static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
-                          unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
+static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
     e->c = c;
     e->control = c->control;

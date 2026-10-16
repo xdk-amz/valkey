@@ -1668,7 +1668,7 @@ void moveCommand(client *c) {
         return;
     }
 
-    incrRefCount(o); /* ref counter = 2 */
+    incrRefCount(o);           /* ref counter = 2 */
     dbDelete(src, c->argv[1]); /* ref counter = 1 */
 
     setKey(c, dst, c->argv[1], &o, set_key_flags);

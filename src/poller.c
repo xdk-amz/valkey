@@ -57,8 +57,16 @@ typedef struct pollerBuf {
     uint32_t *pos; /* setsize entries */
 } pollerBuf;
 
-enum { POLLER_CTL_RUN = 0, POLLER_CTL_PAUSE, POLLER_CTL_STOP };
-enum { POLLER_T_RUNNING = 0, POLLER_T_PAUSED, POLLER_T_EXITED };
+enum {
+    POLLER_CTL_RUN = 0,
+    POLLER_CTL_PAUSE,
+    POLLER_CTL_STOP
+};
+enum {
+    POLLER_T_RUNNING = 0,
+    POLLER_T_PAUSED,
+    POLLER_T_EXITED
+};
 
 /* Locking: lock guards the next buffer (buf[active ^ 1]) and its pos array, active, and the thread
  * control fields. The active buffer is written only by main, in pollerGetNextBatch, and read by

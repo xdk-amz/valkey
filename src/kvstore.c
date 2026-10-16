@@ -65,7 +65,7 @@ static _Atomic int kvs_concurrent = 0;
 static pthread_mutex_t kvs_shared_lock = PTHREAD_MUTEX_INITIALIZER;
 /* The lock decision is taken once per critical section: a thread outside the concurrent window
  * (a bio thread releasing a detached kvstore) must not see the flag flip between lock and unlock. */
-#define KVS_SHARED_LOCK()                  \
+#define KVS_SHARED_LOCK()                                                          \
     int kvs_locked_ = atomic_load_explicit(&kvs_concurrent, memory_order_relaxed); \
     if (kvs_locked_) pthread_mutex_lock(&kvs_shared_lock)
 #define KVS_SHARED_UNLOCK() \

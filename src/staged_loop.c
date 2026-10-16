@@ -23,14 +23,14 @@ extern int ProcessingEventsWhileBlocked; /* networking.c */
 static poller *sl_poller = NULL;
 static phaseBarrier sl_barrier;
 static int sl_barrier_ready = 0;
-static int sl_on = 0;        /* staged mode is on for this iteration */
-static int sl_want = 0;      /* staged mode is wanted: stock IO offload stops so it can start */
-static int sl_workers = 0;   /* IO threads 1..sl_workers are enrolled; the barrier's participant count */
-static int sl_depth = 0;     /* 1 while a nested iteration runs */
+static int sl_on = 0;         /* staged mode is on for this iteration */
+static int sl_want = 0;       /* staged mode is wanted: stock IO offload stops so it can start */
+static int sl_workers = 0;    /* IO threads 1..sl_workers are enrolled; the barrier's participant count */
+static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
-static int sl_ae_fd = -1;    /* ae's own epoll fd, the single main-affinity entry */
+static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
 static int sl_warned = 0;
-static int sl_main_lane = 1; /* main takes a lane in APPLY phases */
+static int sl_main_lane = 1;        /* main takes a lane in APPLY phases */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
 

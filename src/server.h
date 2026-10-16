@@ -1308,11 +1308,11 @@ typedef struct ClientFlags {
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
     uint64_t partitioned : 1;              /* Socket readiness is watched by the IO thread in io_tid, not by the main event loop. */
-    uint64_t ring_epilogue : 1; /* beforeNextClient called from the ring's read epilogue (main thread only) */
-    uint64_t fastpath : 1;       /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
-    uint64_t executor : 1;       /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
-    uint64_t fp_detach_sent : 1; /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
-    uint64_t fp_readmit : 1;     /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
+    uint64_t ring_epilogue : 1;            /* beforeNextClient called from the ring's read epilogue (main thread only) */
+    uint64_t fastpath : 1;                 /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
+    uint64_t executor : 1;                 /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
+    uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
+    uint64_t fp_readmit : 1;               /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -2053,8 +2053,8 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
-    int keyspace_shard_bits;    /* Standalone: split each db into 2^bits hashtables by key slot. */
-    int replica_parallel_apply; /* Replica: apply eligible replicated writes on the staged IO threads. */
+    int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. */
+    int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
