@@ -292,6 +292,13 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal [$primary debug digest] [$replica debug digest]
             assert_equal 20000 [status $primary expired_keys]
             assert_equal 0 [status $replica expired_keys]
+            # Offset parity: the replica consumed exactly the stream the primary produced.
+            assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
+            if {$lanes eq "yes"} {
+                # A replica is the only observer, so the lanes fed the deletes instead of replaying them.
+                assert_morethan [me_cron_calls $primary maint_feed] 0
+                assert_equal 0 [me_cron_calls $primary maint_replay]
+            }
         }
 
         test "Active expire with cron-lanes $lanes replicates UNLINK under lazyfree-lazy-expire" {
@@ -337,6 +344,25 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal 0 [$replica dbsize]
             $replica select 0
         }
+
+        test "Active expire with cron-lanes $lanes keeps a replica attached mid-expiry in sync" {
+            # Detach, load a large volatile set on the primary alone, then attach mid-expiry so the
+            # replica joins by full sync while keys are still expiring. It must converge and match.
+            $replica replicaof no one
+            $primary flushall
+            $primary select 0
+            me_load_volatile $primary m: 40000 1500
+            $primary eval {for i=1,300 do redis.call('set', 'keepm:'..i, i) end return 1} 0
+            after 300
+            # Attach while expiry is in flight.
+            $replica replicaof $primary_host $primary_port
+            wait_for_sync $replica
+            me_wait_empty_except $primary 300
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
+            assert_equal 300 [$replica dbsize]
+        }
     }
 }
 }
@@ -353,6 +379,58 @@ start_server [list tags {"maint expire aof external:skip tls:skip"} overrides [c
         r select 0
         assert_equal 300 [r dbsize]
         assert_equal $digest [r debug digest]
+    }
+
+    test "Active expire with cron-lanes $lanes feeds propagate-only deletes and the AOF DEL count equals expired keys" {
+        r flushall
+        r select 0
+        r config resetstat
+        r config set lazyfree-lazy-expire no
+        # AOF on, no replica, and no other observer -> propagation is the only observer.
+        set repl [attach_to_replication_stream]
+        me_load_volatile r af: 2000 120
+        me_wait_empty r
+        assert_equal 2000 [s expired_keys]
+        set dels {}
+        set deadline [expr {[clock milliseconds] + 8000}]
+        while {[llength $dels] < 2000 && [clock milliseconds] < $deadline} {
+            set cmd [read_from_replication_stream $repl]
+            if {$cmd eq ""} continue
+            if {[lindex $cmd 0] eq "del"} { lappend dels [lindex $cmd 1] }
+        }
+        close $repl
+        # Exactly one DEL per expired key reached the stream (which the AOF shares framing with).
+        assert_equal 2000 [llength [lsort -unique $dels]]
+        if {$lanes eq "yes"} {
+            # The lanes took the propagate-only path: main fed the deletes, it did not run the per-key replay.
+            assert_morethan [me_cron_calls r maint_feed] 0
+            assert_equal 0 [me_cron_calls r maint_replay]
+        } else {
+            assert_equal 0 [me_cron_calls r maint_feed]
+        }
+    }
+
+    test "Active expire with cron-lanes $lanes falls back to full replay when a keyspace-event subscriber exists" {
+        r flushall
+        r select 0
+        r config resetstat
+        r config set notify-keyspace-events Ex
+        set rd [valkey_deferring_client]
+        $rd select 0
+        $rd read
+        $rd subscribe __keyevent@0__:expired
+        $rd read
+        me_load_volatile r ke: 2000 120
+        set got {}
+        for {set i 0} {$i < 2000} {incr i} { lappend got [lindex [$rd read] 2] }
+        assert_equal 2000 [llength [lsort -unique $got]]
+        $rd close
+        if {$lanes eq "yes"} {
+            # An event subscriber forces the full per-key replay, not the propagate-only feed.
+            assert_morethan [me_cron_calls r maint_replay] 0
+            assert_equal 0 [me_cron_calls r maint_feed]
+        }
+        r config set notify-keyspace-events ""
     }
 }
 }

@@ -63,6 +63,14 @@ start_cluster 1 1 [list tags {external:skip cluster maint tls:skip logreqres:ski
         assert_equal 500 [R 1 dbsize]
         assert_equal [R 0 debug digest] [R 1 debug digest]
         assert_equal 0 [getInfoProperty [R 1 info stats] expired_keys]
+        assert_equal [getInfoProperty [R 0 info replication] master_repl_offset] \
+                     [getInfoProperty [R 1 info replication] master_repl_offset]
+        if {$::mc_lanes eq "yes"} {
+            # A replica is the only observer and no slot is exporting, so the lanes fed the deletes
+            # instead of replaying them per key.
+            assert_morethan [mc_cron_calls 0 maint_feed] 0
+            assert_equal 0 [mc_cron_calls 0 maint_replay]
+        }
     }
 
     test "Cluster active expire with cron-lanes $::mc_lanes sends one expired event per key" {
