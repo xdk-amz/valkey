@@ -139,6 +139,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/compression_zstd.c
     ${CMAKE_SOURCE_DIR}/src/compression_stream.c
     ${CMAKE_SOURCE_DIR}/src/hotkeys.c
+    ${CMAKE_SOURCE_DIR}/src/cronstats.c
     ${CMAKE_SOURCE_DIR}/src/space_saving.c
     ${CMAKE_SOURCE_DIR}/src/throttle_token_bucket.c
     ${CMAKE_SOURCE_DIR}/src/stat_calc.c

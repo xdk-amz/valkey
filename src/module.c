@@ -62,6 +62,7 @@
 #include "commandlog.h"
 #include "rdb.h"
 #include "monotonic.h"
+#include "cronstats.h"
 #include "script.h"
 #include "hdr_histogram.h"
 #include "crc16_slottable.h"
@@ -10080,7 +10081,7 @@ typedef struct ValkeyModuleTimer {
 
 /* This is the timer handler that is called by the main event loop. We schedule
  * this timer to be called when the nearest of our module timers will expire. */
-long long moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+static long long moduleTimerHandlerImpl(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);
@@ -10138,6 +10139,13 @@ long long moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *
         aeTimer = -1;
         return AE_NOMORE;
     }
+}
+
+long long moduleTimerHandler(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    monotime t0 = getMonotonicUs();
+    long long r = moduleTimerHandlerImpl(eventLoop, id, clientData);
+    cronStatsRecord(CRON_JOB_MODULE_TIMERS, getMonotonicUs() - t0);
+    return r;
 }
 
 /* Create a new timer that will fire after `period` milliseconds, and will call

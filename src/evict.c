@@ -31,6 +31,7 @@
  */
 
 #include "server.h"
+#include "cronstats.h"
 #include "bio.h"
 #include "script.h"
 #include "cluster_migrateslots.h"
@@ -344,7 +345,10 @@ static long long evictionTimeProc(struct aeEventLoop *eventLoop, long long id, v
     UNUSED(id);
     UNUSED(clientData);
 
-    if (performEvictions() == EVICT_RUNNING) return 0; /* keep evicting */
+    monotime et0 = getMonotonicUs();
+    int evicting = (performEvictions() == EVICT_RUNNING);
+    cronStatsRecord(CRON_JOB_EVICTION_TIMEPROC, getMonotonicUs() - et0);
+    if (evicting) return 0; /* keep evicting */
 
     /* For EVICT_OK - things are good, no need to keep evicting.
      * For EVICT_FAIL - there is nothing left to evict.  */

@@ -558,6 +558,7 @@ ENGINE_SERVER_OBJ = \
     geohash_helper.o \
     hashtable.o \
     hotkeys.o \
+    cronstats.o \
     space_saving.o \
     hyperloglog.o \
     intset.o \

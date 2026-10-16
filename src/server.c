@@ -33,6 +33,7 @@
  */
 #include "server.h"
 #include "hotkeys.h"
+#include "cronstats.h"
 #include "ordered_index.h"
 #include "connection.h"
 #include "monotonic.h"
@@ -1383,6 +1384,7 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
     clientsCron(clients_this_cycle);
 
     server.clients_hz = 1000 / delay_ms;
+    cronStatsRecord(CRON_JOB_CLIENTS_TIMEPROC, elapsedUs(start_time));
     server.el_cron_duration += elapsedUs(start_time);
     return delay_ms;
 }
@@ -1391,6 +1393,7 @@ long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *cli
  * incrementally in the databases, such as active key expiring, resizing,
  * rehashing. */
 void databasesCron(void) {
+    monotime db_t0 = getMonotonicUs();
     /* Expire keys by random sampling. Not required for replicas
      * as primary will synthesize DELs for us. */
     if (server.active_expire_enabled) {
@@ -1411,8 +1414,12 @@ void databasesCron(void) {
         }
     }
 
+    cronStatsRecord(CRON_JOB_SC_EXPIRE_SLOW, getMonotonicUs() - db_t0);
+
     /* Start active defrag cycle or adjust defrag CPU if needed. */
+    monotime defrag_t0 = getMonotonicUs();
     monitorActiveDefrag();
+    cronStatsRecord(CRON_JOB_SC_DEFRAG_MONITOR, getMonotonicUs() - defrag_t0);
 
     /* Perform hash tables rehashing if needed, but only if there are no
      * other processes saving the DB on disk. Otherwise, rehashing is bad
@@ -1433,13 +1440,16 @@ void databasesCron(void) {
             serverDb *db = server.db[resize_db % server.dbnum];
             resize_db++;
             if (db == NULL) continue;
+            monotime rs = getMonotonicUs();
             kvstoreTryResizeHashtables(db->keys, CRON_DICTS_PER_DB);
             kvstoreTryResizeHashtables(db->expires, CRON_DICTS_PER_DB);
             kvstoreTryResizeHashtables(db->keys_with_volatile_items, CRON_DICTS_PER_DB);
+            cronStatsRecord(CRON_JOB_SC_RESIZE, getMonotonicUs() - rs);
         }
 
         /* Rehash */
         if (server.activerehashing) {
+            monotime rh = getMonotonicUs();
             uint64_t elapsed_us = 0;
             uint64_t threshold_us = 1 * 1000000 / server.hz / 100;
             for (j = 0; j < dbs_per_call; j++) {
@@ -1454,6 +1464,7 @@ void databasesCron(void) {
                 }
                 rehash_db++;
             }
+            cronStatsRecord(CRON_JOB_SC_REHASH, getMonotonicUs() - rh);
         }
     }
 
@@ -1641,6 +1652,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     if (server.pause_cron) return 1000 / server.hz;
 
     monotime cron_start = getMonotonicUs();
+    uint64_t sc_sub_before = cronStatsUsecRange(CRON_JOB_SC_EXPIRE_SLOW, CRON_JOB_SC_PERSISTENCE);
 
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
@@ -1661,7 +1673,11 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
                                  server.duration_stats[EL_DURATION_TYPE_EL].cnt, 1);
     }
 
-    cronUpdateMemoryStats();
+    {
+        monotime mem_t0 = getMonotonicUs();
+        cronUpdateMemoryStats();
+        cronStatsRecord(CRON_JOB_SC_MEM_STATS, getMonotonicUs() - mem_t0);
+    }
 
     /* Refresh the cached daylight-saving info periodically every 1 second.
      * This is only used to render log timestamps, so it doesn't need to be
@@ -1719,6 +1735,9 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* Handle background operations on databases. */
     databasesCron();
 
+    /* Persistence: child reaping plus bgsave/AOF-rewrite decisions. */
+    monotime persist_t0 = getMonotonicUs();
+
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. We don't start the rewrite if there is an
      * active child process (to avoid multiple concurrent fork children) or if
@@ -1765,6 +1784,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     /* Just for the sake of defensive programming, to avoid forgetting to
      * call this function when needed. */
     updateDictResizePolicy();
+    cronStatsRecord(CRON_JOB_SC_PERSISTENCE, getMonotonicUs() - persist_t0);
 
     /* AOF postponed flush: Try at every cron cycle if the slow fsync
      * completed. */
@@ -1792,16 +1812,28 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * If the server is trying to failover then run the replication cron faster so
      * progress on the handshake happens more quickly. */
     if (server.failover_state != NO_FAILOVER) {
-        run_with_period(100) replicationCron();
+        run_with_period(100) {
+            monotime rc = getMonotonicUs();
+            replicationCron();
+            cronStatsRecord(CRON_JOB_SC_REPLICATION_CRON, getMonotonicUs() - rc);
+        }
     } else {
-        run_with_period(1000) replicationCron();
+        run_with_period(1000) {
+            monotime rc = getMonotonicUs();
+            replicationCron();
+            cronStatsRecord(CRON_JOB_SC_REPLICATION_CRON, getMonotonicUs() - rc);
+        }
     }
 
     run_with_period(100) throttleRepl_adjustThrottling();
 
     /* Run the Cluster cron. */
     if (server.cluster_enabled) {
-        run_with_period(CLUSTER_CRON_PERIOD_MS) clusterCron();
+        run_with_period(CLUSTER_CRON_PERIOD_MS) {
+            monotime cc = getMonotonicUs();
+            clusterCron();
+            cronStatsRecord(CRON_JOB_SC_CLUSTER_CRON, getMonotonicUs() - cc);
+        }
     }
 
     /* Run the Sentinel timer if we are in sentinel mode. */
@@ -1849,7 +1881,11 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 #endif
 
     if (moduleCount()) {
-        run_with_period(100) modulesCron();
+        run_with_period(100) {
+            monotime mc = getMonotonicUs();
+            modulesCron();
+            cronStatsRecord(CRON_JOB_SC_MODULES_CRON, getMonotonicUs() - mc);
+        }
     }
 
     /* Fire the cron loop modules event. */
@@ -1858,7 +1894,12 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     server.cronloops++;
 
-    server.el_cron_duration += elapsedUs(cron_start);
+    uint64_t cron_whole = elapsedUs(cron_start);
+    cronStatsRecord(CRON_JOB_SC_WHOLE, cron_whole);
+    uint64_t sc_sub = cronStatsUsecRange(CRON_JOB_SC_EXPIRE_SLOW, CRON_JOB_SC_PERSISTENCE) - sc_sub_before;
+    cronStatsRecord(CRON_JOB_SC_REST, cron_whole > sc_sub ? cron_whole - sc_sub : 0);
+
+    server.el_cron_duration += cron_whole;
 
     return 1000 / server.hz;
 }
@@ -2074,7 +2115,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Handle blocked clients.
      * must be done before flushAppendOnlyFile, in case of appendfsync=always,
      * since the unblocked clients may write data. */
+    monotime bs_whole_t0 = getMonotonicUs();
+    monotime blocked_t0 = getMonotonicUs();
     blockedBeforeSleep();
+    cronStatsRecord(CRON_JOB_BS_BLOCKED, getMonotonicUs() - blocked_t0);
 
     /* Record cron time in beforeSleep, which is the sum of active-expire, active-defrag and all other
      * tasks done by cron and beforeSleep, but excluding read, write and AOF, that are counted by other
@@ -2084,16 +2128,20 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
     ustime_t expire_cycle_time = 0;
+    monotime expire_fast_t0 = getMonotonicUs();
     if (server.active_expire_enabled && !server.import_mode && iAmPrimary()) {
         expire_cycle_time = activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
     }
+    cronStatsRecord(CRON_JOB_BS_EXPIRE_FAST, getMonotonicUs() - expire_fast_t0);
 
     /* Batched eviction runs before AOF flush and tracking assertions. */
+    monotime evict_batch_t0 = getMonotonicUs();
     if (server.maxmemory_eviction_batch && server.maxmemory && !isInsideYieldingLongCommand()) {
         server.pre_command_oom_state = (performEvictions() == EVICT_FAIL);
         trackingHandlePendingKeyInvalidations();
         server.evict_check_used_memory = zmalloc_used_memory();
     }
+    cronStatsRecord(CRON_JOB_BS_EVICT_BATCH, getMonotonicUs() - evict_batch_t0);
 
     if (moduleCount()) {
         moduleFireServerEvent(VALKEYMODULE_EVENT_EVENTLOOP, VALKEYMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP, NULL);
@@ -2126,7 +2174,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Send the invalidation messages to clients participating to the
      * client side caching protocol in broadcasting (BCAST) mode. */
+    monotime tracking_t0 = getMonotonicUs();
     trackingBroadcastInvalidationMessages();
+    cronStatsRecord(CRON_JOB_BS_TRACKING_BCAST, getMonotonicUs() - tracking_t0);
 
     /* Record time consumption of AOF writing. */
     monotime aof_start_time = getMonotonicUs();
@@ -2144,6 +2194,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     monotime aof_duration = getMonotonicUs() - aof_start_time;
     durationAddSample(EL_DURATION_TYPE_AOF, aof_duration);
     latencyTraceIfNeeded(aof, aof_flush, aof_duration);
+    cronStatsRecord(CRON_JOB_BS_AOF_FLUSH, aof_duration);
 
     /* Update the fsynced replica offset.
      * If an initial rewrite is in progress then not all data is guaranteed to have actually been
@@ -2176,14 +2227,19 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     monotime cron_start_time_after_write = getMonotonicUs();
 
     /* Close clients that need to be closed asynchronous */
+    monotime async_free_t0 = getMonotonicUs();
     freeClientsInAsyncFreeQueue();
+    cronStatsRecord(CRON_JOB_BS_ASYNC_FREE, getMonotonicUs() - async_free_t0);
 
     /* Incrementally trim replication backlog, 10 times the normal speed is
      * to free replication backlog as much as possible. */
     if (server.repl_backlog) incrementalTrimReplicationBacklog(10 * REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
 
     /* Disconnect some clients if they are consuming too much memory. */
+    monotime evict_clients_t0 = getMonotonicUs();
     evictClients();
+    cronStatsRecord(CRON_JOB_BS_EVICT_CLIENTS, getMonotonicUs() - evict_clients_t0);
+    cronStatsRecord(CRON_JOB_BS_WHOLE, getMonotonicUs() - bs_whole_t0);
 
     /* Record cron time in beforeSleep. */
     monotime current_time = getMonotonicUs();
@@ -7399,6 +7455,13 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || everything || (dictFind(section_dict, "fastget") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = fastGetInfoString(info);
+    }
+
+    /* Opt-in: only when named explicitly or with "everything", so default and
+     * "all" INFO are unchanged. */
+    if (everything || (dictFind(section_dict, "cronstats") != NULL)) {
+        if (sections++) info = sdscat(info, "\r\n");
+        info = cronStatsInfoString(info);
     }
 
     /* Get info from modules.

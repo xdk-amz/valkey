@@ -39,6 +39,7 @@
  */
 
 #include "server.h"
+#include "cronstats.h"
 #include "ordered_index.h"
 #include "hashtable.h"
 #include "eval.h"
@@ -1132,7 +1133,7 @@ static int computeDelayMs(monotime intendedEndtime) {
 
 /* An independent time proc for defrag.  While defrag is running, this is called much more often
  *  than the server cron.  Frequent short calls provides low latency impact. */
-static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+static long long activeDefragTimeProcImpl(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);
@@ -1190,6 +1191,13 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
         endDefragCycle(true);
         return AE_NOMORE; // Ends the timer proc
     }
+}
+
+static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+    monotime t0 = getMonotonicUs();
+    long long r = activeDefragTimeProcImpl(eventLoop, id, clientData);
+    cronStatsRecord(CRON_JOB_DEFRAG_TIMEPROC, getMonotonicUs() - t0);
+    return r;
 }
 
 
