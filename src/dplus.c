@@ -475,11 +475,12 @@ void dplusAggregateStats(void) {
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
         long long n = dplus_thread_stats[i].commands_processed;
+        long long calls_delta = 0;
         if (n > seen_calls[i]) {
-            long long delta = n - seen_calls[i];
+            calls_delta = n - seen_calls[i];
             seen_calls[i] = n;
-            server.stat_numcommands += delta;
-            if (get_cmd) get_cmd->calls += delta;
+            server.stat_numcommands += calls_delta;
+            if (get_cmd) get_cmd->calls += calls_delta;
         }
         /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
          * bypasses main's lookupKey where this is normally incremented). Same
@@ -491,10 +492,17 @@ void dplusAggregateStats(void) {
             seen_hits[i] = h;
         }
         long long us = dplus_thread_stats[i].usec;
+        long long us_delta = 0;
         if (us > seen_usec[i]) {
-            long long delta = us - seen_usec[i];
+            us_delta = us - seen_usec[i];
             seen_usec[i] = us;
-            if (get_cmd) get_cmd->microseconds += delta;
+            if (get_cmd) get_cmd->microseconds += us_delta;
+        }
+        /* Speculated GETs count in LATENCY HISTOGRAM and latencystats at their average duration. */
+        if (get_cmd && calls_delta > 0 && server.latency_tracking_enabled) {
+            int64_t avg_ns = (int64_t)(us_delta * 1000 / calls_delta);
+            if (avg_ns < 1) avg_ns = 1;
+            updateCommandLatencyHistogramCount(&get_cmd->latency_histogram, avg_ns, calls_delta);
         }
     }
 }
