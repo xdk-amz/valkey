@@ -31,6 +31,9 @@ struct serverObject;
  * budget requested for a job wins. */
 void maintRequest(int job, uint64_t budget_us);
 
+/* Each kvstore has more than one table: cluster mode (one per slot) or keyspace-shard-bits > 0. */
+int maintKeyspaceSplit(void);
+
 /* Main: the MAINT phase can fan out to the staged workers now (staged on, not nested, workers
  * enrolled, cron-lanes on, more than one table per kvstore). */
 int maintParallelReady(void);
