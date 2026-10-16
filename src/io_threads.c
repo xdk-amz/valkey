@@ -882,6 +882,14 @@ void waitForClientIO(client *c) {
     /* A staged write only reaches an IO thread once its slab is published. */
     if (inMainThread()) flushWriteSlab();
 
+    /* Staged workers take jobs only at a phase start: run phases until this client's IO is done. */
+    if (inMainThread() && stagedLoopActive()) {
+        commitIOJobs();
+        while (c->io_read_state == CLIENT_PENDING_IO || c->io_write_state == CLIENT_PENDING_IO) stagedDrainWorkers();
+        atomic_thread_fence(memory_order_acquire);
+        return;
+    }
+
     /* Wait for read operation to complete if pending. */
     while (c->io_read_state == CLIENT_PENDING_IO) {
         atomic_thread_fence(memory_order_acquire);
