@@ -2055,7 +2055,8 @@ struct valkeyServer {
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
-    int cron_lanes;                           /* Run due table maintenance (rehash, resize) in a parallel MAINT phase. */
+    int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
+    int cron_lanes_split_budget;              /* Split each MAINT job's time budget across the threads instead of giving each thread all of it. */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
@@ -4168,6 +4169,8 @@ int setModuleUnsignedNumericConfig(ModuleConfig *config, unsigned long long val,
 /* db.c -- Keyspace access API */
 int removeExpire(serverDb *db, robj *key);
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index);
+robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index);
+void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int slot);

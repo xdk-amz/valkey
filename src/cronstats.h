@@ -51,6 +51,8 @@ typedef enum {
     CRON_JOB_SC_RECONCILE,  /* kvstoreReconcile wall time after the MAINT barrier */
     CRON_JOB_MAINT_REHASH,  /* REHASH job lane time, summed across threads */
     CRON_JOB_MAINT_RESIZE,  /* RESIZE job lane time, summed across threads */
+    CRON_JOB_MAINT_EXPIRE,  /* EXPIRE job lane time, summed across threads */
+    CRON_JOB_MAINT_REPLAY,  /* main replaying the deletes the lanes made */
     CRON_JOB_SC_DEFRAG_MONITOR,
     CRON_JOB_SC_MEM_STATS,
     CRON_JOB_SC_REPLICATION_CRON,
