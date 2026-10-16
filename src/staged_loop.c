@@ -30,13 +30,17 @@ static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
 static int sl_warned = 0;
-static int sl_main_lane = 1;        /* main takes a lane in APPLY phases */
+static int sl_main_lane = 1;        /* main has a CPU no worker is pinned to, so it works a share of each phase */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
 
 /* Main and the workers pinned to main's one CPU sleep at the barrier instead of spinning. Pinning
  * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
 #define STAGED_PINNING_READ_US 1000000
+
+/* With few IO threads main waits on epoll itself: handing each ready batch over from an epoll thread
+ * costs a wakeup per iteration that a small pool does not win back. */
+#define STAGED_EPOLL_THREAD_MIN_WORKERS 4
 static int sl_main_spins = 1;     /* no enrolled worker is pinned to main's CPU */
 static int sl_pinned_workers = 0; /* enrolled workers pinned to main's one CPU, as last read */
 static int sl_pinned_cpu = -1;    /* main's one CPU, as last read; -1 when main may run on several */
@@ -82,9 +86,9 @@ static void stagedRunPhase(int phase) {
     serverAssert(rc == 0);
     sl_opens++;
     /* Main works its own share of the phase instead of waiting idle for the IO threads. */
-    if (phase == STAGED_PHASE_READ)
+    if (sl_main_lane && phase == STAGED_PHASE_READ)
         fastpathStagedReadPhase(0);
-    else if (phase == STAGED_PHASE_REPLY)
+    else if (sl_main_lane && phase == STAGED_PHASE_REPLY)
         fastpathStagedReplyPhase(0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
 }
@@ -265,7 +269,7 @@ static void stagedReconcile(aeEventLoop *el) {
     }
     stagedSetWorkers(ioThreadsReadyNum() - 1);
     if (!sl_on) {
-        if (pollerStart(sl_poller) != 0)
+        if (server.io_threads_num - 1 >= STAGED_EPOLL_THREAD_MIN_WORKERS && pollerStart(sl_poller) != 0)
             serverLog(LL_WARNING, "Staged event loop: cannot start the epoll thread; main waits on epoll itself");
         __atomic_store_n(&sl_on, 1, __ATOMIC_RELAXED);
         fastpathStagedSet(1);
