@@ -65,6 +65,36 @@ start_cluster 1 1 [list tags {external:skip cluster maint tls:skip logreqres:ski
         assert_equal 0 [getInfoProperty [R 1 info stats] expired_keys]
     }
 
+    test "Cluster active expire with cron-lanes $::mc_lanes sends one expired event per key" {
+        R 0 flushall
+        wait_for_ofs_sync [Rn 0] [Rn 1]
+        R 0 config set notify-keyspace-events Ex
+        set rd [valkey_deferring_client 0]
+        $rd psubscribe __keyevent@0__:expired
+        $rd read
+        mc_load_volatile 0 ev: 2000 150
+        set got {}
+        for {set i 0} {$i < 2000} {incr i} {
+            lappend got [lindex [$rd read] 3]
+        }
+        assert_equal 2000 [llength [lsort -unique $got]]
+        $rd close
+        R 0 config set notify-keyspace-events ""
+    }
+
+    test "Cluster active expire with cron-lanes $::mc_lanes aborts a transaction watching the key" {
+        R 0 flushall
+        wait_for_ofs_sync [Rn 0] [Rn 1]
+        R 0 set w:1 v px 200
+        set rd [valkey_client 0]
+        $rd watch w:1
+        wait_for_condition 300 50 {[R 0 dbsize] == 0} else { fail "watched key did not expire" }
+        $rd multi
+        $rd set w:1 new
+        assert_equal {} [$rd exec]
+        $rd close
+    }
+
     test "Cluster rehash and shrink with cron-lanes $::mc_lanes keep slot tables consistent" {
         R 0 flushall
         wait_for_ofs_sync [Rn 0] [Rn 1]
