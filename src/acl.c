@@ -794,9 +794,10 @@ void aclOffloadBeginRead(client *c) {
 /* IO-thread side: evaluate and tag one command. Reads only the principal's rule
  * set (never main-owned client/socket/query/output state). Only ALLOW is recorded;
  * a denial leaves the bit clear so main runs the stock check and yields the exact
- * error. Bracketed by the admission seqlock so main can quiesce readers. */
+ * error. Bracketed by the admission seqlock so main can quiesce readers. Main tags too while it
+ * works its own share of a read phase; it changes no rule set inside a phase. */
 void aclOffloadTagCommand(client *c, struct serverCommand *cmd, robj **argv, int argc, int dbid, int *read_flags) {
-    if (!aclOffloadActive() || inMainThread()) return;
+    if (!aclOffloadActive()) return;
     if (cmd == NULL || argc == 0) return;
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     if (*read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)) return;
