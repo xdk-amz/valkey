@@ -154,9 +154,8 @@ sds internDupSds(const_sds s);
  *
  * On the main thread, which parses only while every write is being probed, the
  * object holds a reference. On an IO thread the object is recorded in *pending
- * without one, and an argument after the key may be selected, hashed and
- * recorded instead; the main thread takes the references and admits the
- * selected arguments when it collects the read with internReadCollected(). */
+ * without one; the main thread takes the references when it collects the read
+ * with internReadCollected(). */
 struct serverObject;
 typedef struct internPending internPending;
 struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len, int argi);
@@ -165,7 +164,7 @@ static inline int internParseReady(void) {
     return intern_is_main ? intern_load_ready : 1;
 }
 void internFreePending(internPending *pending);
-/* IO threads share and select only arguments of these commands. */
+/* IO threads share only arguments of these commands. */
 int internIOShares(const char *name, size_t len);
 
 /* Read jobs. An IO thread reads hot shared strings while it parses, and holds

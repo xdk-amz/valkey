@@ -410,7 +410,6 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->cur_tid = 0;
-    c->intern_io_parsed = 0;
     c->intern_pending = NULL;
     c->intern_read_epoch = 0;
     c->nwritten = 0;
@@ -4464,7 +4463,6 @@ int processPendingCommandAndInputBuffer(client *c) {
 void parseInputBuffer(client *c) {
     /* The command queue must be emptied before parsing. */
     serverAssert(c->cmd_queue.len == 0);
-    c->intern_io_parsed = !intern_is_main;
 
     /* Hold off transport read handlers for the duration of parsing (RDMA update_state
      * may otherwise re-enter readQueryFromClient and corrupt cmd_queue). */

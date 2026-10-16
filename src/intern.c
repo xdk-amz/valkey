@@ -942,20 +942,10 @@ int internDrainPending(void) {
 
 #define INTERN_PENDING_MAX 4096
 
-/* Arguments an IO thread selected for admission, with the hash and length it
- * computed, so the main thread can admit them without reading their bytes. */
-typedef struct internSelected {
-    robj *o;
-    uint64_t hash;
-    size_t len;
-} internSelected;
-
 struct internPending {
-    uint32_t n, cap;   /* shared arguments waiting for their references */
-    uint32_t ns, scap; /* arguments selected for admission */
-    uint32_t hits;     /* sampled arguments that were shared */
+    uint32_t n, cap; /* shared arguments waiting for their references */
+    uint32_t hits;   /* sampled arguments that were shared */
     robj **o;
-    internSelected *sel;
 };
 
 static internPending *pendingGet(internPending **pp) {
@@ -973,8 +963,10 @@ static int pendingGrow(void **arr, uint32_t n, uint32_t *cap, size_t entry) {
     return 1;
 }
 
-/* Each IO thread selects one eligible argument in 2^level, the main sampling
- * rate, and hashes it, since the main thread does not have its bytes in cache. */
+/* Each IO thread samples one eligible argument in 2^level, the main sampling
+ * rate, so the sampling level sees the hits parse-time sharing finds. Misses
+ * are left to setKey: handing them to the main thread per read costs more
+ * throughput than the main thread reading their bytes. */
 static __thread uint32_t io_sel_tick = 1;
 
 static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int argi) {
@@ -997,12 +989,7 @@ static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int arg
         p->hits += sampled;
         return o;
     }
-    if (!sampled) return NULL;
-    internPending *p = pendingGet(pp);
-    if (!pendingGrow((void **)&p->sel, p->ns, &p->scap, sizeof(internSelected))) return NULL;
-    robj *o = createStringObject(buf, len);
-    p->sel[p->ns++] = (internSelected){o, internHash(buf, len), len};
-    return o;
+    return NULL;
 }
 
 robj *internParseArg(internPending **pending, const char *buf, size_t len, int argi) {
@@ -1022,9 +1009,8 @@ robj *internParseArg(internPending **pending, const char *buf, size_t len, int a
 
 void internFreePending(internPending *pending) {
     if (pending == NULL) return;
-    serverAssert(pending->n == 0 && pending->ns == 0);
+    serverAssert(pending->n == 0);
     zfree(pending->o);
-    zfree(pending->sel);
     zfree(pending);
 }
 
@@ -1040,19 +1026,6 @@ int internIOShares(const char *name, size_t len) {
     return 0;
 }
 
-/* Admits a private argument an IO thread selected, using the hash and length
- * it computed. Returns the sds the argument must hold. The bytes are read only
- * on a table hit or to copy a new singleton. */
-static sds admitSelected(sds s, size_t len, uint64_t h) {
-    st.sampled++;
-    if (unlikely(filterMayHave(h))) {
-        sds r = admitFromTables(s, len, h);
-        if (r) return r;
-    }
-    observe(0);
-    if (unlikely(selectSingleton(h, len, privateSize(len)))) return makeSingleton(s, len, h);
-    return s;
-}
 
 /* Takes the reference an IO thread left for the main thread. The string may
  * have died since; it was retired, so it is still allocated, and this brings
@@ -1101,20 +1074,11 @@ void internReadCollected(internPending *pending, uint32_t *epoch) {
         pending->n = 0;
         for (; pending->hits; pending->hits--) observe(1);
     }
-    if (pending && pending->ns) {
-        for (uint32_t i = 0; i < pending->ns; i++) {
-            internSelected *e = &pending->sel[i];
-            objectSetVal(e->o, admitSelected(objectGetVal(e->o), e->len, e->hash));
-        }
-        pending->ns = 0;
-    }
-    /* A long pipeline grows the arrays; do not keep them for an idle client. */
-    if (pending && (pending->cap > 64 || pending->scap > 64)) {
+    /* A long pipeline grows the array; do not keep it for an idle client. */
+    if (pending && pending->cap > 64) {
         zfree(pending->o);
-        zfree(pending->sel);
         pending->o = NULL;
-        pending->sel = NULL;
-        pending->cap = pending->scap = 0;
+        pending->cap = 0;
     }
     if (*epoch) {
         serverAssert(read_inflight[*epoch - 1] > 0);
