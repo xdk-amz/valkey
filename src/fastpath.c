@@ -271,6 +271,10 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->input_bytes = input_bytes;
     e->cmd = cmd;
     e->slot = slot;
+    /* acl-offload: the IO thread checks the command's ACL here; main trusts an ALLOW only while the
+     * ACL epoch it was checked under is current. */
+    aclOffloadTagCommand(c, cmd, argv, argc, c->db->id, &read_flags);
+    e->origin.acl_epoch_seen = c->acl_epoch_seen;
     e->read_flags = read_flags;
     e->db = c->db;
     e->resp = (uint8_t)c->resp;
@@ -639,7 +643,11 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         return;
     }
 
-    if (principal->flags & USER_FLAG_RETIRED) principal = ACLResolveUser(principal);
+    if (principal->flags & USER_FLAG_RETIRED) {
+        /* An ALLOW checked under the retired rule set does not describe its live successor. */
+        e->read_flags &= ~READ_FLAGS_ACL_ALLOWED;
+        principal = ACLResolveUser(principal);
+    }
     serverAssert(principal); /* a deleted user's clients are detaching */
     ec->user = principal;
     ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
@@ -652,6 +660,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->parsed_cmd = e->cmd;
     ec->slot = e->slot;
     ec->read_flags = e->read_flags;
+    ec->acl_epoch_seen = e->origin.acl_epoch_seen;
     ec->db = e->db;
     ec->resp = e->resp;
     ec->origin = &e->origin;
