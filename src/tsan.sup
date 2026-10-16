@@ -1,4 +1,4 @@
-# ThreadSanitizer suppressions for the D+/door-2 concurrent-read design.
+# ThreadSanitizer suppressions for IO-thread fast GETs and the staged loop.
 #
 # Usage:  TSAN_OPTIONS="suppressions=src/tsan.sup" ./src/valkey-server ...
 # Build:  make SANITIZER=thread
@@ -33,7 +33,7 @@ race:ioThreadWriteToClient
 # aligned 8-byte loads don't tear on supported targets. This is inherited
 # upstream valkey design (predates door-2), reproduced on the unmodified
 # base commit 89e774674 under unit/lazyfree; converting the array to relaxed
-# atomics is an upstream conversation, not a D+ fix. Root-caused Sep 4 2026
+# atomics is an upstream conversation, not a fast GET fix. Root-caused Sep 4 2026
 # (Phase 1 S1.6 sanitizer leg).
 race:zmalloc_used_memory
 
@@ -45,7 +45,7 @@ race:zmalloc_used_memory
 # Sep 4 2026): cross-thread fd registration vs the F13 unlocked sweep
 # (aeCreateFileEvent/connSocketSetReadHandler/connIncrRefs), SPSC
 # inbox/outbox accessors (spscEnqueue/IsEmpty/IsFull), query-buffer handoff
-# (readToQueryBuf/parseMultibulk/readQueryFromClient), and D+ stats
+# (readToQueryBuf/parseMultibulk/readQueryFromClient), and fast GET stats
 # aggregation. This is the same fence-ordered surface Class 2 documents as
 # TSan-unmodellable, PLUS genuinely unlocked windows that need their own
 # audit -- tracked as the Phase 1 follow-up 'owned-client handshake TSan
@@ -65,9 +65,9 @@ race:connSocketEventHandler
 race:connSocketRead
 race:connSocketSetReadHandler
 race:connSocketSetWriteHandler
-race:dplusAggregateStats
-race:dplusConsumeSpeculated
-race:dplusInfoString
+race:fastGetAggregateStats
+race:fastGetConsumeSpeculated
+race:fastGetInfoString
 race:invoke_callback
 race:ioThreadReadQueryFromClient
 race:parseMultibulk

@@ -542,7 +542,7 @@ ENGINE_SERVER_OBJ = \
     crccombine.o \
     crcspeed.o \
     db.o \
-    dplus.o \
+    fastget.o \
     debug.o \
     defrag.o \
     entry.o \

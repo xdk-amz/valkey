@@ -4,25 +4,25 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-/* D+ -- GET execution on IO threads. See dplus.h. */
+/* Fast GET: GET execution on IO threads. See fastget.h. */
 
 #include "server.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "io_threads.h"
 
 #include <string.h>
 #include <stdatomic.h>
 
-dplusThreadStats dplus_thread_stats[DPLUS_MAX_IO_THREADS] = {{0}};
+fastGetThreadStats fastget_thread_stats[FASTGET_MAX_IO_THREADS] = {{0}};
 
 /* --- Component 6: Stats --- */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-dplusStats dplus_stats[DPLUS_MAX_IO_THREADS] = {{0}};
+fastGetStats fastget_stats[FASTGET_MAX_IO_THREADS] = {{0}};
 
-uint64_t dplusStatsSum(size_t field_offset) {
+uint64_t fastGetStatsSum(size_t field_offset) {
     uint64_t sum = 0;
-    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) {
-        _Atomic(uint64_t) *p = (_Atomic(uint64_t) *)((char *)&dplus_stats[i] + field_offset);
+    for (int i = 0; i < FASTGET_MAX_IO_THREADS; i++) {
+        _Atomic(uint64_t) *p = (_Atomic(uint64_t) *)((char *)&fastget_stats[i] + field_offset);
         sum += atomic_load_explicit(p, memory_order_relaxed);
     }
     return sum;
@@ -36,7 +36,7 @@ uint64_t dplusStatsSum(size_t field_offset) {
  * ACLCheckAllPerm never run on the speculative path — this byte is the
  * substitute, computed at every auth-state change (clientSetUser covers
  * AUTH/HELLO/RESET/module-auth/deluser-kick), on SELECT (per-db ACLs), and
- * on ACL admin ops (dplusOnAclRulesChanged).
+ * on ACL admin ops (fastGetOnAclRulesChanged).
  *
  * Condition (graceful give-up, per design): authenticated AND some selector
  * permits GET with UNRESTRICTED key read access (~* / %R~* / allkeys).
@@ -46,7 +46,7 @@ uint64_t dplusStatsSum(size_t field_offset) {
  * instead of authRequired(): the latter reads DefaultUser->flags which can
  * change with no per-client event (CONFIG SET requirepass) — conservative
  * punts only, never a bypass. */
-void dplusRecomputeSpecAclOk(client *c) {
+void fastGetRecomputeSpecAclOk(client *c) {
     uint8_t ok = 0;
     /* ACL LOAD retires the user a fast-path client still points at; its successor holds the rules. */
     user *u = c->user && (c->user->flags & USER_FLAG_RETIRED) ? ACLResolveUser(c->user) : c->user;
@@ -76,11 +76,11 @@ void dplusRecomputeSpecAclOk(client *c) {
 /* ACL rules changed (ACL SETUSER/DELUSER/LOAD, module SetUserACL).
  * MAIN THREAD ONLY. Recompute every client's gate under the new rules. Rare
  * admin op -- the blanket client walk is deliberate simplicity. */
-void dplusOnAclRulesChanged(void) {
+void fastGetOnAclRulesChanged(void) {
     listIter li;
     listNode *ln;
     listRewind(server.clients, &li);
-    while ((ln = listNext(&li))) dplusRecomputeSpecAclOk((client *)listNodeValue(ln));
+    while ((ln = listNext(&li))) fastGetRecomputeSpecAclOk((client *)listNodeValue(ln));
 }
 
 /* F6: module command-result SUCCESS subscribers require an exact per-command
@@ -89,10 +89,10 @@ void dplusOnAclRulesChanged(void) {
  * SUCCESS events (failures always punt), so only the success listener count
  * matters. Published gate read by workers each batch; transitions are rare
  * module admin ops (subscribe / unload). */
-_Atomic int dplus_module_cmdresult_gate = 0;
+_Atomic int fastget_module_cmdresult_gate = 0;
 
-void dplusOnCommandResultListenersChanged(int success_listeners) {
-    atomic_store_explicit(&dplus_module_cmdresult_gate, success_listeners > 0, memory_order_release);
+void fastGetOnCommandResultListenersChanged(int success_listeners) {
+    atomic_store_explicit(&fastget_module_cmdresult_gate, success_listeners > 0, memory_order_release);
 }
 
 /* F1: MONITOR feeds every executed command to attached monitor clients from
@@ -101,17 +101,17 @@ void dplusOnCommandResultListenersChanged(int success_listeners) {
  * diagnostic feature, so gate speculation OFF while any monitor is attached --
  * MONITOR then observes the exact stock command stream. Zero cost when no
  * monitor (one acquire load of a main-written int per batch). */
-_Atomic int dplus_monitor_gate = 0;
+_Atomic int fastget_monitor_gate = 0;
 
-void dplusOnMonitorsChanged(void) {
-    atomic_store_explicit(&dplus_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
+void fastGetOnMonitorsChanged(void) {
+    atomic_store_explicit(&fastget_monitor_gate, listLength(server.monitors) > 0, memory_order_release);
 }
 
 /* --- Component 2: Speculative GET — reply helpers --- */
 
 /* Format a RESP2/3 bulk string reply directly into the client's output buffer.
  * Returns bytes written, or 0 if insufficient space (punt to main). */
-static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
+static int fastGetWriteBulkReply(client *c, const char *val, size_t vallen) {
     /* Fast bulk-header formatting: "$<len>\r\n" using ll2string instead of
      * snprintf (eliminates 2.6% __vfprintf_internal from worker profile). */
     char hdr[32];
@@ -137,17 +137,17 @@ static int dplusWriteBulkReply(client *c, const char *val, size_t vallen) {
 /* --- Component 2/5: IO-thread batch speculation with batched prefetch --- */
 
 /* Maximum batch depth for prefetch overlap. Matches server.prefetch_batch_max_size default. */
-#define DPLUS_BATCH_DEPTH 16
+#define FASTGET_BATCH_DEPTH 16
 
 /* Per-key state for the batched prefetch + reply pipeline. */
-typedef struct dplusBatchEntry {
+typedef struct fastGetBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
     int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
-} dplusBatchEntry;
+} fastGetBatchEntry;
 
 /* The commandlog threshold of a type, or -1 while that log records nothing. */
-static long long dplusCommandlogThreshold(int type) {
+static long long fastGetCommandlogThreshold(int type) {
     if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
     return server.commandlog[type].threshold;
 }
@@ -155,9 +155,9 @@ static long long dplusCommandlogThreshold(int type) {
 /* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
  * written), 0 on punt. The keyspace is quiescent while IO threads read: main
  * mutates it only outside the read phase. */
-static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
+static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
     /* A GET the large-request commandlog would record goes to main, which records it. */
-    long long request_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    long long request_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
     if (request_threshold >= 0) {
         size_t in = e->is_first_cmd ? c->net_input_bytes_curr_cmd : c->cmd_queue.cmds[e->queue_idx].input_bytes;
         if ((long long)in >= request_threshold) return 0;
@@ -167,7 +167,7 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
         /* Key not found -- punt on miss (E4): main fires the keymiss notification
          * and increments stat_keyspace_misses exactly. */
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-        DPLUS_STAT_ADD(miss_punts, 1);
+        FASTGET_STAT_ADD(miss_punts, 1);
 #endif
         return 0;
     }
@@ -180,7 +180,7 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
         mstime_t when = objectGetExpire(o);
         if (when >= 0 && mstime() >= when) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(expired_replies, 1);
+            FASTGET_STAT_ADD(expired_replies, 1);
 #endif
             return 0;
         }
@@ -196,9 +196,9 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
     } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
         val = objectGetVal(o);
         vallen = sdslen((sds)val);
-        if (vallen > DPLUS_MAX_SPECULATIVE_VALUE_LEN) {
+        if (vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(large_value_punts, 1);
+            FASTGET_STAT_ADD(large_value_punts, 1);
 #endif
             return 0;
         }
@@ -207,12 +207,12 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
     }
 
     /* A reply the large-reply commandlog would record goes to main, which records it. */
-    long long reply_threshold = dplusCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
-    if (dplusWriteBulkReply(c, val, vallen) <= 0) return 0;
+    if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-    DPLUS_STAT_ADD(speculative_hits, 1);
+    FASTGET_STAT_ADD(speculative_hits, 1);
 #endif
     return 1;
 }
@@ -225,7 +225,7 @@ static int dplusReplyFromEntry(client *c, dplusBatchEntry *e) {
  * main thread processes any punted command, whose replies append after.
  *
  * Returns the number of commands speculatively completed. */
-int dplusSpeculateBatch(client *c, int tid) {
+int fastGetSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
     /* Early exit: speculation disabled (single-threaded or cluster mode).
@@ -247,7 +247,7 @@ int dplusSpeculateBatch(client *c, int tid) {
      * just-unblocked clients must have replies ordered after the unblock
      * reply. Cheap plain-byte tests, ordered before any atomics.
      *
-     * BUFFER-STATE GUARD: dplusWriteBulkReply appends RAW RESP to c->buf.
+     * BUFFER-STATE GUARD: fastGetWriteBulkReply appends RAW RESP to c->buf.
      * If the buffer is in copy-avoidance ENCODED mode (header-framed
      * payloads), raw bytes corrupt the framing — trackBufReferences walks
      * off the payload chain ('ptr == buf + bufpos' assert; found by the
@@ -275,19 +275,19 @@ int dplusSpeculateBatch(client *c, int tid) {
      * would silently drop those events. Global, module-rare gate -- zero cost
      * when no module subscribes (single acquire load of a main-written int
      * that changes only on module admin ops). */
-    if (atomic_load_explicit(&dplus_module_cmdresult_gate, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&fastget_module_cmdresult_gate, memory_order_acquire)) return 0;
 
     /* MONITOR GUARD (F1): a monitor feed is produced per executed command in
      * call() on main; speculation bypasses call() and would hide the read from
      * every attached monitor. Global, diagnostic-rare gate -- zero cost when no
      * monitor is attached. */
-    if (atomic_load_explicit(&dplus_monitor_gate, memory_order_acquire)) return 0;
+    if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
 
     /* Lazily cache the GET command pointer -- eliminates repeated case-insensitive
      * siphash lookups. Only a batch that starts with GET can speculate. */
-    static struct serverCommand *dplus_get_cmd = NULL;
-    if (!dplus_get_cmd) dplus_get_cmd = lookupCommandByCString("get");
-    if (c->argc != 2 || c->parsed_cmd != dplus_get_cmd) return 0;
+    static struct serverCommand *fastget_get_cmd = NULL;
+    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
+    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
 
     /* ACL/AUTH GUARD: speculation bypasses processCommand, so neither the
      * NOAUTH check nor ACLCheckAllPerm ever runs on this path. Only clients
@@ -300,25 +300,25 @@ int dplusSpeculateBatch(client *c, int tid) {
 
     /* COMMANDLOG GUARD: with a slow threshold of 0 the commandlog records every command, so every
      * GET goes to main, which records it. Large requests and replies are checked per GET. */
-    if (dplusCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
+    if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
 
     /* Time the batch for commandstats parity: speculated GETs bypass call(),
      * so their duration must be accumulated per-thread and folded into the
-     * GET command's microseconds by dplusAggregateStats (as with calls). */
+     * GET command's microseconds by fastGetAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
 
     hashtable *ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(c->argv[1])));
     if (!ht) return 0;
 
-    /* STREAMING SLOT-REFILL: a ring of DPLUS_BATCH_DEPTH slots holds in-flight
+    /* STREAMING SLOT-REFILL: a ring of FASTGET_BATCH_DEPTH slots holds in-flight
      * finds. Each sweep steps every pending find once (one prefetch per slot);
      * the head slot replies as soon as its find completes, and the fill loop
      * tops the window back up from the queue, so prefetch depth stays constant
      * across the eligible prefix. The first ineligible command or punt ends
      * speculation for the whole read. head..tail are monotonic; slot index =
-     * seq % DPLUS_BATCH_DEPTH; done[] marks completed finds. */
-    dplusBatchEntry batch[DPLUS_BATCH_DEPTH];
-    uint8_t done[DPLUS_BATCH_DEPTH];
+     * seq % FASTGET_BATCH_DEPTH; done[] marks completed finds. */
+    fastGetBatchEntry batch[FASTGET_BATCH_DEPTH];
+    uint8_t done[FASTGET_BATCH_DEPTH];
     cmdQueue *queue = &c->cmd_queue;
     int queue_pos = queue->off;
     int prefix_open = 1;
@@ -331,9 +331,9 @@ int dplusSpeculateBatch(client *c, int tid) {
 
     while (head < tail || prefix_open) {
         /* Fill: top the window up from the queue. */
-        while (prefix_open && tail - head < DPLUS_BATCH_DEPTH && queue_pos < queue->len) {
+        while (prefix_open && tail - head < FASTGET_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
-            if (p->cmd != dplus_get_cmd || p->argc != 2) {
+            if (p->cmd != fastget_get_cmd || p->argc != 2) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
@@ -342,11 +342,11 @@ int dplusSpeculateBatch(client *c, int tid) {
                 prefix_open = 0; /* an unallocated shard ends the prefix; main answers it */
                 break;
             }
-            dplusBatchEntry *e = &batch[tail % DPLUS_BATCH_DEPTH];
+            fastGetBatchEntry *e = &batch[tail % FASTGET_BATCH_DEPTH];
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
             hashtableIncrementalFindInit(&e->find_state, pht, objectGetVal(p->argv[1]));
-            done[tail % DPLUS_BATCH_DEPTH] = 0;
+            done[tail % FASTGET_BATCH_DEPTH] = 0;
             tail++;
             queue_pos++;
         }
@@ -355,17 +355,17 @@ int dplusSpeculateBatch(client *c, int tid) {
 
         /* Sweep: one find step per pending slot (one prefetch each). */
         for (unsigned s = head; s < tail; s++) {
-            unsigned i = s % DPLUS_BATCH_DEPTH;
+            unsigned i = s % FASTGET_BATCH_DEPTH;
             if (!done[i]) done[i] = !hashtableIncrementalFindStep(&batch[i].find_state);
         }
 
         /* Drain: reply completed HEADS in command order. */
-        while (head < tail && done[head % DPLUS_BATCH_DEPTH]) {
-            dplusBatchEntry *e = &batch[head % DPLUS_BATCH_DEPTH];
+        while (head < tail && done[head % FASTGET_BATCH_DEPTH]) {
+            fastGetBatchEntry *e = &batch[head % FASTGET_BATCH_DEPTH];
 #ifdef IO_LOOKUP_OFFLOAD_STATS
-            DPLUS_STAT_ADD(speculative_attempts, 1);
+            FASTGET_STAT_ADD(speculative_attempts, 1);
 #endif
-            if (!dplusReplyFromEntry(c, e)) {
+            if (!fastGetReplyFromEntry(c, e)) {
                 /* Contiguous-prefix rule: in-flight slots behind a punt are
                  * abandoned and their commands fall through to main. */
                 prefix_open = 0;
@@ -373,17 +373,17 @@ int dplusSpeculateBatch(client *c, int tid) {
                 break;
             }
             if (e->is_first_cmd)
-                c->read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                c->read_flags |= READ_FLAGS_FASTGET_SPECULATED;
             else
-                queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_DPLUS_SPECULATED;
+                queue->cmds[e->queue_idx].read_flags |= READ_FLAGS_FASTGET_SPECULATED;
             speculated++;
             head++;
         }
     }
 
     /* Commandstats parity: fold execution time into the per-thread counter
-     * (calls are accumulated in dplusConsumeSpeculated). */
-    if (speculated > 0) dplus_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
+     * (calls are accumulated in fastGetConsumeSpeculated). */
+    if (speculated > 0) fastget_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
     return speculated;
 }
 
@@ -391,10 +391,10 @@ int dplusSpeculateBatch(client *c, int tid) {
 
 /* Consume speculated commands at the IO thread so they never reach main.
  *
- * After dplusSpeculateBatch writes replies into c->buf and marks commands
- * with READ_FLAGS_DPLUS_SPECULATED, this function:
+ * After fastGetSpeculateBatch writes replies into c->buf and marks commands
+ * with READ_FLAGS_FASTGET_SPECULATED, this function:
  * 1. Frees the first command's argv (c->argv) and clears pending_command state.
- * 2. Advances cmd_queue past all DPLUS_SPECULATED entries, freeing their argv.
+ * 2. Advances cmd_queue past all FASTGET_SPECULATED entries, freeing their argv.
  * 3. Increments per-IO-thread command counter (NOT shared stat_numcommands).
  * 4. Increments c->commands_processed directly — safe because the IO thread
  *    owns the client exclusively during the read phase (io_read_state ==
@@ -404,12 +404,12 @@ int dplusSpeculateBatch(client *c, int tid) {
  * After this, c->argc == 0, pending_command is clear, and cmd_queue has no
  * speculated entries. Main-thread processClientIOReadsDone sees nothing to
  * execute. */
-void dplusConsumeSpeculated(client *c, int count, int tid) {
+void fastGetConsumeSpeculated(client *c, int count, int tid) {
     int consumed = 0;
 
     /* --- First command (c->argv / c->parsed_cmd case) --- */
-    if (count > 0 && (c->read_flags & READ_FLAGS_DPLUS_SPECULATED)) {
-        c->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+    if (count > 0 && (c->read_flags & READ_FLAGS_FASTGET_SPECULATED)) {
+        c->read_flags &= ~READ_FLAGS_FASTGET_SPECULATED;
         /* CRITICAL: clear pending_command — the parse path set it, and without
          * clearing it here the main thread's processPendingCommandAndInputBuffer
          * would call processCommandAndResetClient() on argc==0 + a STALE c->cmd
@@ -439,8 +439,8 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     cmdQueue *queue = &c->cmd_queue;
     while (consumed < count && queue->off < queue->len) {
         parsedCommand *p = &queue->cmds[queue->off];
-        if (!(p->read_flags & READ_FLAGS_DPLUS_SPECULATED)) break;
-        p->read_flags &= ~READ_FLAGS_DPLUS_SPECULATED;
+        if (!(p->read_flags & READ_FLAGS_FASTGET_SPECULATED)) break;
+        p->read_flags &= ~READ_FLAGS_FASTGET_SPECULATED;
         queue->off++;
         /* Free argv for the consumed command. */
         for (int j = 0; j < p->argc; j++) {
@@ -459,11 +459,11 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     }
 
     /* Accumulate into per-IO-thread counter (no shared-line write). */
-    dplus_thread_stats[tid].commands_processed += consumed;
+    fastget_thread_stats[tid].commands_processed += consumed;
     /* E3: every consumed speculation is a GET keyspace HIT (valid-nil misses now
      * punt to main via E4; large/expired/torn also punt). Count them per-thread
      * so main can fold into stat_keyspace_hits, which the worker path bypasses. */
-    dplus_thread_stats[tid].keyspace_hits += consumed;
+    fastget_thread_stats[tid].keyspace_hits += consumed;
 }
 
 /* Aggregate per-IO-thread command counters into server.stat_numcommands.
@@ -480,7 +480,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
  * (found by valkey-benchmark.tcl: calls=101 vs 100, calls=10000 vs 10010).
  * For RESETSTAT the settle happens BEFORE the zeroing, absorbing pending
  * counts into the stats about to be cleared. */
-void dplusAggregateStats(void) {
+void fastGetAggregateStats(void) {
     /* Commandstats parity: speculated GETs bypass call(), which is where
      * cmd->calls / cmd->microseconds are normally incremented. Fold the
      * per-thread counters into the GET command here so INFO COMMANDSTATS
@@ -494,13 +494,13 @@ void dplusAggregateStats(void) {
      * Workers' counters only ever grow; main folds the delta since its own
      * last_seen snapshot. A racy read can only UNDER-read (missing the very
      * latest increment), which the next fold picks up — never loses. */
-    static long long seen_calls[DPLUS_MAX_IO_THREADS] = {0};
-    static long long seen_usec[DPLUS_MAX_IO_THREADS] = {0};
-    static long long seen_hits[DPLUS_MAX_IO_THREADS] = {0};
+    static long long seen_calls[FASTGET_MAX_IO_THREADS] = {0};
+    static long long seen_usec[FASTGET_MAX_IO_THREADS] = {0};
+    static long long seen_hits[FASTGET_MAX_IO_THREADS] = {0};
     static struct serverCommand *get_cmd = NULL;
     if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
-        long long n = dplus_thread_stats[i].commands_processed;
+        long long n = fastget_thread_stats[i].commands_processed;
         long long calls_delta = 0;
         if (n > seen_calls[i]) {
             calls_delta = n - seen_calls[i];
@@ -512,12 +512,12 @@ void dplusAggregateStats(void) {
          * bypasses main's lookupKey where this is normally incremented). Same
          * monotonic-delta scheme: workers only grow their slot, main folds the
          * delta since its last snapshot; a racy read only under-reads, never loses. */
-        long long h = dplus_thread_stats[i].keyspace_hits;
+        long long h = fastget_thread_stats[i].keyspace_hits;
         if (h > seen_hits[i]) {
             server.stat_keyspace_hits += h - seen_hits[i];
             seen_hits[i] = h;
         }
-        long long us = dplus_thread_stats[i].usec;
+        long long us = fastget_thread_stats[i].usec;
         long long us_delta = 0;
         if (us > seen_usec[i]) {
             us_delta = us - seen_usec[i];
@@ -533,22 +533,22 @@ void dplusAggregateStats(void) {
     }
 }
 
-sds dplusInfoString(sds info) {
+sds fastGetInfoString(sds info) {
     long long speculated = 0;
-    for (int i = 0; i < DPLUS_MAX_IO_THREADS; i++) speculated += dplus_thread_stats[i].commands_processed;
-    info = sdscatprintf(info, "# Dplus\r\ndplus_speculated_commands:%lld\r\n", speculated);
+    for (int i = 0; i < FASTGET_MAX_IO_THREADS; i++) speculated += fastget_thread_stats[i].commands_processed;
+    info = sdscatprintf(info, "# Fastget\r\nfastget_speculated_commands:%lld\r\n", speculated);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     info = sdscatprintf(info,
-                        "dplus_speculative_attempts:%llu\r\n"
-                        "dplus_speculative_hits:%llu\r\n"
-                        "dplus_large_value_punts:%llu\r\n"
-                        "dplus_expired_replies:%llu\r\n"
-                        "dplus_miss_punts:%llu\r\n",
-                        (unsigned long long)DPLUS_STAT_SUM(speculative_attempts),
-                        (unsigned long long)DPLUS_STAT_SUM(speculative_hits),
-                        (unsigned long long)DPLUS_STAT_SUM(large_value_punts),
-                        (unsigned long long)DPLUS_STAT_SUM(expired_replies),
-                        (unsigned long long)DPLUS_STAT_SUM(miss_punts));
+                        "fastget_speculative_attempts:%llu\r\n"
+                        "fastget_speculative_hits:%llu\r\n"
+                        "fastget_large_value_punts:%llu\r\n"
+                        "fastget_expired_replies:%llu\r\n"
+                        "fastget_miss_punts:%llu\r\n",
+                        (unsigned long long)FASTGET_STAT_SUM(speculative_attempts),
+                        (unsigned long long)FASTGET_STAT_SUM(speculative_hits),
+                        (unsigned long long)FASTGET_STAT_SUM(large_value_punts),
+                        (unsigned long long)FASTGET_STAT_SUM(expired_replies),
+                        (unsigned long long)FASTGET_STAT_SUM(miss_punts));
 #endif
     return info;
 }

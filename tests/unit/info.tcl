@@ -545,7 +545,7 @@ start_server {tags {"info" "external:skip"} overrides {keyspace-shard-bits 0}} {
         assert_equal [getInfoProperty $info_mem mem_overhead_db_hashtable_rehashing] {0}
         # overhead.db.hashtable.lut = memory overhead of hashtable including hashtable struct and tables
         set hashtable_overhead [dict get $mem_stats overhead.db.hashtable.lut]
-        # The D+ version array adds a fixed 2KB per hashtable, so the overhead
+        # The fast GET version array adds a fixed 2KB per hashtable, so the overhead
         # no longer tells 32-bit from 64-bit; ask the server.
         set bits [s arch_bits]
         assert_range $hashtable_overhead 1 4096

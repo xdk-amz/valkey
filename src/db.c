@@ -32,7 +32,7 @@
 #include "listpack.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "latency.h"
@@ -514,7 +514,7 @@ robj *dbRandomKey(serverDb *db) {
 }
 
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
-    /* D+ (S1.4): keyspace deletes must run on main -- IO threads punt.
+    /* Fast GET: keyspace deletes must run on main -- IO threads punt.
      * See expireIfNeededWithDictIndex for the rationale. */
     debugServerAssert(inMainThread());
     hashtablePosition pos;
@@ -976,8 +976,8 @@ void selectCommand(client *c) {
         addReplyError(c, "DB index is out of range");
         return;
     }
-    /* Per-db ACL selectors: the D+ speculation gate is db-dependent. */
-    dplusRecomputeSpecAclOk(c);
+    /* Per-db ACL selectors: the fast GET speculation gate is db-dependent. */
+    fastGetRecomputeSpecAclOk(c);
 
     if (c->flag.multi) {
         serverAssert(c->mstate != NULL);
@@ -2245,9 +2245,9 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
     else if (policy == POLICY_KEEP_EXPIRED) /* Treat expired keys as invalid, but do not delete them. */
         return KEY_EXPIRED;
 
-    /* D+ (S1.4): expiry deletion mutates the keyspace and MUST run on main.
+    /* Fast GET: expiry deletion mutates the keyspace and MUST run on main.
      * Speculative readers check embedded expiry and punt the whole command
-     * to main (dplus.c) -- they must never reach this point. Checked
+     * to main (fastget.c) -- they must never reach this point. Checked
      * invariant so any future IO-thread path that forgets the punt rule
      * trips immediately in debug builds instead of corrupting silently. */
     debugServerAssert(inMainThread());

@@ -29,7 +29,7 @@
 
 #include "server.h"
 #include "sha256.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "module.h"
 #include "intset.h"
 #include <fcntl.h>
@@ -4340,8 +4340,8 @@ void aclCommand(client *c) {
         zfree(temp_argv);
         if (error == NULL) {
             /* Existing clients may point at the mutated user — drain
-             * in-flight speculation and recompute their D+ ACL gates. */
-            dplusOnAclRulesChanged();
+             * in-flight speculation and recompute their fast GET ACL gates. */
+            fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyErrorSdsSafe(c, error);
@@ -4371,7 +4371,7 @@ void aclCommand(client *c) {
         }
         /* Surviving clients kicked to DefaultUser were re-gated via
          * clientSetUser; drain covers the in-flight temporal window. */
-        if (deleted) dplusOnAclRulesChanged();
+        if (deleted) fastGetOnAclRulesChanged();
         addReplyLongLong(c, deleted);
     } else if (!strcasecmp(sub, "getuser") && c->argc == 3) {
         /* Redact the username to not leak any information about the user. */
@@ -4497,7 +4497,7 @@ void aclCommand(client *c) {
         if (errors == NULL) {
             /* ACLLoadFromFile swaps c->user pointers directly (not via
              * clientSetUser) — blanket re-gate + drain. */
-            dplusOnAclRulesChanged();
+            fastGetOnAclRulesChanged();
             addReply(c, shared.ok);
         } else {
             addReplyError(c, errors);

@@ -1,11 +1,11 @@
 # io-threads-speculation-replica-only: with the flag set, a primary or
 # standalone server never speculates reads on IO threads (stock read path);
-# a replica does. The observable is dplus_speculated_commands in INFO dplus.
+# a replica does. The observable is fastget_speculated_commands in INFO fastget.
 
 proc speculated {r} {
-    set payload [$r info dplus]
-    if {![regexp {dplus_speculated_commands:(\d+)} $payload -> value]} {
-        fail "missing dplus_speculated_commands in INFO dplus"
+    set payload [$r info fastget]
+    if {![regexp {fastget_speculated_commands:(\d+)} $payload -> value]} {
+        fail "missing fastget_speculated_commands in INFO fastget"
     }
     return $value
 }
@@ -24,7 +24,7 @@ proc pump_gets {r key {level 0}} {
     return [expr {[speculated $r] - $before}]
 }
 
-start_server {tags {"dplus-replica-only tls:skip"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
+start_server {tags {"fastget-replica-only tls:skip"} overrides {io-threads 4 io-threads-always-active yes save {}}} {
     r select 0 ;# the same db as the fast-path clients
     r set ro:key v1
 

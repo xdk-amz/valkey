@@ -69,7 +69,7 @@
 #include "module.h"
 #include "call_reply.h"
 #include "io_threads.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
@@ -10566,7 +10566,7 @@ int VM_SetModuleUserACL(ValkeyModuleUser *user, const char *acl) {
         return VALKEYMODULE_ERR;
     }
     /* Module users can be attached to clients: re-gate IO-thread reads. */
-    dplusOnAclRulesChanged();
+    fastGetOnAclRulesChanged();
     return VALKEYMODULE_OK;
 }
 
@@ -10601,8 +10601,8 @@ int VM_SetModuleUserACLString(ValkeyModuleCtx *ctx,
         return VALKEYMODULE_ERR;
     }
 
-    /* Re-gate D+ speculation for clients attached to the mutated user. */
-    dplusOnAclRulesChanged();
+    /* Re-gate fast GET speculation for clients attached to the mutated user. */
+    fastGetOnAclRulesChanged();
     return VALKEYMODULE_OK;
 }
 
@@ -13135,7 +13135,7 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
             zfree(el);
             if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+                fastGetOnCommandResultListenersChanged(commandResultSuccessListeners);
             } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
@@ -13158,7 +13158,7 @@ int VM_SubscribeToServerEvent(ValkeyModuleCtx *ctx, ValkeyModuleEvent event, Val
     listAddNodeTail(ValkeyModule_EventListeners, el);
     if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
         commandResultSuccessListeners++;
-        dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+        fastGetOnCommandResultListenersChanged(commandResultSuccessListeners);
     } else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
         commandResultFailureListeners++;
     else if (event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)
@@ -13330,7 +13330,7 @@ void moduleUnsubscribeAllServerEvents(ValkeyModule *module) {
         if (el->module == module) {
             if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_SUCCESS) {
                 commandResultSuccessListeners--;
-                dplusOnCommandResultListenersChanged(commandResultSuccessListeners);
+                fastGetOnCommandResultListenersChanged(commandResultSuccessListeners);
             } else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_FAILURE)
                 commandResultFailureListeners--;
             else if (el->event.id == VALKEYMODULE_EVENT_COMMAND_RESULT_REJECTED)

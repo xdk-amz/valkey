@@ -1660,7 +1660,7 @@ int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
 
 /* Return the UNIX time in microseconds */
 long long ustime(void) {
-    /* D+ (S1.6): thread-local, NOT shared statics. IO threads call
+    /* Fast GET: thread-local, NOT shared statics. IO threads call
      * mstime()/ustime() on the speculative expiry-check path, racing main's
      * writes to a shared calibration cache -- TSan-confirmed. A reader could
      * observe the new monotonic anchor with the stale ust and return a time

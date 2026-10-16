@@ -33,7 +33,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/util.c
     ${CMAKE_SOURCE_DIR}/src/object.c
     ${CMAKE_SOURCE_DIR}/src/db.c
-    ${CMAKE_SOURCE_DIR}/src/dplus.c
+    ${CMAKE_SOURCE_DIR}/src/fastget.c
     ${CMAKE_SOURCE_DIR}/src/replication.c
     ${CMAKE_SOURCE_DIR}/src/rdb.c
     ${CMAKE_SOURCE_DIR}/src/rdb_transcoder.c

@@ -10,7 +10,7 @@
 #include "fastpath.h"
 #include "io_threads.h"
 #include "memory_prefetch.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "fastpath_no_epoll.h"
 #include "poller.h"
 #include "staged_loop.h"
@@ -386,9 +386,9 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt);
 static void fpSpeculate(fpThread *t, int tid, client *c) {
     if (c->fp_inflight != 0 || c->argc == 0 || !(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) return;
     if (fpDepth() > 0) return; /* main is blocked: every command goes to main for its BUSY/LOADING reply */
-    int n = dplusSpeculateBatch(c, tid);
+    int n = fastGetSpeculateBatch(c, tid);
     if (n <= 0) return;
-    dplusConsumeSpeculated(c, n, tid);
+    fastGetConsumeSpeculated(c, n, tid);
     if (c->argc == 0) c->net_input_bytes_curr_cmd = 0; /* resetClient never runs for this client */
     t->speculated += n;
     struct iovec iov = {.iov_base = c->buf, .iov_len = c->bufpos};

@@ -48,7 +48,7 @@
 #include "syscheck.h"
 #include "threads_mngr.h"
 #include "fmtargs.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "io_threads.h"
 #include "compression.h"
 #include "fastpath.h"
@@ -2044,8 +2044,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     }
 
     /* We should handle pending reads clients ASAP after event loop. */
-    /* D+: fold per-IO-thread speculated command counters into stat_numcommands. */
-    dplusAggregateStats();
+    /* Fold per-IO-thread speculated command counters into stat_numcommands. */
+    fastGetAggregateStats();
     int io_responses = processIOThreadsResponses();
     if (io_responses > 0) server.el_iteration_active = true;
 
@@ -3024,7 +3024,7 @@ int listenToPort(connListener *sfd) {
 void resetServerStats(void) {
     int j;
 
-    dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
+    fastGetAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     server.stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
@@ -7308,7 +7308,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     if (all_sections || (dictFind(section_dict, "commandstats") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
         info = sdscatprintf(info, "# Commandstats\r\n");
-        dplusAggregateStats(); /* speculated replies already sent must count before rendering */
+        fastGetAggregateStats(); /* speculated replies already sent must count before rendering */
         info = genValkeyInfoStringCommandStats(info, server.commands);
     }
 
@@ -7396,9 +7396,9 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         info = throttleRepl_sdscatInfoMetrics(info);
     }
 
-    if (all_sections || everything || (dictFind(section_dict, "dplus") != NULL)) {
+    if (all_sections || everything || (dictFind(section_dict, "fastget") != NULL)) {
         if (sections++) info = sdscat(info, "\r\n");
-        info = dplusInfoString(info);
+        info = fastGetInfoString(info);
     }
 
     /* Get info from modules.
@@ -7477,7 +7477,7 @@ void monitorCommand(client *c) {
     c->flag.replica = 1;
     c->flag.monitor = 1;
     listAddNodeTail(server.monitors, c);
-    dplusOnMonitorsChanged(); /* gate speculation off while a monitor is attached */
+    fastGetOnMonitorsChanged(); /* gate speculation off while a monitor is attached */
     addReply(c, shared.ok);
 }
 

@@ -38,7 +38,7 @@
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
 #include "io_threads.h"
-#include "dplus.h"
+#include "fastget.h"
 #include "compression_stream.h"
 #include "fastpath.h"
 #include "throttle.h"
@@ -284,9 +284,9 @@ void clientSetUser(client *c, user *u, int authenticated) {
     c->flag.authenticated = authenticated;
     if (authenticated)
         c->flag.ever_authenticated = authenticated;
-    /* D+ speculation ACL gate follows auth state (AUTH/HELLO/RESET/module
+    /* fast GET speculation ACL gate follows auth state (AUTH/HELLO/RESET/module
      * auth/deluser-kick all funnel through here). Main thread only. */
-    dplusRecomputeSpecAclOk(c);
+    fastGetRecomputeSpecAclOk(c);
 }
 
 static int clientEverAuthenticated(client *c) {
@@ -2371,7 +2371,7 @@ void clearClientConnectionState(client *c) {
 
         c->flag.monitor = 0;
         c->flag.replica = 0;
-        dplusOnMonitorsChanged(); /* re-enable speculation when the last monitor detaches */
+        fastGetOnMonitorsChanged(); /* re-enable speculation when the last monitor detaches */
     }
 
     serverAssert(!(c->flag.replica || c->flag.primary || c->slot_migration_job));

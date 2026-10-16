@@ -702,7 +702,7 @@ start_server {tags {"modules"}} {
     }
 
     test {Module commandresult - speculated reads punt while success subscriber active (F6)} {
-        # D+ ownership: speculation bypasses call(), which would silently drop
+        # Speculation bypasses call(), which would silently drop
         # command-result events. With a SUCCESS subscriber, every GET -- even a
         # deep pipelined batch on an owned client -- must take the stock path
         # and fire exactly one event per command. After unsubscribe,

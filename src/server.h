@@ -1530,7 +1530,7 @@ typedef struct client {
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
-    _Atomic(uint8_t) spec_acl_ok;         /* D+ ACL gate: 1 = authenticated AND user may run GET with
+    _Atomic(uint8_t) spec_acl_ok;         /* fast GET ACL gate: 1 = authenticated AND user may run GET with
                                            * unrestricted key read access, so IO threads may speculate.
                                            * Written only on main at auth-state changes; read by IO threads. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
@@ -3220,12 +3220,12 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
 #define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
-#define READ_FLAGS_ACL_ALLOWED (1 << 24)      /* acl-offload: an IO thread evaluated this command's ACL    \
-                                                 permissions under client->acl_epoch_seen and it passed.   \
-                                                 Only ALLOW is recorded; a denial leaves the bit clear and \
-                                                 main runs the stock check to produce the exact error. */
-#define READ_FLAGS_DPLUS_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
-#define READ_FLAGS_DRAIN (1 << 26)            /* Read the socket repeatedly before parsing. */
+#define READ_FLAGS_ACL_ALLOWED (1 << 24)        /* acl-offload: an IO thread evaluated this command's ACL    \
+                                                   permissions under client->acl_epoch_seen and it passed.   \
+                                                   Only ALLOW is recorded; a denial leaves the bit clear and \
+                                                   main runs the stock check to produce the exact error. */
+#define READ_FLAGS_FASTGET_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
+#define READ_FLAGS_DRAIN (1 << 26)              /* Read the socket repeatedly before parsing. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                        \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
