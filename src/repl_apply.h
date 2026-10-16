@@ -20,6 +20,16 @@ struct client;
 int replApplyDefer(struct client *c);
 /* Main: apply every held command before anything else observes the keyspace. */
 void replApplyFlush(struct client *c);
+/* Main, before sending the primary's read in the read phase: whether the IO thread sorts the commands it
+ * parses into write lanes. Fixes the lanes until the plan runs. */
+int replApplyPlanBegin(void);
+/* IO thread, a read of the primary: forget the last plan; after parsing, plan what was parsed. */
+void replApplyPlanReset(void);
+void replApplyPlanRead(struct client *c);
+void replApplyPlanReadTime(long long us);
+/* Main, a completed read of the primary: run its plan, if any, before the usual processing takes the rest.
+ * Returns C_ERR when the client is gone. */
+int replApplyRunPlan(struct client *c);
 /* Main: the primary's writes may be held for parallel apply, so main need not prefetch them. */
 int replApplyMayDefer(void);
 /* Main: commands held and not yet applied. */

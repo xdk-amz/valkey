@@ -28,7 +28,8 @@
 /* Create a new commandlog entry.
  * Incrementing the ref count of all the objects retained is up to
  * this function. */
-static commandlogEntry *commandlogCreateEntry(client *c, robj **argv, int argc, long long value, int type) {
+/* The entry without its id, which only main assigns. */
+static commandlogEntry *commandlogNewEntry(client *c, robj **argv, int argc, long long value) {
     commandlogEntry *ce = zmalloc(sizeof(*ce));
     int j, ceargc = argc;
 
@@ -68,13 +69,50 @@ static commandlogEntry *commandlogCreateEntry(client *c, robj **argv, int argc, 
     }
     ce->time = time(NULL);
     ce->value = value;
-    ce->id = server.commandlog[type].entry_id++;
     /* For commands executed from a script, the executing client is a fake
      * client with no connection, so attribute the entry to the calling client. */
     client *caller = scriptIsRunning() ? scriptGetCaller() : c;
     ce->peerid = sdsnew(getClientPeerId(caller));
     ce->cname = caller->name ? sdsnew(objectGetVal(caller->name)) : sdsempty();
     return ce;
+}
+
+static commandlogEntry *commandlogCreateEntry(client *c, robj **argv, int argc, long long value, int type) {
+    commandlogEntry *ce = commandlogNewEntry(c, argv, argc, value);
+    ce->id = server.commandlog[type].entry_id++;
+    return ce;
+}
+
+static void commandlogTrim(int type) {
+    while (listLength(server.commandlog[type].entries) > server.commandlog[type].max_len)
+        listDelNode(server.commandlog[type].entries, listLast(server.commandlog[type].entries));
+}
+
+/* A parallel write lane: build, without touching the logs, the entries the command c just ran would
+ * add (at most one per type). Main adds them with commandlogPushPrepared. Returns how many. */
+int commandlogPrepareCurrentCommand(client *c, struct serverCommand *cmd, void **entries, int *types) {
+    if (cmd->flags & CMD_SKIP_COMMANDLOG) return 0;
+    robj **argv = c->original_argv ? c->original_argv : c->argv;
+    int argc = c->original_argv ? c->original_argc : c->argc;
+    const int order[3] = {COMMANDLOG_TYPE_SLOW, COMMANDLOG_TYPE_LARGE_REQUEST, COMMANDLOG_TYPE_LARGE_REPLY};
+    const long long values[3] = {c->duration, (long long)c->net_input_bytes_curr_cmd, (long long)c->net_output_bytes_curr_cmd};
+    int n = 0;
+    for (int k = 0; k < 3; k++) {
+        int type = order[k];
+        if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) continue;
+        if (values[k] < server.commandlog[type].threshold) continue;
+        entries[n] = commandlogNewEntry(c, argv, argc, values[k]);
+        types[n] = type;
+        n++;
+    }
+    return n;
+}
+
+void commandlogPushPrepared(void *entry, int type) {
+    commandlogEntry *ce = entry;
+    ce->id = server.commandlog[type].entry_id++;
+    listAddNodeHead(server.commandlog[type].entries, ce);
+    commandlogTrim(type);
 }
 
 /* Free a command log entry. The argument is void so that the prototype of this
@@ -111,7 +149,7 @@ static void commandlogPushEntryIfNeeded(client *c, robj **argv, int argc, long l
         listAddNodeHead(server.commandlog[type].entries, commandlogCreateEntry(c, argv, argc, value, type));
 
     /* Remove old entries if needed. */
-    while (listLength(server.commandlog[type].entries) > server.commandlog[type].max_len) listDelNode(server.commandlog[type].entries, listLast(server.commandlog[type].entries));
+    commandlogTrim(type);
 }
 
 /* Remove all the entries from the current command log of the specified type. */

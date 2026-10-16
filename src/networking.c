@@ -317,8 +317,8 @@ int cmdHasPushAsReply(struct serverCommand *cmd) {
 
 /* Publish-to-self push must wait until after the command reply. */
 static int shouldDeferPushMessage(client *c) {
-    return c->flag.pushing && c == server.current_client && server.executing_client &&
-           !cmdHasPushAsReply(server.executing_client->cmd);
+    return c->flag.pushing && c == ectx->current_client && ectx->executing_client &&
+           !cmdHasPushAsReply(ectx->executing_client->cmd);
 }
 
 /* Decides if copy avoidance is preferred according to client type, number of I/O threads, object size
@@ -937,6 +937,31 @@ void addReplyErrorLength(client *c, const char *s, size_t len) {
 /* Do some actions after an error reply was sent (Log if needed, updates stats, etc.)
  * Possible flags:
  * * ERR_REPLY_FLAG_NO_STATS_UPDATE - indicate not to update any error stats. */
+/* Count an error reply under its prefix in the error stats. */
+void incrementErrorStatsForReply(const char *s, size_t len, int flags) {
+    /* If the string already starts with "-..." then the error prefix
+     * is provided by the caller (we limit the search to 32 chars). Otherwise, we use "-ERR". */
+    char *err_prefix = "ERR";
+    size_t prefix_len = 3;
+    if (s[0] == '-') {
+        const char *spaceloc = memchr(s, ' ', len < 32 ? len : 32);
+        /* If we cannot retrieve the error prefix, use the default: "ERR". */
+        if (spaceloc) {
+            const size_t errEndPos = (size_t)(spaceloc - s);
+            err_prefix = (char *)s + 1;
+            prefix_len = errEndPos - 1;
+        }
+    }
+    /* After the errors RAX reaches its limit, instead of tracking
+     * custom errors (e.g. LUA), we track the error under `errorstat_ERRORSTATS_OVERFLOW` */
+    if (flags & ERR_REPLY_FLAG_CUSTOM && raxSize(server.errors) >= ERRORSTATS_LIMIT &&
+        !raxFind(server.errors, (unsigned char *)err_prefix, prefix_len, NULL)) {
+        err_prefix = ERRORSTATS_OVERFLOW_ERR;
+        prefix_len = strlen(ERRORSTATS_OVERFLOW_ERR);
+    }
+    incrementErrorCount(err_prefix, prefix_len);
+}
+
 void afterErrorReply(client *c, const char *s, size_t len, int flags) {
     /* Module clients fall into two categories:
      * Calls to RM_Call, in which case the error isn't being returned to a client, so should not be counted.
@@ -952,31 +977,15 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
     }
 
     commitDeferredReplyBuffer(c, 1);
+    if (exec_lane) {
+        /* The error stats belong to main; an executor's reply never reaches a primary or replica. */
+        fastpathLaneErrorReply(c, s, len, flags);
+        return;
+    }
     if (!(flags & ERR_REPLY_FLAG_NO_STATS_UPDATE)) {
         /* Increment the global error counter */
-        server.stat_total_error_replies++;
-        /* Increment the error stats
-         * If the string already starts with "-..." then the error prefix
-         * is provided by the caller (we limit the search to 32 chars). Otherwise, we use "-ERR". */
-        char *err_prefix = "ERR";
-        size_t prefix_len = 3;
-        if (s[0] == '-') {
-            const char *spaceloc = memchr(s, ' ', len < 32 ? len : 32);
-            /* If we cannot retrieve the error prefix, use the default: "ERR". */
-            if (spaceloc) {
-                const size_t errEndPos = (size_t)(spaceloc - s);
-                err_prefix = (char *)s + 1;
-                prefix_len = errEndPos - 1;
-            }
-        }
-        /* After the errors RAX reaches its limit, instead of tracking
-         * custom errors (e.g. LUA), we track the error under `errorstat_ERRORSTATS_OVERFLOW` */
-        if (flags & ERR_REPLY_FLAG_CUSTOM && raxSize(server.errors) >= ERRORSTATS_LIMIT &&
-            !raxFind(server.errors, (unsigned char *)err_prefix, prefix_len, NULL)) {
-            err_prefix = ERRORSTATS_OVERFLOW_ERR;
-            prefix_len = strlen(ERRORSTATS_OVERFLOW_ERR);
-        }
-        incrementErrorCount(err_prefix, prefix_len);
+        ectx->stat_total_error_replies++;
+        incrementErrorStatsForReply(s, len, flags);
     } else {
         /* stat_total_error_replies will not be updated, which means that
          * the cmd stats will not be updated as well, we still want this command
@@ -2258,7 +2267,7 @@ void unlinkClient(client *c) {
     listNode *ln;
 
     /* If this is marked as current client unset it. */
-    if (c->conn && server.current_client == c) server.current_client = NULL;
+    if (c->conn && ectx->current_client == c) ectx->current_client = NULL;
 
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
@@ -2580,7 +2589,7 @@ void freeClientAsync(client *c) {
  * assert in prepareClientToWrite() when the server tries to write the response.
  * So instead flag it for closure after the current command completes. */
 void freeClientOrCloseLater(client *c, int async) {
-    if (c == server.current_client) {
+    if (c == ectx->current_client) {
         c->flag.close_after_command = 1;
     } else {
         if (async) {
@@ -4200,6 +4209,9 @@ void parseMultibulkBuffer(client *c) {
         return;
     }
 
+    /* A read the replica's write lanes plan: its parallel parse takes what follows the first command. */
+    if (c->read_flags & READ_FLAGS_STREAM_LANES) return;
+
     /* Try parsing pipelined commands. */
     cmdQueue *queue = &c->cmd_queue;
     serverAssert(queue->len == 0);
@@ -4515,8 +4527,8 @@ void commandProcessed(client *c) {
  * of processing the command, otherwise C_OK is returned. */
 int processCommandAndResetClient(client *c) {
     int deadclient = 0;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    client *old_client = ectx->current_client;
+    ectx->current_client = c;
     if (processCommand(c) == C_OK) {
         commandProcessed(c);
         /* Update the client's memory to include output buffer growth following the
@@ -4524,19 +4536,35 @@ int processCommandAndResetClient(client *c) {
         if (c->conn) updateClientMemUsageAndBucket(c);
     }
 
-    if (server.current_client == NULL) deadclient = 1;
+    if (ectx->current_client == NULL) deadclient = 1;
     /*
      * Restore the old client, this is needed because when a script
      * times out, we will get into this code from processEventsWhileBlocked.
-     * Which will cause to set the server.current_client. If not restored
+     * Which will cause to set the ectx->current_client. If not restored
      * we will return 1 to our caller which will falsely indicate the client
      * is dead and will stop reading from its buffer.
      */
-    server.current_client = old_client;
+    ectx->current_client = old_client;
     /* performEvictions may flush replica output buffers. This may
      * result in a replica, that may be the active client, to be
      * freed. */
     return deadclient ? C_ERR : C_OK;
+}
+
+/* A replica's stream plan (repl_apply.c): run the client's current command, popped from its queue first
+ * when pop is set, as processInputBuffer runs one. Returns C_ERR when the client is gone, C_OK when it can
+ * take its next command, and 1 when it cannot now. */
+int processPlannedCommand(client *c, int pop) {
+    if (pop) {
+        c->read_flags = isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
+        c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
+        if (!consumeCommandQueue(c)) return 1;
+    }
+    if (handleParseResults(c) != PARSE_OK) return 1;
+    if (c->argc == 0) return C_OK;
+    c->flag.pending_command = 1;
+    if (processCommandAndResetClient(c) == C_ERR) return C_ERR;
+    return canParseCommand(c) ? C_OK : 1;
 }
 
 /* This function will execute any fully parsed commands pending on
@@ -4967,6 +4995,7 @@ bool readToQueryBuf(client *c) {
 
         /* Read as much as possible from the socket to save read(2) system calls. */
         readlen = sdsavail(c->querybuf);
+        if ((c->read_flags & READ_FLAGS_STREAM_LANES) && readlen > REPL_LANES_READ_MAX) readlen = REPL_LANES_READ_MAX;
     }
     if (use_thread_shared_qb) serverAssert(c->querybuf == thread_shared_qb);
 
@@ -5176,9 +5205,9 @@ char *getClientSockname(client *c) {
 int isClientConnIpV6(client *c) {
     /* The cached client peer id is on the form "[IPv6]:port" for IPv6
      * addresses, so we just check for '[' here. */
-    if (c->flag.fake && server.current_client) {
+    if (c->flag.fake && ectx->current_client) {
         /* Fake client? Use current client instead, if we have one. */
-        c = server.current_client;
+        c = ectx->current_client;
     }
 
     if (c->origin) return c->origin->peer.family == AF_INET6;
@@ -5773,7 +5802,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
     if (client_filter->user && client->user != client_filter->user) return 0;
-    if (client_filter->skipme && client == server.current_client) return 0;
+    if (client_filter->skipme && client == ectx->current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
     if (client_filter->flags && clientMatchesFlagFilter(client, client_filter->flags) == 0) return 0;
@@ -7344,8 +7373,8 @@ void processEventsWhileBlocked(void) {
      * provide a fresher time than the one from when the script started (they
      * still won't get it from the call due to execution_nesting. For commands
      * during loading this doesn't matter. */
-    mstime_t prev_cmd_time_snapshot = server.cmd_time_snapshot;
-    server.cmd_time_snapshot = server.mstime;
+    mstime_t prev_cmd_time_snapshot = ectx->cmd_time_snapshot;
+    ectx->cmd_time_snapshot = server.mstime;
 
     /* Note: when we are processing events while blocked (for instance during
      * busy Lua scripts), we set a global flag. When such flag is set, we
@@ -7374,7 +7403,7 @@ void processEventsWhileBlocked(void) {
     ProcessingEventsWhileBlocked--;
     serverAssert(ProcessingEventsWhileBlocked >= 0);
 
-    server.cmd_time_snapshot = prev_cmd_time_snapshot;
+    ectx->cmd_time_snapshot = prev_cmd_time_snapshot;
 }
 
 /* Return 1 if the client read is handled using threaded I/O.
@@ -7497,6 +7526,9 @@ int processClientIOReadsDone(client *c) {
         return needs_post_read_update;
     }
 
+    /* The commands a replica's IO thread sorted into write lanes run first; the rest goes on as usual. */
+    if (c->read_flags & READ_FLAGS_STREAM_LANES && replApplyRunPlan(c) == C_ERR) return needs_post_read_update;
+
     if (!(c->read_flags & READ_FLAGS_DONT_PARSE)) {
         parseResult res = handleParseResults(c);
         /* On parse error - stop here. */
@@ -7601,6 +7633,11 @@ void evictClients(void) {
 
 void ioThreadReadQueryFromClient(client *c) {
     serverAssert(c->io_read_state == CLIENT_PENDING_IO);
+    monotime job_start = 0;
+    if (c->read_flags & READ_FLAGS_STREAM_LANES) {
+        replApplyPlanReset();
+        job_start = getMonotonicUs();
+    }
 
     /* Read */
     if (c->read_flags & READ_FLAGS_DRAIN) {
@@ -7612,6 +7649,7 @@ void ioThreadReadQueryFromClient(client *c) {
             if (c->nread <= 0) break;
             total += c->nread;
             if (!full || c->flag.close_asap) break;
+            if ((c->read_flags & READ_FLAGS_STREAM_LANES) && total >= REPL_LANES_READ_MAX) break;
         }
         if (total > 0) c->nread = total;
     } else {
@@ -7638,8 +7676,10 @@ void ioThreadReadQueryFromClient(client *c) {
     }
 
     parseInputBuffer(c);
-    trimCommandQueue(c);
+    /* A planned read fills its queue in the PARSE phase; keep the allocation for it. */
+    if (!(c->read_flags & READ_FLAGS_STREAM_LANES)) trimCommandQueue(c);
     prepareCommandQueue(c);
+    if (c->read_flags & READ_FLAGS_STREAM_LANES) replApplyPlanRead(c);
 
     /* Parsing was not completed - let the main-thread handle it. */
     if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
@@ -7658,6 +7698,7 @@ done:
         trimClientQueryBuffer(c);
     }
 
+    if (job_start) replApplyPlanReadTime(getMonotonicUs() - job_start);
     c->io_read_state = CLIENT_COMPLETED_IO;
     c->cur_tid = getCurTid();
 

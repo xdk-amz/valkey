@@ -101,7 +101,7 @@ static void hotkeysRecordSample(robj *key, int dbid) {
  * user key access and must not feed or evict the sampler). Importing traffic is
  * user-driven load and is counted. */
 static bool hotkeysShouldRecord(void) {
-    client *c = server.current_client;
+    client *c = ectx->current_client;
     return c != NULL && c->flag.executing_command && !mustObeyClient(c) && !server.loading &&
            !server.server_del_keys_in_slot;
 }

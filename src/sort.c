@@ -592,11 +592,11 @@ void sortCommandGeneric(client *c, int readonly) {
              * freeing it below. */
             sobj = NULL;
             notifyKeyspaceEvent(NOTIFY_LIST, "sortstore", storekey, c->db->id);
-            server.dirty += outputlen;
+            ectx->dirty += outputlen;
         } else if (dbDelete(c->db, storekey)) {
             signalModifiedKey(c, c->db, storekey);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
-            server.dirty++;
+            ectx->dirty++;
         }
         if (sobj != NULL) decrRefCount(sobj);
         addReplyLongLong(c, outputlen);

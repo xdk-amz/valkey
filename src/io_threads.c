@@ -1338,6 +1338,8 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedReplyPhase((int)id);
         else if (phase == STAGED_PHASE_APPLY)
             replApplyRunLane((int)id);
+        else if (phase == STAGED_PHASE_WRITE)
+            fastpathStagedWriteLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
         atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
@@ -1850,7 +1852,7 @@ int trySendReadToIOThreads(client *c) {
 }
 
 int ioThreadsSendStagedRead(client *c) {
-    return sendReadToIOThreads(c, READ_FLAGS_DRAIN);
+    return sendReadToIOThreads(c, READ_FLAGS_DRAIN | (replApplyPlanBegin() ? READ_FLAGS_STREAM_LANES : 0));
 }
 
 static int sendReadToIOThreads(client *c, int read_flags) {
@@ -2187,7 +2189,7 @@ void ioThreadFreeArgv(robj **argv) {
  * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
  * C_ERR otherwise. */
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
-    if (server.active_io_threads_num <= 1 || argc == 0) {
+    if (server.active_io_threads_num <= 1 || argc == 0 || (exec_lane && !inMainThread())) {
         return C_ERR;
     }
 
@@ -2237,7 +2239,7 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 
 /* Only sole-reference strings and object-local aggregates may free on IO threads. */
 int tryOffloadFreeObjToIOThreads(robj *obj) {
-    if (server.active_io_threads_num <= 1) {
+    if (server.active_io_threads_num <= 1 || (exec_lane && !inMainThread())) {
         return C_ERR;
     }
 
@@ -2266,7 +2268,7 @@ int tryOffloadFreeObjToIOThreads(robj *obj) {
 int tryOffloadFreePtrToIOThreads(void *ptr) {
     if (ptr == NULL) return C_OK;
     if (inline_reclaim_depth) return C_ERR; /* emergency reclaim frees inline */
-    if (server.active_io_threads_num <= 1) return C_ERR;
+    if (server.active_io_threads_num <= 1 || (exec_lane && !inMainThread())) return C_ERR;
 
     offloadFreeAccountAdd(zmalloc_size(ptr));
     slabAppendFree(ptr, 0);
@@ -2277,6 +2279,17 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
     if (inline_reclaim_depth || repl_apply_in_lane) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
+        return;
+    }
+    if (exec_lane && !inMainThread()) {
+        /* A write lane is already off main and the free slab is main's. As main does, streams and module
+         * values go to bio; the rest is freed here, unless large enough to hold the lane up. */
+        if (!val) return;
+        if (val->refcount == 1 && (val->type == OBJ_STREAM || val->type == OBJ_MODULE ||
+                                   (val->type != OBJ_STRING && lazyfreeGetFreeEffort(key, val, dbid) > 64)))
+            freeObjAsyncForce(val);
+        else
+            decrRefCount(val);
         return;
     }
     if (val->refcount > 1) {

@@ -246,7 +246,9 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
         return;
     hashtableRelease(kvs->hashtables[didx]);
     kvs->hashtables[didx] = NULL;
+    KVS_SHARED_LOCK();
     kvs->allocated_hashtables--;
+    KVS_SHARED_UNLOCK();
 }
 
 /*************************************/

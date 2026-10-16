@@ -114,6 +114,8 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 
 /* Global vars */
 struct valkeyServer server; /* Server global state */
+_Thread_local execContext *ectx = &server.exec_ctx;
+_Thread_local int exec_lane = 0;
 
 /*============================ Internal prototypes ========================== */
 
@@ -126,7 +128,7 @@ void addReplyCommandInfo(client *c, struct serverCommand *cmd);
 /*============================ Utility functions ============================ */
 
 /* This macro tells if we are in the context of loading an AOF. */
-#define isAOFLoadingContext() ((server.current_client && server.current_client->id == CLIENT_ID_AOF) ? 1 : 0)
+#define isAOFLoadingContext() ((ectx->current_client && ectx->current_client->id == CLIENT_ID_AOF) ? 1 : 0)
 
 /* We use a private localtime implementation which is fork-safe. The logging
  * function of the server may be called from other threads. */
@@ -353,7 +355,7 @@ mstime_t commandTimeSnapshot(void) {
      * propagation to replicas / AOF consistent. See issue #1525 for more info.
      * Note that we cannot use the cached server.mstime because it can change
      * in processEventsWhileBlocked etc. */
-    return server.cmd_time_snapshot;
+    return ectx->cmd_time_snapshot;
 }
 
 /* After an RDB dump or AOF rewrite we exit from children using _exit() instead of
@@ -1503,17 +1505,17 @@ void updateCachedTime(int update_daylight_info) {
  * update_cached_time - if 0, will not update the cached time even if required.
  * us - if not zero, use this time for cached time, otherwise get current time. */
 void enterExecutionUnit(int update_cached_time, ustime_t us) {
-    if (server.execution_nesting++ == 0 && update_cached_time) {
+    if (ectx->execution_nesting++ == 0 && update_cached_time) {
         if (us == 0) {
             us = ustime();
         }
         updateCachedTimeWithUs(0, us);
-        server.cmd_time_snapshot = server.mstime;
+        ectx->cmd_time_snapshot = server.mstime;
     }
 }
 
 void exitExecutionUnit(void) {
-    --server.execution_nesting;
+    --ectx->execution_nesting;
 }
 
 void checkChildrenDone(void) {
@@ -1645,7 +1647,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     run_with_period(100) {
         monotime current_time = getMonotonicUs();
         long long factor = 1000000; // us
-        trackInstantaneousMetric(STATS_METRIC_COMMAND, server.stat_numcommands, current_time, factor);
+        trackInstantaneousMetric(STATS_METRIC_COMMAND, ectx->stat_numcommands, current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_INPUT, server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                                  current_time, factor);
         trackInstantaneousMetric(STATS_METRIC_NET_OUTPUT,
@@ -1741,7 +1743,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
              * the given amount of seconds, and if the latest bgsave was
              * successful or if, in case of an error, at least
              * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
-            if (server.dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
+            if (ectx->dirty >= sp->changes && server.unixtime - server.lastsave > sp->seconds &&
                 (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == C_OK)) {
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
@@ -2201,8 +2203,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     latencyTraceIfNeeded(server, eventloop_cron, server.el_cron_duration);
     server.el_cron_duration = 0;
     /* Record max command count per cycle. */
-    if (server.stat_numcommands > server.el_cmd_cnt_start) {
-        long long el_command_cnt = server.stat_numcommands - server.el_cmd_cnt_start;
+    if (ectx->stat_numcommands > server.el_cmd_cnt_start) {
+        long long el_command_cnt = ectx->stat_numcommands - server.el_cmd_cnt_start;
         if (el_command_cnt > server.el_cmd_cnt_max) {
             server.el_cmd_cnt_max = el_command_cnt;
         }
@@ -2265,7 +2267,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */
-        server.el_cmd_cnt_start = server.stat_numcommands;
+        server.el_cmd_cnt_start = ectx->stat_numcommands;
     }
 
     /* Update the time cache. Skip the (relatively expensive) daylight-saving
@@ -2276,7 +2278,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
      * e.g. somehow used by module timers. Don't update it while yielding to a
      * blocked command, call() will handle that and restore the original time. */
     if (!ProcessingEventsWhileBlocked) {
-        server.cmd_time_snapshot = server.mstime;
+        ectx->cmd_time_snapshot = server.mstime;
     }
 
     IOThreadsAfterSleep(numevents);
@@ -2517,7 +2519,7 @@ void initServerConfig(void) {
 
     initConfigValues();
     updateCachedTime(1);
-    server.cmd_time_snapshot = server.mstime;
+    ectx->cmd_time_snapshot = server.mstime;
     getRandomHexChars(server.runid, CONFIG_RUN_ID_SIZE);
     server.runid[CONFIG_RUN_ID_SIZE] = '\0';
     changeReplicationId();
@@ -2535,7 +2537,7 @@ void initServerConfig(void) {
     memset(server.listeners, 0x00, sizeof(server.listeners));
     server.active_expire_enabled = 1;
     server.forkless_infrastructure_enabled = 0;
-    server.lazy_expire_disabled = 0;
+    ectx->lazy_expire_disabled = 0;
     server.skip_checksum_validation = 0;
     server.loading = 0;
     server.async_loading = 0;
@@ -3018,12 +3020,19 @@ void resetServerStats(void) {
     int j;
 
     dplusAggregateStats(); /* settle speculated counts into the stats about to be cleared */
-    server.stat_numcommands = 0;
+    ectx->stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
+    server.stat_repl_lane_reads = 0;
+    server.stat_repl_lane_read_usec = 0;
+    server.stat_repl_lane_classify_usec = 0;
+    server.stat_repl_lane_parse_usec = 0;
+    server.stat_repl_lane_plan_usec = 0;
+    server.stat_repl_lane_apply_usec = 0;
+    server.stat_repl_lane_barriers = 0;
     server.stat_numconnections = 0;
-    server.stat_expiredkeys = 0;
-    server.stat_expiredfields = 0;
+    ectx->stat_expiredkeys = 0;
+    ectx->stat_expiredfields = 0;
     server.stat_expired_keys_stale_perc = 0;
     server.stat_expired_keys_with_vola_stale_perc = 0;
     server.stat_expired_time_cap_reached_count = 0;
@@ -3033,8 +3042,8 @@ void resetServerStats(void) {
     server.stat_evictedscripts = 0;
     server.stat_total_eviction_exceeded_time = 0;
     server.stat_last_eviction_exceeded_time = 0;
-    server.stat_keyspace_misses = 0;
-    server.stat_keyspace_hits = 0;
+    ectx->stat_keyspace_misses = 0;
+    ectx->stat_keyspace_hits = 0;
     server.stat_active_defrag_hits = 0;
     server.stat_active_defrag_misses = 0;
     server.stat_active_defrag_key_hits = 0;
@@ -3079,7 +3088,7 @@ void resetServerStats(void) {
     server.stat_net_cluster_slot_export_bytes = 0;
     server.stat_net_cluster_slot_import_bytes = 0;
     server.stat_unexpected_error_replies = 0;
-    server.stat_total_error_replies = 0;
+    ectx->stat_total_error_replies = 0;
     server.stat_acl_offload_hits = 0;
     server.stat_acl_offload_punts = 0;
     server.stat_acl_offload_quiesce_count = 0;
@@ -3193,9 +3202,9 @@ void initServer(void) {
     server.slot_migration_pipe_read = -1;
     server.slot_migration_child_exit_pipe = -1;
     server.main_thread_id = pthread_self();
-    server.current_client = NULL;
+    ectx->current_client = NULL;
     server.errors = raxNew();
-    server.execution_nesting = 0;
+    ectx->execution_nesting = 0;
     server.clients = listCreate();
     server.clients_index = raxNew();
     server.clients_to_close = listCreate();
@@ -3291,7 +3300,7 @@ void initServer(void) {
     server.watching_clients = 0;
     server.cronloops = 0;
     server.in_exec = 0;
-    server.in_call = 0;
+    ectx->in_call = 0;
     server.busy_module_yield_flags = BUSY_MODULE_YIELD_NONE;
     server.busy_module_yield_reply = NULL;
     server.client_pause_in_transaction = 0;
@@ -3314,7 +3323,7 @@ void initServer(void) {
     server.rdb_save_time_start = -1;
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
-    server.dirty = 0;
+    ectx->dirty = 0;
     server.crashed = 0;
     resetServerStats();
     /* A few stats we don't want to reset: server startup time, and peak mem. */
@@ -3722,6 +3731,7 @@ void populateCommandTable(void) {
 }
 
 void resetCommandTableStats(hashtable *commands) {
+    fastpathResetLaneStats();
     hashtableIterator iter;
     void *next;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
@@ -3924,6 +3934,8 @@ static int shouldPropagate(int target) {
  * to replicate SELECT for this command (used for database neutral commands).
  */
 static void propagateNow(int dbid, robj **argv, int argc, int target, int slot) {
+    /* Lanes capture their ops; main replays them in T order after the phase. */
+    debugServerAssert(!exec_lane);
     if (!shouldPropagate(target)) return;
 
     /* This needs to be unreachable since the dataset should be fixed during
@@ -3990,7 +4002,7 @@ static void propagateToBgIteration(int dbid, int argc, robj **argv, int target) 
                 /* For a script or multi/exec, we should be sending the MULTI at
                  * the beginning of the execution unit.  There shouldn't be any
                  * commands in the propagation queue yet. */
-                serverAssert(server.also_propagate.numops == 0);
+                serverAssert(ectx->also_propagate.numops == 0);
                 /* If this is the first propagated command of a script or multi,
                  * make it a transaction.  It may turn out that there is only 1
                  * command in the MULTI block, but we can't know that now.
@@ -4042,7 +4054,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
      *
      * However, if we need to propagate to AOF, we should still do that. */
     bool propagate_aof = (target & PROPAGATE_AOF) && server.aof_state != AOF_OFF;
-    if (server.current_client != NULL && server.current_client->slot_migration_job) {
+    if (ectx->current_client != NULL && ectx->current_client->slot_migration_job) {
         if (!propagate_aof) return;
         /* Disable propagation to replication (just do the AOF) */
         target &= ~PROPAGATE_REPL;
@@ -4053,7 +4065,7 @@ void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot) {
         argvcopy[j] = argv[j];
         incrRefCount(argv[j]);
     }
-    serverOpArrayAppend(&server.also_propagate, dbid, argvcopy, argc, target, slot);
+    serverOpArrayAppend(&ectx->also_propagate, dbid, argvcopy, argc, target, slot);
 }
 
 /* It is possible to call the function forceCommandPropagation() inside a
@@ -4102,14 +4114,26 @@ void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram
 /* Handle the alsoPropagate() API to handle commands that want to propagate
  * multiple separated commands. Note that alsoPropagate() is not affected
  * by CLIENT_PREVENT_PROP flag. */
+/* Main, after a parallel write phase: propagate one entry's captured ops as its execution unit
+ * would have, then release them. */
+void replayLanePropagation(serverOp *ops, int numops, int wrap) {
+    if (wrap) propagateNow(-1, &shared.multi, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
+    for (int j = 0; j < numops; j++) propagateNow(ops[j].dbid, ops[j].argv, ops[j].argc, ops[j].target, ops[j].slot);
+    if (wrap) propagateNow(-1, &shared.exec, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
+    for (int j = 0; j < numops; j++) {
+        for (int k = 0; k < ops[j].argc; k++) decrRefCount(ops[j].argv[k]);
+        zfree(ops[j].argv);
+    }
+}
+
 static void propagatePendingCommands(void) {
-    /* This is done before the check on server.also_propagate.numops.  Numops
+    /* This is done before the check on ectx->also_propagate.numops.  Numops
      * might be zero if there is no replica but we might be running bgIteration
      * for something other than replication.  If we sent the multi (to
      * bgIteration), we need to send the matching exec. */
     propagateToBgIteration(-1, 0, NULL, 0);
 
-    if (server.also_propagate.numops == 0) return;
+    if (ectx->also_propagate.numops == 0) return;
 
     int j;
     serverOp *rop;
@@ -4117,13 +4141,13 @@ static void propagatePendingCommands(void) {
     /* If we got here it means we have finished an execution-unit.
      * If that unit has caused propagation of multiple commands, they
      * should be propagated as a transaction */
-    int transaction = server.also_propagate.numops > 1;
+    int transaction = ectx->also_propagate.numops > 1;
 
     /* In case a command that may modify random keys was run *directly*
      * (i.e. not from within a script, MULTI/EXEC, RM_Call, etc.) we want
      * to avoid using a transaction (much like active-expire) */
-    if (server.current_client && server.current_client->cmd &&
-        server.current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
+    if (ectx->current_client && ectx->current_client->cmd &&
+        ectx->current_client->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS) {
         transaction = 0;
     }
 
@@ -4133,8 +4157,8 @@ static void propagatePendingCommands(void) {
         propagateNow(-1, &shared.multi, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
     }
 
-    for (j = 0; j < server.also_propagate.numops; j++) {
-        rop = &server.also_propagate.ops[j];
+    for (j = 0; j < ectx->also_propagate.numops; j++) {
+        rop = &ectx->also_propagate.ops[j];
         serverAssert(rop->target);
         propagateNow(rop->dbid, rop->argv, rop->argc, rop->target, rop->slot);
     }
@@ -4144,7 +4168,7 @@ static void propagatePendingCommands(void) {
         propagateNow(-1, &shared.exec, 1, PROPAGATE_AOF | PROPAGATE_REPL, -1);
     }
 
-    serverOpArrayFree(&server.also_propagate);
+    serverOpArrayFree(&ectx->also_propagate);
 }
 
 /* Whether any of the module-jobs / propagation / module-yield post-execution-
@@ -4159,7 +4183,7 @@ static void propagatePendingCommands(void) {
  * Must stay an OR of every condition below - never drop one as an
  * optimization, since that would silently skip real pending work. */
 static inline int hasPostExecutionUnitPendingWork(void) {
-    return moduleHasPostExecUnitJobs() || server.also_propagate.numops || server.busy_module_yield_flags;
+    return moduleHasPostExecUnitJobs() || ectx->also_propagate.numops || server.busy_module_yield_flags;
 }
 
 /* Performs operations that should be performed after an execution unit ends.
@@ -4177,7 +4201,7 @@ static inline int hasPostExecutionUnitPendingWork(void) {
  * be other considerations. So we basically want the `postUnitOperations` to trigger
  * after the entire chain finished. */
 void postExecutionUnitOperations(void) {
-    if (server.execution_nesting) return;
+    if (ectx->execution_nesting) return;
 
     /* Combined pending-work gate: in the overwhelming majority of calls
      * (e.g. after a plain read-only command like GET) none of the three
@@ -4212,11 +4236,9 @@ void postExecutionUnitOperations(void) {
  *
  * The function returns true if stats was updated and false if not. */
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
-    /* hold the prev error count captured on the last command execution */
-    static long long prev_err_count = 0;
     int res = 0;
     if (cmd) {
-        if ((server.stat_total_error_replies - prev_err_count) > 0) {
+        if ((ectx->stat_total_error_replies - ectx->prev_err_count) > 0) {
             if (flags & ERROR_COMMAND_REJECTED) {
                 cmd->rejected_calls++;
                 res = 1;
@@ -4226,7 +4248,7 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
             }
         }
     }
-    prev_err_count = server.stat_total_error_replies;
+    ectx->prev_err_count = ectx->stat_total_error_replies;
     return res;
 }
 
@@ -4268,14 +4290,14 @@ int incrCommandStatsOnError(struct serverCommand *cmd, int flags) {
 void call(client *c, int flags) {
     if (bgIteration_blockClientIfRequired(c)) return;
 
-    server.in_call++;
+    ectx->in_call++;
 
     long long dirty;
     struct ClientFlags client_old_flags = c->flag;
 
     struct serverCommand *real_cmd = c->realcmd;
-    client *prev_client = server.executing_client;
-    server.executing_client = c;
+    client *prev_client = ectx->executing_client;
+    ectx->executing_client = c;
 
     /* When call() is issued during loading the AOF we don't want commands called
      * from module, exec or LUA to go into the commandlog or to populate statistics. */
@@ -4309,7 +4331,7 @@ void call(client *c, int flags) {
      * In that case, the module is in charge of propagation. */
 
     /* Call the command. */
-    dirty = server.dirty;
+    dirty = ectx->dirty;
     long long old_primary_repl_offset = server.primary_repl_offset;
     incrCommandStatsOnError(NULL, 0);
 
@@ -4385,7 +4407,7 @@ void call(client *c, int flags) {
 
     valkey_commands_trace(valkey_commands, command_call, getClientConnType(c), getClientPeerId(c), getClientSockname(c), real_cmd->declared_name, duration);
     c->duration += duration;
-    dirty = server.dirty - dirty;
+    dirty = ectx->dirty - dirty;
     if (dirty < 0) dirty = 0;
 
     /* Update failed command calls if required. */
@@ -4425,7 +4447,7 @@ void call(client *c, int flags) {
         } else {
             latencyTraceIfNeeded(server, command, duration);
         }
-        if (server.execution_nesting == 0) {
+        if (ectx->execution_nesting == 0) {
             durationAddSample(EL_DURATION_TYPE_CMD, duration);
             /* Attribute command execution latency for high-priority client connections. */
             if (connIsPriority(c->conn)) {
@@ -4508,19 +4530,19 @@ void call(client *c, int flags) {
         /* We use the tracking flag of the original external client that
          * triggered the command, but we take the keys from the actual command
          * being executed. */
-        if (server.current_client && (server.current_client->flag.tracking) &&
-            !(server.current_client->flag.tracking_bcast)) {
-            trackingRememberKeys(server.current_client, c);
+        if (ectx->current_client && (ectx->current_client->flag.tracking) &&
+            !(ectx->current_client->flag.tracking_bcast)) {
+            trackingRememberKeys(ectx->current_client, c);
         }
     }
 
     if (!c->flag.blocked) {
-        /* Modules may call commands in cron, in which case server.current_client
+        /* Modules may call commands in cron, in which case ectx->current_client
          * is not set. */
-        if (server.current_client) {
-            server.current_client->commands_processed++;
+        if (ectx->current_client) {
+            ectx->current_client->commands_processed++;
         }
-        server.stat_numcommands++;
+        ectx->stat_numcommands++;
     }
 
     /* Do some maintenance job and cleanup */
@@ -4536,8 +4558,8 @@ void call(client *c, int flags) {
         server.client_pause_in_transaction = 0;
     }
 
-    server.executing_client = prev_client;
-    server.in_call--;
+    ectx->executing_client = prev_client;
+    ectx->in_call--;
 }
 
 /* Used when a command that is ready for execution needs to be rejected, due to
@@ -4605,7 +4627,7 @@ void afterCommand(client *c) {
      * intentionally excluded from the gate: it is not deferred/queued
      * work, it must run for every command whenever slot-stats accounting
      * is enabled. */
-    if (server.execution_nesting == 0 &&
+    if (ectx->execution_nesting == 0 &&
         unlikely(hasPostExecutionUnitPendingWork() || trackingHasPendingKeyInvalidations() ||
                  listLength(server.pending_push_messages))) {
         /* Should be done before trackingHandlePendingKeyInvalidations so that we
@@ -4740,6 +4762,11 @@ static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct
 /* Prepare the client's current command. See prepareCommandGeneric(). */
 void prepareCommand(client *c) {
     prepareCommandGeneric(c->argv, c->argc, &c->read_flags, &c->parsed_cmd, &c->slot);
+}
+
+/* Prepare one parsed command, as a queued one. See prepareCommandGeneric(). */
+void prepareParsedCommand(parsedCommand *p) {
+    prepareCommandGeneric(p->argv, p->argc, &p->read_flags, &p->cmd, &p->slot);
 }
 
 /* Prepare all parsed commands in the client's queue. See prepareCommand(). */
@@ -5004,7 +5031,7 @@ int processCommand(client *c) {
      * before every command. */
     if (!server.maxmemory_eviction_batch) {
         evictClients();
-        if (server.current_client == NULL) {
+        if (ectx->current_client == NULL) {
             return C_ERR;
         }
     }
@@ -5039,7 +5066,7 @@ int processCommand(client *c) {
 
             /* performEvictions may flush replica output buffers. This may result
              * in a replica, that may be the active client, to be freed. */
-            if (server.current_client == NULL) return C_ERR;
+            if (ectx->current_client == NULL) return C_ERR;
 
             server.evict_check_used_memory = zmalloc_used_memory();
         } else {
@@ -6469,6 +6496,7 @@ sds genValkeyInfoStringACLStats(sds info) {
 }
 
 sds genValkeyInfoStringLatencyStats(sds info, hashtable *commands) {
+    fastpathFoldLaneHistograms();
     hashtableIterator iter;
     void *next;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
@@ -6937,7 +6965,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "current_fork_perc:%.2f\r\n", save_perc,
                 "current_save_keys_processed:%zu\r\n", server.stat_current_save_keys_processed,
                 "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
-                "rdb_changes_since_last_save:%lld\r\n", server.dirty,
+                "rdb_changes_since_last_save:%lld\r\n", ectx->dirty,
                 "rdb_bgsave_in_progress:%d\r\n", isSaveInProgress(),
                 "rdb_current_bgsave_type:%s\r\n", current_bgsave_type,
                 "rdb_last_bgsave_type:%s\r\n", last_bgsave_type,
@@ -7026,9 +7054,16 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
             info,
             "# Stats\r\n" FMTARGS(
                 "total_connections_received:%lld\r\n", server.stat_numconnections,
-                "total_commands_processed:%lld\r\n", server.stat_numcommands,
+                "total_commands_processed:%lld\r\n", ectx->stat_numcommands,
                 "repl_parallel_applied:%lld\r\n", server.stat_repl_parallel_applied,
                 "repl_apply_phases:%lld\r\n", server.stat_repl_apply_phases,
+                "repl_lane_reads:%lld\r\n", server.stat_repl_lane_reads,
+                "repl_lane_read_usec:%lld\r\n", server.stat_repl_lane_read_usec,
+                "repl_lane_classify_usec:%lld\r\n", server.stat_repl_lane_classify_usec,
+                "repl_lane_parse_usec:%lld\r\n", server.stat_repl_lane_parse_usec,
+                "repl_lane_plan_usec:%lld\r\n", server.stat_repl_lane_plan_usec,
+                "repl_lane_apply_usec:%lld\r\n", server.stat_repl_lane_apply_usec,
+                "repl_lane_barriers:%lld\r\n", server.stat_repl_lane_barriers,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,
@@ -7052,8 +7087,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "sync_full:%lld\r\n", server.stat_sync_full,
                 "sync_partial_ok:%lld\r\n", server.stat_sync_partial_ok,
                 "sync_partial_err:%lld\r\n", server.stat_sync_partial_err,
-                "expired_keys:%lld\r\n", server.stat_expiredkeys,
-                "expired_fields:%lld\r\n", server.stat_expiredfields,
+                "expired_keys:%lld\r\n", ectx->stat_expiredkeys,
+                "expired_fields:%lld\r\n", ectx->stat_expiredfields,
                 "expired_stale_perc:%.2f\r\n", server.stat_expired_keys_stale_perc * 100,
                 "expired_keys_with_volatile_items_stale_perc:%.2f\r\n", server.stat_expired_keys_with_vola_stale_perc * 100,
                 "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
@@ -7068,8 +7103,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "evicted_scripts:%lld\r\n", server.stat_evictedscripts,
                 "total_eviction_exceeded_time:%lld\r\n", (server.stat_total_eviction_exceeded_time + current_eviction_exceeded_time) / 1000,
                 "current_eviction_exceeded_time:%lld\r\n", current_eviction_exceeded_time / 1000,
-                "keyspace_hits:%lld\r\n", server.stat_keyspace_hits,
-                "keyspace_misses:%lld\r\n", server.stat_keyspace_misses,
+                "keyspace_hits:%lld\r\n", ectx->stat_keyspace_hits,
+                "keyspace_misses:%lld\r\n", ectx->stat_keyspace_misses,
                 "pubsub_channels:%llu\r\n", kvstoreSize(server.pubsub_channels),
                 "pubsub_patterns:%zu\r\n", dictSize(server.pubsub_patterns),
                 "pubsubshard_channels:%llu\r\n", kvstoreSize(server.pubsubshard_channels),
@@ -7087,7 +7122,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "tracking_total_items:%lld\r\n", (unsigned long long)trackingGetTotalItems(),
                 "tracking_total_prefixes:%lld\r\n", (unsigned long long)trackingGetTotalPrefixes(),
                 "unexpected_error_replies:%lld\r\n", server.stat_unexpected_error_replies,
-                "total_error_replies:%lld\r\n", server.stat_total_error_replies,
+                "total_error_replies:%lld\r\n", ectx->stat_total_error_replies,
                 "dump_payload_sanitizations:%lld\r\n", server.stat_dump_payload_sanitizations,
                 "total_reads_processed:%lld\r\n", server.stat_total_reads_processed,
                 "total_writes_processed:%lld\r\n", server.stat_total_writes_processed,

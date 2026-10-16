@@ -1748,6 +1748,31 @@ typedef struct serverOpArray {
     int capacity;
 } serverOpArray;
 
+/* State of the execution unit a thread is running. Every thread reaches it through ectx, which
+ * points at main's context (server.exec_ctx) except on a lane thread inside a parallel write
+ * phase, which runs with its lane's own context. */
+typedef struct execContext {
+    long long dirty;                 /* Changes to DB from the last save (lanes: in this phase) */
+    struct client *current_client;   /* The client that triggered the command execution (External or AOF). */
+    struct client *executing_client; /* The client executing the current command (possibly script or module). */
+    int execution_nesting;           /* Execution nesting level: call(), async module stuff, cron stuff */
+    int in_call;                     /* Nesting level within the call() function. */
+    mstime_t cmd_time_snapshot;      /* Time snapshot of the root execution nesting. */
+    serverOpArray also_propagate;    /* Additional command to propagate. */
+    int lazy_expire_disabled;        /* If > 0, don't trigger lazy expire */
+    long long stat_numcommands;      /* Number of processed commands */
+    long long stat_keyspace_hits;    /* Number of successful lookups of keys */
+    long long stat_keyspace_misses;  /* Number of failed lookups of keys */
+    long long stat_expiredkeys;      /* Number of expired keys */
+    long long stat_expiredfields;    /* Number of expired hash fields */
+    long long stat_total_error_replies; /* Total number of issued error replies ( command + rejected errors ) */
+    long long prev_err_count;        /* stat_total_error_replies seen by incrCommandStatsOnError */
+} execContext;
+
+extern _Thread_local execContext *ectx;
+/* Set while this thread runs a parallel write lane (main included while it runs its lane). */
+extern _Thread_local int exec_lane;
+
 /* This structure is returned by the getMemoryOverheadData() function in
  * order to return memory overhead information. */
 struct serverMemOverhead {
@@ -1950,6 +1975,7 @@ typedef enum childInfoType {
 #define COPY_AVOID_ADAPTIVE_FLOOR_MIN 1024
 
 struct valkeyServer {
+    execContext exec_ctx; /* main's execution context; see ectx */
     /* General */
     pid_t pid;                                        /* Main process pid. */
     pthread_t main_thread_id;                         /* Main thread id */
@@ -1982,7 +2008,6 @@ struct valkeyServer {
     size_t initial_memory_usage;                      /* Bytes used after initialization. */
     int always_show_logo;                             /* Show logo even for non-stdout logging. */
     int in_exec;                                      /* Are we inside EXEC? */
-    int in_call;                                      /* Nesting level within the call() function. */
     int busy_module_yield_flags;                      /* Are we inside a busy module? (triggered by RM_Yield). see BUSY_MODULE_YIELD_ flags. */
     const char *busy_module_yield_reply;              /* When non-null, we are inside RM_Yield. */
     char *ignore_warnings;                            /* Config: warnings that should be ignored. */
@@ -2025,8 +2050,6 @@ struct valkeyServer {
                                             * Value: RDB client object
                                             * This structure holds dual-channel sync replicas from the start of their
                                             * RDB transfer until their main channel establishes partial synchronization. */
-    client *current_client;                /* The client that triggered the command execution (External or AOF). */
-    client *executing_client;              /* The client executing the current command (possibly script or module). */
 
 #ifdef LOG_REQ_RES
     char *req_res_logfile; /* Path of log file for logging all requests and their replies. If NULL, no logging will be
@@ -2038,9 +2061,6 @@ struct valkeyServer {
     clientMemUsageBucket *client_mem_usage_buckets;
 
     rax *clients_timeout_table; /* Radix tree for blocked clients timeouts. */
-    int execution_nesting;      /* Execution nesting level.
-                                 * e.g. call(), async module stuff (timers, events, etc.),
-                                 * cron stuff (active expire, eviction) */
     rax *clients_index;         /* Active clients dictionary by client ID. */
     rax *kill_waiters;          /* Killed client ID -> list of IDs of CLIENT KILL callers waiting for its free. */
     uint32_t paused_actions;    /* Bitmask of actions that are currently paused */
@@ -2055,6 +2075,8 @@ struct valkeyServer {
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
     int keyspace_shard_bits;    /* Standalone: split each db into 2^bits hashtables by key slot. */
     int replica_parallel_apply; /* Replica: apply eligible replicated writes on the staged IO threads. */
+    int io_threads_parallel_writes;     /* Run the staged write phase's commands in parallel lanes by shard */
+    int io_threads_parallel_writes_min; /* Fewest entries in a segment worth a parallel write phase */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
@@ -2095,12 +2117,16 @@ struct valkeyServer {
     time_t loading_process_events_interval_ms;
     /* Fields used only for stats */
     time_t stat_starttime;                         /* Server start time */
-    long long stat_numcommands;                    /* Number of processed commands */
     long long stat_repl_parallel_applied;          /* Replicated writes applied in APPLY phases */
     long long stat_repl_apply_phases;              /* APPLY phases run */
+    long long stat_repl_lane_reads;                /* Primary reads whose plan main ran on the write lanes */
+    long long stat_repl_lane_read_usec;            /* IO-thread time of those reads: read, parse and plan */
+    long long stat_repl_lane_classify_usec;        /* Of which the scan, and the parse of one-chunk reads */
+    long long stat_repl_lane_parse_usec;           /* Main's time in PARSE phases */
+    long long stat_repl_lane_plan_usec;            /* Main's time running those plans, APPLY phases included */
+    long long stat_repl_lane_apply_usec;           /* Of which APPLY phases */
+    long long stat_repl_lane_barriers;             /* Commands of those plans main ran in their place */
     long long stat_numconnections;                 /* Number of connections received */
-    long long stat_expiredkeys;                    /* Number of expired keys */
-    long long stat_expiredfields;                  /* Number of expired hash fields */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */
     long long stat_expired_time_cap_reached_count; /* Early expire cycle stops.*/
@@ -2110,8 +2136,6 @@ struct valkeyServer {
     long long stat_evictedscripts;                 /* Number of evicted lua scripts. */
     long long stat_total_eviction_exceeded_time;   /* Total time over the memory limit, unit us */
     monotime stat_last_eviction_exceeded_time;     /* Timestamp of current eviction start, unit us */
-    long long stat_keyspace_hits;                  /* Number of successful lookups of keys */
-    long long stat_keyspace_misses;                /* Number of failed lookups of keys */
     long long stat_active_defrag_hits;             /* number of allocations moved */
     long long stat_active_defrag_misses;           /* number of allocations scanned but not moved */
     long long stat_active_defrag_key_hits;         /* number of keys with moved allocations */
@@ -2160,7 +2184,6 @@ struct valkeyServer {
     long long stat_cluster_io_main_thread_fallbacks;    /* Cluster I/O ops handled on the main thread because dispatch failed */
     long long
         stat_unexpected_error_replies;                 /* Number of unexpected (aof-loading, replica to primary, etc.) error replies */
-    long long stat_total_error_replies;                /* Total number of issued error replies ( command + rejected errors ) */
     long long stat_dump_payload_sanitizations;         /* Number deep dump payloads integrity validations. */
     long long stat_io_reads_processed;                 /* Number of read events processed by IO threads */
     long long stat_io_reads_pending;                   /* Number of read events pending in IO threads */
@@ -2211,7 +2234,6 @@ struct valkeyServer {
     int tcpkeepalive;            /* Set SO_KEEPALIVE if non-zero. */
     int active_expire_enabled;   /* Can be disabled for testing purposes. */
     int active_expire_effort;    /* From 1 (default) to 10, active effort. */
-    int lazy_expire_disabled;    /* If > 0, don't trigger lazy expire */
     int active_defrag_enabled;
     int skip_checksum_validation;                /* Disable checksum validation for RDB and RESTORE payload. */
     int rdb_version_check;                       /* Try to load RDB produced by a future version. */
@@ -2288,7 +2310,6 @@ struct valkeyServer {
                                            default no. (for testings). */
 
     /* RDB persistence */
-    long long dirty;                      /* Changes to DB from the last save */
     long long dirty_before_bgsave;        /* Used to restore dirty on failed BGSAVE */
     long long rdb_last_load_keys_expired; /* number of expired keys when loading RDB */
     long long rdb_last_load_keys_loaded;  /* number of loaded keys when loading RDB */
@@ -2331,7 +2352,6 @@ struct valkeyServer {
     int child_info_pipe[2]; /* Pipe used to write the child_info_data. */
     int child_info_nread;   /* Num of bytes of the last read from pipe */
     /* Propagation of commands in AOF / replication */
-    serverOpArray also_propagate; /* Additional command to propagate. */
     int replication_allowed;      /* Are we allowed to replicate? */
     /* Logging */
     char *logfile;            /* Path of log file */
@@ -2521,7 +2541,6 @@ struct valkeyServer {
     _Atomic(int) daylight_active; /* Currently in daylight saving time. */
     mstime_t mstime;              /* 'unixtime' in milliseconds. */
     ustime_t ustime;              /* 'unixtime' in microseconds. */
-    mstime_t cmd_time_snapshot;   /* Time snapshot of the root execution nesting. */
     size_t blocking_op_nesting;   /* Nesting level of blocking operation, used to reset blocked_last_cron. */
     long long blocked_last_cron;  /* Indicate the mstime of the last time we did cron jobs from a blocking operation */
     /* Pubsub */
@@ -3021,6 +3040,7 @@ struct serverCommand {
                          ACLs. A connection is able to execute a given command if
                          the user associated to the connection has this command
                          bit set in the bitmap of allowed commands. */
+    int write_lane;   /* A parallel write lane may run it (docs/parallel-write-stage.md). */
     sds fullname;     /* Includes parent name if any: "parentcmd|childcmd". Unchanged if command is renamed. */
     sds current_name; /* Same as fullname, becomes a separate string if command is renamed. */
     struct hdr_histogram
@@ -3226,6 +3246,8 @@ void dictVanillaFree(void *val);
                                                  main runs the stock check to produce the exact error. */
 #define READ_FLAGS_DPLUS_SPECULATED (1 << 25) /* The IO thread already executed and replied to this read. */
 #define READ_FLAGS_DRAIN (1 << 26)            /* Read the socket repeatedly before parsing. */
+#define READ_FLAGS_STREAM_LANES (1 << 27)     /* Replica: sort the primary's parsed commands into write lanes. */
+#define REPL_LANES_READ_MAX (1024 * 1024)     /* Bytes of the primary's stream one planned read takes. */
 /* Every parse error flag; also marks a queued command that is complete but bad. */
 #define READ_FLAGS_ERROR_MASK                                                                                        \
     (READ_FLAGS_ERROR_BIG_INLINE_REQUEST | READ_FLAGS_ERROR_BIG_MULTIBULK | READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN | \
@@ -3586,6 +3608,8 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 /* Replication */
 int prepareReplicasToWrite(void);
 void replicationFeedReplicas(int dictid, robj **argv, int argc);
+sds replicationCatCommand(sds buf, robj **argv, int argc);
+void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
@@ -3858,10 +3882,12 @@ int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 void prepareCommand(client *c);
 void prepareCommandQueue(client *c);
+void prepareParsedCommand(parsedCommand *p);
 void unprepareCommand(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);
 int processCommandAndResetClient(client *c);
+int processPlannedCommand(client *c, int pop);
 void setupSignalHandlers(void);
 #ifdef USE_LIBBACKTRACE
 void initLibbacktraceFrameState(void);
@@ -3882,6 +3908,16 @@ void startCommandExecution(void);
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags);
 void call(client *c, int flags);
 void alsoPropagate(int dbid, robj **argv, int argc, int target, int slot);
+void replayLanePropagation(serverOp *ops, int numops, int wrap);
+void incrementErrorStatsForReply(const char *s, size_t len, int flags);
+int trackingIsIdle(void);
+int ACLUserUnrestricted(user *u);
+void commandProcessed(client *c);
+/* Parallel write lanes (fastpath.c): side effects a lane hands to main. */
+void fastpathLaneErrorReply(client *c, const char *s, size_t len, int flags);
+void fastpathLaneLatencySample(const char *event, long long latency_us);
+void fastpathFoldLaneHistograms(void);
+void fastpathResetLaneStats(void);
 void postExecutionUnitOperations(void);
 void serverOpArrayFree(serverOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
@@ -3889,6 +3925,8 @@ void preventCommandPropagation(client *c);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void commandlogPushCurrentCommand(client *c, struct serverCommand *cmd);
+int commandlogPrepareCurrentCommand(client *c, struct serverCommand *cmd, void **entries, int *types);
+void commandlogPushPrepared(void *entry, int type);
 void updateCommandLatencyHistogram(struct hdr_histogram **latency_histogram, int64_t duration_hist);
 void updateCommandLatencyHistogramCount(struct hdr_histogram **latency_histogram, int64_t duration_hist, int64_t count);
 int prepareForShutdown(client *c, int flags);

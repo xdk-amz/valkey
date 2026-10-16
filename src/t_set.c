@@ -614,7 +614,7 @@ void saddCommand(client *c) {
     if (added) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[1], c->db->id);
-        server.dirty += added;
+        ectx->dirty += added;
     }
     addReplyLongLong(c, added);
 }
@@ -642,7 +642,7 @@ void sremCommand(client *c) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_SET, "srem", c->argv[1], c->db->id);
         if (keyremoved) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
-        server.dirty += deleted;
+        ectx->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }
@@ -689,11 +689,11 @@ void smoveCommand(client *c) {
     }
 
     signalModifiedKey(c, c->db, c->argv[1]);
-    server.dirty++;
+    ectx->dirty++;
 
     /* An extra key has changed when ele was successfully added to dstset */
     if (setTypeAdd(dstset, objectGetVal(ele))) {
-        server.dirty++;
+        ectx->dirty++;
         signalModifiedKey(c, c->db, c->argv[2]);
         notifyKeyspaceEvent(NOTIFY_SET, "sadd", c->argv[2], c->db->id);
     }
@@ -826,7 +826,7 @@ void spopWithCountCommand(client *c) {
 
     /* Generate an SPOP keyspace notification */
     notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
-    server.dirty += (count >= size) ? size : count;
+    ectx->dirty += (count >= size) ? size : count;
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
@@ -1041,7 +1041,7 @@ void spopCommand(client *c) {
 
     /* Set has been modified */
     signalModifiedKey(c, c->db, c->argv[1]);
-    server.dirty++;
+    ectx->dirty++;
 }
 
 /* handle the "SRANDMEMBER key <count>" variant. The normal version of the
@@ -1343,7 +1343,7 @@ void sinterGenericCommand(client *c,
             if (dbDelete(c->db, dstkey)) {
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
-                server.dirty++;
+                ectx->dirty++;
             }
             addReply(c, shared.czero);
         } else if (cardinality_only) {
@@ -1445,11 +1445,11 @@ void sinterGenericCommand(client *c,
             }
             setKey(c, c->db, dstkey, &dstset, 0);
             notifyKeyspaceEvent(NOTIFY_SET, "sinterstore", dstkey, c->db->id);
-            server.dirty++;
+            ectx->dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
         } else {
             if (dbDelete(c->db, dstkey)) {
-                server.dirty++;
+                ectx->dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
             }
@@ -1669,11 +1669,11 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum, robj *dstke
         if (setTypeSize(dstset) > 0) {
             setKey(c, c->db, dstkey, &dstset, 0);
             notifyKeyspaceEvent(NOTIFY_SET, op == SET_OP_UNION ? "sunionstore" : "sdiffstore", dstkey, c->db->id);
-            server.dirty++;
+            ectx->dirty++;
             addReplyLongLong(c, setTypeSize(dstset));
         } else {
             if (dbDelete(c->db, dstkey)) {
-                server.dirty++;
+                ectx->dirty++;
                 signalModifiedKey(c, c->db, dstkey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", dstkey, c->db->id);
             }
