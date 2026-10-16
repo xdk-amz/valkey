@@ -3983,6 +3983,12 @@ static int shouldPropagate(int target) {
     return 0;
 }
 
+/* Would an active-expire DEL/UNLINK propagate to AOF, replicas/backlog or an exporting slot? Used by the
+ * MAINT expire lanes to decide whether an expired key needs main's replay or can be freed in the lane. */
+int shouldPropagateExpire(void) {
+    return shouldPropagate(PROPAGATE_AOF | PROPAGATE_REPL);
+}
+
 /* Propagate the specified command (in the context of the specified database id)
  * to AOF and replicas.
  *

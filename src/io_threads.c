@@ -288,6 +288,16 @@ void endInlineReclaim(void) {
     inline_reclaim_depth--;
 }
 
+/* A MAINT expire lane freeing an unobserved expired value frees it inline: a lane runs on an IO thread
+ * that cannot submit free jobs to its peers. Set for the duration of the lane phase. */
+static _Thread_local int maint_lane_free = 0;
+void beginMaintLaneFree(void) {
+    maint_lane_free = 1;
+}
+void endMaintLaneFree(void) {
+    maint_lane_free = 0;
+}
+
 size_t offloadPendingFreeBytes(void) {
     return atomic_load_explicit(&offload_pending_free_bytes, memory_order_relaxed);
 }
@@ -2294,7 +2304,7 @@ int tryOffloadFreePtrToIOThreads(void *ptr) {
 
 /* Terminal frees use IO threads when active; otherwise preserve freeObjAsync behavior. */
 void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
-    if (inline_reclaim_depth || repl_apply_in_lane) { /* emergency reclaim frees inline */
+    if (inline_reclaim_depth || repl_apply_in_lane || maint_lane_free) { /* emergency reclaim frees inline */
         if (val) decrRefCount(val);
         return;
     }

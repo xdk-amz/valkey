@@ -3437,6 +3437,7 @@ void enableTracking(client *c, uint64_t redirect_to, struct ClientFlags options,
 void disableTracking(client *c);
 void trackingRememberKeys(client *tracking, client *executing);
 void trackingInvalidateKey(client *c, robj *keyobj, int bcast);
+int trackingHasActivePrefixes(void);
 void trackingScheduleKeyInvalidation(uint64_t client_id, robj *keyobj);
 void trackingHandlePendingKeyInvalidations(void);
 bool trackingHasPendingKeyInvalidations(void);
@@ -4175,6 +4176,7 @@ robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index);
 void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
+int shouldPropagateExpire(void);
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int slot);
 size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
 int keyIsExpired(serverDb *db, robj *key);

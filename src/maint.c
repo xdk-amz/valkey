@@ -272,7 +272,21 @@ void maintRun(void) {
     int parallel = maintParallelReady();
     mt_nlanes = parallel ? stagedWorkerCount() + stagedMainTakesLane() : 1;
     if (mt_requested[MAINT_JOB_EXPIRE]) {
-        mt_budget_us[MAINT_JOB_EXPIRE] = maintExpireThreadBudget(mt_budget_us[MAINT_JOB_EXPIRE], mt_nlanes);
+        /* Decide once, before the exclusive phase, whether expired keys need main's per-key replay or a
+         * lane can free the value itself. The state it reads is global or db-wide and cannot change in
+         * the phase. */
+        int replay_needed = maintExpireReplayNeeded();
+        activeExpireSetFreeInline(!replay_needed);
+        uint64_t phase_budget = mt_budget_us[MAINT_JOB_EXPIRE];
+        if (server.cron_lanes_split_budget) {
+            /* Override: each thread gets a plain slice of the budget, replay bound off. */
+            mt_budget_us[MAINT_JOB_EXPIRE] = maintExpireThreadBudget(phase_budget, mt_nlanes);
+            activeExpireBudgetBegin(0, 0.0);
+        } else {
+            /* Shared replay-bounded budget: lanes get the whole-phase budget as a per-thread safety
+             * ceiling and stop on the shared bound (elapsed + logged keys * replay cost). */
+            activeExpireBudgetBegin(phase_budget, mt_expire_replay_us);
+        }
         activeExpireLaneBegin();
     }
 

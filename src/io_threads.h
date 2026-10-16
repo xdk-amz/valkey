@@ -72,6 +72,8 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv);
 int tryOffloadFreePtrToIOThreads(void *ptr);
 void beginInlineReclaim(void);
 void endInlineReclaim(void);
+void beginMaintLaneFree(void);
+void endMaintLaneFree(void);
 void freeValueNeverOnMain(robj *key, robj *val, int dbid);
 void drainPendingMainFrees(void);
 size_t pendingMainFreesLen(void);
