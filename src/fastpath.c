@@ -657,8 +657,12 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->flag.pending_command = 1;
 
     fp_exec_entry = e;
+    ec->woff = 0;
     processCommandAndResetClient(ec);
     fp_exec_entry = NULL;
+    /* WAIT and WAITAOF on the client wait for its last write's replication offset. IO threads wait at
+     * the barrier while main executes, so main may set it on the client. */
+    if (ec->woff && e->c) e->c->woff = ec->woff;
     if (ec->flag.close_asap) {
         /* Closed for the output buffer limit: nothing of this reply is sent. */
         ec->flag.close_asap = 0;
