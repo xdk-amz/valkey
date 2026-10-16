@@ -18,6 +18,7 @@
 #include "bgiteration.h"
 #include "throttle.h"
 #include <sys/uio.h>
+#include <sched.h>
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
 
@@ -41,6 +42,7 @@ typedef struct fpThread {
     cmdBatch **sb[STAGED_MAX_DEPTH];
     int sbn[STAGED_MAX_DEPTH];
     int sbcap[STAGED_MAX_DEPTH];
+    int sb_streamed[STAGED_MAX_DEPTH]; /* STREAM/REPLY: index of the first batch not fully delivered. */
     list staged_leaving;
 } fpThread;
 
@@ -127,6 +129,8 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     b->count = 0;
     b->io_tid = tid;
     b->arena_used = 0;
+    atomic_store_explicit(&b->executed, 0, memory_order_relaxed);
+    b->delivered = 0;
     return b;
 }
 
@@ -577,15 +581,37 @@ static void fpRequeue(fpThread *t, client *c, cmdEntry *e, int n) {
 }
 
 /* Consecutive entries for one client share a writev. */
-static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
+/* Free what main did not keep in a run of entries, on the thread that produced them; no free
+ * traffic through the shared inbox. Requeued entries' argv was moved to the client's queue by
+ * fpRequeue (set to NULL there), so this skips them. */
+static void fpFreeEntries(cmdEntry *e, int n) {
+    for (int k = 0; k < n; k++) {
+        if (e[k].reply_big) {
+            zfree(e[k].reply_big);
+            e[k].reply_big = NULL;
+        }
+        if (e[k].argv) {
+            for (int j = 0; j < e[k].argc; j++)
+                if (e[k].argv[j]) decrRefCount(e[k].argv[j]);
+            zfree(e[k].argv);
+            e[k].argv = NULL;
+        }
+    }
+}
+
+/* Deliver the entries [from, to) of a batch. from and to must each fall on a client-run boundary,
+ * so a run is never split across two calls. Consecutive entries for one client share a writev.
+ * Shared by the STREAM phase (runs as main finishes them, to = b->executed) and the REPLY phase
+ * (the remaining runs at once, from = b->delivered, to = b->count). */
+static void fpDeliverRange(fpThread *t, cmdBatch *b, int from, int to) {
     struct iovec iov[IO_BATCH_MAX];
-    int i = 0;
-    while (i < b->count) {
+    int i = from;
+    while (i < to) {
         client *c = b->e[i].c;
         int n = 0;
         int j = i;
         int requeued = 0;
-        while (j < b->count && b->e[j].c == c) {
+        while (j < to && b->e[j].c == c) {
             cmdEntry *e = &b->e[j];
             if (e->requeued) {
                 requeued++;
@@ -600,19 +626,8 @@ static void fpDeliverBatch(fpThread *t, cmdBatch *b) {
         c->fp_inflight -= (j - i);
         c->commands_processed += (j - i) - requeued;
         if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+        fpFreeEntries(&b->e[i], j - i);
         i = j;
-    }
-    for (int k = 0; k < b->count; k++) {
-        cmdEntry *e = &b->e[k];
-        if (e->reply_big) zfree(e->reply_big);
-        /* Terminal frees of what main did not keep, on the thread that
-         * allocated it; no free traffic through the shared inbox. */
-        if (e->argv) {
-            for (int j = 0; j < e->argc; j++)
-                if (e->argv[j]) decrRefCount(e->argv[j]);
-            zfree(e->argv);
-            e->argv = NULL;
-        }
     }
 }
 
@@ -1038,18 +1053,215 @@ int fastpathStagedRepliesPending(void) {
     return 0;
 }
 
-/* Reply phase, on each IO thread and on main (tid 0): write the replies of the batches this thread
- * produced, in order. */
+/* ---- Streaming (overlap) executor ----
+ * Main executes runs round-robin across threads so every worker gets replies early, while the
+ * STREAM-phase workers deliver completed runs concurrently. See docs/staged-event-loop.md. */
+
+/* Per-thread streaming cursor: the next run to execute, as a batch index and an entry index. */
+typedef struct fpStreamCursor {
+    int bi; /* batch index into t->sb[d] */
+    int ei; /* entry index into that batch */
+} fpStreamCursor;
+
+static _Atomic int fp_stream_abort = 0; /* main asks STREAM workers to stop before the barrier close */
+
+/* True once no thread has a run left to execute. */
+static int fpStreamDone(fpThread **ts, fpStreamCursor *cur, int n, int d) {
+    for (int i = 0; i < n; i++) {
+        fpThread *t = ts[i];
+        if (cur[i].bi < t->sbn[d]) return 0;
+    }
+    return 1;
+}
+
+/* Advance one thread's cursor to the start of its next run, skipping empty batches. Returns the
+ * batch of the run at the cursor, or NULL when the thread is exhausted. */
+static cmdBatch *fpStreamRunAt(fpThread *t, fpStreamCursor *c, int d) {
+    while (c->bi < t->sbn[d]) {
+        cmdBatch *b = t->sb[d][c->bi];
+        if (c->ei < b->count) return b;
+        c->bi++;
+        c->ei = 0;
+    }
+    return NULL;
+}
+
+/* Execute the one run of client b->e[c->ei] starting at the cursor, publish b->executed at its end,
+ * and move the cursor past it. Prefetch is done by the caller window. */
+static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c) {
+    int from = c->ei;
+    client *cl = b->e[from].c;
+    int j = from;
+    while (j < b->count && b->e[j].c == cl) {
+        fpExecute(ec, b, &b->e[j]);
+        j++;
+    }
+    /* Release so a STREAM worker that reads executed with acquire sees every reply byte of this run. */
+    atomic_store_explicit(&b->executed, j, memory_order_release);
+    c->ei = j;
+}
+
+/* Prefetch a window of up to prefetch-batch-max-size entries, in the same round-robin run order the
+ * executor will run them, without disturbing the executor cursors. */
+static void fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, int d, int window) {
+    getKeysResult result;
+    initGetKeysResult(&result);
+    fpStreamCursor look[IO_THREADS_MAX_NUM];
+    for (int i = 0; i < n; i++) look[i] = cur[i];
+    int added = 0, active = 1;
+    ClientControl *last_control = NULL;
+    while (active && added < window) {
+        active = 0;
+        for (int i = 0; i < n && added < window; i++) {
+            cmdBatch *b = fpStreamRunAt(ts[i], &look[i], d);
+            if (!b) continue;
+            active = 1;
+            client *cl = b->e[look[i].ei].c;
+            int j = look[i].ei;
+            int room = 1;
+            while (j < b->count && b->e[j].c == cl && room && added < window) {
+                cmdEntry *e = &b->e[j];
+                if (e->control != last_control) {
+                    __builtin_prefetch(e->control);
+                    last_control = e->control;
+                }
+                if (e->cmd && !(e->read_flags & READ_FLAGS_BAD_ARITY))
+                    room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
+                j++;
+                added++;
+            }
+            look[i].ei = j;
+        }
+    }
+    getKeysFreeResult(&result);
+    prefetchBatchRun();
+    prefetchBatchReset();
+}
+
+/* Main, write phase (exec/loop overlap): execute runs round-robin across threads, publishing each
+ * batch's executed count as runs finish, so STREAM workers can deliver them while main runs on. */
+int fastpathStagedExecuteStreaming(void) {
+    int d = fpDepth();
+    int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
+    int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
+    int window = server.prefetch_batch_max_size;
+    if (window < 1) window = 1;
+
+    fpThread *ts[IO_THREADS_MAX_NUM];
+    fpStreamCursor cur[IO_THREADS_MAX_NUM];
+    client *ecs[IO_THREADS_MAX_NUM];
+    int n = 0, total = 0;
+    /* tid 0 holds main's own read share; main delivers it in the reply phase, not in STREAM. */
+    for (int tid = 0; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->sbn[d] == 0) continue;
+        ts[n] = t;
+        cur[n].bi = 0;
+        cur[n].ei = 0;
+        ecs[n] = fpExecutor(tid);
+        n++;
+    }
+    if (n == 0) return 0;
+
+    while (!fpStreamDone(ts, cur, n, d)) {
+        if (use_prefetch && !paused) fpStreamPrefetchWindow(ts, cur, n, d, window);
+        for (int w = 0; w < window;) {
+            int progressed = 0;
+            for (int i = 0; i < n && w < window; i++) {
+                cmdBatch *b = fpStreamRunAt(ts[i], &cur[i], d);
+                if (!b) continue;
+                int before = cur[i].ei;
+                fpStreamExecRun(ecs[i], b, &cur[i]);
+                w += cur[i].ei - before;
+                total += cur[i].ei - before;
+                progressed = 1;
+            }
+            if (!progressed) break;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        ecs[i]->origin = NULL;
+        clientSetUser(ecs[i], DefaultUser, 0); /* never keep a principal that may retire */
+    }
+    return total;
+}
+
+/* IO thread, STREAM phase: deliver this thread's completed runs as main publishes them, advancing
+ * delivered within each batch and the thread's batch cursor, until every batch is delivered or main
+ * set the abort flag. Undelivered runs are left for the following REPLY phase, which resumes at the
+ * same cursor. */
+void fastpathStagedStreamPhase(int tid) {
+    fpThread *t = &fp_threads[tid];
+    int d = fpDepth();
+    fp_cur_tid = tid;
+    int bi = t->sb_streamed[d];
+    while (bi < t->sbn[d]) {
+        cmdBatch *b = t->sb[d][bi];
+        for (;;) {
+            int exec = atomic_load_explicit(&b->executed, memory_order_acquire);
+            if (b->delivered < exec) {
+                fpDeliverRange(t, b, b->delivered, exec);
+                b->delivered = exec;
+            }
+            if (b->delivered >= b->count) break; /* this batch is fully delivered */
+            if (atomic_load_explicit(&fp_stream_abort, memory_order_acquire)) {
+                t->sb_streamed[d] = bi; /* REPLY resumes here */
+                return;
+            }
+            /* Spin briefly for the next run, then yield the CPU so a worker sharing main's core
+             * cannot keep main from producing. */
+            int ready = 0;
+            for (int s = 0; s < 256; s++) {
+                if (atomic_load_explicit(&b->executed, memory_order_acquire) > b->delivered) {
+                    ready = 1;
+                    break;
+                }
+#if defined(__x86_64__) || defined(__i386__)
+                __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                __asm__ __volatile__("isb" ::: "memory");
+#endif
+            }
+            if (!ready) sched_yield();
+        }
+        bi++;
+    }
+    t->sb_streamed[d] = bi;
+}
+
+/* Main: open streaming for this iteration (clear the abort flag before the STREAM phase opens). */
+void fastpathStagedStreamBegin(void) {
+    atomic_store_explicit(&fp_stream_abort, 0, memory_order_relaxed);
+}
+
+/* Main: tell STREAM workers to stop at a batch boundary; the barrier close then waits for them. */
+void fastpathStagedStreamAbort(void) {
+    atomic_store_explicit(&fp_stream_abort, 1, memory_order_release);
+}
+
+/* Main: total batches queued for the current depth, to decide whether STREAM and REPLY run. */
+int fastpathStagedStreamBatchCount(void) {
+    int d = fpDepth();
+    int n = 0;
+    for (int tid = 1; tid < fp_slots; tid++) n += fp_threads[tid].sbn[d];
+    return n;
+}
+
+/* Reply phase, on each IO thread and on main (tid 0): write the replies not yet delivered by a
+ * preceding STREAM phase, in order, then recycle every batch. Without streaming, sb_streamed and
+ * delivered are 0, so it writes all. */
 void fastpathStagedReplyPhase(int tid) {
     fpThread *t = &fp_threads[tid];
     int d = fpDepth();
     fp_cur_tid = tid;
-    for (int i = 0; i < t->sbn[d]; i++) {
+    for (int i = t->sb_streamed[d]; i < t->sbn[d]; i++) {
         cmdBatch *b = t->sb[d][i];
-        fpDeliverBatch(t, b);
+        if (b->delivered < b->count) fpDeliverRange(t, b, b->delivered, b->count);
         fpRecycleBatch(t, b);
     }
+    for (int i = 0; i < t->sb_streamed[d]; i++) fpRecycleBatch(t, t->sb[d][i]); /* fully delivered in STREAM */
     t->sbn[d] = 0;
+    t->sb_streamed[d] = 0;
 }
 
 static void fpStagedHandoff(client *c) {

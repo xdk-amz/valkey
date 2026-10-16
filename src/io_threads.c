@@ -1366,6 +1366,8 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
             fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_STREAM)
+            fastpathStagedStreamPhase((int)id);
         else if (phase == STAGED_PHASE_APPLY)
             stagedRunLane(phase, (int)id);
         else if (phase == STAGED_PHASE_MAINT) {

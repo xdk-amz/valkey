@@ -52,6 +52,8 @@ typedef struct cmdEntry {
 typedef struct cmdBatch {
     int count;
     int io_tid;
+    _Atomic(int) executed; /* entries main has finished executing; published release at client-run boundaries. */
+    int delivered;        /* worker-owned: entries this thread has already written in STREAM/REPLY. */
     char *arena;
     size_t arena_cap;
     size_t arena_used;
@@ -88,8 +90,13 @@ void fastpathStagedSet(int on);
 void fastpathStagedSetDepth(int depth);
 void fastpathStagedReadPhase(int tid);
 int fastpathStagedExecute(void);
+int fastpathStagedExecuteStreaming(void);
 int fastpathStagedRepliesPending(void);
 void fastpathStagedReplyPhase(int tid);
+void fastpathStagedStreamPhase(int tid);
+void fastpathStagedStreamBegin(void);
+void fastpathStagedStreamAbort(void);
+int fastpathStagedStreamBatchCount(void);
 void fastpathStagedFinish(void);
 void fastpathStagedReleaseAll(void);
 void fastpathStagedAdoptClients(void);

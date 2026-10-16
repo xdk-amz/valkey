@@ -24,6 +24,7 @@ enum {
     SL_T_POLL,
     SL_T_READ,
     SL_T_EXEC,
+    SL_T_STREAMWAIT,
     SL_T_EVENTS,
     SL_T_AOF,
     SL_T_REPLY,
@@ -31,9 +32,10 @@ enum {
     SL_T_CRONS,
     SL_T_COUNT
 };
-static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll", "read", "exec", "events",
-                                                   "aof", "reply", "finish", "crons"};
-static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none", "read", "reply", "sync", "drain", "apply", "maint"};
+static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll",   "read",   "exec",  "streamwait",
+                                                   "events",      "aof",    "reply",  "finish", "crons"};
+static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none",  "read",  "reply", "sync",
+                                                               "drain", "apply", "maint", "stream"};
 static uint64_t sl_main_ns[SL_T_COUNT];
 static uint64_t sl_iterations;
 static uint64_t sl_phases[STAGED_PHASE_KINDS];
@@ -109,6 +111,7 @@ static int sl_warned = 0;
 static int sl_main_lane = 1;        /* main has a CPU no worker is pinned to, so it works a share of each phase */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
+static int sl_stream_open = 0;      /* a STREAM phase is open: workers deliver while main executes */
 
 /* Main and the workers pinned to main's one CPU sleep at the barrier instead of spinning. Pinning
  * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
@@ -156,8 +159,33 @@ int stagedWorkerEnrolled(int tid, uint64_t *seen, uint32_t *gen) {
     return 1;
 }
 
+/* Main: open a STREAM phase. Unlike stagedRunPhase it does not wait: the workers deliver completed
+ * runs while main executes. Closed by stagedStreamClose. */
+static void stagedStreamOpen(void) {
+    fastpathStagedStreamBegin();
+    int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_STREAM);
+    serverAssert(rc == 0);
+    sl_opens++;
+    sl_stream_open = 1;
+}
+
+/* Main: close an open STREAM phase. abort asks the workers to stop at a batch boundary first, used
+ * when main must open another phase before it finished executing (a nested iteration mid-exec); the
+ * undelivered runs then go out in the following REPLY phase. With abort 0 main has finished executing,
+ * so every batch's executed equals its count and the workers drain naturally. */
+static void stagedStreamClose(int abort) {
+    if (!sl_stream_open) return;
+    if (abort) fastpathStagedStreamAbort();
+    uint64_t t0 = stagedNowNs();
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    sl_main_ns[SL_T_STREAMWAIT] += stagedNowNs() - t0;
+    stagedAccountPhase(STAGED_PHASE_STREAM, sl_workers);
+    sl_stream_open = 0;
+}
+
 /* Open one phase for the enrolled workers and wait until all of them are done. */
 static void stagedRunPhase(int phase) {
+    stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
@@ -402,7 +430,24 @@ static void readPhase(void) {
     stagedRunPhase(STAGED_PHASE_READ);
 }
 
-/* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. */
+/* Main: a STREAM phase may overlap exec this iteration. Only when batches exist, workers are
+ * enrolled, no nested depth, the base would not flush the AOF before replies (appendfsync always),
+ * no worker shares main's CPU (a shared core would only take turns), and no BCAST tracking prefix is
+ * set (the base sends replies before trackingBroadcastInvalidationMessages; streaming must not widen
+ * that window). */
+extern rax *PrefixTable; /* tracking.c */
+static int stagedStreamEligible(void) {
+    if (server.staged_reply_overlap == STAGED_REPLY_OVERLAP_NONE) return 0;
+    if (sl_depth != 0 || sl_workers <= 0) return 0;
+    if (fastpathStagedStreamBatchCount() == 0) return 0;
+    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
+    if (!sl_main_spins || !sl_main_lane) return 0; /* a worker shares main's CPU */
+    if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
+    return 1;
+}
+
+/* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients.
+ * In exec/loop overlap, a STREAM phase delivers completed runs while main executes. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
     uint64_t t0 = stagedNowNs();
@@ -410,12 +455,23 @@ static void writePhase(aeEventLoop *el) {
         sl_read_queued = 0;
         processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
     }
-    fastpathStagedExecute();
+    int stream = stagedStreamEligible();
+    if (stream) {
+        stagedStreamOpen();
+        fastpathStagedExecuteStreaming();
+    } else {
+        fastpathStagedExecute();
+    }
     uint64_t t1 = stagedNowNs();
     sl_main_ns[SL_T_EXEC] += t1 - t0;
+    /* Close the stream (wait for the workers to finish delivering) before main does anything that
+     * reads worker-owned client state or opens another phase. A nested iteration inside exec already
+     * aborted and closed it through stagedRunPhase. */
+    stagedStreamClose(0);
+    uint64_t t2 = stagedNowNs();
     if (ae_ready) {
         aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
-        sl_main_ns[SL_T_EVENTS] += stagedNowNs() - t1;
+        sl_main_ns[SL_T_EVENTS] += stagedNowNs() - t2;
     }
 }
 
@@ -535,6 +591,7 @@ void stagedRunLane(int phase, int tid) {
 /* Open phase for the enrolled workers, run main's lane when it takes one, and wait. with_workers 0,
  * or no enrolled worker, runs lane 0 on main alone with no barrier. */
 void stagedRunLanePhase(int phase, int with_workers) {
+    stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     if (!with_workers) {
         stagedRunLane(phase, 0);
         return;
@@ -552,6 +609,7 @@ void stagedRunApplyPhase(int with_workers) {
 }
 
 void stagedStopWorkers(void) {
+    stagedStreamClose(1);
     if (sl_barrier_ready) phaseBarrierShutdown(&sl_barrier);
     if (sl_poller) pollerStop(sl_poller);
 }

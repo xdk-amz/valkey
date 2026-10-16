@@ -112,6 +112,12 @@ configEnum copy_avoid_mode_enum[] = {
     {"off", COPY_AVOID_MODE_OFF},
     {NULL, 0}};
 
+configEnum staged_reply_overlap_enum[] = {
+    {"none", STAGED_REPLY_OVERLAP_NONE},
+    {"exec", STAGED_REPLY_OVERLAP_EXEC},
+    {"loop", STAGED_REPLY_OVERLAP_LOOP},
+    {NULL, 0}};
+
 configEnum shutdown_on_sig_enum[] = {
     {"default", SHUTDOWN_NOFLAGS},
     {"save", SHUTDOWN_SAVE},
@@ -3595,6 +3601,7 @@ standardConfig static_configs[] = {
     createIntConfig("min-string-size-avoid-copy-reply", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid, 16384, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("min-string-size-avoid-copy-reply-threaded", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, INT_MAX, server.min_string_size_copy_avoid_threaded, 65536, INTEGER_CONFIG, NULL, NULL),
     createEnumConfig("avoid-copy-reply-mode", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, copy_avoid_mode_enum, server.copy_avoid_mode, COPY_AVOID_MODE_STATIC, NULL, NULL),
+    createEnumConfig("staged-reply-overlap", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, staged_reply_overlap_enum, server.staged_reply_overlap, STAGED_REPLY_OVERLAP_EXEC, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("prefetch-ring-stride", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.prefetch_ring_stride, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
