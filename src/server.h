@@ -1952,7 +1952,8 @@ typedef enum childInfoType {
 /* Staged loop reply overlap mode (staged-reply-overlap). */
 #define STAGED_REPLY_OVERLAP_NONE 0 /* Base behavior: exec then a separate reply phase. */
 #define STAGED_REPLY_OVERLAP_EXEC 1 /* Workers stream replies while main executes, closed before crons. */
-
+#define STAGED_STREAM_ORDER_THREAD 0 /* Execute each thread's batches as the window allows (thread-major at depth). */
+#define STAGED_STREAM_ORDER_CHUNK 1  /* Round-robin across threads a chunk at a time, so every worker delivers at once. */
 struct valkeyServer {
     /* General */
     pid_t pid;                                        /* Main process pid. */
@@ -2070,6 +2071,7 @@ struct valkeyServer {
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
     int staged_stream_chunk;                  /* Staged loop: entries main executes between executed publishes while streaming. */
+    int staged_stream_order;                  /* Staged loop: STREAM execution order, see STAGED_STREAM_ORDER_* */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
