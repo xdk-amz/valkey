@@ -298,6 +298,14 @@ static void stagedReadCpuPinning(void) {
     sl_pinned_workers = pinned;
     sl_pinned_cpu = cpu;
     sl_main_spins = pinned == 0;
+    /* Pinning can change after start (taskset), so the lane is reread here too, not only when the
+     * worker set changes: a harness that re-pins main and the IO threads to distinct CPUs post-start
+     * must start streaming without an enroll churn. */
+    int lane = sl_workers > 0 && !stagedMainSharesWorkerCpu();
+    if (lane != sl_main_lane)
+        serverLog(LL_NOTICE, "Staged event loop: main %s a CPU with an IO thread; apply lane %s",
+                  lane ? "no longer shares" : "now shares", lane ? "on" : "off");
+    sl_main_lane = lane;
     sl_pinning_read = getMonotonicUs();
 }
 
@@ -321,7 +329,6 @@ static void stagedSetWorkers(int want) {
         ioThreadsStagedUnpark();
         stagedPlaceEpollThread();
     }
-    sl_main_lane = !stagedMainSharesWorkerCpu();
     stagedReadCpuPinning();
 }
 
