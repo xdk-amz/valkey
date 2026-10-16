@@ -98,6 +98,8 @@ static int replStreamSendOne(client *replica, long long stable) {
         if (nwritten == 0) return C_OK;
         return C_ERR;
     }
+    atomic_fetch_add_explicit(&server.stat_repl_sender_writes, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&server.stat_repl_sender_bytes, nwritten, memory_order_relaxed);
 
     /* Advance the sender position by nwritten and publish sent_offset. */
     size_t remaining = (size_t)nwritten;
@@ -133,13 +135,16 @@ static void *replStreamSenderMain(void *arg) {
     pthread_mutex_lock(&repl_sender_mutex);
     while (!repl_sender_stop) {
         long long stable = atomic_load_explicit(&server.repl_stable_offset, memory_order_acquire);
+        atomic_fetch_add_explicit(&server.stat_repl_sender_wakeups, 1, memory_order_relaxed);
         listIter li;
         listNode *ln;
         listRewind(repl_sender_replicas, &li);
         while ((ln = listNext(&li))) {
             client *replica = listNodeValue(ln);
-            if (replStreamSendOne(replica, stable) == C_ERR)
+            if (replStreamSendOne(replica, stable) == C_ERR) {
+                atomic_fetch_add_explicit(&server.stat_repl_sender_write_errors, 1, memory_order_relaxed);
                 atomic_store_explicit(&replica->repl_data->send_error, 1, memory_order_release);
+            }
         }
         /* Wait for main to publish a newer stable offset, or a stop. */
         long long wake = atomic_load_explicit(&repl_sender_wake_offset, memory_order_acquire);
@@ -271,6 +276,13 @@ int replStreamSenderActive(void) {
     return repl_sender_running;
 }
 
+/* Main: number of replicas the sender currently owns. The list is mutated only on
+ * main (add/remove/account under the mutex); the sender never changes its length, so
+ * reading it on main without the lock is safe. */
+unsigned long replStreamSenderOwnedReplicas(void) {
+    return repl_sender_replicas ? listLength(repl_sender_replicas) : 0;
+}
+
 /* Main: one service step of the sender from the event loop. Starts/stops the thread to
  * follow the config, accounts for what the sender streamed (advance cursors, drop
  * refcounts, enforce COB/disconnect, trim), then publishes the next stable offset. Called
@@ -333,5 +345,6 @@ int replStreamSenderActive(void) { return 0; }
 void replStreamSenderTick(void) {}
 void replStreamSenderInit(void) {}
 void replStreamSenderStop(void) {}
+unsigned long replStreamSenderOwnedReplicas(void) { return 0; }
 
 #endif /* HAVE_FASTPATH_EPOLL */

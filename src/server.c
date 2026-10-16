@@ -7264,6 +7264,28 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_backlog_size:%lld\r\n", server.repl_backlog_size,
                 "repl_backlog_first_byte_offset:%lld\r\n", server.repl_backlog ? server.repl_backlog->offset : 0,
                 "repl_backlog_histlen:%lld\r\n", server.repl_backlog ? server.repl_backlog->histlen : 0));
+        /* repl-stream-sender diagnostics: a benchmark can tell from INFO alone that the
+         * sender (not main or an IO thread) sent the replica stream. repl_sender_main_queued
+         * is the number of online replicas main still has an in-flight IO-thread write for. */
+        {
+            long long sender_main_queued = 0;
+            listIter rli;
+            listNode *rln;
+            listRewind(server.replicas, &rli);
+            while ((rln = listNext(&rli))) {
+                client *rc = listNodeValue(rln);
+                if (getClientType(rc) == CLIENT_TYPE_REPLICA && rc->io_write_state != CLIENT_IDLE)
+                    sender_main_queued++;
+            }
+            info = sdscatprintf(info, FMTARGS(
+                "repl_sender_enabled:%d\r\n", server.repl_stream_sender != 0 && replStreamSenderActive(),
+                "repl_sender_replicas:%lu\r\n", replStreamSenderOwnedReplicas(),
+                "repl_sender_bytes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_bytes, memory_order_acquire),
+                "repl_sender_writes:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_writes, memory_order_acquire),
+                "repl_sender_wakeups:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_wakeups, memory_order_acquire),
+                "repl_sender_write_errors:%lld\r\n", atomic_load_explicit(&server.stat_repl_sender_write_errors, memory_order_acquire),
+                "repl_sender_main_queued:%lld\r\n", sender_main_queued));
+        }
     }
 
     /* CPU */

@@ -2383,6 +2383,14 @@ struct valkeyServer {
     _Atomic(long long) repl_stable_offset;            /* repl-stream-sender: bytes of backlog main has finished
                                                        * appending (and fsynced under appendfsync always) that the
                                                        * sender thread may stream. Published with release. */
+    /* repl-stream-sender counters. The sender thread writes stat_repl_sender_* with
+     * release; main reads them with acquire for INFO, and never writes them, so no
+     * counter is written non-atomically from two threads. stat_repl_sender_main_queued
+     * is main-owned (replica writes still handed to IO threads) and plain. */
+    _Atomic(long long) stat_repl_sender_bytes;        /* Bytes the sender put on the wire. */
+    _Atomic(long long) stat_repl_sender_writes;       /* connWritev calls the sender made. */
+    _Atomic(long long) stat_repl_sender_wakeups;      /* Times the sender ran its replica loop. */
+    _Atomic(long long) stat_repl_sender_write_errors; /* Write errors the sender saw. */
     long long second_replid_offset;                   /* Accept offsets up to this for replid2. */
     _Atomic(long long) fsynced_reploff_pending;       /* Largest replication offset to
                                                        * potentially have been fsynced, applied to
@@ -3661,6 +3669,7 @@ int replStreamSenderActive(void);
 void replStreamSenderTick(void);
 void replStreamSenderInit(void);
 void replStreamSenderStop(void);
+unsigned long replStreamSenderOwnedReplicas(void);
 
 void rebaseReplicationBuffer(long long base_repl_offset);
 void showLatestBacklog(void);
