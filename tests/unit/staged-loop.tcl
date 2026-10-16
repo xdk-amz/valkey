@@ -309,3 +309,27 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
     }
 }
 }
+
+# The crash report's memory test cancels and joins every IO thread; staged workers wait on the barrier.
+tags {"valgrind:skip"} {
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes crash-memcheck-enabled yes}} {
+    test {Staged loop: a crash with several workers at the barrier finishes the report and exits} {
+        r client setname sl-control
+        r select 0
+        set fd [sl_socket]
+        puts -nonewline $fd [sl_resp set sl:crash v]
+        flush $fd
+        assert_equal {+OK} [sl_read_reply $fd]
+        sl_wait_fastpath_clients 1
+        set pid [srv 0 pid]
+        catch {r debug segfault}
+        wait_for_condition 300 100 {
+            ![is_alive $pid]
+        } else {
+            fail "server did not exit after the crash report"
+        }
+        assert_equal 1 [count_log_message 0 "Fast memory test PASSED"]
+        close $fd
+    }
+}
+}

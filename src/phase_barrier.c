@@ -123,6 +123,10 @@ void phaseBarrierShutdown(phaseBarrier *b) {
     pthread_mutex_unlock(&b->lock);
 }
 
+static void phaseBarrierUnlock(void *lock) {
+    pthread_mutex_unlock(lock);
+}
+
 /* Returns 1 with *phase set if st names a new phase that includes worker_id; marks it seen either way. */
 static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int *phase) {
     if (stateSeq(st) == (uint32_t)*last_seen) return 0;
@@ -145,6 +149,9 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
         }
     }
     pthread_mutex_lock(&b->lock);
+    /* pthread_cond_wait is a cancellation point that returns holding the lock: a worker cancelled
+     * there (the crash report's memory test joins every IO thread) must not exit holding it. */
+    pthread_cleanup_push(phaseBarrierUnlock, &b->lock);
     for (;;) {
         if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) {
             phase = PHASE_BARRIER_EXIT;
@@ -162,7 +169,7 @@ int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, 
             b->open_sleepers--;
         }
     }
-    pthread_mutex_unlock(&b->lock);
+    pthread_cleanup_pop(1);
     return phase;
 }
 
