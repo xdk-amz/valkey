@@ -75,9 +75,13 @@ static void maintRunUnit(int tid, const maintUnit *u, uint64_t remain_us[MAINT_J
         if (mt_requested[MAINT_JOB_RESIZE]) {
             monotime t = getMonotonicUs();
             unsigned long before = kvstoreHashtableBuckets(kvs, u->didx);
+            int rehashing_before = kvstoreHashtableRehashingAt(kvs, u->didx);
             kvstoreTryResizeHashtable(kvs, u->didx);
             mt_lane_usec[tid][MAINT_JOB_RESIZE] += getMonotonicUs() - t;
-            if (kvstoreHashtableBuckets(kvs, u->didx) != before) mt_lane_work[tid][MAINT_JOB_RESIZE]++;
+            /* A rightsize either changes the bucket count outright or starts a shrink/grow rehash. */
+            if (kvstoreHashtableBuckets(kvs, u->didx) != before ||
+                (!rehashing_before && kvstoreHashtableRehashingAt(kvs, u->didx)))
+                mt_lane_work[tid][MAINT_JOB_RESIZE]++;
         }
         if (mt_requested[MAINT_JOB_REHASH] && remain_us[MAINT_JOB_REHASH] > 0) {
             uint64_t spent = kvstoreRehashHashtable(kvs, u->didx, remain_us[MAINT_JOB_REHASH]);
