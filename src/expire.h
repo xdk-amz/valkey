@@ -69,6 +69,16 @@ int convertExpireArgumentToUnixTime(client *c, robj *arg, mstime_t basetime, int
 ustime_t activeExpireCycle(int type);
 /* Main: active expire of keys runs in the MAINT phase now (lanes ready and nothing observes deletes). */
 int activeExpireInLanes(void);
+/* Main, before a MAINT phase: does an expired key need main's per-key replay (an observer or propagation
+ * sees it), or can a lane free the value itself? Decided once; the state it reads cannot change in the
+ * exclusive phase. */
+int maintExpireReplayNeeded(void);
+/* Main, before a MAINT phase that runs the EXPIRE job: set whether lanes free expired values inline
+ * (no observer, no propagation) instead of logging them for replay. */
+void activeExpireSetFreeInline(int free_inline);
+/* Main, before opening the phase: arm the shared replay-bounded budget (whole-phase budget_us and the
+ * measured per-key replay cost; pass 0,0 to disable it and use the per-thread split ceiling instead). */
+void activeExpireBudgetBegin(uint64_t budget_us, double replay_us);
 /* Main, before a MAINT phase that runs the EXPIRE job: reset the per-thread results. */
 void activeExpireLaneBegin(void);
 /* Lane tid: expire keys of table didx of db within budget_us; sets *hit_limit when the budget ran out

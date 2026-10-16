@@ -50,6 +50,12 @@ uint64_t TrackingTableTotalItems = 0; /* Total number of IDs stored across
 robj *TrackingChannelName;
 static int TrackingBroadcastKeysPending = 0; /* Some prefix holds keys for the next broadcast. */
 
+/* Does any client track by BCAST prefix? trackingInvalidateKey records a modified key against these
+ * prefixes, so an expired key must take main's replay when any exist. */
+int trackingHasActivePrefixes(void) {
+    return PrefixTable != NULL && raxSize(PrefixTable) > 0;
+}
+
 /* This is the structure that we have as value of the PrefixTable, and
  * represents the list of keys modified, and the list of clients that need
  * to be notified, for a given prefix. */

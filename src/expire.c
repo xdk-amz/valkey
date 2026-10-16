@@ -44,6 +44,8 @@
 #include "module.h"
 #include "staged_loop.h"
 
+#include <stdatomic.h>
+
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
  *
@@ -449,8 +451,25 @@ static ustime_t activeExpireCycleJob(enum activeExpiryType jobType, int cycleTyp
 typedef struct {
     unsigned long sampled;
     unsigned long expired;
+    unsigned long freed; /* expired keys the lane freed itself (no observer, no propagation) */
     int hit_limit;
 } laneExpireStats;
+
+/* When no observer and no propagation watch an expired key, a lane frees the value itself instead of
+ * logging it for main's per-key replay. Decided once on main before the phase opens (maintExpireReplayNeeded),
+ * from state that cannot change during the exclusive MAINT phase. */
+static int lane_expire_free_inline = 0;
+
+/* Replay-bounded phase budget. Instead of pre-dividing the cycle budget per thread, every lane shares
+ * one ceiling: a lane stops once the phase's elapsed time plus the keys logged so far across all lanes
+ * times the measured per-key replay cost reaches the budget. The replay is serial on main, so bounding
+ * it by the real logged-key count (not a moving-average ratio) holds the stall without the overshoot the
+ * pre-divided estimate caused in dense expiry. In free-inline mode no key is logged, so lanes run to the
+ * full budget. */
+static uint64_t lane_expire_budget_us = 0;    /* whole-phase budget */
+static monotime lane_expire_phase_start = 0;  /* phase open time, shared by all lanes */
+static double lane_expire_replay_us = 0.0;    /* measured per-key replay cost, 0 when freeing inline */
+static _Atomic unsigned long lane_expire_logged = 0; /* keys logged for replay so far, all lanes */
 
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
 static int lane_expire_tables = 0;
@@ -469,6 +488,51 @@ int activeExpireInLanes(void) {
     if (isPausedActions(PAUSE_ACTION_EXPIRE)) return 0;
     if (bgIteration_iterationActive() || moduleObservesWrites()) return 0;
     return 1;
+}
+
+/* Main, before the MAINT phase opens: does an expired key need main's per-key replay, or can a lane free
+ * the value itself? Replay is needed when any observer or propagation would see the delete. All of this
+ * state is global or db-wide and cannot change inside the exclusive phase, so one decision covers every
+ * key this phase expires. Returns 1 (replay) when any of these hold, 0 (free inline) otherwise:
+ *   - keyspace `expired` notifications reach a subscriber (notifyKeyspaceEvent) or a module keyspace sub;
+ *   - WATCH is active in any db (signalModifiedKey -> touchWatchedKey);
+ *   - tracking is active, default or BCAST (signalModifiedKey -> trackingInvalidateKey);
+ *   - a client is blocked on keys (signalDeletedKeyAsReady);
+ *   - the delete would propagate to AOF, replicas/backlog or an exporting slot (propagateDeletion).
+ * Anything it cannot reproduce exactly keeps the replay path: module data-type/key-event listeners and
+ * bgIteration already force expire fully onto main (activeExpireInLanes), so they are not re-tested here. */
+int maintExpireReplayNeeded(void) {
+    /* keyspace `expired` events to pub/sub clients, or any module keyspace subscriber. */
+    if ((server.notify_keyspace_events & NOTIFY_EXPIRED) &&
+        (server.notify_keyspace_events & (NOTIFY_KEYSPACE | NOTIFY_KEYEVENT)) && serverPubsubSubscriptionCount() > 0)
+        return 1;
+    if (moduleNotifyKeyspaceSubscribersCnt() > 0) return 1;
+    /* tracking: default (per-key RESP3 invalidation) or BCAST (prefix). */
+    if (server.tracking_clients > 0 || trackingHasActivePrefixes()) return 1;
+    /* propagation: AOF on, a replica or backlog present, or a slot exporting. */
+    if (shouldPropagateExpire()) return 1;
+    /* WATCH or a blocked client in any db. */
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (!db) continue;
+        if (dictSize(db->watched_keys) > 0) return 1;
+        if (dictSize(db->blocking_keys) > 0) return 1;
+    }
+    return 0;
+}
+
+void activeExpireSetFreeInline(int free_inline) {
+    lane_expire_free_inline = free_inline;
+}
+
+/* Main, before opening the phase: arm the shared replay-bounded budget. budget_us is the whole-phase
+ * budget; replay_us is the measured per-key replay cost (pass 0 in free-inline mode, where no key is
+ * replayed). Lanes read these and the shared logged-key counter to decide when to stop. */
+void activeExpireBudgetBegin(uint64_t budget_us, double replay_us) {
+    lane_expire_budget_us = budget_us;
+    lane_expire_replay_us = lane_expire_free_inline ? 0.0 : replay_us;
+    lane_expire_phase_start = getMonotonicUs();
+    atomic_store_explicit(&lane_expire_logged, 0, memory_order_relaxed);
 }
 
 void activeExpireLaneBegin(void) {
@@ -494,6 +558,7 @@ typedef struct {
     int tid;
     unsigned long sampled;
     unsigned long expired;
+    unsigned long freed;
     mstime_t ttl_sum;
     long long ttl_samples;
 } laneExpireScanData;
@@ -505,7 +570,15 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
     if (ttl < 0) {
         robj *unlinked = dbUnlinkExpiredInLane(d->db, val, didx);
         if (unlinked) {
-            maintLogExpired(d->tid, unlinked, d->db->id, didx);
+            if (lane_expire_free_inline) {
+                /* No observer and no propagation: the lane frees the value itself. freeValueNeverOnMain
+                 * drops a reference for a value still pinned by an in-flight reply (refcount > 1) and
+                 * frees it here otherwise; main does no per-key work for this key. */
+                freeValueNeverOnMain(NULL, unlinked, d->db->id);
+                d->freed++;
+            } else {
+                maintLogExpired(d->tid, unlinked, d->db->id, didx);
+            }
             d->expired++;
         }
     } else if (ttl > 0) {
@@ -513,6 +586,19 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
         d->ttl_samples++;
     }
     d->sampled++;
+}
+
+/* Lane stop test: the phase has used its budget once the elapsed phase time plus the estimated replay of
+ * every key logged so far (serial on main) reaches the whole-phase budget. table_start is this table
+ * call's start, used only as a per-thread safety ceiling so one lane cannot monopolize the phase when the
+ * shared bound is loose (e.g. a stale replay estimate). */
+static int maintExpireBudgetSpent(uint64_t per_thread_ceiling_us, monotime table_start) {
+    if (lane_expire_budget_us == 0) return elapsedUs(table_start) >= per_thread_ceiling_us;
+    unsigned long logged = atomic_load_explicit(&lane_expire_logged, memory_order_relaxed);
+    double projected = (double)elapsedUs(lane_expire_phase_start) + (double)logged * lane_expire_replay_us;
+    if (projected >= (double)lane_expire_budget_us) return 1;
+    /* Safety ceiling: no single lane runs past the whole-phase budget on one table. */
+    return elapsedUs(table_start) >= lane_expire_budget_us;
 }
 
 uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit) {
@@ -524,7 +610,9 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
     unsigned long long *cursor = &lane_expire_cursor[db->id * lane_expire_tables + didx];
     laneExpireScanData d = {.db = db, .now = now, .tid = tid};
     monotime start = getMonotonicUs();
+    if (lane_expire_free_inline) beginMaintLaneFree();
     int repeat;
+    unsigned long logged_batch = 0; /* keys logged for replay since the last publish */
     /* As one db iteration of activeExpireCycleJob, confined to this table. */
     do {
         unsigned long num = kvstoreHashtableSize(kvs, didx);
@@ -543,16 +631,27 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
         }
         sampled = d.sampled - sampled;
         expired = d.expired - expired;
+        /* Publish this batch's logged keys so other lanes see them in the shared replay bound. In
+         * free-inline mode nothing is logged, so the bound reduces to elapsed time against the budget. */
+        if (!lane_expire_free_inline) {
+            unsigned long now_logged = d.expired - logged_batch;
+            if (now_logged) {
+                atomic_fetch_add_explicit(&lane_expire_logged, now_logged, memory_order_relaxed);
+                logged_batch = d.expired;
+            }
+        }
         repeat = !done && (sampled == 0 || expired * 100 / sampled > acceptable);
-        if (repeat && elapsedUs(start) >= budget_us) {
+        if (repeat && maintExpireBudgetSpent(budget_us, start)) {
             *hit_limit = 1;
             break;
         }
     } while (repeat);
+    if (lane_expire_free_inline) endMaintLaneFree();
 
     laneExpireStats *st = &lane_expire_stats[tid];
     st->sampled += d.sampled;
     st->expired += d.expired;
+    st->freed += d.freed;
     if (*hit_limit) st->hit_limit = 1;
     if (d.ttl_samples) {
         lane_ttl_sum[tid * server.dbnum + db->id] += d.ttl_sum;
@@ -564,12 +663,19 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
 void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us) {
     UNUSED(lanes_us);
     int nthreads = stagedWorkerCount() + 1;
-    unsigned long sampled = 0, expired = 0;
+    unsigned long sampled = 0, expired = 0, freed = 0;
     int hit = 0;
     for (int t = 0; t < nthreads; t++) {
         sampled += lane_expire_stats[t].sampled;
         expired += lane_expire_stats[t].expired;
+        freed += lane_expire_stats[t].freed;
         hit |= lane_expire_stats[t].hit_limit;
+    }
+    /* Keys the lanes freed themselves get no replay, so main bulk-adds their expired and dirty counts
+     * here (the replay accounts for the rest, one by one). */
+    if (freed) {
+        server.stat_expiredkeys += freed;
+        server.dirty += freed;
     }
     lane_expire_hit_limit = hit;
     if (hit) server.stat_expired_time_cap_reached_count++;
