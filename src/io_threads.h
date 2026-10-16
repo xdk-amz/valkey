@@ -94,6 +94,12 @@ int trySendClusterWriteToIOThreads(struct clusterLink *link);
 int trySendClusterAcceptToIOThreads(connection *conn);
 int updateIOThreads(const char **err);
 int ioThreadsStagedIdle(void);
+/* Outside the staged loop: wakes for IO threads and main that block when idle. */
+void ioThreadWake(int tid);
+void ioThreadsWakeAll(void);
+void ioThreadsWakeMain(void);
+int ioThreadsMainMustPoll(void);
+void ioThreadsMainAwake(void);
 int ioThreadsInboxPending(void);
 void ioThreadsStagedUnpark(void);
 int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize);

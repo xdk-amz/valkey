@@ -31,6 +31,9 @@ static inline void cpuRelax(void) {
 #include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
 #define IO_SPMC_QUEUE_SIZE 4096
@@ -70,6 +73,77 @@ int ioThreadsReadyNum(void) {
 
 static inline int ioWorkerState(int tid) {
     return atomic_load_explicit(&io_worker_state[tid], memory_order_acquire);
+}
+
+/* Outside the staged loop an idle IO thread, and main with only offloaded clients, block instead of
+ * polling. A sleeper announces it, rechecks everything it consumes, then blocks; a publisher fences
+ * after publishing and wakes a sleeper it sees announced, so one of the two always sees the other. */
+typedef struct ioSleepSlot {
+    _Alignas(CACHE_LINE_SIZE) _Atomic int sleeping;
+    int fd; /* eventfd, readable while a wake is pending; in the thread's epoll set */
+} ioSleepSlot;
+static ioSleepSlot io_sleep[IO_THREADS_MAX_NUM];
+static ioSleepSlot main_sleep = {.sleeping = 0, .fd = -1};
+static monotime main_io_work_at = 0; /* main only: last time IO results were processed */
+
+static void ioSleepDrain(ioSleepSlot *s) {
+    uint64_t v;
+    while (read(s->fd, &v, sizeof(v)) > 0) {
+    }
+}
+
+static void ioSleepSignal(ioSleepSlot *s) {
+    if (!atomic_exchange_explicit(&s->sleeping, 0, memory_order_relaxed)) return; /* another publisher woke it */
+    uint64_t one = 1;
+    ssize_t n = write(s->fd, &one, sizeof(one));
+    UNUSED(n); /* EAGAIN means a wake is already pending */
+}
+
+/* After publishing work only thread tid consumes. */
+void ioThreadWake(int tid) {
+    atomic_thread_fence(memory_order_seq_cst);
+    ioSleepSlot *s = &io_sleep[tid];
+    if (s->fd >= 0 && atomic_load_explicit(&s->sleeping, memory_order_relaxed)) ioSleepSignal(s);
+}
+
+/* After publishing work any thread may take, or before main waits for one: wakes every sleeper. */
+void ioThreadsWakeAll(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    for (int tid = 1; tid < IO_THREADS_MAX_NUM; tid++) {
+        ioSleepSlot *s = &io_sleep[tid];
+        if (s->fd >= 0 && atomic_load_explicit(&s->sleeping, memory_order_relaxed)) ioSleepSignal(s);
+    }
+}
+
+/* IO thread, after publishing results for main. */
+void ioThreadsWakeMain(void) {
+    atomic_thread_fence(memory_order_seq_cst);
+    if (main_sleep.fd >= 0 && atomic_load_explicit(&main_sleep.sleeping, memory_order_relaxed))
+        ioSleepSignal(&main_sleep);
+}
+
+static void mainWakeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(privdata);
+    UNUSED(mask);
+    ioSleepDrain(&main_sleep);
+}
+
+static void mainWakeInit(void) {
+    if (main_sleep.fd >= 0 || server.el == NULL) return;
+    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (fd < 0) return;
+    if (aeCreateFileEvent(server.el, fd, AE_READABLE, mainWakeHandler, NULL) == AE_ERR) {
+        close(fd);
+        return;
+    }
+    main_sleep.fd = fd;
+}
+
+/* Main has processed no IO result for io-threads-idle-us. */
+static int mainIOIdle(void) {
+    return main_sleep.fd >= 0 && getMonotonicUs() - main_io_work_at >= (monotime)server.io_threads_idle_us;
 }
 
 /* QoS Swim Lanes for I/O threads
@@ -239,6 +313,7 @@ static int submitSlabJob(void *slab, int spsc_type) {
     if (spscIsFull(&io_private_inbox[tid])) return 0;
     spscEnqueue(&io_private_inbox[tid], tagJob(slab, spsc_type), true);
     io_jobs_submitted++;
+    ioThreadWake(tid);
     return 1;
 }
 
@@ -442,6 +517,7 @@ static void waitPartitionPass(int tid) {
     uint64_t seq = atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire);
     while (atomic_load_explicit(&io_epoll_seq[tid], memory_order_acquire) == seq) {
         if (io_threads[tid] == 0) break;
+        ioThreadWake(tid); /* a sleeping thread finishes its pass only when woken */
     }
 }
 
@@ -562,25 +638,32 @@ int partitionedClientClaimRead(client *c) {
     return 1;
 }
 
-/* One-shot readiness keeps a partitioned client idle until main rearms it. */
-static int ioThreadPollPartition(int id) {
+/* One-shot readiness keeps a partitioned client idle until main rearms it. With a timeout the thread
+ * sleeps here, after announcing it; wakes arrive as its eventfd. */
+static int ioThreadPollPartition(int id, int timeout_ms) {
     /* Empty polls back off briefly while inbox work continues. */
     static _Thread_local monotime next_poll_at = 0;
-    if (next_poll_at) {
+    if (timeout_ms == 0 && next_poll_at) {
         if (getMonotonicUs() < next_poll_at) return 0;
         next_poll_at = 0;
     }
     struct epoll_event evs[IO_EPOLL_BATCH];
-    int n = epoll_wait(io_epfd[id], evs, IO_EPOLL_BATCH, 0);
-    if (n == 0 && server.io_poll_backoff_us > 0) next_poll_at = getMonotonicUs() + server.io_poll_backoff_us;
+    int n = epoll_wait(io_epfd[id], evs, IO_EPOLL_BATCH, timeout_ms);
+    if (timeout_ms != 0) atomic_store_explicit(&io_sleep[id].sleeping, 0, memory_order_relaxed);
+    if (n == 0 && timeout_ms == 0 && server.io_poll_backoff_us > 0)
+        next_poll_at = getMonotonicUs() + server.io_poll_backoff_us;
     int processed = 0;
     for (int i = 0; i < n; i++) {
+        if (evs[i].data.ptr == &io_sleep[id]) {
+            ioSleepDrain(&io_sleep[id]);
+            continue;
+        }
         client *c = (client *)evs[i].data.ptr;
         if (!partitionedClientClaimRead(c)) continue;
         ioThreadReadQueryFromClient(c);
         processed++;
     }
-    if (processed) spscCommit(&io_cmd_ring[id]);
+    if (processed && spscCommit(&io_cmd_ring[id])) ioThreadsWakeMain();
     atomic_fetch_add_explicit(&io_epoll_seq[id], 1, memory_order_release);
     return processed;
 }
@@ -796,7 +879,7 @@ int getCurTid(void) {
 
 void commitIOJobs(void) {
     for (int i = 1; i < server.active_io_threads_num; i++) {
-        spscCommit(&io_private_inbox[i]);
+        if (spscCommit(&io_private_inbox[i])) ioThreadWake(i);
     }
 }
 
@@ -841,6 +924,7 @@ int ioThreadGetAffinity(int tid, void *cpuset, size_t cpusetsize) {
 void ioThreadsStagedUnpark(void) {
     for (int i = 1; i < io_ready_num; i++) ioWorkerUnpark(i);
     server.active_io_threads_num = io_ready_num;
+    ioThreadsWakeAll(); /* a sleeping thread enrolls only once it wakes */
 }
 
 /* Drains the I/O threads queue by waiting for all jobs to be processed.
@@ -855,6 +939,7 @@ void drainIOThreadsQueue(void) {
         return;
     }
     while (getPendingIOThreadsJobs()) {
+        ioThreadsWakeAll(); /* the job may wait in the shared inbox for a sleeping thread */
         atomic_thread_fence(memory_order_acquire);
     }
 }
@@ -890,7 +975,11 @@ void waitForClientIO(client *c) {
         return;
     }
 
-    /* Wait for read operation to complete if pending. */
+    /* Wait for read operation to complete if pending. A sleeping thread takes a queued job once woken. */
+    if (inMainThread() && (c->io_read_state == CLIENT_PENDING_IO || c->io_write_state == CLIENT_PENDING_IO)) {
+        commitIOJobs();
+        ioThreadsWakeAll();
+    }
     while (c->io_read_state == CLIENT_PENDING_IO) {
         atomic_thread_fence(memory_order_acquire);
     }
@@ -910,6 +999,7 @@ void IOThreadsBeforeSleep(long long current_time) {
 
     flushWriteSlab();
     commitIOJobs();
+    ioThreadsWakeAll(); /* shared-inbox jobs queued this iteration wake a sleeping thread */
 
     if (stagedLoopActive()) return; /* staged workers wait on the phase barrier; no park policy */
 
@@ -1071,6 +1161,7 @@ static void flushPendingIOResponsesList(list **pending_list, mpscQueue *outbox, 
 
         if (pushed) {
             listDelNode(*pending_list, ln);
+            ioThreadsWakeMain();
         } else {
             return;
         }
@@ -1255,6 +1346,56 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
     }
 }
 
+#define IO_SLEEP_MAX_MS 100
+
+/* Nothing the thread consumes is waiting, so only a socket event or a wake gives it work. */
+static int ioThreadMaySleep(int id) {
+    if (ioWorkerState(id) != IO_WORKER_RUNNING) return 0; /* a retiring thread keeps handing back */
+    if (stagedLoopActive()) return 0;                     /* staged workers wait at the barrier instead */
+    if (spscBacklog(&io_private_inbox[id]) > 0) return 0;
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
+        if (pending_io_responses[p]) return 0;
+        if (spmcConsumerHasItem(&io_shared_inbox[p])) return 0;
+    }
+    return 1;
+}
+
+/* Blocks until a socket event, a wake or the timeout; returns the events handled. */
+static int ioThreadSleep(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    if (s->fd < 0) return 0; /* no wake channel: keep polling */
+    atomic_store_explicit(&s->sleeping, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!ioThreadMaySleep(id)) {
+        atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+        return 0;
+    }
+    if (io_epfd[id] > 0) return ioThreadPollPartition(id, IO_SLEEP_MAX_MS);
+    struct pollfd pfd = {.fd = s->fd, .events = POLLIN};
+    poll(&pfd, 1, IO_SLEEP_MAX_MS);
+    atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+    ioSleepDrain(s);
+    return 0;
+}
+
+static void ioSleepSlotInit(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    atomic_store_explicit(&s->sleeping, 0, memory_order_relaxed);
+    s->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (s->fd < 0 || io_epfd[id] < 0) return;
+    struct epoll_event ev = {.events = EPOLLIN, .data.ptr = s};
+    if (epoll_ctl(io_epfd[id], EPOLL_CTL_ADD, s->fd, &ev) != 0) {
+        close(s->fd);
+        s->fd = -1;
+    }
+}
+
+static void ioSleepSlotFree(int id) {
+    ioSleepSlot *s = &io_sleep[id];
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1;
+}
+
 static void *IOThreadMain(void *myid) {
     /* The ID is the thread ID number (from 1 to server.io_threads_num-1). ID 0 is the main thread. */
     long id = (long)myid;
@@ -1272,6 +1413,7 @@ static void *IOThreadMain(void *myid) {
     monotime work_start_time = 0;
     uint64_t staged_seen = 0;
     uint32_t staged_gen = 0;
+    monotime idle_since = 0;
     while (1) {
         /* Cancellation point so that pthread_cancel() from main thread is honored. */
         pthread_testcancel();
@@ -1292,7 +1434,7 @@ static void *IOThreadMain(void *myid) {
         }
         processed = ioThreadDrainInboxes(id, batch_jobs);
 
-        if (io_epfd[id] > 0) processed += ioThreadPollPartition(id);
+        if (io_epfd[id] > 0) processed += ioThreadPollPartition(id, 0);
 
         /* If both queues were empty (no processing done), wait for signal. */
         if (processed == 0) {
@@ -1306,7 +1448,17 @@ static void *IOThreadMain(void *myid) {
                 /* If it is locked. We should block until main thread unlocks it. */
                 pthread_mutex_lock(&io_threads_mutex[id]);
                 pthread_mutex_unlock(&io_threads_mutex[id]);
+                monotime now = getMonotonicUs();
+                if (idle_since == 0) {
+                    idle_since = now;
+                } else if (now - idle_since >= (monotime)server.io_threads_idle_us) {
+                    processed = ioThreadSleep((int)id);
+                    idle_since = 0;
+                    work_start_time = getMonotonicUs(); /* the sleep is not active time */
+                }
             }
+        } else {
+            idle_since = 0;
         }
     }
     pthread_cleanup_pop(1);
@@ -1322,6 +1474,7 @@ static void freeIOThreadSlot(int id) {
     spscFree(&io_private_inbox[id]);
     spscFree(&io_cmd_ring[id]);
     fastpathFreeThread(id);
+    ioSleepSlotFree(id);
     if (io_epfd[id] >= 0) {
         close(io_epfd[id]);
         io_epfd[id] = -1;
@@ -1354,6 +1507,7 @@ static int createIOThread(int id) {
 
     io_epfd[id] = epoll_create1(EPOLL_CLOEXEC);
     if (io_epfd[id] < 0) serverLog(LL_WARNING, "IO thread %d: epoll_create1 failed (%s); no clients will be partitioned to it", id, strerror(errno));
+    ioSleepSlotInit(id);
 
     pthread_t tid;
     pthread_mutex_init(&io_threads_mutex[id], NULL);
@@ -1400,6 +1554,7 @@ static void shutdownIOThread(int id) {
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
     io_threads[id] = 0;
+    ioSleepSlotFree(id);
     if (io_epfd[id] >= 0) {
         close(io_epfd[id]);
         io_epfd[id] = -1;
@@ -1428,6 +1583,7 @@ void ioThreadsStopForExit(void) {
             atomic_store_explicit(&io_worker_state[id], IO_WORKER_STOPPING, memory_order_release);
         }
         ioWorkerUnpark(id);
+        ioThreadWake(id);
         any = 1;
     }
     if (!any) return;
@@ -1456,6 +1612,7 @@ static void ioWorkerRetire(int tid) {
     spscCommit(&io_private_inbox[tid]); /* the last jobs main batched for it */
     ioWorkerUnpark(tid);
     atomic_store_explicit(&io_worker_state[tid], IO_WORKER_QUIESCING, memory_order_release);
+    ioThreadWake(tid);
     unpartitionWorkerClients(tid);
 }
 
@@ -1476,7 +1633,10 @@ static void ioThreadsInitShared(void) {
     server.active_io_threads_num = 1; /* We start with threads not active. */
     server.io_poll_state = AE_IO_STATE_NONE;
     server.io_ae_fired_events = 0;
-    for (int i = 0; i < IO_THREADS_MAX_NUM; i++) io_epfd[i] = -1;
+    for (int i = 0; i < IO_THREADS_MAX_NUM; i++) {
+        io_epfd[i] = -1;
+        io_sleep[i].fd = -1;
+    }
     for (int p = 0; p < JOB_PRIORITY_COUNT; p++) {
         spmcInit(&io_shared_inbox[p], IO_SPMC_QUEUE_SIZE);
         mpscInit(&io_shared_outbox[p], IO_MPSC_QUEUE_SIZE);
@@ -1485,6 +1645,7 @@ static void ioThreadsInitShared(void) {
     atomic_init(&io_jobs_finished, 0);
     cluster_io_pending_responses = 0;
     prefetchCommandsBatchInit();
+    mainWakeInit();
     io_threads_initialized = 1;
 }
 
@@ -1515,6 +1676,7 @@ static int ioThreadsConvergeOnce(int teardown) {
         if (st == IO_WORKER_QUIESCING) {
             if (ioWorkerDrained(tid)) {
                 atomic_store_explicit(&io_worker_state[tid], IO_WORKER_STOPPING, memory_order_release);
+                ioThreadWake(tid);
             }
             pending = 1;
             continue;
@@ -2211,6 +2373,9 @@ void trySendPollJobToIOThreads(void) {
         return;
     }
 
+    /* An idle main blocks in its own poll; the threads wake it when results land. */
+    if (mainIOIdle()) return;
+
     /* If the IO thread is already processing poll events, don't send another job. */
     if (server.io_poll_state != AE_IO_STATE_NONE) {
         return;
@@ -2257,7 +2422,9 @@ void sendToMainThread(void *data, int type) {
             pending_io_responses[qidx] = listCreate();
         }
         listAddNodeTail(pending_io_responses[qidx], job);
+        return;
     }
+    ioThreadsWakeMain();
 }
 
 static void ioThreadAccept(client *c) {
@@ -2479,5 +2646,36 @@ int processIOThreadsResponses(void) {
     }
     flushWriteSlab();
     io_responses_depth--;
+    if (total_processed) main_io_work_at = getMonotonicUs();
     return total_processed;
+}
+
+static int ioThreadsMainHasWork(void) {
+    for (int p = 0; p < JOB_PRIORITY_COUNT; p++)
+        if (mpscConsumerHasItem(&io_shared_outbox[p])) return 1;
+    for (int tid = 1; tid < io_worker_hwm; tid++)
+        if (io_cmd_ring[tid].buffer && spscBacklog(&io_cmd_ring[tid]) > 0) return 1;
+    return 0;
+}
+
+/* beforeSleep, as the last step outside the staged loop: whether the event loop must poll without
+ * blocking because IO threads may publish results it does not watch. After io-threads-idle-us without
+ * results main announces sleep instead, and a thread that publishes for it then wakes it. */
+int ioThreadsMainMustPoll(void) {
+    if (stagedLoopActive() || getPendingIOResponsesCount() == 0) return 0;
+    if (!mainIOIdle() || server.io_poll_state != AE_IO_STATE_NONE) return 1;
+    /* Reads and writes that could not be offloaded are retried on the next pass. */
+    if (listLength(server.clients_pending_read) || listLength(server.clients_pending_write)) return 1;
+    atomic_store_explicit(&main_sleep.sleeping, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);
+    if (ioThreadsMainHasWork()) {
+        atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
+        return 1;
+    }
+    return 0;
+}
+
+/* afterSleep */
+void ioThreadsMainAwake(void) {
+    atomic_store_explicit(&main_sleep.sleeping, 0, memory_order_relaxed);
 }

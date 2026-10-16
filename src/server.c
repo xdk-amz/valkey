@@ -2221,6 +2221,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     ioThreadsConverge();
     IOThreadsBeforeSleep(current_time);
 
+    /* Outside the staged loop, results of offloaded clients arrive on rings the event loop does not
+     * watch, so main polls without blocking until it has been idle a while; then the IO threads wake it. */
+    if (ioThreadsMainMustPoll()) aeSetDontWait(server.el, 1);
+
     /* Before we are going to sleep, let the threads access the dataset by
      * releasing the GIL. The server main thread will not touch anything at this
      * time. */
@@ -2257,6 +2261,7 @@ void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
         }
         /* Set the eventloop start time. */
         server.el_start = getMonotonicUs();
+        ioThreadsMainAwake();
         /* Reset iteration work flag */
         server.el_iteration_active = (numevents > 0);
         /* Set the eventloop command count at start. */

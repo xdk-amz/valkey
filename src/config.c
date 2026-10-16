@@ -3596,6 +3596,7 @@ standardConfig static_configs[] = {
     createIntConfig("prefetch-ring-stride", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.prefetch_ring_stride, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-ring-coalesce-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 10000, server.io_ring_coalesce_us, 0, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("auto-aof-rewrite-percentage", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.aof_rewrite_perc, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("cluster-replica-validity-factor", "cluster-slave-validity-factor", MODIFIABLE_CONFIG, 0, INT_MAX, server.cluster_replica_validity_factor, 10, INTEGER_CONFIG, NULL, NULL), /* replica max data age factor. */
