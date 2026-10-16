@@ -45,6 +45,7 @@ typedef struct cmdEntry {
     uint32_t reply_big_len;
     uint8_t resp;
     uint8_t requeued;     /* Main did not execute it; the IO thread hands it back for the main path. */
+    uint8_t readonly;     /* The client sent READONLY: a cluster replica serves its reads. */
     CommandOrigin origin; /* Written by the IO thread with the entry; main reads it only to attribute events. */
 } cmdEntry;
 

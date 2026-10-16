@@ -10,6 +10,7 @@
 #include "fastget.h"
 #include "io_threads.h"
 #include "module.h"
+#include "cluster.h"
 
 #include <string.h>
 #include <stdatomic.h>
@@ -125,6 +126,24 @@ typedef struct fastGetBatchEntry {
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
 } fastGetBatchEntry;
 
+/* IO thread, read phase: this node serves a GET on the slot for client c with no redirect or cluster
+ * error. getNodeByQuery reads the command and slot from the client, so they are set for the call. */
+static int fastGetClusterServes(client *c, struct serverCommand *cmd, int slot, int read_flags) {
+    if (slot < 0 || (read_flags & (READ_FLAGS_CROSSSLOT | READ_FLAGS_NO_KEYS))) return 0;
+    if (getMigratingSlotDest(slot) != NULL || getImportingSlotSource(slot) != NULL) return 0;
+    struct serverCommand *saved_cmd = c->cmd;
+    int saved_slot = c->slot, saved_flags = c->read_flags;
+    c->cmd = cmd;
+    c->slot = slot;
+    c->read_flags = read_flags;
+    int err = CLUSTER_REDIR_NONE;
+    clusterNode *n = getNodeByQuery(c, &err);
+    c->cmd = saved_cmd;
+    c->slot = saved_slot;
+    c->read_flags = saved_flags;
+    return n != NULL && clusterNodeIsMyself(n) && err == CLUSTER_REDIR_NONE;
+}
+
 /* The commandlog threshold of a type, or -1 while that log records nothing. */
 static long long fastGetCommandlogThreshold(int type) {
     if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
@@ -206,8 +225,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
 int fastGetSpeculateBatch(client *c, int tid) {
     int speculated = 0;
 
-    /* Not with a single thread or in cluster mode. */
-    if (server.io_threads_num <= 1 || server.cluster_enabled) return 0;
+    if (server.io_threads_num <= 1) return 0;
 
     /* io-threads-speculation-replica-only: only a replica answers GETs on IO threads. */
     if (server.io_threads_speculation_replica_only && server.primary_host == NULL) return 0;
@@ -239,6 +257,11 @@ int fastGetSpeculateBatch(client *c, int tid) {
     static struct serverCommand *fastget_get_cmd = NULL;
     if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
     if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
+
+    /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
+     * cluster state main changes only outside the read phase. A slot being migrated or imported needs
+     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. */
+    if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 0;
 
     /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
     if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
@@ -278,7 +301,8 @@ int fastGetSpeculateBatch(client *c, int tid) {
         /* Fill: top the window up from the queue. */
         while (prefix_open && tail - head < FASTGET_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
-            if (p->cmd != fastget_get_cmd || p->argc != 2) {
+            if (p->cmd != fastget_get_cmd || p->argc != 2 ||
+                (server.cluster_enabled && !fastGetClusterServes(c, p->cmd, p->slot, p->read_flags))) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }

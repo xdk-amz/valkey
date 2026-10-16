@@ -182,7 +182,7 @@ static int fpSessionEligible(client *c) {
     if (!c->conn || c->flag.fake) return 0;
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
     if (authRequired(c)) return 0; /* main enforces a later default-user password change per entry */
-    if (server.cluster_enabled) return 0;
+    if (c->flag.asking) return 0; /* ASKING applies to the next command only, which main runs */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
     if (bgIteration_iterationActive()) return 0;                                        /* a forkless save may block commands on keys in use */
     if (throttle_anyThrottlers()) return 0;                                             /* a throttler may hold a command; main runs the check */
@@ -289,6 +289,7 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->read_flags = read_flags;
     e->db = c->db;
     e->resp = (uint8_t)c->resp;
+    e->readonly = c->flag.readonly;
     e->origin.client_id = c->id;
     e->origin.principal = c->user;
     e->origin.authenticated = c->flag.authenticated;
@@ -321,6 +322,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             c->argv_len_sum = 0;
             c->parsed_cmd = NULL;
             c->read_flags = 0;
+            c->slot = -1; /* the next command's slot is computed afresh */
             c->net_input_bytes_curr_cmd = 0; /* the parser accumulates; resetClient never runs for this client */
             if (t->cur->count >= max) fpSubmit(t);
         }
@@ -689,6 +691,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
     ec->acl_epoch_seen = e->origin.acl_epoch_seen;
     ec->db = e->db;
     ec->resp = e->resp;
+    ec->flag.readonly = e->readonly;
     ec->origin = &e->origin;
     ec->buf = b->arena + b->arena_used;
     ec->buf_usable_size = b->arena_cap - b->arena_used;
