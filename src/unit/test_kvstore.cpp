@@ -228,3 +228,124 @@ TEST_F(KvstoreTest, kvstoreHashtableExpand) {
 
     kvstoreRelease(kvs);
 }
+
+/* Apply the same per-table operations serially (reference) and concurrently (N threads over
+ * disjoint tables, then kvstoreReconcile), and assert every kvstore-wide aggregate matches. */
+extern "C" {
+#include <pthread.h>
+}
+
+namespace {
+struct LaneArg {
+    kvstore *kvs;
+    int first_didx;
+    int last_didx;
+    int keys_per_table;
+};
+
+/* Each key is "<didx>:<n>"; adding by didx keeps a thread on its own tables. */
+char *tableKey(int didx, int n) {
+    char buf[48];
+    int len = snprintf(buf, sizeof(buf), "%d:%d", didx, n);
+    char *s = (char *)zmalloc(len + 1);
+    memcpy(s, buf, len + 1);
+    return s;
+}
+
+/* Insert keys_per_table keys into each owned table, delete every third, then rehash to completion. */
+void runTableWork(kvstore *kvs, int first, int last, int kpt) {
+    for (int didx = first; didx <= last; didx++) {
+        for (int n = 0; n < kpt; n++) kvstoreHashtableAdd(kvs, didx, tableKey(didx, n));
+        for (int n = 0; n < kpt; n += 3) {
+            void *popped = nullptr;
+            char *k = tableKey(didx, n);
+            if (kvstoreHashtablePop(kvs, didx, k, &popped)) zfree(popped);
+            zfree(k);
+        }
+        kvstoreTryResizeHashtable(kvs, didx);
+        while (kvstoreRehashHashtable(kvs, didx, 1000) > 0) {
+        }
+    }
+}
+
+void *laneThread(void *arg) {
+    LaneArg *a = (LaneArg *)arg;
+    runTableWork(a->kvs, a->first_didx, a->last_didx, a->keys_per_table);
+    return nullptr;
+}
+} /* namespace */
+
+TEST_F(KvstoreTest, kvstoreConcurrentReconcileMatchesSerial) {
+    const int bits = 3; /* 8 tables */
+    const int ntables = 1 << bits;
+    const int nthreads = 4;
+    const int kpt = 500;
+
+    kvstore *serial = kvstoreCreate(&KvstoreHashtableTestType, bits, KVSTORE_FREE_EMPTY_HASHTABLES);
+    kvstore *conc = kvstoreCreate(&KvstoreHashtableTestType, bits, KVSTORE_FREE_EMPTY_HASHTABLES);
+
+    /* Reference: do all tables serially on main. */
+    runTableWork(serial, 0, ntables - 1, kpt);
+
+    /* Concurrent: nthreads each own a contiguous, disjoint band of tables. */
+    kvstoreSetConcurrent(1);
+    pthread_t th[nthreads];
+    LaneArg args[nthreads];
+    int per = ntables / nthreads;
+    for (int t = 0; t < nthreads; t++) {
+        args[t] = LaneArg{conc, t * per, (t + 1) * per - 1, kpt};
+        ASSERT_EQ(pthread_create(&th[t], nullptr, laneThread, &args[t]), 0);
+    }
+    for (int t = 0; t < nthreads; t++) pthread_join(th[t], nullptr);
+    kvstoreSetConcurrent(0);
+    kvstoreReconcile(conc);
+
+    /* Kvstore-wide aggregates must be identical. */
+    ASSERT_EQ(kvstoreSize(conc), kvstoreSize(serial));
+    ASSERT_EQ(kvstoreBuckets(conc), kvstoreBuckets(serial));
+    ASSERT_EQ(kvstoreNumNonEmptyHashtables(conc), kvstoreNumNonEmptyHashtables(serial));
+    ASSERT_EQ(kvstoreNumAllocatedHashtables(conc), kvstoreNumAllocatedHashtables(serial));
+    ASSERT_EQ(kvstoreHashtableRehashingCount(conc), kvstoreHashtableRehashingCount(serial));
+    ASSERT_EQ(kvstoreOverheadHashtableLut(conc), kvstoreOverheadHashtableLut(serial));
+    ASSERT_EQ(kvstoreOverheadHashtableRehashing(conc), kvstoreOverheadHashtableRehashing(serial));
+
+    /* Fenwick index: every cumulative lookup resolves to the same table in both. */
+    for (unsigned long target = 1; target <= kvstoreSize(serial); target += 7) {
+        ASSERT_EQ(kvstoreFindHashtableIndexByKeyIndex(conc, target),
+                  kvstoreFindHashtableIndexByKeyIndex(serial, target));
+    }
+    /* Per-table sizes match. */
+    for (int didx = 0; didx < ntables; didx++) {
+        ASSERT_EQ(kvstoreHashtableSize(conc, didx), kvstoreHashtableSize(serial, didx));
+    }
+
+    kvstoreRelease(serial);
+    kvstoreRelease(conc);
+}
+
+/* A table emptied entirely in concurrent mode is deferred-freed by reconcile, not by the lane. */
+TEST_F(KvstoreTest, kvstoreConcurrentDeferredEmptyFree) {
+    const int bits = 2; /* 4 tables */
+    kvstore *kvs = kvstoreCreate(&KvstoreHashtableTestType, bits, KVSTORE_FREE_EMPTY_HASHTABLES);
+    for (int didx = 0; didx < 4; didx++)
+        for (int n = 0; n < 50; n++) kvstoreHashtableAdd(kvs, didx, tableKey(didx, n));
+
+    kvstoreSetConcurrent(1);
+    for (int n = 0; n < 50; n++) {
+        void *popped = nullptr;
+        char *k = tableKey(0, n);
+        if (kvstoreHashtablePop(kvs, 0, k, &popped)) zfree(popped);
+        zfree(k);
+    }
+    /* The lane did not free table 0: it still exists until reconcile. */
+    ASSERT_NE(kvstoreGetHashtable(kvs, 0), nullptr);
+    ASSERT_EQ(kvstoreHashtableSize(kvs, 0), 0u);
+    kvstoreSetConcurrent(0);
+    kvstoreReconcile(kvs);
+
+    ASSERT_EQ(kvstoreGetHashtable(kvs, 0), nullptr);
+    ASSERT_EQ(kvstoreNumNonEmptyHashtables(kvs), 3);
+    ASSERT_EQ(kvstoreSize(kvs), 150u);
+
+    kvstoreRelease(kvs);
+}
