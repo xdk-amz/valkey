@@ -1136,6 +1136,21 @@ static void fpStreamPrefetchWindow(fpThread **ts, fpStreamCursor *cur, int n, in
     prefetchBatchReset();
 }
 
+/* After a chunk is published, open a fresh-line gap in the batch arena so the next reply main
+ * writes starts at least staged-stream-arena-guard bytes past the published end, on a 64-byte
+ * boundary. A STREAM worker reading the published chunk and its prefetcher then never touch the
+ * line main writes next. The skipped bytes are wasted arena; account them. A reply that no longer
+ * fits spills to the heap exactly as without the guard. No-op when the guard is 0. */
+static void fpStreamArenaGuard(cmdBatch *b) {
+    int guard = server.staged_stream_arena_guard;
+    if (guard <= 0) return;
+    size_t want = b->arena_used + (size_t)guard;
+    want = (want + 63) & ~(size_t)63; /* round up to a 64-byte line */
+    if (want >= b->arena_cap) return; /* no room: the next reply spills as usual */
+    server.stat_staged_stream_arena_guard_bytes += (long long)(want - b->arena_used);
+    b->arena_used = want;
+}
+
 /* Main, write phase (exec/loop overlap): execute runs round-robin across threads, publishing each
  * batch's executed count as runs finish, so STREAM workers can deliver them while main runs on. */
 int fastpathStagedExecuteStreaming(void) {
@@ -1196,6 +1211,7 @@ int fastpathStagedExecuteStreaming(void) {
                 }
                 if (pubb[i] && turn > 0) {
                     fpStreamPublish(pubb[i], cur[i].ei);
+                    fpStreamArenaGuard(pubb[i]);
                     acc[i] = 0;
                 }
             }
@@ -1223,6 +1239,7 @@ int fastpathStagedExecuteStreaming(void) {
                 /* Publish a chunk's worth at a run boundary (cur[i].ei always is one). */
                 if (acc[i] >= chunk) {
                     fpStreamPublish(b, cur[i].ei);
+                    fpStreamArenaGuard(b);
                     acc[i] = 0;
                 }
                 progressed = 1;
