@@ -2072,6 +2072,7 @@ struct valkeyServer {
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
     int staged_stream_chunk;                  /* Staged loop: entries main executes between executed publishes while streaming. */
     int staged_stream_order;                  /* Staged loop: STREAM execution order, see STAGED_STREAM_ORDER_* */
+    int staged_stream_arena_guard;            /* Staged loop: bytes of fresh-line gap left after a published chunk (0 = off). */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
@@ -2178,6 +2179,7 @@ struct valkeyServer {
     long long stat_io_accept_offloaded;                /* Number of offloaded accepts */
     long long stat_io_primary_drain_jobs;              /* IO-thread reads that drained the primary link */
     long long stat_io_primary_drain_bytes;             /* Bytes read by those drained reads */
+    long long stat_staged_stream_arena_guard_bytes;    /* Arena bytes skipped as guard gaps after published chunks. */
     long long stat_strict_deferred_reads;              /* Strict offload: client reads deferred off main to the retry FIFO */
     long long stat_poll_processed_by_io_threads;       /* Total number of poll jobs processed by IO */
     long long stat_total_reads_processed;              /* Total number of read events processed */

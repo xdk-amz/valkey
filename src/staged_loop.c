@@ -66,6 +66,8 @@ static void stagedAccountPhase(int phase, int nworkers) {
 void stagedInfo(char **info) {
     sds s = *info;
     s = sdscatprintf(s, "staged_iterations:%llu\r\n", (unsigned long long)sl_iterations);
+    s = sdscatprintf(s, "staged_stream_arena_guard_bytes:%lld\r\n",
+                     (long long)server.stat_staged_stream_arena_guard_bytes);
     for (int i = 0; i < SL_T_COUNT; i++)
         s = sdscatprintf(s, "staged_main_%s_us:%llu\r\n", sl_t_names[i], (unsigned long long)(sl_main_ns[i] / 1000));
     for (int p = 1; p < STAGED_PHASE_KINDS; p++) {
