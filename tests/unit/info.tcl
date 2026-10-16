@@ -528,7 +528,8 @@ start_server {tags {"info" "external:skip" "debug_defrag:skip"}} {
     }
 }
 
-start_server {tags {"info" "external:skip"}} {
+# Measures the single main hashtable of a db, so keep the keyspace unsharded.
+start_server {tags {"info" "external:skip"} overrides {keyspace-shard-bits 0}} {
     test {memory: database and pubsub overhead and rehashing dict count} {
         r flushall
         set info_mem [r info memory]
