@@ -17,6 +17,7 @@
  * per-unit code runs inline on main. */
 
 #include <stdint.h>
+#include "sds.h"
 
 /* Jobs a cron can request for the next MAINT phase. */
 #define MAINT_JOB_REHASH 0
@@ -40,6 +41,14 @@ int maintParallelReady(void);
 
 /* Lane: record a value the lane unlinked as expired; main replays its delete after the phase. */
 void maintLogExpired(int tid, struct serverObject *val, int dbid, int didx);
+
+/* Lane (propagate-only mode): record an expensive-to-free value for main to free after the phase without
+ * replaying its effects; its DEL/UNLINK was already recorded with maintLogPropagate. */
+void maintLogExpiredFreeOnly(int tid, struct serverObject *val, int dbid, int didx);
+
+/* Lane (propagate-only mode): record an expired key whose DEL/UNLINK main feeds to the AOF and replicas
+ * after the phase. key_copy is owned by the log and freed by main once fed. */
+void maintLogPropagate(int tid, sds key_copy, int dbid, int lazy);
 
 /* Main: a MAINT job is pending for this iteration. */
 int maintPending(void);
