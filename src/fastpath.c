@@ -1086,8 +1086,10 @@ static cmdBatch *fpStreamRunAt(fpThread *t, fpStreamCursor *c, int d) {
     return NULL;
 }
 
-/* Execute the one run of client b->e[c->ei] starting at the cursor, publish b->executed at its end,
- * and move the cursor past it. Prefetch is done by the caller window. */
+/* Execute the one run of client b->e[c->ei] starting at the cursor and move the cursor past it.
+ * The caller publishes b->executed at chunk granularity (always on a run boundary, since a run runs
+ * whole), so a STREAM worker that reads executed with acquire sees every reply byte of the runs in
+ * [prev published, executed). Prefetch is done by the caller window. */
 static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c) {
     int from = c->ei;
     client *cl = b->e[from].c;
@@ -1096,9 +1098,14 @@ static void fpStreamExecRun(client *ec, cmdBatch *b, fpStreamCursor *c) {
         fpExecute(ec, b, &b->e[j]);
         j++;
     }
-    /* Release so a STREAM worker that reads executed with acquire sees every reply byte of this run. */
-    atomic_store_explicit(&b->executed, j, memory_order_release);
     c->ei = j;
+}
+
+/* Publish b->executed up to the executor cursor with a release store, so the STREAM worker can
+ * deliver the newly finished runs. Skipped when nothing new finished since the last publish. */
+static void fpStreamPublish(cmdBatch *b, int upto) {
+    if (upto > atomic_load_explicit(&b->executed, memory_order_relaxed))
+        atomic_store_explicit(&b->executed, upto, memory_order_release);
 }
 
 /* Prefetch a window of up to prefetch-batch-max-size entries, in the same round-robin run order the
@@ -1163,6 +1170,15 @@ int fastpathStagedExecuteStreaming(void) {
     }
     if (n == 0) return 0;
 
+    int chunk = server.staged_stream_chunk;
+    if (chunk < 1) chunk = 1;
+    cmdBatch *pubb[IO_THREADS_MAX_NUM]; /* batch each thread is currently publishing into */
+    int acc[IO_THREADS_MAX_NUM];        /* entries executed in that batch since its last publish */
+    for (int i = 0; i < n; i++) {
+        pubb[i] = NULL;
+        acc[i] = 0;
+    }
+
     while (!fpStreamDone(ts, cur, n, d)) {
         if (use_prefetch && !paused) fpStreamPrefetchWindow(ts, cur, n, d, window);
         for (int w = 0; w < window;) {
@@ -1170,15 +1186,32 @@ int fastpathStagedExecuteStreaming(void) {
             for (int i = 0; i < n && w < window; i++) {
                 cmdBatch *b = fpStreamRunAt(ts[i], &cur[i], d);
                 if (!b) continue;
+                /* A new batch for this thread: finish publishing the previous one so no run is left
+                 * unpublished behind the cursor, then start accounting the new batch. */
+                if (b != pubb[i]) {
+                    if (pubb[i]) fpStreamPublish(pubb[i], pubb[i]->count);
+                    pubb[i] = b;
+                    acc[i] = 0;
+                }
                 int before = cur[i].ei;
                 fpStreamExecRun(ecs[i], b, &cur[i]);
-                w += cur[i].ei - before;
-                total += cur[i].ei - before;
+                int ran = cur[i].ei - before;
+                acc[i] += ran;
+                w += ran;
+                total += ran;
+                /* Publish a chunk's worth at a run boundary (cur[i].ei always is one). */
+                if (acc[i] >= chunk) {
+                    fpStreamPublish(b, cur[i].ei);
+                    acc[i] = 0;
+                }
                 progressed = 1;
             }
             if (!progressed) break;
         }
     }
+    /* Publish whatever each thread's last batch has left; stagedStreamClose then drains the workers. */
+    for (int i = 0; i < n; i++)
+        if (pubb[i]) fpStreamPublish(pubb[i], pubb[i]->count);
     for (int i = 0; i < n; i++) {
         ecs[i]->origin = NULL;
         clientSetUser(ecs[i], DefaultUser, 0); /* never keep a principal that may retire */

@@ -2073,6 +2073,7 @@ struct valkeyServer {
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */
     int io_threads_fast_path;                 /* Fast path enabled for new TCP clients */
     int staged_reply_overlap;                 /* Staged loop: overlap reply delivery with exec, see STAGED_REPLY_OVERLAP_* */
+    int staged_stream_chunk;                  /* Staged loop: entries main executes between executed publishes while streaming. */
     int acl_offload;                          /* acl-offload: evaluate ACL permissions on IO threads (fast path). */
     int io_threads_speculation_replica_only;  /* Speculate reads on IO threads only while this server is a replica. */
     int io_ring_coalesce_us;                  /* Command ring: spin up to this long for a fuller batch before draining a thin ring (0 = off) */
