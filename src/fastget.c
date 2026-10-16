@@ -260,7 +260,9 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
     /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
      * cluster state main changes only outside the read phase. A slot being migrated or imported needs
-     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. */
+     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. With per-slot stats on,
+     * main runs every GET so the stats count it. */
+    if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 0;
     if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 0;
 
     /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */

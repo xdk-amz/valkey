@@ -68,7 +68,7 @@ proc cluster_get_node_by_slot {idx slot} {
     fail "slot $slot not served"
 }
 
-start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:skip} overrides {io-threads 3}} {
+start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:skip} overrides {io-threads 3 cluster-slot-stats-enabled no}} {
 
     test {Staged loop runs in cluster mode} {
         wait_for_cluster_state ok
@@ -181,6 +181,25 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
         set fd [scl_socket 0]
         set r [scl_pipeline $fd [list [list MSET "{a}1" x "{b}2" y] [list MGET "{a}1" "{b}2"]]]
         foreach x $r { assert_match {-CROSSSLOT *} $x }
+        close $fd
+    }
+
+    test {Fast path: CLUSTER SLOT-STATS counts every fast-path GET} {
+        set p [srv 0 client]
+        $p config set cluster-slot-stats-enabled yes
+        $p config resetstat
+        $p set $local counted
+        set slot [$p cluster keyslot $local]
+        set fd [scl_socket 0]
+        assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
+        wait_for_condition 100 20 {[scl_fastpath_clients 0] >= 1} else { fail "client did not join the fast path" }
+        set cmds {}
+        for {set i 0} {$i < 20} {incr i} { lappend cmds [list GET $local] }
+        foreach r [scl_pipeline $fd $cmds] { assert_equal counted $r }
+        set stats [lindex [$p cluster slot-stats slotsrange $slot $slot] 0 1]
+        assert {[dict get $stats network-bytes-in] >= 20 * [string length [scl_resp GET $local]]}
+        assert {[dict get $stats network-bytes-out] >= 20 * [string length "\$7\r\ncounted\r\n"]}
+        $p config set cluster-slot-stats-enabled no
         close $fd
     }
 }
