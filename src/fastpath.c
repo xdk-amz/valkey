@@ -8,6 +8,7 @@
 #include "fastpath_no_epoll.h"
 #include "poller.h"
 #include "staged_loop.h"
+#include "module.h"
 #include <sys/uio.h>
 
 extern int ProcessingEventsWhileBlocked; /* networking.c */
@@ -230,6 +231,9 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
     if (cmd->flags & (CMD_BLOCKING | CMD_PUBSUB | CMD_ADMIN | CMD_NOSCRIPT | CMD_NO_MULTI | CMD_NO_ASYNC_LOADING |
                       CMD_ALLOW_BUSY | CMD_TOUCHES_ARBITRARY_KEYS))
         return 0;
+    /* A module command or a module keyspace subscriber may block the client running the command, which
+     * an executor cannot be. Main changes both only between phases. */
+    if (cmd->module_cmd || moduleHasKeyspaceSubscribers()) return 0;
     return 1;
 }
 
@@ -339,6 +343,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
             c->argv = p->argv, c->argc = p->argc, c->argv_len = p->argv_len, c->argv_len_sum = p->argv_len_sum;
             c->net_input_bytes_curr_cmd = p->input_bytes, c->parsed_cmd = p->cmd, c->slot = p->slot;
             c->read_flags |= p->read_flags;
+            if (q->off == q->len) q->off = q->len = 0; /* an emptied queue reads as empty to the parser */
         }
         fpBeginLeave(t, c, FP_LEAVING);
         return;
@@ -818,7 +823,6 @@ void fastpathHandoffDone(client *c, int closing) {
         return;
     }
     if (c->flag.close_asap) return; /* the returned replies passed the output buffer limit */
-    int authenticating = c->parsed_cmd && (c->parsed_cmd->proc == authCommand || c->parsed_cmd->proc == helloCommand);
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED) && !(c->read_flags & READ_FLAGS_ERROR_MASK))
         c->flag.pending_command = 1;
     if (c->read_flags & READ_FLAGS_ERROR_MASK) {
@@ -826,13 +830,14 @@ void fastpathHandoffDone(client *c, int closing) {
         return;
     }
     if (processPendingCommandAndInputBuffer(c) != C_OK) return;
-    if (authenticating || c->flag.fp_readmit) {
-        if (!fp_staged_admit) {
-            c->flag.fp_readmit = 1; /* no admission while staged mode is off: rejoins when it starts */
-        } else {
-            c->flag.fp_readmit = 0;
-            if (fpReadmit(c)) return;
-        }
+    /* The command that sent it to main does not keep it there: it rejoins once main has nothing further
+     * to do for it and it is still eligible. */
+    if (!fp_staged_admit) {
+        c->flag.fp_readmit = 1; /* no admission while staged mode is off: rejoins when it starts */
+    } else {
+        c->flag.fp_readmit = 0;
+        if (fpReadmit(c)) return;
+        c->flag.fp_readmit = 1; /* not quiescent yet: beforeNextClient retries */
     }
     beforeNextClient(c);
 }
