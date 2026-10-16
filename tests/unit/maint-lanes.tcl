@@ -82,5 +82,29 @@ start_server {tags {"maint external:skip tls:skip"} overrides {
             assert {[getInfoProperty [r info cronstats] cron_rehash] ne ""}
         }
     }
+
+    test "MAINT ($lanes): FLUSHDB ASYNC frees a large database while phases run on another" {
+        r config set hz 100
+        r config resetstat
+        for {set i 0} {$i < 4} {incr i} {
+            # db 0 holds keys expiring over the next second, so MAINT phases run back to back while
+            # the bio thread releases db 9's old keyspace.
+            r select 0
+            r eval {for i=1,200000 do redis.call('set', 'v:'..i, i, 'px', 300 + i % 700) end return 1} 0
+            r select 9
+            r debug populate 1000000 big: 16
+            after 300
+            r flushdb async
+            assert_equal 0 [r dbsize]
+            wait_for_condition 100 50 {[status r lazyfree_pending_objects] == 0} else { fail "lazyfree did not drain" }
+            r select 0
+            wait_for_condition 100 50 {[r dbsize] == 0} else { fail "db 0 keys did not expire" }
+            r select 9
+        }
+        r debug populate 1000 after: 16
+        assert_equal 1000 [r dbsize]
+        assert_match "*db9:keys=1000*" [r info keyspace]
+        r config set hz 10
+    }
 }
 }
