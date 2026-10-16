@@ -569,6 +569,32 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
  * owns the table. The four observers inside dbGenericDeleteWithDictIndex do not apply: bgIteration and
  * module listeners keep expire off the lanes, hot keys ignore expiry, and the ready-key signal is
  * replayed. */
+/* Main, around a lane phase: threads may mutate distinct tables of every live database's kvstores.
+ * Databases created later and databases a bio thread is releasing are not in concurrent mode. */
+void dbLanePhaseBegin(void) {
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (!db) continue;
+        kvstoreSetConcurrent(db->keys, 1);
+        kvstoreSetConcurrent(db->expires, 1);
+        kvstoreSetConcurrent(db->keys_with_volatile_items, 1);
+    }
+}
+
+/* Main, after the threads joined: end concurrent mode and fold each touched table's changes into its
+ * kvstore. */
+void dbLanePhaseEnd(void) {
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (!db) continue;
+        kvstore *kvs[3] = {db->keys, db->expires, db->keys_with_volatile_items};
+        for (int k = 0; k < 3; k++) {
+            kvstoreSetConcurrent(kvs[k], 0);
+            kvstoreReconcile(kvs[k]);
+        }
+    }
+}
+
 robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index) {
     sds key = objectGetKey(val);
     hashtablePosition pos;

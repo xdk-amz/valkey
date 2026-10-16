@@ -277,23 +277,16 @@ void maintRun(void) {
     }
 
     monotime phase_t0 = getMonotonicUs();
-    kvstoreSetConcurrent(1);
+    dbLanePhaseBegin();
     if (parallel) {
         stagedRunLanePhase(STAGED_PHASE_MAINT, mt_nlanes > 1 || !stagedMainTakesLane());
     } else {
         maintLane(0);
     }
-    kvstoreSetConcurrent(0);
     uint64_t lanes_us = getMonotonicUs() - phase_t0;
 
     monotime rec_t0 = getMonotonicUs();
-    for (int dbid = 0; dbid < server.dbnum; dbid++) {
-        serverDb *db = server.db[dbid];
-        if (!db) continue;
-        kvstoreReconcile(db->keys);
-        kvstoreReconcile(db->expires);
-        kvstoreReconcile(db->keys_with_volatile_items);
-    }
+    dbLanePhaseEnd();
     cronStatsRecord(CRON_JOB_SC_RECONCILE, getMonotonicUs() - rec_t0);
 
     maintReplay();

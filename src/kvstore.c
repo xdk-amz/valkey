@@ -58,22 +58,17 @@
 
 static hashtable *kvstoreIteratorNextHashtable(kvstoreIterator *kvs_it);
 
-/* While set, threads may mutate different hashtables of the same kvstore at once. Each table then
- * records its own count, bucket, overhead and rehash changes into its metadata; main folds them
- * into the kvstore-wide fields with kvstoreReconcile after the threads join. No lock is taken. */
-static _Atomic int kvs_concurrent = 0;
-
-void kvstoreSetConcurrent(int on) {
-    atomic_store_explicit(&kvs_concurrent, on, memory_order_relaxed);
-}
-
-static inline int kvstoreConcurrent(void) {
-    return atomic_load_explicit(&kvs_concurrent, memory_order_relaxed);
-}
+/* Concurrent mode is set per kvstore, by main, around a lane phase that mutates that kvstore: while set,
+ * threads may mutate different hashtables of it at once. Each table then records its own count,
+ * bucket, overhead and rehash changes into its metadata; main folds them into the kvstore-wide fields
+ * with kvstoreReconcile after the threads join. No lock is taken. A kvstore outside the phase, such as
+ * a database a bio thread is releasing after FLUSHALL ASYNC or a full resync, keeps updating its own
+ * fields directly. */
+#define kvstoreConcurrent(kvs) atomic_load_explicit(&(kvs)->concurrent, memory_order_relaxed)
 
 /* A kvstore-wide aggregate must not be read while threads are mutating tables; main reads it only
  * after kvstoreReconcile. */
-#define KVS_ASSERT_SERIAL() assert(!kvstoreConcurrent())
+#define KVS_ASSERT_SERIAL(kvs) assert(!kvstoreConcurrent(kvs))
 
 struct _kvstore {
     int flags;
@@ -93,6 +88,9 @@ struct _kvstore {
     size_t overhead_hashtable_rehashing;      /* Overhead of hash tables rehashing in bytes. */
     hashtable *importing;                     /* The set of hashtable indexes that are being imported */
     unsigned long long importing_key_count;   /* Total number of importing keys in this kvstore. */
+    uint16_t *dirty_tables;                   /* Concurrent mode: indexes of tables with deltas, each once. */
+    _Atomic int dirty_count;                  /* Entries in dirty_tables. */
+    _Atomic int concurrent;                   /* Set by main around a lane phase; see kvstoreSetConcurrent. */
 };
 
 /* Structure for kvstore iterator that allows iterating across multiple hashtables. */
@@ -117,9 +115,10 @@ typedef struct {
     listNode *rehashing_node; /* list node in rehashing list */
     kvstore *kvs;
     /* Concurrent-mode deltas, written by the one thread that owns this table during a lane phase
-     * and folded into the kvstore-wide fields by kvstoreReconcile on main. dirty marks a table main
-     * must visit. */
+     * and folded into the kvstore-wide fields by kvstoreReconcile on main. dirty marks a table that
+     * is on the kvstore's list of tables main must visit. */
     int dirty;
+    int didx;                           /* this table's index in its kvstore */
     long key_delta;                     /* net key count change */
     long long bucket_delta;             /* net bucket_count change */
     ssize_t overhead_lut_delta;         /* net overhead_hashtable_lut change */
@@ -127,6 +126,20 @@ typedef struct {
     int alloc_delta;                    /* net allocated_hashtables change (table created this phase) */
     int defer_free;                     /* became empty under FREE_EMPTY_HASHTABLES; main frees it */
 } kvstoreHashtableMetadata;
+
+void kvstoreSetConcurrent(kvstore *kvs, int on) {
+    atomic_store_explicit(&kvs->concurrent, on, memory_order_relaxed);
+}
+
+/* Concurrent mode: the table has deltas for kvstoreReconcile. Only the thread that owns the table
+ * writes its metadata, so the first-touch check needs no lock; the list slot is claimed atomically. */
+static inline void kvstoreMarkDirty(kvstoreHashtableMetadata *m) {
+    if (m->dirty) return;
+    m->dirty = 1;
+    kvstore *kvs = m->kvs;
+    int i = atomic_fetch_add_explicit(&kvs->dirty_count, 1, memory_order_relaxed);
+    kvs->dirty_tables[i] = (uint16_t)m->didx;
+}
 
 hashtableType intHashtableType = {.instant_rehashing = 1};
 
@@ -156,7 +169,7 @@ static unsigned long long cumulativeKeyCountRead(kvstore *kvs, int didx) {
         assert(didx == 0);
         return kvstoreSize(kvs);
     }
-    KVS_ASSERT_SERIAL();
+    KVS_ASSERT_SERIAL(kvs);
     int idx = didx + 1;
     unsigned long long sum = 0;
     while (idx > 0) {
@@ -188,11 +201,11 @@ int kvstoreIsImporting(kvstore *kvs, int didx) {
 static void cumulativeKeyCountAddLocked(kvstore *kvs, int didx, long delta);
 
 static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(kvs)) {
         /* The owning thread records the change in the table's own metadata; main folds it in later. */
         kvstoreHashtableMetadata *m = (kvstoreHashtableMetadata *)hashtableMetadata(kvstoreGetHashtable(kvs, didx));
         m->key_delta += delta;
-        m->dirty = 1;
+        kvstoreMarkDirty(m);
         return;
     }
     cumulativeKeyCountAddLocked(kvs, didx, delta);
@@ -238,15 +251,16 @@ static hashtable *createHashtableIfNeeded(kvstore *kvs, int didx) {
     kvs->hashtables[didx] = hashtableCreate(kvs->dtype);
     kvstoreHashtableMetadata *metadata = (kvstoreHashtableMetadata *)hashtableMetadata(kvs->hashtables[didx]);
     metadata->kvs = kvs;
+    metadata->didx = didx;
     /* Memory is counted by kvstoreHashtableTrackMemUsage, but when it's invoked
      * by hashtableCreate above, we don't know which hashtable it is for, because
      * the metadata has yet been initialized. Account for the newly created
      * hashtable here instead. */
     size_t usage = hashtableMemUsage(kvs->hashtables[didx]);
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(kvs)) {
         metadata->overhead_lut_delta += usage;
         metadata->alloc_delta += 1;
-        metadata->dirty = 1;
+        kvstoreMarkDirty(metadata);
     } else {
         kvs->overhead_hashtable_lut += usage;
         kvs->allocated_hashtables++;
@@ -265,11 +279,11 @@ static void freeHashtableIfNeeded(kvstore *kvs, int didx) {
     if (!(kvs->flags & KVSTORE_FREE_EMPTY_HASHTABLES) || !kvstoreGetHashtable(kvs, didx) || kvstoreHashtableSize(kvs, didx) != 0 ||
         kvstoreHashtableIsRehashingPaused(kvs, didx))
         return;
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(kvs)) {
         /* The thread cannot free the table under main's hashtables array; main frees it in reconcile. */
         kvstoreHashtableMetadata *m = (kvstoreHashtableMetadata *)hashtableMetadata(kvs->hashtables[didx]);
         m->defer_free = 1;
-        m->dirty = 1;
+        kvstoreMarkDirty(m);
         return;
     }
     hashtableRelease(kvs->hashtables[didx]);
@@ -292,10 +306,10 @@ void kvstoreHashtableRehashingStarted(hashtable *ht) {
     kvstore *kvs = metadata->kvs;
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(kvs)) {
         metadata->bucket_delta += (long long)to;
         metadata->overhead_rehashing_delta += (ssize_t)(from * HASHTABLE_BUCKET_SIZE);
-        metadata->dirty = 1;
+        kvstoreMarkDirty(metadata);
         return;
     }
     listAddNodeTail(kvs->rehashing, ht);
@@ -313,10 +327,10 @@ void kvstoreHashtableRehashingCompleted(hashtable *ht) {
     kvstore *kvs = metadata->kvs;
     size_t from, to;
     hashtableRehashingInfo(ht, &from, &to);
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(kvs)) {
         metadata->bucket_delta -= (long long)from;
         metadata->overhead_rehashing_delta -= (ssize_t)(from * HASHTABLE_BUCKET_SIZE);
-        metadata->dirty = 1;
+        kvstoreMarkDirty(metadata);
         return;
     }
     if (metadata->rehashing_node) {
@@ -335,9 +349,9 @@ void kvstoreHashtableTrackMemUsage(hashtable *ht, ssize_t delta) {
          * hasn't been initialized yet. */
         return;
     }
-    if (kvstoreConcurrent()) {
+    if (kvstoreConcurrent(metadata->kvs)) {
         metadata->overhead_lut_delta += delta;
-        metadata->dirty = 1;
+        kvstoreMarkDirty(metadata);
         return;
     }
     metadata->kvs->overhead_hashtable_lut += delta;
@@ -376,6 +390,7 @@ kvstore *kvstoreCreate(hashtableType *type, int num_hashtables_bits, int flags) 
     kvs->importing = hashtableCreate(&intHashtableType);
     kvs->rehashing = listCreate();
     kvs->hashtable_size_index = kvs->num_hashtables > 1 ? zcalloc(sizeof(unsigned long long) * (kvs->num_hashtables + 1)) : NULL;
+    kvs->dirty_tables = zmalloc(sizeof(uint16_t) * kvs->num_hashtables);
     if (!(kvs->flags & KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND)) {
         for (int i = 0; i < kvs->num_hashtables; i++) createHashtableIfNeeded(kvs, i);
     }
@@ -420,13 +435,14 @@ void kvstoreRelease(kvstore *kvs) {
 
     listRelease(kvs->rehashing);
     if (kvs->hashtable_size_index) zfree(kvs->hashtable_size_index);
+    zfree(kvs->dirty_tables);
 
     zfree(kvs);
 }
 
 unsigned long long int kvstoreSize(kvstore *kvs) {
     if (kvs->num_hashtables != 1) {
-        KVS_ASSERT_SERIAL();
+        KVS_ASSERT_SERIAL(kvs);
         return kvs->key_count;
     } else {
         return kvs->hashtables[0] ? hashtableSize(kvs->hashtables[0]) : 0;
@@ -441,7 +457,7 @@ unsigned long long int kvstoreImportingSize(kvstore *kvs) {
  * across hash tables in a database. */
 unsigned long kvstoreBuckets(kvstore *kvs) {
     if (kvs->num_hashtables != 1) {
-        KVS_ASSERT_SERIAL();
+        KVS_ASSERT_SERIAL(kvs);
         return kvs->bucket_count;
     } else {
         return kvs->hashtables[0] ? hashtableBuckets(kvs->hashtables[0]) : 0;
@@ -681,7 +697,7 @@ int kvstoreGetNextNonEmptyHashtableIndex(kvstore *kvs, int didx) {
 }
 
 int kvstoreNumNonEmptyHashtables(kvstore *kvs) {
-    KVS_ASSERT_SERIAL();
+    KVS_ASSERT_SERIAL(kvs);
     return kvs->non_empty_hashtables;
 }
 
@@ -845,8 +861,10 @@ uint64_t kvstoreRehashHashtable(kvstore *kvs, int didx, uint64_t us) {
 /* Main, after a lane phase: fold each touched table's deltas into the kvstore-wide fields. Must run
  * with concurrent mode off and no other thread touching the kvstore. */
 void kvstoreReconcile(kvstore *kvs) {
-    assert(!kvstoreConcurrent());
-    for (int didx = 0; didx < kvs->num_hashtables; didx++) {
+    assert(!kvstoreConcurrent(kvs));
+    int ndirty = atomic_load_explicit(&kvs->dirty_count, memory_order_relaxed);
+    for (int i = 0; i < ndirty; i++) {
+        int didx = kvs->dirty_tables[i];
         hashtable *ht = kvstoreGetHashtable(kvs, didx);
         if (!ht) continue;
         kvstoreHashtableMetadata *m = (kvstoreHashtableMetadata *)hashtableMetadata(ht);
@@ -910,6 +928,7 @@ void kvstoreReconcile(kvstore *kvs) {
             kvs->allocated_hashtables--;
         }
     }
+    atomic_store_explicit(&kvs->dirty_count, 0, memory_order_relaxed);
 }
 
 /* Size in bytes of hash tables used by the hashtables. */
