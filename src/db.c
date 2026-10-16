@@ -564,6 +564,26 @@ int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, 
     }
 }
 
+/* MAINT lane: unlink an expired key's value from table dict_index of every index and return it, still
+ * allocated; main replays the delete's events and propagation and frees it after the phase. The lane
+ * owns the table. The four observers inside dbGenericDeleteWithDictIndex do not apply: bgIteration and
+ * module listeners keep expire off the lanes, hot keys ignore expiry, and the ready-key signal is
+ * replayed. */
+robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index) {
+    sds key = objectGetKey(val);
+    hashtablePosition pos;
+    void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, key, &pos);
+    if (ref == NULL) return NULL;
+    serverAssert(*ref == val);
+    kvstoreHashtableTwoPhasePopDelete(db->keys, dict_index, &pos);
+    bool deleted = kvstoreHashtableDelete(db->expires, dict_index, key);
+    serverAssert(deleted);
+    if (objectGetType(val) == OBJ_HASH && hashTypeHasVolatileFields(val)) {
+        kvstoreHashtableDelete(db->keys_with_volatile_items, dict_index, key);
+    }
+    return val;
+}
+
 /* Helper for sync and async delete. */
 int dbGenericDelete(serverDb *db, robj *key, int async, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
@@ -2062,6 +2082,24 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     signalModifiedKey(NULL, db, keyobj);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
     server.stat_expiredkeys++;
+}
+
+/* Main, after a MAINT phase: the effects of deleteExpiredKeyAndPropagateWithDictIndex for a value a lane
+ * unlinked with dbUnlinkExpiredInLane, in the same order, as one execution unit. Frees the value. */
+void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index) {
+    sds key = objectGetKey(val);
+    robj *keyobj = createStringObject(key, sdslen(key));
+    enterExecutionUnit(1, 0);
+    signalDeletedKeyAsReady(db, keyobj, objectGetType(val));
+    notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
+    signalModifiedKey(NULL, db, keyobj);
+    propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
+    server.stat_expiredkeys++;
+    server.dirty++;
+    exitExecutionUnit();
+    postExecutionUnitOperations();
+    freeValueNeverOnMain(keyobj, val, db->id);
+    decrRefCount(keyobj);
 }
 
 /* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */

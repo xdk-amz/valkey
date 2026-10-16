@@ -67,6 +67,15 @@ int convertExpireArgumentToUnixTime(client *c, robj *arg, mstime_t basetime, int
 
 /* Handling of expired keys and hash fields */
 ustime_t activeExpireCycle(int type);
+/* Main: active expire of keys runs in the MAINT phase now (lanes ready and nothing observes deletes). */
+int activeExpireInLanes(void);
+/* Main, before a MAINT phase that runs the EXPIRE job: reset the per-thread results. */
+void activeExpireLaneBegin(void);
+/* Lane tid: expire keys of table didx of db within budget_us; sets *hit_limit when the budget ran out
+ * with expired keys left. Returns the microseconds spent. */
+uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
+/* Main, after the phase and its replay: merge the per-thread results into the server's stats. */
+void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us);
 void expireReplicaKeys(void);
 void rememberReplicaKeyWithExpire(serverDb *db, robj *key);
 void flushReplicaKeysWithExpireList(int async);

@@ -21,12 +21,22 @@
 /* Jobs a cron can request for the next MAINT phase. */
 #define MAINT_JOB_REHASH 0
 #define MAINT_JOB_RESIZE 1
-#define MAINT_JOB_COUNT 2
+#define MAINT_JOB_EXPIRE 2 /* active expire of keys; hash fields stay on main */
+#define MAINT_JOB_COUNT 3
+
+struct serverObject;
 
 /* Main, from a cron: request job for the next MAINT phase with a per-thread time ceiling of
  * budget_us (0 for an untimed job such as resize). Idempotent within one iteration: the largest
  * budget requested for a job wins. */
 void maintRequest(int job, uint64_t budget_us);
+
+/* Main: the MAINT phase can fan out to the staged workers now (staged on, not nested, workers
+ * enrolled, cron-lanes on, more than one table per kvstore). */
+int maintParallelReady(void);
+
+/* Lane: record a value the lane unlinked as expired; main replays its delete after the phase. */
+void maintLogExpired(int tid, struct serverObject *val, int dbid, int didx);
 
 /* Main: a MAINT job is pending for this iteration. */
 int maintPending(void);

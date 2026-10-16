@@ -40,6 +40,9 @@
 #include "cluster_migrateslots.h"
 #include "util.h"
 #include "bgiteration.h"
+#include "maint.h"
+#include "module.h"
+#include "staged_loop.h"
 
 /*-----------------------------------------------------------------------------
  * Incremental collection of expired keys.
@@ -435,6 +438,163 @@ static ustime_t activeExpireCycleJob(enum activeExpiryType jobType, int cycleTyp
     return elapsed;
 }
 
+/* ---------------------------------------------------------------------------
+ * Active expire of keys in MAINT lanes
+ *
+ * Each lane expires keys table by table in the tables it claimed, unlinking expired values without
+ * their per-delete effects; main replays those effects after the phase (maint.c). Hash fields stay on
+ * main. Per-table cursors replace the per-db cursor; per-thread results are merged on main.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    unsigned long sampled;
+    unsigned long expired;
+    int hit_limit;
+} laneExpireStats;
+
+static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
+static int lane_expire_tables = 0;
+static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
+static laneExpireStats lane_expire_stats[IO_THREADS_MAX_NUM];
+static long long *lane_ttl_sum = NULL;     /* [tid * dbnum + dbid] */
+static long long *lane_ttl_samples = NULL; /* [tid * dbnum + dbid] */
+
+static unsigned long activeExpireAcceptableStale(void) {
+    return ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE - activeExpireEffort();
+}
+
+int activeExpireInLanes(void) {
+    if (!server.active_expire_enabled || !iAmPrimary() || server.import_mode) return 0;
+    if (!maintParallelReady()) return 0;
+    if (isPausedActions(PAUSE_ACTION_EXPIRE)) return 0;
+    if (bgIteration_iterationActive() || moduleObservesWrites()) return 0;
+    return 1;
+}
+
+void activeExpireLaneBegin(void) {
+    int tables = server.cluster_enabled ? CLUSTER_SLOTS : 1 << server.keyspace_shard_bits;
+    if (lane_expire_tables != tables) {
+        zfree(lane_expire_cursor);
+        lane_expire_cursor = zcalloc(sizeof(unsigned long long) * server.dbnum * tables);
+        lane_expire_tables = tables;
+    }
+    if (!lane_ttl_sum) {
+        lane_ttl_sum = zcalloc(sizeof(long long) * IO_THREADS_MAX_NUM * server.dbnum);
+        lane_ttl_samples = zcalloc(sizeof(long long) * IO_THREADS_MAX_NUM * server.dbnum);
+    }
+    int nthreads = stagedWorkerCount() + 1;
+    memset(lane_expire_stats, 0, sizeof(laneExpireStats) * nthreads);
+    memset(lane_ttl_sum, 0, sizeof(long long) * nthreads * server.dbnum);
+    memset(lane_ttl_samples, 0, sizeof(long long) * nthreads * server.dbnum);
+}
+
+typedef struct {
+    serverDb *db;
+    mstime_t now;
+    int tid;
+    unsigned long sampled;
+    unsigned long expired;
+    mstime_t ttl_sum;
+    long long ttl_samples;
+} laneExpireScanData;
+
+static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
+    laneExpireScanData *d = privdata;
+    robj *val = entry;
+    mstime_t ttl = objectGetExpire(val) - d->now;
+    if (ttl < 0) {
+        robj *unlinked = dbUnlinkExpiredInLane(d->db, val, didx);
+        if (unlinked) {
+            maintLogExpired(d->tid, unlinked, d->db->id, didx);
+            d->expired++;
+        }
+    } else if (ttl > 0) {
+        d->ttl_sum += ttl;
+        d->ttl_samples++;
+    }
+    d->sampled++;
+}
+
+uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit) {
+    kvstore *kvs = db->expires;
+    if (kvstoreHashtableSize(kvs, didx) == 0) return 0;
+    unsigned long keys_per_loop =
+        ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP / 4 * activeExpireEffort();
+    unsigned long acceptable = activeExpireAcceptableStale();
+    unsigned long long *cursor = &lane_expire_cursor[db->id * lane_expire_tables + didx];
+    laneExpireScanData d = {.db = db, .now = now, .tid = tid};
+    monotime start = getMonotonicUs();
+    int repeat;
+    /* As one db iteration of activeExpireCycleJob, confined to this table. */
+    do {
+        unsigned long num = kvstoreHashtableSize(kvs, didx);
+        if (num == 0) break;
+        if (num > keys_per_loop) num = keys_per_loop;
+        unsigned long sampled = d.sampled, expired = d.expired;
+        long max_buckets = num * 10, checked = 0;
+        int done = 0;
+        while (d.sampled - sampled < num && checked < max_buckets) {
+            *cursor = kvstoreScan(kvs, *cursor, didx, didx, laneExpireScanCallback, expireShouldSkipTableForSamplingCb, &d);
+            checked++;
+            if (*cursor == 0) {
+                done = 1;
+                break;
+            }
+        }
+        sampled = d.sampled - sampled;
+        expired = d.expired - expired;
+        repeat = !done && (sampled == 0 || expired * 100 / sampled > acceptable);
+        if (repeat && elapsedUs(start) >= budget_us) {
+            *hit_limit = 1;
+            break;
+        }
+    } while (repeat);
+
+    laneExpireStats *st = &lane_expire_stats[tid];
+    st->sampled += d.sampled;
+    st->expired += d.expired;
+    if (*hit_limit) st->hit_limit = 1;
+    if (d.ttl_samples) {
+        lane_ttl_sum[tid * server.dbnum + db->id] += d.ttl_sum;
+        lane_ttl_samples[tid * server.dbnum + db->id] += d.ttl_samples;
+    }
+    return elapsedUs(start);
+}
+
+void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us) {
+    UNUSED(lanes_us);
+    int nthreads = stagedWorkerCount() + 1;
+    unsigned long sampled = 0, expired = 0;
+    int hit = 0;
+    for (int t = 0; t < nthreads; t++) {
+        sampled += lane_expire_stats[t].sampled;
+        expired += lane_expire_stats[t].expired;
+        hit |= lane_expire_stats[t].hit_limit;
+    }
+    lane_expire_hit_limit = hit;
+    if (hit) server.stat_expired_time_cap_reached_count++;
+    if (sampled) {
+        double perc = (double)expired / sampled;
+        server.stat_expired_keys_stale_perc = (perc * 0.05) + (server.stat_expired_keys_stale_perc * 0.95);
+    }
+    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+        serverDb *db = server.db[dbid];
+        if (!db) continue;
+        long long sum = 0, samples = 0;
+        for (int t = 0; t < nthreads; t++) {
+            sum += lane_ttl_sum[t * server.dbnum + dbid];
+            samples += lane_ttl_samples[t * server.dbnum + dbid];
+        }
+        if (!samples) continue;
+        mstime_t avg = sum / samples;
+        long long *cur = &db->expiry[KEYS].avg_ttl;
+        *cur = *cur == 0 ? avg : avg + (*cur - avg) * avg_ttl_factor[0];
+    }
+    server.stat_expire_cycle_time_used += expire_us;
+    ustime_t phase = (ustime_t)phase_us;
+    latencyAddSampleIfNeeded("expire-cycle", phase);
+}
+
 /* activeExpireCycle
  *
  * This function performs active expiration of both normal keys (with TTL)
@@ -498,6 +658,18 @@ ustime_t activeExpireCycle(int type) {
 
     /* Try to smoke-out bugs (server.also_propagate should be empty here) */
     serverAssert(server.also_propagate.numops == 0);
+
+    if (activeExpireInLanes()) {
+        /* Keys expire in the MAINT phase after crons(), every staged thread taking whole tables, each
+         * with this cycle's budget. Hash fields stay here. A fast cycle is requested only when the last
+         * lane run was cut off or the stale estimate is high, as activeExpireCycleJob decides. */
+        elapsed = activeExpireCycleJob(FIELDS, type, timelimit_us);
+        if (type == ACTIVE_EXPIRE_CYCLE_SLOW || lane_expire_hit_limit ||
+            server.stat_expired_keys_stale_perc >= activeExpireAcceptableStale())
+            maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
+        server.stat_expire_cycle_time_used += elapsed;
+        return elapsed;
+    }
 
     if (expireCycleStartWithFields) {
         elapsed += activeExpireCycleJob(FIELDS, type, timelimit_us - elapsed);
