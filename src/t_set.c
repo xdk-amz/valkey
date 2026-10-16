@@ -1503,9 +1503,10 @@ void smoveCommand(client *c) {
     /* The member's TTL moves with it. */
     mstime_t expiry = EXPIRY_NONE;
     bool src_volatile = setTypeHasVolatileMembers(srcset);
+    bool dst_volatile = setTypeHasVolatileMembers(dstset);
     if (src_volatile) setTypeGetExpiry(srcset, objectGetVal(ele), &expiry);
-    unsigned long dst_original_size = dstset ? setTypeSize(dstset) : 0;
-    mstime_t dst_key_expire = dstset ? objectGetExpire(dstset) : EXPIRY_NONE;
+    unsigned long dst_original_size = dst_volatile ? setTypeSize(dstset) : 0;
+    mstime_t dst_key_expire = dst_volatile ? objectGetExpire(dstset) : EXPIRY_NONE;
 
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset, objectGetVal(ele))) {
@@ -1532,17 +1533,20 @@ void smoveCommand(client *c) {
     server.dirty++;
 
     /* An extra key has changed when ele was successfully added to dstset */
-    bool dst_volatile = setTypeHasVolatileMembers(dstset);
     bool replaced_expired = false;
-    int added =
-        setTypeAddWithExpiry(dstset, objectGetVal(ele), expiry, SET_ADD_KEEP_EXPIRY, &replaced_expired, NULL);
-    if (replaced_expired) {
-        server.stat_expiredsetmembers++;
-        notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[2], c->db->id);
-        incrRefCount(ele);
-        propagateItemsDeletion(c->db, dstset, 1, &ele, c->slot);
+    int added;
+    if (expiry == EXPIRY_NONE && !dst_volatile) {
+        added = setTypeAdd(dstset, objectGetVal(ele));
+    } else {
+        added = setTypeAddWithExpiry(dstset, objectGetVal(ele), expiry, SET_ADD_KEEP_EXPIRY, &replaced_expired, NULL);
+        if (replaced_expired) {
+            server.stat_expiredsetmembers++;
+            notifyKeyspaceEvent(NOTIFY_SET, "sexpired", c->argv[2], c->db->id);
+            incrRefCount(ele);
+            propagateItemsDeletion(c->db, dstset, 1, &ele, c->slot);
+        }
+        if (dst_volatile != setTypeHasVolatileMembers(dstset)) dbUpdateObjectWithVolatileItemsTracking(c->db, dstset);
     }
-    if (dst_volatile != setTypeHasVolatileMembers(dstset)) dbUpdateObjectWithVolatileItemsTracking(c->db, dstset);
     if (added) {
         server.dirty++;
         signalModifiedKey(c, c->db, c->argv[2]);
