@@ -81,6 +81,11 @@ static void stagedRunPhase(int phase) {
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
+    /* Main works its own share of the phase instead of waiting idle for the IO threads. */
+    if (phase == STAGED_PHASE_READ)
+        fastpathStagedReadPhase(0);
+    else if (phase == STAGED_PHASE_REPLY)
+        fastpathStagedReplyPhase(0);
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
 }
 

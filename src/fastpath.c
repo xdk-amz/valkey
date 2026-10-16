@@ -889,7 +889,7 @@ void fastpathHandoffDone(client *c, int closing) {
 void fastpathInfo(sds *info) {
     long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
               batches = fp_retired[4], speculated = fp_retired[5];
-    for (int i = 1; i < fp_slots; i++) {
+    for (int i = 0; i < fp_slots; i++) {
         if (!fp_threads[i].ready) continue;
         reads += fp_threads[i].reads;
         in += fp_threads[i].net_input_bytes;
@@ -953,6 +953,7 @@ int fastpathAttach(client *c) {
 /* Main, between phases. Turning off first hands every staged client back (fastpathStagedReleaseAll). */
 void fastpathStagedSet(int on) {
     if (on) {
+        if (!fp_threads[0].ready) fastpathInitThread(0); /* main takes a share of every read and reply phase */
         fp_staged_admit = 1;
         atomic_store_explicit(&fp_staged, 1, memory_order_relaxed);
     } else {
@@ -1002,7 +1003,7 @@ int fastpathStagedExecute(void) {
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
-    for (int tid = 1; tid < fp_slots; tid++) {
+    for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (t->sbn[d] == 0) continue;
         client *ec = fpExecutor(tid);
@@ -1020,7 +1021,7 @@ int fastpathStagedExecute(void) {
 
 int fastpathStagedRepliesPending(void) {
     int d = fpDepth();
-    for (int tid = 1; tid < fp_slots; tid++)
+    for (int tid = 0; tid < fp_slots; tid++)
         if (fp_threads[tid].sbn[d]) return 1;
     return 0;
 }
@@ -1049,7 +1050,7 @@ static void fpStagedHandoff(client *c) {
  * runs nested iterations that call this again and change the leaving list, so that walk restarts from
  * the head after every handoff instead of keeping a node across it. */
 void fastpathStagedFinish(void) {
-    for (int tid = 1; tid < fp_slots; tid++) {
+    for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (!t->ready) continue;
         server.stat_io_reads_processed += t->reads - t->reads_synced;
@@ -1058,7 +1059,7 @@ void fastpathStagedFinish(void) {
         t->writes_synced = t->writes;
     }
     if (!fpStaged()) return;
-    for (int tid = 1; tid < fp_slots; tid++) {
+    for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         listNode *ln = listFirst(&t->staged_leaving);
         while (ln) {
