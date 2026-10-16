@@ -1176,6 +1176,7 @@ int fastpathStagedExecuteStreaming(void) {
 
     int chunk = server.staged_stream_chunk;
     if (chunk < 1) chunk = 1;
+    int order = server.staged_stream_order;
     cmdBatch *pubb[IO_THREADS_MAX_NUM]; /* batch each thread is currently publishing into */
     int acc[IO_THREADS_MAX_NUM];        /* entries executed in that batch since its last publish */
     for (int i = 0; i < n; i++) {
@@ -1185,6 +1186,36 @@ int fastpathStagedExecuteStreaming(void) {
 
     while (!fpStreamDone(ts, cur, n, d)) {
         if (use_prefetch && !paused) fpStreamPrefetchWindow(ts, cur, n, d, window);
+        if (order == STAGED_STREAM_ORDER_CHUNK) {
+            /* Round-robin across threads a chunk at a time: each visit runs whole runs until this
+             * thread has executed at least a chunk (or its batch ends), publishes, then moves to the
+             * next thread, so every worker has runs to deliver instead of one draining the window. */
+            int progressed = 0;
+            for (int i = 0; i < n; i++) {
+                int turn = 0;
+                while (turn < chunk) {
+                    cmdBatch *b = fpStreamRunAt(ts[i], &cur[i], d);
+                    if (!b) break;
+                    if (b != pubb[i]) {
+                        if (pubb[i]) fpStreamPublish(pubb[i], pubb[i]->count);
+                        pubb[i] = b;
+                        acc[i] = 0;
+                    }
+                    int before = cur[i].ei;
+                    fpStreamExecRun(ecs[i], b, &cur[i]);
+                    int ran = cur[i].ei - before;
+                    turn += ran;
+                    total += ran;
+                    progressed = 1;
+                }
+                if (pubb[i] && turn > 0) {
+                    fpStreamPublish(pubb[i], cur[i].ei);
+                    acc[i] = 0;
+                }
+            }
+            if (!progressed) break;
+            continue;
+        }
         for (int w = 0; w < window;) {
             int progressed = 0;
             for (int i = 0; i < n && w < window; i++) {
