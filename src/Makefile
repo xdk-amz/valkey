@@ -603,6 +603,7 @@ ENGINE_SERVER_OBJ = \
     rdma.o \
     release.o \
     replication.o \
+    repl_sender.o \
     resp_parser.o \
     rio.o \
     script.o \

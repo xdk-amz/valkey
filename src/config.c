@@ -3530,6 +3530,7 @@ standardConfig static_configs[] = {
     createBoolConfig("cron-lanes-split-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes_split_budget, 0, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
+    createBoolConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.repl_stream_sender, 0, NULL, NULL),
     createBoolConfig("acl-offload", NULL, IMMUTABLE_CONFIG, server.acl_offload, 0, NULL, NULL),
     createBoolConfig("io-threads-speculation-replica-only", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_speculation_replica_only, 0, NULL, NULL),
 

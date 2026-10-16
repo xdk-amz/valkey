@@ -519,6 +519,10 @@ static void stagedLoopIteration(aeEventLoop *el) {
     t = getMonotonicUs();
     replyPhase();
     cronStatsRecord(CRON_JOB_SL_REPLY, getMonotonicUs() - t);
+    /* repl-stream-sender: the staged loop does not run beforeSleep, so service the sender
+     * here: account for last iteration's sends and publish this iteration's new data as the
+     * next stable offset. No-op when the sender is off. */
+    replStreamSenderTick();
     t = getMonotonicUs();
     crons(el);
     cronStatsRecord(CRON_JOB_SL_CRONS, getMonotonicUs() - t);

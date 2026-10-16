@@ -493,6 +493,8 @@ void installClientWriteHandler(client *c) {
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
 void putClientInPendingWriteQueue(client *c) {
+    /* repl-stream-sender owns the send for this replica; main must not also queue it. */
+    if (c->repl_data && c->repl_data->stream_via_sender) return;
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
@@ -2412,6 +2414,12 @@ void clearClientConnectionState(client *c) {
  * asynchronous freeing, and 1 if the client was freed immediately. */
 int freeClient(client *c) {
     listNode *ln;
+
+    /* repl-stream-sender: ensure the sender thread holds no reference to this client
+     * before we free it. Takes the sender mutex, so after this returns the sender has
+     * released the client (it serialises per-replica against the sender's send). Safe
+     * for non-replicas and when the sender is off (no-op). */
+    if (c->repl_data && c->repl_data->stream_via_sender) replStreamSenderRemove(c);
 
     /* A staged client is freed once main took it back after a reply barrier. */
     if (c->flag.fastpath) {
