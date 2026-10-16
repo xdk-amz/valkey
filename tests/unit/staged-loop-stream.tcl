@@ -314,3 +314,76 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         }
     }
 }
+
+# Lane recheck: the apply lane (and so streaming eligibility) is reread with the periodic pinning
+# read, not only when the worker set changes. A server started with every thread on one CPU does not
+# stream (main shares a CPU with the IO threads); after main and the IO threads are re-pinned to
+# distinct CPUs, streaming must start on its own, with no reconfiguration.
+proc sls_io_tids {pid} {
+    set out {}
+    foreach t [glob -nocomplain /proc/$pid/task/*] {
+        set tid [file tail $t]
+        if {[catch {set comm [string trim [exec cat /proc/$pid/task/$tid/comm]]}]} continue
+        if {[string match "io_thd_*" $comm]} { lappend out $comm $tid }
+    }
+    return $out
+}
+
+proc sls_drive_incr {port rounds depth n} {
+    set fds {}
+    for {set i 0} {$i < $n} {incr i} {
+        set fd [socket [srv 0 host] $port]
+        fconfigure $fd -translation binary -blocking 1 -buffering full
+        # One command puts the socket on the fast path.
+        puts -nonewline $fd [sls_resp ping]; flush $fd; sls_read_reply $fd
+        lappend fds $fd
+    }
+    for {set round 0} {$round < $rounds} {incr round} {
+        set i 0
+        foreach fd $fds {
+            set p ""
+            for {set k 0} {$k < $depth} {incr k} { append p [sls_resp incr sls:lane:$i] }
+            puts -nonewline $fd $p; flush $fd
+            incr i
+        }
+        foreach fd $fds { for {set k 0} {$k < $depth} {incr k} { sls_read_reply $fd } }
+    }
+    foreach fd $fds { close $fd }
+}
+
+start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 4 enable-debug-command yes}} {
+    r select 0
+    test {Lane recheck: streaming starts after main and IO threads move to distinct CPUs} {
+        set ncpu [exec nproc]
+        set pid [srv 0 pid]
+        if {$ncpu < 5 || [catch {exec taskset -cp 0 $pid}]} {
+            skip "needs taskset and at least 5 CPUs"
+        }
+        r config set staged-reply-overlap exec
+        r flushall
+
+        # Put main, the IO threads and io_epoll all on CPU 0. taskset -acp sets every thread.
+        exec taskset -acp 0 $pid
+        after 1200 ;# let one periodic pinning read run with everyone on one CPU
+        r config resetstat
+        sls_drive_incr [srv 0 port] 40 16 8
+        set phases_shared [getInfoProperty [r info fastpath] staged_stream_phases]
+        assert_equal 0 $phases_shared
+
+        # Re-pin: main (tid == pid) stays on CPU 0, each IO thread to its own distinct CPU.
+        exec taskset -cp 0 $pid
+        set io [sls_io_tids $pid]
+        set cpu 1
+        foreach {comm tid} $io {
+            exec taskset -cp $cpu $tid
+            incr cpu
+        }
+        assert {[llength $io] > 0}
+        # The lane is reread every second; wait for the transition to be logged, then drive load.
+        wait_for_log_messages 0 {"*main works a share of each phase*"} 0 50 100
+        r config resetstat
+        sls_drive_incr [srv 0 port] 40 16 8
+        set phases_distinct [getInfoProperty [r info fastpath] staged_stream_phases]
+        assert {$phases_distinct > 0}
+    }
+}
