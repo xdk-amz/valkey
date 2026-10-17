@@ -454,6 +454,8 @@ typedef struct {
     unsigned long expired;
     unsigned long freed; /* expired keys the lane freed itself (no observer, no propagation) */
     unsigned long fields; /* expired hash fields this lane deleted; main bulk-adds to stat_expiredfields */
+    unsigned long fsampled; /* hashes with volatile fields this lane sampled */
+    unsigned long fexpired; /* sampled hashes that had expired fields */
     long long dirty;      /* dirty increments this lane made (free-inline field path); main bulk-adds */
     int hit_limit;
 } laneExpireStats;
@@ -488,6 +490,7 @@ static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] 
 static unsigned long long *lane_field_cursor = NULL;  /* [dbid * tables + didx], hash-field expiry */
 static int lane_expire_tables = 0;
 static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
+static int lane_expire_behind = 0;    /* the last phase stopped on its budget or found too much expired */
 static laneExpireStats lane_expire_stats[IO_THREADS_MAX_NUM];
 static long long *lane_ttl_sum = NULL;     /* [tid * dbnum + dbid] */
 static long long *lane_ttl_samples = NULL; /* [tid * dbnum + dbid] */
@@ -843,6 +846,8 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
         }
     } while (repeat);
     if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
+    lane_expire_stats[tid].fsampled += d.sampled;
+    lane_expire_stats[tid].fexpired += d.hashes;
     return elapsedUs(start);
 }
 
@@ -874,10 +879,23 @@ void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_u
     }
     lane_expire_hit_limit = hit;
     if (hit) server.stat_expired_time_cap_reached_count++;
-    if (sampled) {
-        double perc = (double)expired / sampled;
-        server.stat_expired_keys_stale_perc = (perc * 0.05) + (server.stat_expired_keys_stale_perc * 0.95);
+    /* Estimates of logically expired keys and hashes still present: 5% per phase, as the serial jobs
+     * update them per cycle, with 0 when nothing was sampled. */
+    unsigned long fsampled = 0, fexpired = 0;
+    for (int t = 0; t < nthreads; t++) {
+        fsampled += lane_expire_stats[t].fsampled;
+        fexpired += lane_expire_stats[t].fexpired;
     }
+    double perc = sampled ? (double)expired / sampled : 0;
+    server.stat_expired_keys_stale_perc = (perc * 0.05) + (server.stat_expired_keys_stale_perc * 0.95);
+    double fperc = fsampled ? (double)fexpired / fsampled : 0;
+    server.stat_expired_keys_with_vola_stale_perc =
+        (fperc * 0.05) + (server.stat_expired_keys_with_vola_stale_perc * 0.95);
+    /* Expiry is behind when this phase stopped on its budget or found more than the acceptable share of
+     * its sampled keys or hashes expired; fast cycles open phases only then. */
+    unsigned long acceptable = activeExpireAcceptableStale();
+    lane_expire_behind = hit || (sampled && expired * 100 / sampled > acceptable) ||
+                         (fsampled && fexpired * 100 / fsampled > acceptable);
     for (int dbid = 0; dbid < server.dbnum; dbid++) {
         serverDb *db = server.db[dbid];
         if (!db) continue;
@@ -963,8 +981,10 @@ ustime_t activeExpireCycle(int type) {
     if (activeExpireInLanes()) {
         /* Keys and hash fields both expire in the MAINT phase after crons(), every staged thread taking
          * whole tables. No client is served between crons() and the phase, so the stall is the phase. One
-         * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). beforeSleep's
-         * unconditional FAST call adds extra phases when expiry is behind, as it does for serial. */
+         * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). A fast cycle opens a
+         * phase only while expiry is behind (see activeExpireLaneEnd), so a keyspace with nothing due
+         * gets the slow cycle's phases only. */
+        if (type == ACTIVE_EXPIRE_CYCLE_FAST && !lane_expire_behind) return 0;
         maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
         return 0;
     }
