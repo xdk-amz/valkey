@@ -85,7 +85,7 @@ int maintExpirePropagateOnly(void);
 void activeExpireSetPropagateOnly(int propagate_only);
 /* Main, before opening the phase: arm the shared replay-bounded budget (whole-phase budget_us and the
  * measured per-key replay cost; pass 0,0 to disable it and use the per-thread split ceiling instead). */
-void activeExpireBudgetBegin(uint64_t budget_us, double replay_us);
+void activeExpireBudgetBegin(uint64_t budget_us, double replay_us, double field_us);
 /* Main, before a MAINT phase that runs the EXPIRE job: reset the per-thread results. */
 void activeExpireLaneBegin(void);
 /* Lane tid: expire keys of table didx of db within budget_us; sets *hit_limit when the budget ran out
