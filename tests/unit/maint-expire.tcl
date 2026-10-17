@@ -244,7 +244,10 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
     test "Active expire with cron-lanes $lanes opens no phase per loop iteration while nothing is due" {
         r flushdb
         # Keys and hash fields whose TTLs are an hour away: no phase stops on its budget, so a fast cycle
-        # must not open a MAINT phase on every event loop iteration; slow cycles open about hz a second.
+        # must not open a MAINT phase on every event loop iteration; at hz 10 slow cycles open about 10
+        # phases a second, against hundreds with one phase per iteration.
+        set hz [lindex [r config get hz] 1]
+        r config set hz 10
         me_load_volatile r far: 20000 3600000
         r eval {for h=1,2000 do redis.call('hsetex', 'farh:'..h, 'EX', 3600, 'FIELDS', 2, 'a', 1, 'b', 2) end return 1} 0
         after 300
@@ -253,6 +256,7 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         set n 0
         while {[clock milliseconds] - $t0 < 1000} { r ping; incr n }
         set phases [expr {[me_cron_calls r maint] - $before}]
+        r config set hz $hz
         assert_morethan $n 200
         assert_lessthan $phases 60
         r flushdb
