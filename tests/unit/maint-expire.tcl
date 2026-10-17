@@ -186,14 +186,106 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
             return 1
         } 0 400 1000
         wait_for_condition 400 50 {[r dbsize] == 0} else { fail "keys and fields did not expire: [r dbsize]" }
-        # One expire-cycle sample per second covers everything clients waited for: field expiry on main
-        # and the phase. Two budgets back to back put every busy second near 50 ms or more; a loaded
+        # One expire-cycle sample per second covers the whole MAINT phase (keys and fields both run in the
+        # lanes). Spending the budget twice per tick puts every busy second near 50 ms or more; a loaded
         # host can stretch a single tick, so allow one sample past 45 ms.
         set samples [r latency history expire-cycle]
         set over [lmap s $samples {expr {[lindex $s 1] > 45 ? [lindex $s 1] : [continue]}}]
         assert_morethan [llength $samples] 1
         assert {[llength $over] <= 1}
         r config set latency-monitor-threshold 0
+    }
+
+    test "Active expire with cron-lanes $lanes expires hash fields in the phase, not on main" {
+        r flushdb
+        r config resetstat
+        # A hash whose fields expire but which keeps a non-volatile field, and one that empties.
+        r hset keeph f1 1 f2 2 stay 9
+        r hpexpire keeph 100 FIELDS 2 f1 f2
+        r hset goneh only 1
+        r hpexpire goneh 100 FIELDS 1 only
+        wait_for_condition 300 50 {[r hlen keeph] == 1 && [r exists goneh] == 0} else {
+            fail "fields did not expire: keeph [r hgetall keeph] goneh [r exists goneh]"
+        }
+        assert_equal {stay 9} [r hgetall keeph]
+        if {$lanes eq "yes"} {
+            # Field expiry ran in the EXPIRE lane job; main's serial field pass did not run.
+            assert_morethan [me_cron_calls r maint_expire] 0
+        }
+    }
+
+    test "Active expire with cron-lanes $lanes shrinks keys_with_volatile_items when a hash empties" {
+        r flushdb
+        r set anchor 1
+        for {set i 0} {$i < 200} {incr i} { r hset vh:$i only 1; r hpexpire vh:$i 100 FIELDS 1 only }
+        assert_match "*keys_with_volatile_items=200*" [r info keyspace]
+        wait_for_condition 300 50 {[r dbsize] == 1} else { fail "hashes did not empty: [r dbsize]" }
+        assert_match "*keys_with_volatile_items=0*" [r info keyspace]
+    }
+
+    test "Active expire with cron-lanes $lanes sends hexpired per hash and del when it empties" {
+        r flushdb
+        r config set notify-keyspace-events Exg
+        set rd [valkey_deferring_client]
+        $rd select 0
+        $rd read
+        $rd psubscribe __keyevent@0__:hexpired __keyevent@0__:del
+        $rd read
+        $rd read
+        r hset eh a 1 b 2
+        r hpexpire eh 120 FIELDS 2 a b
+        # Expect one hexpired (fields a,b in one batch) and one del (hash emptied).
+        set hexpired 0
+        set del 0
+        set deadline [expr {[clock milliseconds] + 5000}]
+        while {($hexpired == 0 || $del == 0) && [clock milliseconds] < $deadline} {
+            set msg [$rd read]
+            if {[lindex $msg 0] ne "pmessage"} continue
+            if {[lindex $msg 1] eq "__keyevent@0__:hexpired"} { incr hexpired }
+            if {[lindex $msg 1] eq "__keyevent@0__:del"} { incr del }
+        }
+        assert_equal 1 $hexpired
+        assert_equal 1 $del
+        $rd close
+        r config set notify-keyspace-events ""
+    }
+
+    test "Active expire with cron-lanes $lanes aborts a transaction watching a hash whose fields expire" {
+        r flushdb
+        r hset wh a 1 b 2
+        r hpexpire wh 150 FIELDS 2 a b
+        set rd [valkey_client]
+        $rd select 0
+        $rd watch wh
+        wait_for_condition 300 50 {[r exists wh] == 0} else { fail "watched hash did not empty" }
+        $rd multi
+        $rd set wh new
+        assert_equal {} [$rd exec]
+        $rd close
+    }
+
+    test "Active expire with cron-lanes $lanes propagates HDEL per hash with a SELECT" {
+        r flushall
+        r select 0
+        r config set lazyfree-lazy-expire no
+        set repl [attach_to_replication_stream]
+        # 200 hashes, 2 fields each expiring, keep 1 field so the hash survives (HDEL, no DEL).
+        for {set i 0} {$i < 200} {incr i} { r hset ph:$i a 1 b 2 keep 9; r hpexpire ph:$i 120 FIELDS 2 a b }
+        wait_for_condition 300 50 {[r hlen ph:0] == 1 && [r hlen ph:199] == 1} else { fail "fields did not expire" }
+        set hdels {}
+        set saw_select 0
+        set deadline [expr {[clock milliseconds] + 8000}]
+        while {[llength $hdels] < 200 && [clock milliseconds] < $deadline} {
+            set cmd [read_from_replication_stream $repl]
+            if {$cmd eq ""} continue
+            set op [lindex $cmd 0]
+            if {$op eq "select"} { set saw_select 1; continue }
+            if {$op eq "hdel"} { lappend hdels [lindex $cmd 1] }
+        }
+        close $repl
+        assert_equal 1 $saw_select
+        assert_equal 200 [llength [lsort -unique $hdels]]
+        r config set lazyfree-lazy-expire no
     }
 
     test "Active expire with cron-lanes $lanes frees large values off the MAINT phase" {
@@ -207,9 +299,10 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         me_wait_empty r
         assert_equal 51 [s expired_keys]
         if {$lanes eq "yes"} {
-            # The large value went to main's replay, which hands it to a free off the phase, so no phase
-            # ran for the length of its free.
-            assert_morethan [me_cron_calls r maint_replay] 0
+            # The large value's free is handed off the phase: whichever mode is active (full replay with
+            # no observer, or the propagate-only feed once a repl backlog exists), main logs the expensive
+            # value and frees it after the barrier, so no phase ran for the length of its free.
+            assert_morethan [expr {[me_cron_calls r maint_replay] + [me_cron_calls r maint_feed]}] 0
             regexp {max_usec=(\d+)} [getInfoProperty [r info cronstats] cron_maint] -> maxus
             assert_lessthan $maxus 100000
         }
@@ -373,6 +466,29 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
             assert_equal 300 [$replica dbsize]
         }
+
+        test "Active expire with cron-lanes $lanes replicates hash-field expiry to a replica" {
+            $primary flushall
+            $primary select 0
+            $replica select 0
+            # Hashes whose fields expire (some empty, some survive); replica must match field for field.
+            for {set i 0} {$i < 2000} {incr i} {
+                $primary hset fh:$i a 1 b 2 keep 9
+                $primary hpexpire fh:$i 200 FIELDS 2 a b
+            }
+            for {set i 0} {$i < 2000} {incr i} {
+                $primary hset fe:$i only 1
+                $primary hpexpire fe:$i 200 FIELDS 1 only
+            }
+            wait_for_condition 400 50 {
+                [$primary hlen fh:0] == 1 && [$primary exists fe:0] == 0 && [$primary exists fe:1999] == 0
+            } else { fail "field expiry did not drain on the primary" }
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            assert_equal [status $primary master_repl_offset] [status $replica master_repl_offset]
+            assert_equal 1 [$replica hlen fh:0]
+            assert_equal 0 [$replica exists fe:0]
+        }
     }
 }
 }
@@ -389,6 +505,25 @@ start_server [list tags {"maint expire aof external:skip tls:skip"} overrides [c
         r select 0
         assert_equal 300 [r dbsize]
         assert_equal $digest [r debug digest]
+    }
+
+    test "Active expire with cron-lanes $lanes leaves an AOF with hash-field deletes that reloads consistently" {
+        r flushall
+        r select 0
+        for {set i 0} {$i < 2000} {incr i} { r hset ah:$i a 1 b 2 keep 9; r hpexpire ah:$i 150 FIELDS 2 a b }
+        for {set i 0} {$i < 2000} {incr i} { r hset ae:$i only 1; r hpexpire ae:$i 150 FIELDS 1 only }
+        wait_for_condition 400 50 {
+            [r hlen ah:0] == 1 && [r exists ae:0] == 0 && [r exists ae:1999] == 0
+        } else { fail "field expiry did not drain" }
+        set dbsize [r dbsize]
+        r debug loadaof
+        r select 0
+        # The HDEL/DEL the lanes fed are in the AOF, so the reload keeps the surviving field and the
+        # emptied hashes stay gone. (DEBUG DIGEST across an AOF reload differs for field-TTL hashes on
+        # the base too, so compare the observable data, not the digest.)
+        assert_equal $dbsize [r dbsize]
+        assert_equal {keep 9} [r hgetall ah:0]
+        assert_equal 0 [r exists ae:0]
     }
 
     test "Active expire with cron-lanes $lanes feeds propagate-only deletes and the AOF DEL count equals expired keys" {
