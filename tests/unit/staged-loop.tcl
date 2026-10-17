@@ -263,5 +263,49 @@ start_server {tags {"staged-loop external:skip tls:skip logreqres:skip"} overrid
         exec taskset -pc $main_cpus $pid
         wait_for_log_messages 0 {"*no IO thread is pinned to main's CPU*"} $loglines 100 50
     }
+
+    test {Staged loop: main takes its share of each phase again once its CPU is its own} {
+        set pid [srv 0 pid]
+        set io1 [sl_thread_tid $pid io_thd_1]
+        set io2 [sl_thread_tid $pid io_thd_2]
+        set main_cpus [sl_affinity $pid]
+        set io1_cpus [sl_affinity $io1]
+        set io2_cpus [sl_affinity $io2]
+        set cpus {}
+        foreach range [split $main_cpus ,] {
+            lassign [split $range -] lo hi
+            if {$hi eq ""} { set hi $lo }
+            for {set c $lo} {$c <= $hi} {incr c} { lappend cpus $c }
+        }
+        if {[llength $cpus] < 2} {
+            puts "skipped: the server may run on only one CPU"
+        } else {
+            lassign $cpus a b
+            # Pinned after start, as a benchmark harness pins: main and both IO threads share CPU a.
+            set loglines [count_log_lines 0]
+            exec taskset -pc $a $pid
+            exec taskset -pc $a $io1
+            exec taskset -pc $a $io2
+            wait_for_log_messages 0 {"*main shares a CPU with an IO thread and leaves the phases*"} $loglines 100 50
+            set loglines [count_log_lines 0]
+            exec taskset -pc $b $io1
+            exec taskset -pc $b $io2
+            wait_for_log_messages 0 {"*main works a share of each phase*"} $loglines 100 50
+            set fd [sl_socket]
+            set payload ""
+            set expect {}
+            for {set i 0} {$i < 200} {incr i} {
+                append payload [sl_resp set sl:lane:$i v$i] [sl_resp get sl:lane:$i]
+                lappend expect {+OK} v$i
+            }
+            puts -nonewline $fd $payload
+            flush $fd
+            assert_equal $expect [sl_read_replies $fd 400]
+            close $fd
+            exec taskset -pc $io2_cpus $io2
+            exec taskset -pc $io1_cpus $io1
+            exec taskset -pc $main_cpus $pid
+        }
+    }
 }
 }

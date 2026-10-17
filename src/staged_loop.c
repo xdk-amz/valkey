@@ -202,6 +202,11 @@ static void stagedReadCpuPinning(void) {
     sl_pinned_workers = pinned;
     sl_pinned_cpu = cpu;
     sl_main_spins = pinned == 0;
+    int lane = !stagedMainSharesWorkerCpu();
+    if (sl_workers > 0 && lane != sl_main_lane)
+        serverLog(LL_NOTICE, lane ? "Staged event loop: main works a share of each phase"
+                                  : "Staged event loop: main shares a CPU with an IO thread and leaves the phases to the IO threads");
+    sl_main_lane = lane;
     sl_pinning_read = getMonotonicUs();
 }
 
@@ -225,7 +230,6 @@ static void stagedSetWorkers(int want) {
         ioThreadsStagedUnpark();
         stagedPlaceEpollThread();
     }
-    sl_main_lane = !stagedMainSharesWorkerCpu();
     stagedReadCpuPinning();
 }
 
