@@ -605,9 +605,9 @@ static bool fullScanIteratorHasPassedItem(genericIterator *genIt, const_sds key,
 
     if (it->kvs == NULL) return true; // just finished this DB
 
-    /* We're in the middle of processing a DB.  In cluster-mode, the DB is divided into 1 hashtable
-     * per slot.  In cluster-mode-disabled, we treat all keys as in slot 0. */
-    int keySlot = server.cluster_enabled ? getKVStoreIndexForKey((sds)key) : 0;
+    /* We're in the middle of processing a DB.  The DB is divided into 1 hashtable per slot in
+     * cluster-mode, or per shard with keyspace-shard-bits; otherwise all keys are in hashtable 0. */
+    int keySlot = getKVStoreIndexForKey((sds)key);
     if (keySlot < it->kvs_didx) return true;
     if (keySlot > it->kvs_didx) return false;
 
