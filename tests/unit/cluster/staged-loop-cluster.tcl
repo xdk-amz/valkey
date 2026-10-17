@@ -77,8 +77,8 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
         }
     }
 
-    set local [scl_key_on 0 "fpl"]
-    set remote [scl_key_on -1 "fpr"]
+    set local [scl_key_on 0 "local"]
+    set remote [scl_key_on -1 "remote"]
     set port1 [srv -1 port]
 
     test {Fast path: a pipeline of local and remote keys gets values and MOVED in order} {
