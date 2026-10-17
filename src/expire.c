@@ -453,6 +453,8 @@ typedef struct {
     unsigned long sampled;
     unsigned long expired;
     unsigned long freed; /* expired keys the lane freed itself (no observer, no propagation) */
+    unsigned long fields; /* expired hash fields this lane deleted; main bulk-adds to stat_expiredfields */
+    long long dirty;      /* dirty increments this lane made (free-inline field path); main bulk-adds */
     int hit_limit;
 } laneExpireStats;
 
@@ -742,6 +744,9 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
         size_t expired = hashTypeDeleteExpiredFields(o, d->now, EXPIRE_BULK_LIMIT, entries);
         if (expired == 0) break;
         any = 1;
+        /* Count per lane; main bulk-adds to server.stat_expiredfields after the phase (the global write
+         * is removed from hashTypeDeleteExpiredFields so concurrent lanes do not race on it). */
+        lane_expire_stats[d->tid].fields += expired;
         int empty = hashTypeLength(o) == 0;
         if (!hashTypeHasVolatileFields(o))
             kvstoreHashtableDelete(db->keys_with_volatile_items, didx, objectGetKey(o));
@@ -750,7 +755,7 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
         if (lane_expire_free_inline) {
             for (size_t i = 0; i < expired; i++) decrRefCount(entries[i]);
             if (empty && emptied_val) freeValueNeverOnMain(NULL, emptied_val, db->id);
-            server.dirty += empty ? 1 : (long long)expired;
+            lane_expire_stats[d->tid].dirty += empty ? 1 : (long long)expired;
         } else {
             robj **fields = zmalloc(sizeof(robj *) * expired);
             for (size_t i = 0; i < expired; i++) fields[i] = entries[i];
@@ -842,14 +847,22 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
 void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us) {
     UNUSED(lanes_us);
     int nthreads = stagedWorkerCount() + 1;
-    unsigned long sampled = 0, expired = 0, freed = 0;
+    unsigned long sampled = 0, expired = 0, freed = 0, fields = 0;
+    long long lane_dirty = 0;
     int hit = 0;
     for (int t = 0; t < nthreads; t++) {
         sampled += lane_expire_stats[t].sampled;
         expired += lane_expire_stats[t].expired;
         freed += lane_expire_stats[t].freed;
+        fields += lane_expire_stats[t].fields;
+        lane_dirty += lane_expire_stats[t].dirty;
         hit |= lane_expire_stats[t].hit_limit;
     }
+    /* The lanes deleted hash fields without touching the global counter (that write races across lanes),
+     * so main adds the total here. Field dirty increments the free-inline lane made are also added here;
+     * the feed/replay paths account dirty on main themselves. */
+    if (fields) server.stat_expiredfields += fields;
+    if (lane_dirty) server.dirty += lane_dirty;
     /* Keys the lanes freed themselves (free-inline mode) get no replay, so main bulk-adds their expired
      * and dirty counts here. In propagate-only mode the feed owns the count for every key (freed or not),
      * so the lane does not add it again. */

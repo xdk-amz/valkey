@@ -167,8 +167,10 @@ static inline void hashTypeIgnoreTTL(robj *o, bool ignore, bool *oldstate) {
      * was converted listpack->hashtable in between cannot leak the flag.
      * Setting, however, must NOT touch the flag for hashtable objects:
      * hashTypeFreeVolatileSet() uses ignore=true as steady-state (not
-     * bracketed) configuration for hashes without volatile fields. */
-    if (!ignore) listpack_ttl_ignored = false;
+     * bracketed) configuration for hashes without volatile fields.
+     * The clear is conditional so a MAINT expire lane -- which only ever runs with the flag already
+     * false and no main-thread listpack bracket open -- performs no shared write. */
+    if (!ignore && listpack_ttl_ignored) listpack_ttl_ignored = false;
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
         /* prevent placing access function if not needed */
         if (!ignore && hashTypeGetVolatileSet(o) == NULL) {
@@ -2964,7 +2966,8 @@ static int hashTypeExpireEntry(void *entry, void *c) {
     if (deleted) {
         if (ctx->fields)
             ctx->fields[ctx->n_fields++] = createStringObjectFromSds(entryGetField(entry));
-        server.stat_expiredfields++;
+        /* The caller of hashTypeDeleteExpiredFields adds expired fields to server.stat_expiredfields from
+         * the returned count: a MAINT lane runs this concurrently, so a global write here would race. */
         entryFree(entry);
         return 1;
     }
@@ -2998,7 +3001,8 @@ size_t hashTypeDeleteExpiredFields(robj *o, mstime_t now, unsigned long max_fiel
                  * instead of restarting, keeping the reap linear. */
                 zl = lpDeleteRangeWithEntry(zl, &fptr, 2);
                 objectSetVal(o, zl);
-                server.stat_expiredfields++;
+                /* The caller adds expired fields to server.stat_expiredfields from the returned count; a
+                 * MAINT lane runs this concurrently, so a global write here would race. */
                 expired_count++;
                 p = fptr;
                 continue;
