@@ -122,6 +122,9 @@ static uint64_t mt_feed_us = 0;
 static long mt_fields_hashes = 0;  /* hashes main handled (replay or feed) */
 static long mt_fields_fields = 0;  /* fields across those hashes */
 static uint64_t mt_fields_us = 0;
+/* Measured main cost per expired FIELD (one HDEL carries many; a DEL is added when the hash empties).
+ * Moving-averaged over phases that handled fields; the shared budget charges fields at this rate. */
+static double mt_expire_field_us = 0.2;
 
 void maintRequest(int job, uint64_t budget_us) {
     if (job < 0 || job >= MAINT_JOB_COUNT) return;
@@ -455,6 +458,10 @@ static void maintExpireUpdateCosts(uint64_t lane_us) {
         double feed = (double)mt_feed_us / mt_fed;
         mt_expire_feed_us = 0.8 * mt_expire_feed_us + 0.2 * feed;
     }
+    if (mt_fields_fields >= 256) {
+        double field = (double)mt_fields_us / mt_fields_fields;
+        mt_expire_field_us = 0.8 * mt_expire_field_us + 0.2 * field;
+    }
     if (mt_replayed < 256) return;
     double lane = (double)lane_us / mt_replayed, replay = (double)mt_replay_us / mt_replayed;
     mt_expire_lane_us = 0.8 * mt_expire_lane_us + 0.2 * lane;
@@ -500,11 +507,12 @@ void maintRun(void) {
         if (server.cron_lanes_split_budget) {
             /* Override: each thread gets a plain slice of the budget, replay bound off. */
             mt_budget_us[MAINT_JOB_EXPIRE] = maintExpireThreadBudget(phase_budget, mt_nlanes);
-            activeExpireBudgetBegin(0, 0.0);
+            activeExpireBudgetBegin(0, 0.0, 0.0);
         } else {
             /* Shared replay-bounded budget: lanes get the whole-phase budget as a per-thread safety
-             * ceiling and stop on the shared bound (elapsed + logged keys * per-key cost). */
-            activeExpireBudgetBegin(phase_budget, per_key_us);
+             * ceiling and stop on the shared bound (elapsed + keys * per-key cost + fields * per-field
+             * cost). The per-field cost is far larger per logged unit, so it must be charged separately. */
+            activeExpireBudgetBegin(phase_budget, per_key_us, mt_expire_field_us);
         }
         activeExpireLaneBegin();
     }

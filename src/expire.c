@@ -476,6 +476,11 @@ static uint64_t lane_expire_budget_us = 0;    /* whole-phase budget */
 static monotime lane_expire_phase_start = 0;  /* phase open time, shared by all lanes */
 static double lane_expire_replay_us = 0.0;    /* measured per-key replay cost, 0 when freeing inline */
 static _Atomic unsigned long lane_expire_logged = 0; /* keys logged for replay so far, all lanes */
+/* Hash fields drive their own, larger per-unit main cost (one HDEL carries every expired field, and an
+ * emptied hash adds a DEL), so the budget charges them separately: fields logged this phase times the
+ * measured per-field feed-or-replay cost. */
+static double lane_expire_field_us = 0.0;     /* measured per-field feed/replay cost, 0 when freeing inline */
+static _Atomic unsigned long lane_expire_fields_logged = 0; /* expired fields logged for main, all lanes */
 
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
 static unsigned long long *lane_field_cursor = NULL;  /* [dbid * tables + didx], hash-field expiry */
@@ -562,11 +567,13 @@ void activeExpireSetPropagateOnly(int propagate_only) {
 /* Main, before opening the phase: arm the shared replay-bounded budget. budget_us is the whole-phase
  * budget; replay_us is the measured per-key replay cost (pass 0 in free-inline mode, where no key is
  * replayed). Lanes read these and the shared logged-key counter to decide when to stop. */
-void activeExpireBudgetBegin(uint64_t budget_us, double replay_us) {
+void activeExpireBudgetBegin(uint64_t budget_us, double replay_us, double field_us) {
     lane_expire_budget_us = budget_us;
     lane_expire_replay_us = lane_expire_free_inline ? 0.0 : replay_us;
+    lane_expire_field_us = lane_expire_free_inline ? 0.0 : field_us;
     lane_expire_phase_start = getMonotonicUs();
     atomic_store_explicit(&lane_expire_logged, 0, memory_order_relaxed);
+    atomic_store_explicit(&lane_expire_fields_logged, 0, memory_order_relaxed);
 }
 
 void activeExpireLaneBegin(void) {
@@ -645,7 +652,9 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
 static int maintExpireBudgetSpent(uint64_t per_thread_ceiling_us, monotime table_start) {
     if (lane_expire_budget_us == 0) return elapsedUs(table_start) >= per_thread_ceiling_us;
     unsigned long logged = atomic_load_explicit(&lane_expire_logged, memory_order_relaxed);
-    double projected = (double)elapsedUs(lane_expire_phase_start) + (double)logged * lane_expire_replay_us;
+    unsigned long flogged = atomic_load_explicit(&lane_expire_fields_logged, memory_order_relaxed);
+    double projected = (double)elapsedUs(lane_expire_phase_start) + (double)logged * lane_expire_replay_us +
+                       (double)flogged * lane_expire_field_us;
     if (projected >= (double)lane_expire_budget_us) return 1;
     /* Safety ceiling: no single lane runs past the whole-phase budget on one table. */
     return elapsedUs(table_start) >= lane_expire_budget_us;
@@ -722,6 +731,7 @@ typedef struct {
     int tid;
     unsigned long sampled;
     unsigned long hashes;
+    int budget_spent;
 } laneFieldScanData;
 
 static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
@@ -753,10 +763,19 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
                     for_main = emptied_val;
             }
             maintLogFields(d->tid, sdsdup(objectGetKey(o)), fields, (int)expired, db->id, didx, empty, for_main);
-            atomic_fetch_add_explicit(&lane_expire_logged, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&lane_expire_fields_logged, expired, memory_order_relaxed);
         }
         if (empty) break;
         if (expired < EXPIRE_BULK_LIMIT) break;
+        /* A very large hash can exceed one batch; stop it on the shared bound so one hash does not blow
+         * the phase budget (the surviving fields are reclaimed next tick from the per-table cursor). */
+        if (lane_expire_budget_us) {
+            unsigned long logged = atomic_load_explicit(&lane_expire_logged, memory_order_relaxed);
+            unsigned long flogged = atomic_load_explicit(&lane_expire_fields_logged, memory_order_relaxed);
+            double projected = (double)elapsedUs(lane_expire_phase_start) +
+                               (double)logged * lane_expire_replay_us + (double)flogged * lane_expire_field_us;
+            if (projected >= (double)lane_expire_budget_us) break;
+        }
     }
     if (any) d->hashes++;
 }
@@ -766,9 +785,19 @@ static void laneFieldScanCallback(void *privdata, void *entry, int didx) {
     robj *o = entry;
     d->sampled++;
     if (!hashTypeHasVolatileFields(o)) return;
+    /* Stop touching more hashes once the shared bound is spent; the scan callback cannot break the walk,
+     * but skipping work makes the remaining callbacks cheap and the outer loop ends on its next check. */
+    if (lane_expire_budget_us && d->budget_spent) return;
     /* A forkless save keeps the whole lanes path off (activeExpireInLanes gates on bgIteration), so no
      * per-hash in-use check is needed or safe here: bgIteration_isEntryInuse requires main exclusivity. */
     laneFieldExpireOneHash(d, o, didx);
+    if (lane_expire_budget_us) {
+        unsigned long logged = atomic_load_explicit(&lane_expire_logged, memory_order_relaxed);
+        unsigned long flogged = atomic_load_explicit(&lane_expire_fields_logged, memory_order_relaxed);
+        double projected = (double)elapsedUs(lane_expire_phase_start) +
+                           (double)logged * lane_expire_replay_us + (double)flogged * lane_expire_field_us;
+        if (projected >= (double)lane_expire_budget_us) d->budget_spent = 1;
+    }
 }
 
 uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us,
@@ -795,7 +824,9 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
                                   expireShouldSkipTableForSamplingCb, &d);
             checked++;
             if (*cursor == 0) { done = 1; break; }
+            if (d.budget_spent) break;
         }
+        if (d.budget_spent) { *hit_limit = 1; break; }
         sampled = d.sampled - sampled;
         hashes = d.hashes - hashes;
         repeat = !done && (sampled == 0 || hashes * 100 / sampled > acceptable);
@@ -917,8 +948,8 @@ ustime_t activeExpireCycle(int type) {
     if (activeExpireInLanes()) {
         /* Keys and hash fields both expire in the MAINT phase after crons(), every staged thread taking
          * whole tables. No client is served between crons() and the phase, so the stall is the phase. One
-         * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). A fast cycle is
-         * requested only when the last lane run was cut off or the stale estimate is high. */
+         * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). beforeSleep's
+         * unconditional FAST call adds extra phases when expiry is behind, as it does for serial. */
         maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
         return 0;
     }

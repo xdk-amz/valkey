@@ -489,6 +489,35 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             assert_equal 1 [$replica hlen fh:0]
             assert_equal 0 [$replica exists fe:0]
         }
+
+        test "Active expire with cron-lanes $lanes keeps the per-tick stall bounded under dense field expiry with a replica" {
+            $primary flushall
+            $primary select 0
+            $primary config resetstat
+            $primary latency reset
+            $primary config set latency-monitor-threshold 1
+            # Many hashes, each with many fields all expiring in a tight window: a dense burst that main
+            # must feed to the replica. With fields charged per field in the shared budget, no single
+            # MAINT phase runs long; the worst expire-cycle sample stays within the 25 ms budget + slack.
+            for {set h 0} {$h < 4000} {incr h} {
+                set fields {}
+                for {set f 0} {$f < 100} {incr f} { $primary hset dh:$h f$f $f; lappend fields f$f }
+                $primary hset dh:$h keep 1
+                $primary hpexpire dh:$h 400 FIELDS 100 {*}$fields
+            }
+            wait_for_condition 600 50 {[$primary hlen dh:0] == 1 && [$primary hlen dh:3999] == 1} else {
+                fail "dense field expiry did not drain"
+            }
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary debug digest] [$replica debug digest]
+            set worst 0
+            foreach ev [$primary latency latest] {
+                if {[lindex $ev 0] eq "expire-cycle"} { set worst [lindex $ev 3] }
+            }
+            assert_morethan $worst 0
+            assert_lessthan $worst 35
+            $primary config set latency-monitor-threshold 0
+        }
     }
 }
 }
@@ -512,9 +541,11 @@ start_server [list tags {"maint expire aof external:skip tls:skip"} overrides [c
         r select 0
         for {set i 0} {$i < 2000} {incr i} { r hset ah:$i a 1 b 2 keep 9; r hpexpire ah:$i 150 FIELDS 2 a b }
         for {set i 0} {$i < 2000} {incr i} { r hset ae:$i only 1; r hpexpire ae:$i 150 FIELDS 1 only }
-        wait_for_condition 400 50 {
-            [r hlen ah:0] == 1 && [r exists ae:0] == 0 && [r exists ae:1999] == 0
-        } else { fail "field expiry did not drain" }
+        # Wait until the whole burst has settled: the 2000 ae:* hashes are gone and only the 2000 ah:*
+        # survive, so dbsize is stable before the reload (a partial drain would carry extra keys over).
+        wait_for_condition 600 50 {
+            [r dbsize] == 2000 && [r hlen ah:0] == 1 && [r hlen ah:1999] == 1
+        } else { fail "field expiry did not fully drain: dbsize [r dbsize]" }
         set dbsize [r dbsize]
         r debug loadaof
         r select 0
