@@ -1008,12 +1008,16 @@ void fastpathStagedReadPhase(int tid) {
     }
 }
 
-/* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
+/* Main, write phase: execute every batch the read phase published, filling each entry's reply. Main sends
+ * the replies of the batches it read itself as soon as it has executed them: IO threads are parked, and
+ * one thread reads a client per iteration, so nothing else touches those clients until the reply phase.
+ * With appendfsync always every reply waits for the AOF fsync after the write phase. */
 int fastpathStagedExecute(void) {
     int d = fpDepth();
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);
+    int send_own = !(server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS);
     for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
         if (t->sbn[d] == 0) continue;
@@ -1025,7 +1029,12 @@ int fastpathStagedExecute(void) {
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
+            if (tid == 0 && send_own) {
+                fpDeliverBatch(t, b);
+                fpRecycleBatch(t, b);
+            }
         }
+        if (tid == 0 && send_own) t->sbn[d] = 0;
     }
     return total;
 }
