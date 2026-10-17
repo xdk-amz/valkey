@@ -139,11 +139,18 @@ static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     }
 }
 
+static client *fpExecutor(int tid);
+
+/* Main. A thread's first batch and its executor are allocated here rather than by the first command
+ * the thread reads, so memory a thread needs to serve at all is in use before any eviction limit is
+ * measured against it. */
 void fastpathInitThread(int tid) {
     fpThread *t = &fp_threads[tid];
     memset(t, 0, sizeof(*t));
     t->ready = 1;
     if (tid + 1 > fp_slots) fp_slots = tid + 1;
+    fpRecycleBatch(t, fpAllocBatch(t, tid));
+    fpExecutor(tid);
 }
 
 /* Destruction preconditions: no batch or leaving client may still name this thread. */
