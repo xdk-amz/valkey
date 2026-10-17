@@ -488,6 +488,11 @@ static _Atomic unsigned long lane_expire_fields_logged = 0; /* expired fields lo
 
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
 static unsigned long long *lane_field_cursor = NULL;  /* [dbid * tables + didx], hash-field expiry */
+/* [dbid * tables + didx]: the table's last visit stopped while it was still above the acceptable stale
+ * level (keys, and hash fields). Such a table starts its next visit with a full sampling loop; any other
+ * table starts with one probe sample, so a phase with nothing due samples each table once. */
+static unsigned char *lane_expire_stale = NULL;
+static unsigned char *lane_field_stale = NULL;
 static int lane_expire_tables = 0;
 static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
 static int lane_expire_behind = 0;    /* the last phase stopped on its budget or found too much expired */
@@ -586,8 +591,12 @@ void activeExpireLaneBegin(void) {
     if (lane_expire_tables != tables) {
         zfree(lane_expire_cursor);
         zfree(lane_field_cursor);
+        zfree(lane_expire_stale);
+        zfree(lane_field_stale);
         lane_expire_cursor = zcalloc(sizeof(unsigned long long) * server.dbnum * tables);
         lane_field_cursor = zcalloc(sizeof(unsigned long long) * server.dbnum * tables);
+        lane_expire_stale = zcalloc((size_t)server.dbnum * tables);
+        lane_field_stale = zcalloc((size_t)server.dbnum * tables);
         lane_expire_tables = tables;
     }
     if (!lane_ttl_sum) {
@@ -672,16 +681,22 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
         ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP / 4 * activeExpireEffort();
     unsigned long acceptable = activeExpireAcceptableStale();
     unsigned long long *cursor = &lane_expire_cursor[db->id * lane_expire_tables + didx];
+    unsigned char *stale = &lane_expire_stale[db->id * lane_expire_tables + didx];
+    int probe = !*stale;
     laneExpireScanData d = {.db = db, .now = now, .tid = tid};
     monotime start = getMonotonicUs();
     if (lane_expire_free_inline || lane_expire_propagate_only) beginMaintLaneFree();
-    int repeat;
+    int repeat = 0;
     unsigned long logged_batch = 0; /* keys logged for replay since the last publish */
     /* As one db iteration of activeExpireCycleJob, confined to this table. */
     do {
         unsigned long num = kvstoreHashtableSize(kvs, didx);
         if (num == 0) break;
         if (num > keys_per_loop) num = keys_per_loop;
+        if (probe) {
+            num = 1;
+            probe = 0;
+        }
         unsigned long sampled = d.sampled, expired = d.expired;
         long max_buckets = num * 10, checked = 0;
         int done = 0;
@@ -710,6 +725,7 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
             break;
         }
     } while (repeat);
+    *stale = repeat;
     if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
 
     laneExpireStats *st = &lane_expire_stats[tid];
@@ -818,14 +834,20 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
         ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP / 4 * activeExpireEffort();
     unsigned long acceptable = activeExpireAcceptableStale();
     unsigned long long *cursor = &lane_field_cursor[db->id * lane_expire_tables + didx];
+    unsigned char *stale = &lane_field_stale[db->id * lane_expire_tables + didx];
+    int probe = !*stale;
     laneFieldScanData d = {.db = db, .now = now, .tid = tid};
     monotime start = getMonotonicUs();
     if (lane_expire_free_inline || lane_expire_propagate_only) beginMaintLaneFree();
-    int repeat;
+    int repeat = 0;
     do {
         unsigned long num = kvstoreHashtableSize(kvs, didx);
         if (num == 0) break;
         if (num > keys_per_loop) num = keys_per_loop;
+        if (probe) {
+            num = 1;
+            probe = 0;
+        }
         unsigned long sampled = d.sampled, hashes = d.hashes;
         long max_buckets = num * 10, checked = 0;
         int done = 0;
@@ -836,7 +858,11 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
             if (*cursor == 0) { done = 1; break; }
             if (d.budget_spent) break;
         }
-        if (d.budget_spent) { *hit_limit = 1; break; }
+        if (d.budget_spent) {
+            *hit_limit = 1;
+            repeat = 1;
+            break;
+        }
         sampled = d.sampled - sampled;
         hashes = d.hashes - hashes;
         repeat = !done && (sampled == 0 || hashes * 100 / sampled > acceptable);
@@ -845,6 +871,7 @@ uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t
             break;
         }
     } while (repeat);
+    *stale = repeat;
     if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
     lane_expire_stats[tid].fsampled += d.sampled;
     lane_expire_stats[tid].fexpired += d.hashes;
