@@ -127,9 +127,20 @@ typedef struct fastGetBatchEntry {
 } fastGetBatchEntry;
 
 /* IO thread, read phase: this node serves a GET on the slot for client c with no redirect or cluster
- * error. getNodeByQuery reads the command and slot from the client, so they are set for the call. */
+ * error. The common states are decided from the slot owner directly: this node owns the slot, or it is a
+ * replica of the owner and the client sent READONLY, with the cluster healthy and no slot migrating or
+ * importing anywhere. Any other state goes through getNodeByQuery, which reads the command and slot from
+ * the client, so they are set for the call. */
 static int fastGetClusterServes(client *c, struct serverCommand *cmd, int slot, int read_flags) {
     if (slot < 0 || (read_flags & (READ_FLAGS_CROSSSLOT | READ_FLAGS_NO_KEYS))) return 0;
+    if (!isAnySlotInManualMigratingState() && !isAnySlotInManualImportingState() && isClusterHealthy() &&
+        !(server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)) {
+        clusterNode *owner = getNodeBySlot(slot);
+        if (owner == NULL) return 0;
+        clusterNode *myself = getMyClusterNode();
+        if (owner == myself) return 1;
+        return c->flag.readonly && clusterNodeIsReplica(myself) && clusterNodeGetPrimary(myself) == owner;
+    }
     if (getMigratingSlotDest(slot) != NULL || getImportingSlotSource(slot) != NULL) return 0;
     struct serverCommand *saved_cmd = c->cmd;
     int saved_slot = c->slot, saved_flags = c->read_flags;
