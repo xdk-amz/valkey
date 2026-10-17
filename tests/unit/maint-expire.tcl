@@ -519,28 +519,41 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             $primary config resetstat
             $primary latency reset
             $primary config set latency-monitor-threshold 1
-            # Many hashes, each with many fields all expiring in a tight window: a dense burst that main
-            # must feed to the replica. With fields charged per field in the shared budget, no single
-            # MAINT phase runs long; the worst expire-cycle sample stays within the 25 ms budget + slack.
-            for {set h 0} {$h < 4000} {incr h} {
-                set fields {}
-                for {set f 0} {$f < 100} {incr f} { $primary hset dh:$h f$f $f; lappend fields f$f }
-                $primary hset dh:$h keep 1
-                $primary hpexpire dh:$h 400 FIELDS 100 {*}$fields
-            }
-            wait_for_condition 600 50 {[$primary hlen dh:0] == 1 && [$primary hlen dh:3999] == 1} else {
+            # Many hashes whose fields all expire at once: a dense burst that main must feed to the replica.
+            # Charged per field, no MAINT phase runs past the 25 ms budget; charging a hash as one unit
+            # let phases run to about twice the budget. A loaded host can stretch one phase.
+            $primary eval {
+                for h=0,tonumber(ARGV[1])-1 do
+                    local a = {}
+                    for f=0,99 do a[#a+1]='f'..f; a[#a+1]=f end
+                    a[#a+1]='keep'; a[#a+1]=1
+                    redis.call('hset', 'dh:'..h, unpack(a))
+                end
+                return 1
+            } 0 16000
+            $primary config resetstat
+            $primary eval {
+                local a = {}
+                for f=0,99 do a[#a+1]='f'..f end
+                for h=0,tonumber(ARGV[1])-1 do
+                    redis.call('hpexpire', 'dh:'..h, 300, 'FIELDS', 100, unpack(a))
+                end
+                return 1
+            } 0 16000
+            wait_for_condition 600 50 {[$primary hlen dh:0] == 1 && [$primary hlen dh:15999] == 1} else {
                 fail "dense field expiry did not drain"
             }
             wait_for_ofs_sync $primary $replica
             assert_equal [$primary debug digest] [$replica debug digest]
-            set worst 0
-            foreach ev [$primary latency latest] {
-                if {[lindex $ev 0] eq "expire-cycle"} { set worst [lindex $ev 3] }
+            # Phases of 32 ms or more: histogram buckets 15 and up (bucket i counts [2^i, 2^(i+1)) us).
+            regexp {hist=([0-9/]+)} [getInfoProperty [$primary info cronstats] cron_maint] -> hist
+            set long 0
+            set i 0
+            foreach n [split $hist /] {
+                if {$i >= 15} { incr long $n }
+                incr i
             }
-            # The drain + digest match above prove expiry ran; here we only bound the worst phase. A run
-            # whose phases are all under the 1 ms monitor threshold records no sample (worst stays 0),
-            # which is itself within budget, so only the upper bound is asserted.
-            assert_lessthan $worst 35
+            assert {$long <= 1}
             $primary config set latency-monitor-threshold 0
         }
     }
