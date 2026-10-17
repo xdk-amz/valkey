@@ -214,6 +214,29 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         }
     }
 
+    test "Active expire with cron-lanes $lanes counts every expired field exactly in free-inline mode" {
+        r flushdb
+        r config resetstat
+        # Dense: many hashes across tables, every field expiring in a tight window, no observer so the
+        # lanes delete and count fields themselves. A per-field global increment in the lane would race
+        # and lose counts; main bulk-adds a per-lane total instead, so expired_fields is exact.
+        set loaded 0
+        for {set h 0} {$h < 400} {incr h} {
+            set args [list hset dh:$h]
+            for {set f 0} {$f < 100} {incr f} { lappend args f$f $f }
+            lappend args keep 1
+            r {*}$args
+            set fields {}
+            for {set f 0} {$f < 100} {incr f} { lappend fields f$f }
+            r hpexpire dh:$h 300 FIELDS 100 {*}$fields
+            incr loaded 100
+        }
+        wait_for_condition 400 50 {[r hlen dh:0] == 1 && [r hlen dh:399] == 1} else {
+            fail "dense field expiry did not drain"
+        }
+        assert_equal $loaded [s expired_fields]
+    }
+
     test "Active expire with cron-lanes $lanes shrinks keys_with_volatile_items when a hash empties" {
         r flushdb
         r set anchor 1
@@ -514,7 +537,9 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
             foreach ev [$primary latency latest] {
                 if {[lindex $ev 0] eq "expire-cycle"} { set worst [lindex $ev 3] }
             }
-            assert_morethan $worst 0
+            # The drain + digest match above prove expiry ran; here we only bound the worst phase. A run
+            # whose phases are all under the 1 ms monitor threshold records no sample (worst stays 0),
+            # which is itself within budget, so only the upper bound is asserted.
             assert_lessthan $worst 35
             $primary config set latency-monitor-threshold 0
         }

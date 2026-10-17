@@ -2285,6 +2285,9 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         robj *entries[EXPIRE_BULK_LIMIT];
         size_t expired = hashTypeDeleteExpiredFields(o, now, batch_size, entries);
         if (expired == 0) break;
+        /* hashTypeDeleteExpiredFields no longer bumps the global (a MAINT lane calls it concurrently);
+         * the serial path counts it here on main. */
+        server.stat_expiredfields += expired;
 
         /* Clean up volatile set if no more volatile fields remain */
         if (!hashTypeHasVolatileFields(o)) {
