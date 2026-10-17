@@ -148,7 +148,10 @@ start_server {tags {"maxmemory external:skip"}} {
 
 }
 
-start_server {tags {"maxmemory external:skip"}} {
+# These tests set maxmemory to used+100/400KiB, then fill to the limit. A split keyspace adds fixed
+# memory that eviction cannot reclaim: the per-table structures and MAINT's per-table expire state
+# (about 200KiB together at 8 bits), more than that headroom, so keep the keyspace unsharded here.
+start_server {tags {"maxmemory external:skip"} overrides {keyspace-shard-bits 0}} {
     foreach policy {
         allkeys-random allkeys-lru allkeys-lfu volatile-lru volatile-lfu volatile-random volatile-ttl
     } {
@@ -398,7 +401,8 @@ test_slave_buffers {slave buffer are counted correctly} 1000000 10 0 1
 # test again with fewer (and bigger) commands without pipeline, but with eviction
 test_slave_buffers "replica buffer don't induce eviction" 100000 100 1 0
 
-start_server {tags {"maxmemory external:skip"}} {
+# Reads the single main hash table 0 and its soft fill factor, so keep the keyspace unsharded.
+start_server {tags {"maxmemory external:skip"} overrides {keyspace-shard-bits 0}} {
     test {Don't rehash if used memory exceeds maxmemory after rehash} {
         r config set latency-tracking no
         r config set maxmemory 0

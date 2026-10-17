@@ -127,6 +127,9 @@ start_server {tags {"obuf-limits external:skip logreqres:skip"}} {
         for {set i 0} {$i < 150} {incr i} {
             r lpush mylist $item
         }
+        # With a split keyspace, background table maintenance allocates its per-table state once
+        # after the first keys appear; let that settle before taking the baseline.
+        after 500
         set orig_mem [s used_memory]
         # Set client name and get all items
         set rd [valkey_deferring_client]
