@@ -759,6 +759,8 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
         } else {
             robj **fields = zmalloc(sizeof(robj *) * expired);
             for (size_t i = 0; i < expired; i++) fields[i] = entries[i];
+            /* The key name lives in the hash object, which may be freed below once it empties. */
+            sds key = sdsdup(objectGetKey(o));
             robj *for_main = NULL;
             if (empty && emptied_val) {
                 if (emptied_val->refcount > 1 ||
@@ -767,7 +769,7 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
                 else
                     for_main = emptied_val;
             }
-            maintLogFields(d->tid, sdsdup(objectGetKey(o)), fields, (int)expired, db->id, didx, empty, for_main);
+            maintLogFields(d->tid, key, fields, (int)expired, db->id, didx, empty, for_main);
             atomic_fetch_add_explicit(&lane_expire_fields_logged, expired, memory_order_relaxed);
         }
         if (empty) break;
