@@ -144,6 +144,12 @@ static int fastGetClusterServes(client *c, struct serverCommand *cmd, int slot, 
     return n != NULL && clusterNodeIsMyself(n) && err == CLUSTER_REDIR_NONE;
 }
 
+/* The keyspace table of a GET's key. In cluster mode that is the slot the parser already computed. */
+static inline int fastGetTableIndex(sds key, int slot) {
+    if (server.cluster_enabled && slot >= 0) return slot;
+    return getKVStoreIndexForKey(key);
+}
+
 /* The commandlog threshold of a type, or -1 while that log records nothing. */
 static long long fastGetCommandlogThreshold(int type) {
     if (server.commandlog[type].threshold < 0 || server.commandlog[type].max_len == 0) return -1;
@@ -277,7 +283,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * GET command's microseconds by fastGetAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
 
-    hashtable *ht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(c->argv[1])));
+    hashtable *ht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(objectGetVal(c->argv[1]), c->slot));
     if (!ht) return 0;
 
     /* STREAMING SLOT-REFILL: a ring of FASTGET_BATCH_DEPTH slots holds in-flight
@@ -308,7 +314,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
             }
-            hashtable *pht = kvstoreGetHashtable(c->db->keys, getKVStoreIndexForKey(objectGetVal(p->argv[1])));
+            hashtable *pht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(objectGetVal(p->argv[1]), p->slot));
             if (!pht) {
                 prefix_open = 0; /* an unallocated shard ends the prefix; main answers it */
                 break;
