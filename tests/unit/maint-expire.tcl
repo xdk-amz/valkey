@@ -188,11 +188,13 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         wait_for_condition 400 50 {[r dbsize] == 0} else { fail "keys and fields did not expire: [r dbsize]" }
         # One expire-cycle sample per second covers the whole MAINT phase (keys and fields both run in the
         # lanes). Spending the budget twice per tick puts every busy second near 50 ms or more; a loaded
-        # host can stretch a single tick, so allow one sample past 45 ms.
-        set samples [r latency history expire-cycle]
-        set over [lmap s $samples {expr {[lindex $s 1] > 45 ? [lindex $s 1] : [continue]}}]
-        assert_morethan [llength $samples] 1
-        assert {[llength $over] <= 1}
+        # host can stretch a single tick, so allow one sample past 45 ms. Slow builds skip it (--no-latency).
+        if {!$::no_latency} {
+            set samples [r latency history expire-cycle]
+            set over [lmap s $samples {expr {[lindex $s 1] > 45 ? [lindex $s 1] : [continue]}}]
+            assert_morethan [llength $samples] 1
+            assert {[llength $over] <= 1}
+        }
         r config set latency-monitor-threshold 0
     }
 
@@ -553,7 +555,8 @@ start_server [list tags {"maint expire repl external:skip tls:skip"} overrides [
                 if {$i >= 15} { incr long $n }
                 incr i
             }
-            assert {$long <= 1}
+            # Slow builds skip the timing check (--no-latency).
+            if {!$::no_latency} { assert {$long <= 1} }
             $primary config set latency-monitor-threshold 0
         }
     }
