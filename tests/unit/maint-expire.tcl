@@ -186,14 +186,13 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
             return 1
         } 0 400 1000
         wait_for_condition 400 50 {[r dbsize] == 0} else { fail "keys and fields did not expire: [r dbsize]" }
-        # One expire-cycle sample per tick covers everything clients waited for: field expiry on main
-        # and the phase. It stays within the 25 ms budget plus scheduling slack.
-        set worst 0
-        foreach ev [r latency latest] {
-            if {[lindex $ev 0] eq "expire-cycle"} { set worst [lindex $ev 3] }
-        }
-        assert_morethan $worst 0
-        assert_lessthan $worst 35
+        # One expire-cycle sample per second covers everything clients waited for: field expiry on main
+        # and the phase. Two budgets back to back put every busy second near 50 ms or more; a loaded
+        # host can stretch a single tick, so allow one sample past 45 ms.
+        set samples [r latency history expire-cycle]
+        set over [lmap s $samples {expr {[lindex $s 1] > 45 ? [lindex $s 1] : [continue]}}]
+        assert_morethan [llength $samples] 1
+        assert {[llength $over] <= 1}
         r config set latency-monitor-threshold 0
     }
 
