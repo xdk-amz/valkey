@@ -904,6 +904,29 @@ start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     } {} {needs:debug}
 }
 
+start_server {overrides {forkless-infrastructure-enabled yes save "" keyspace-shard-bits 6}} {
+    test "deleting keys during forkless bgsave with a split keyspace" {
+        # The keys spread over 64 tables; the save must keep each one it had not reached when it was deleted.
+        populate 2000
+        r config set rdb-key-save-delay 1000
+        r config set bgsave-default-method forkless
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave did not start"
+        }
+        for {set i 0} {$i < 2000} {incr i} { r del key:$i }
+        assert_equal [r dbsize] 0
+        assert_equal [s rdb_bgsave_in_progress] 1
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        catch {r debug reload nosave}
+        assert_equal 2000 [r dbsize]
+        for {set i 0} {$i < 2000} {incr i} { assert_equal AAA [r get key:$i] }
+    } {} {needs:debug}
+}
+
 start_server {overrides {forkless-infrastructure-enabled yes save ""}} {
     test "blocking commands during forkless bgsave" {
         
