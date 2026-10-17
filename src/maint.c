@@ -53,6 +53,26 @@ typedef struct {
     int cap;
 } maintPropLog;
 
+/* One hash whose expired fields a lane deleted; main replays the observers (hexpired, HDEL propagation,
+ * signalModifiedKey, and when the hash emptied the key's delete) after the phase. The lane owns the key
+ * name copy and the deleted field-name objects; main frees them. empty means the hash has no fields left,
+ * so main also deletes the key (val carries it for the free). */
+typedef struct {
+    sds key;        /* hash key name, owned copy */
+    robj **fields;  /* deleted field-name objects, owned */
+    int n_fields;
+    int dbid;
+    int didx;
+    int empty;      /* hash emptied: main deletes the key too */
+    robj *val;      /* the emptied hash value to free (NULL unless empty and freed via main) */
+} maintFieldExpired;
+
+typedef struct {
+    maintFieldExpired *e;
+    int len;
+    int cap;
+} maintFieldLog;
+
 /* Pending requests for the current iteration. */
 static int mt_requested[MAINT_JOB_COUNT];
 static uint64_t mt_budget_us[MAINT_JOB_COUNT];
@@ -89,6 +109,7 @@ static uint64_t mt_lane_usec[IO_THREADS_MAX_NUM][MAINT_JOB_COUNT];
 static uint64_t mt_lane_work[IO_THREADS_MAX_NUM][MAINT_JOB_COUNT]; /* units where the job did work */
 static maintLog mt_logs[IO_THREADS_MAX_NUM];
 static maintPropLog mt_prop_logs[IO_THREADS_MAX_NUM];
+static maintFieldLog mt_field_logs[IO_THREADS_MAX_NUM];
 
 /* EXPIRE propagate-only append cost on main, per key: feeding one DEL/UNLINK to the AOF and replicas.
  * Measured on phases that fed, moving-averaged. The shared budget uses this instead of the full replay
@@ -96,6 +117,11 @@ static maintPropLog mt_prop_logs[IO_THREADS_MAX_NUM];
 static double mt_expire_feed_us = 0.3;
 static long mt_fed = 0;
 static uint64_t mt_feed_us = 0;
+
+/* Field-expiry main-side cost and totals for the phase (replay or feed of hash-field deletes). */
+static long mt_fields_hashes = 0;  /* hashes main handled (replay or feed) */
+static long mt_fields_fields = 0;  /* fields across those hashes */
+static uint64_t mt_fields_us = 0;
 
 void maintRequest(int job, uint64_t budget_us) {
     if (job < 0 || job >= MAINT_JOB_COUNT) return;
@@ -148,6 +174,20 @@ void maintLogPropagate(int tid, sds key_copy, int dbid, int lazy) {
     l->e[l->len++] = (maintPropagate){.key = key_copy, .dbid = dbid, .lazy = lazy};
 }
 
+/* Lane: record a hash whose expired fields it deleted, for main to replay or feed after the phase. The
+ * lane owns and passes key_copy and the fields array (n field-name objects); empty means the hash emptied
+ * and val (if non-NULL) is the hash value for main to free. Main frees key, each field, the array, and
+ * val. */
+void maintLogFields(int tid, sds key_copy, robj **fields, int n_fields, int dbid, int didx, int empty, robj *val) {
+    maintFieldLog *l = &mt_field_logs[tid];
+    if (l->len == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 512;
+        l->e = zrealloc(l->e, sizeof(maintFieldExpired) * l->cap);
+    }
+    l->e[l->len++] = (maintFieldExpired){.key = key_copy, .fields = fields, .n_fields = n_fields,
+                                         .dbid = dbid, .didx = didx, .empty = empty, .val = val};
+}
+
 /* Return the db's kvstore for slot k (0 keys, 1 expires, 2 keys_with_volatile_items). */
 static kvstore *maintKvstore(serverDb *db, int k) {
     switch (k) {
@@ -180,6 +220,17 @@ static void maintRunUnit(int tid, int claim_index, const maintUnit *u, uint64_t 
         if (spent > 0) mt_lane_work[tid][MAINT_JOB_EXPIRE]++;
         remain_us[MAINT_JOB_EXPIRE] = spent >= remain_us[MAINT_JOB_EXPIRE] ? 0 : remain_us[MAINT_JOB_EXPIRE] - spent;
         if (hit_limit) maintNoteCut(claim_index);
+        /* Hash fields of the same table share the EXPIRE job and its remaining budget. */
+        if (remain_us[MAINT_JOB_EXPIRE] > 0 && u->didx < kvstoreNumHashtables(db->keys_with_volatile_items)) {
+            int fhit = 0;
+            uint64_t fspent = activeExpireFieldsTableInLane(tid, db, u->didx, mt_now,
+                                                            remain_us[MAINT_JOB_EXPIRE], &fhit);
+            mt_lane_usec[tid][MAINT_JOB_EXPIRE] += fspent;
+            if (fspent > 0) mt_lane_work[tid][MAINT_JOB_EXPIRE]++;
+            remain_us[MAINT_JOB_EXPIRE] =
+                fspent >= remain_us[MAINT_JOB_EXPIRE] ? 0 : remain_us[MAINT_JOB_EXPIRE] - fspent;
+            if (fhit) maintNoteCut(claim_index);
+        }
     }
 
     for (int k = 0; k < 3; k++) {
@@ -244,7 +295,9 @@ static void maintBuildUnits(void) {
             if (!due && mt_requested[MAINT_JOB_REHASH])
                 due = kvstoreHashtableRehashingAt(db->keys, didx) || kvstoreHashtableRehashingAt(db->expires, didx) ||
                       kvstoreHashtableRehashingAt(db->keys_with_volatile_items, didx);
-            if (!due && mt_requested[MAINT_JOB_EXPIRE]) due = kvstoreHashtableSize(db->expires, didx) > 0;
+            if (!due && mt_requested[MAINT_JOB_EXPIRE])
+                due = kvstoreHashtableSize(db->expires, didx) > 0 ||
+                      kvstoreHashtableSize(db->keys_with_volatile_items, didx) > 0;
             if (!due) continue;
             if (mt_units_len == mt_units_cap) {
                 mt_units_cap = mt_units_cap ? mt_units_cap * 2 : 256;
@@ -326,6 +379,65 @@ static void maintFeedPropagation(void) {
     if (fed) cronStatsRecord(CRON_JOB_MAINT_FEED, mt_feed_us);
 }
 
+/* The expire mode chosen for this phase, so the field handler matches the key path. */
+static int mt_expire_propagate_only = 0;
+
+/* Main, after the phase: handle the hash-field deletes the lanes logged, in each lane's expiry order.
+ * In propagate-only mode, feed HDEL (and DEL when the hash emptied) to the AOF and replicas with
+ * propagateNow's framing; otherwise replay the full observers through replayExpiredFieldsUnlinkedInLane.
+ * Frees the logged key copies, field objects and emptied-hash values either way. The lane already deleted
+ * the fields and, when empty, unlinked the key. */
+static void maintHandleFields(void) {
+    monotime t0 = getMonotonicUs();
+    long hashes = 0, fields_total = 0;
+    int propagate_to_aof = server.aof_state != AOF_OFF;
+    int propagate_to_repl = 1;
+    if (!propagate_to_aof)
+        propagate_to_repl = server.primary_host == NULL && (server.repl_backlog || listLength(server.replicas) != 0);
+    for (int tid = 0; tid < IO_THREADS_MAX_NUM; tid++) {
+        maintFieldLog *l = &mt_field_logs[tid];
+        for (int i = 0; i < l->len; i++) {
+            maintFieldExpired *e = &l->e[i];
+            if (mt_expire_propagate_only) {
+                robj *keyobj = createStringObject(e->key, sdslen(e->key));
+                /* HDEL key field... (fields capped at the batch size the lane logged). */
+                int argc = 0;
+                robj *hdel_argv[2 + 1024];
+                int nf = e->n_fields > 1024 ? 1024 : e->n_fields;
+                hdel_argv[argc++] = shared.hdel;
+                hdel_argv[argc++] = keyobj;
+                for (int f = 0; f < nf; f++) hdel_argv[argc++] = e->fields[f];
+                if (propagate_to_aof) feedAppendOnlyFile(e->dbid, hdel_argv, argc);
+                if (propagate_to_repl) replicationFeedReplicas(e->dbid, hdel_argv, argc);
+                if (e->empty) {
+                    robj *del_argv[2] = {server.lazyfree_lazy_expire ? shared.unlink : shared.del, keyobj};
+                    if (propagate_to_aof) feedAppendOnlyFile(e->dbid, del_argv, 2);
+                    if (propagate_to_repl) replicationFeedReplicas(e->dbid, del_argv, 2);
+                    server.dirty++;
+                } else {
+                    server.dirty += e->n_fields;
+                }
+                decrRefCount(keyobj);
+            } else {
+                replayExpiredFieldsUnlinkedInLane(server.db[e->dbid], e->key, e->fields, e->n_fields,
+                                                  e->didx, e->empty, e->val);
+                e->val = NULL; /* freed inside the replay */
+            }
+            for (int f = 0; f < e->n_fields; f++) decrRefCount(e->fields[f]);
+            zfree(e->fields);
+            sdsfree(e->key);
+            if (e->empty && e->val) freeValueNeverOnMain(NULL, e->val, e->dbid);
+            hashes++;
+            fields_total += e->n_fields;
+        }
+        l->len = 0;
+    }
+    mt_fields_hashes = hashes;
+    mt_fields_fields = fields_total;
+    mt_fields_us = hashes ? getMonotonicUs() - t0 : 0;
+    if (hashes) cronStatsRecord(CRON_JOB_MAINT_FIELDS, mt_fields_us);
+}
+
 /* Main: each thread's share of the EXPIRE budget. Threads running for t each expire about
  * n * t / lane_us keys, which main then replays at replay_us each, so t = budget / (1 + n * replay_us /
  * lane_us) keeps lanes plus replay within the budget. */
@@ -380,6 +492,7 @@ void maintRun(void) {
         int propagate_only = replay_needed && maintExpirePropagateOnly();
         activeExpireSetFreeInline(!replay_needed);
         activeExpireSetPropagateOnly(propagate_only);
+        mt_expire_propagate_only = propagate_only;
         uint64_t phase_budget = mt_budget_us[MAINT_JOB_EXPIRE];
         /* The shared bound charges the per-key cost main pays after the phase: a full replay normally, or
          * just the propagation feed in propagate-only mode. In free-inline mode nothing is charged. */
@@ -415,6 +528,7 @@ void maintRun(void) {
 
     maintReplay();
     maintFeedPropagation();
+    maintHandleFields();
     cronStatsRecord(CRON_JOB_SC_MAINT, getMonotonicUs() - phase_t0);
 
     /* Per-job lane time summed across threads, recorded only when a job actually did work so a

@@ -478,9 +478,9 @@ static double lane_expire_replay_us = 0.0;    /* measured per-key replay cost, 0
 static _Atomic unsigned long lane_expire_logged = 0; /* keys logged for replay so far, all lanes */
 
 static unsigned long long *lane_expire_cursor = NULL; /* [dbid * tables + didx] */
+static unsigned long long *lane_field_cursor = NULL;  /* [dbid * tables + didx], hash-field expiry */
 static int lane_expire_tables = 0;
 static int lane_expire_hit_limit = 0; /* the last lane run cut a thread off at its budget */
-static ustime_t lane_expire_fields_us = 0; /* field expiry time on main in the tick that posted the phase */
 static laneExpireStats lane_expire_stats[IO_THREADS_MAX_NUM];
 static long long *lane_ttl_sum = NULL;     /* [tid * dbnum + dbid] */
 static long long *lane_ttl_samples = NULL; /* [tid * dbnum + dbid] */
@@ -573,7 +573,9 @@ void activeExpireLaneBegin(void) {
     int tables = server.cluster_enabled ? CLUSTER_SLOTS : 1 << server.keyspace_shard_bits;
     if (lane_expire_tables != tables) {
         zfree(lane_expire_cursor);
+        zfree(lane_field_cursor);
         lane_expire_cursor = zcalloc(sizeof(unsigned long long) * server.dbnum * tables);
+        lane_field_cursor = zcalloc(sizeof(unsigned long long) * server.dbnum * tables);
         lane_expire_tables = tables;
     }
     if (!lane_ttl_sum) {
@@ -708,6 +710,104 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
     return elapsedUs(start);
 }
 
+/* Field expiry in a lane: one table of keys_with_volatile_items. Each hash's expired fields are deleted
+ * in batches (hashTypeDeleteExpiredFields, which also bumps stat_expiredfields), then dispatched by the
+ * phase's mode -- freed in the lane with no main work, recorded for main to feed (propagate-only), or
+ * logged for main's full replay. An emptied hash is unlinked in the lane; its value is freed in the lane
+ * (cheap) or handed to main. bgIteration keeps a hash it is using serial (skipped here, next tick). */
+
+typedef struct {
+    serverDb *db;
+    mstime_t now;
+    int tid;
+    unsigned long sampled;
+    unsigned long hashes;
+} laneFieldScanData;
+
+static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
+    serverDb *db = d->db;
+    int any = 0;
+    for (;;) {
+        robj *entries[EXPIRE_BULK_LIMIT];
+        size_t expired = hashTypeDeleteExpiredFields(o, d->now, EXPIRE_BULK_LIMIT, entries);
+        if (expired == 0) break;
+        any = 1;
+        int empty = hashTypeLength(o) == 0;
+        if (!hashTypeHasVolatileFields(o))
+            kvstoreHashtableDelete(db->keys_with_volatile_items, didx, objectGetKey(o));
+        robj *emptied_val = NULL;
+        if (empty) emptied_val = dbUnlinkExpiredHashInLane(db, o, didx);
+        if (lane_expire_free_inline) {
+            for (size_t i = 0; i < expired; i++) decrRefCount(entries[i]);
+            if (empty && emptied_val) freeValueNeverOnMain(NULL, emptied_val, db->id);
+            server.dirty += empty ? 1 : (long long)expired;
+        } else {
+            robj **fields = zmalloc(sizeof(robj *) * expired);
+            for (size_t i = 0; i < expired; i++) fields[i] = entries[i];
+            robj *for_main = NULL;
+            if (empty && emptied_val) {
+                if (emptied_val->refcount > 1 ||
+                    lazyfreeGetFreeEffort(NULL, emptied_val, db->id) <= LAZYFREE_THRESHOLD)
+                    freeValueNeverOnMain(NULL, emptied_val, db->id);
+                else
+                    for_main = emptied_val;
+            }
+            maintLogFields(d->tid, sdsdup(objectGetKey(o)), fields, (int)expired, db->id, didx, empty, for_main);
+            atomic_fetch_add_explicit(&lane_expire_logged, 1, memory_order_relaxed);
+        }
+        if (empty) break;
+        if (expired < EXPIRE_BULK_LIMIT) break;
+    }
+    if (any) d->hashes++;
+}
+
+static void laneFieldScanCallback(void *privdata, void *entry, int didx) {
+    laneFieldScanData *d = privdata;
+    robj *o = entry;
+    d->sampled++;
+    if (!hashTypeHasVolatileFields(o)) return;
+    /* A forkless save keeps the whole lanes path off (activeExpireInLanes gates on bgIteration), so no
+     * per-hash in-use check is needed or safe here: bgIteration_isEntryInuse requires main exclusivity. */
+    laneFieldExpireOneHash(d, o, didx);
+}
+
+uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us,
+                                       int *hit_limit) {
+    kvstore *kvs = db->keys_with_volatile_items;
+    if (kvstoreHashtableSize(kvs, didx) == 0) return 0;
+    unsigned long keys_per_loop =
+        ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP + ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP / 4 * activeExpireEffort();
+    unsigned long acceptable = activeExpireAcceptableStale();
+    unsigned long long *cursor = &lane_field_cursor[db->id * lane_expire_tables + didx];
+    laneFieldScanData d = {.db = db, .now = now, .tid = tid};
+    monotime start = getMonotonicUs();
+    if (lane_expire_free_inline || lane_expire_propagate_only) beginMaintLaneFree();
+    int repeat;
+    do {
+        unsigned long num = kvstoreHashtableSize(kvs, didx);
+        if (num == 0) break;
+        if (num > keys_per_loop) num = keys_per_loop;
+        unsigned long sampled = d.sampled, hashes = d.hashes;
+        long max_buckets = num * 10, checked = 0;
+        int done = 0;
+        while (d.sampled - sampled < num && checked < max_buckets) {
+            *cursor = kvstoreScan(kvs, *cursor, didx, didx, laneFieldScanCallback,
+                                  expireShouldSkipTableForSamplingCb, &d);
+            checked++;
+            if (*cursor == 0) { done = 1; break; }
+        }
+        sampled = d.sampled - sampled;
+        hashes = d.hashes - hashes;
+        repeat = !done && (sampled == 0 || hashes * 100 / sampled > acceptable);
+        if (repeat && maintExpireBudgetSpent(budget_us, start)) {
+            *hit_limit = 1;
+            break;
+        }
+    } while (repeat);
+    if (lane_expire_free_inline || lane_expire_propagate_only) endMaintLaneFree();
+    return elapsedUs(start);
+}
+
 void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us) {
     UNUSED(lanes_us);
     int nthreads = stagedWorkerCount() + 1;
@@ -746,10 +846,8 @@ void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_u
         *cur = *cur == 0 ? avg : avg + (*cur - avg) * avg_ttl_factor[0];
     }
     server.stat_expire_cycle_time_used += expire_us;
-    /* Clients waited for this tick's field expiry on main and the phase back to back. */
-    ustime_t phase = (ustime_t)phase_us + lane_expire_fields_us;
-    lane_expire_fields_us = 0;
-    latencyAddSampleIfNeeded("expire-cycle", phase);
+    /* One expire-cycle sample covers the whole MAINT phase (keys and fields). */
+    latencyAddSampleIfNeeded("expire-cycle", (ustime_t)phase_us);
 }
 
 /* activeExpireCycle
@@ -817,28 +915,12 @@ ustime_t activeExpireCycle(int type) {
     serverAssert(server.also_propagate.numops == 0);
 
     if (activeExpireInLanes()) {
-        /* Keys expire in the MAINT phase after crons(), every staged thread taking whole tables. Hash
-         * fields stay here. Both share this cycle's budget: no client is served between crons() and the
-         * phase, so the stall is their sum. Fields take at most half when keys may expire too, so neither
-         * starves. A fast cycle is requested only when the last lane run was cut off or the stale
-         * estimate is high, as activeExpireCycleJob decides. */
-        ustime_t fields_limit = timelimit_us;
-        for (int j = 0; j < server.dbnum; j++) {
-            if (server.db[j] && kvstoreSize(server.db[j]->expires)) {
-                fields_limit = timelimit_us / 2;
-                break;
-            }
-        }
-        elapsed = activeExpireCycleJob(FIELDS, type, fields_limit);
-        lane_expire_fields_us = elapsed;
-        if ((type == ACTIVE_EXPIRE_CYCLE_SLOW || lane_expire_hit_limit ||
-             server.stat_expired_keys_stale_perc >= activeExpireAcceptableStale()) &&
-            timelimit_us > elapsed)
-            maintRequest(MAINT_JOB_EXPIRE, timelimit_us - elapsed);
-        else if (elapsed)
-            latencyAddSampleIfNeeded("expire-cycle", elapsed);
-        server.stat_expire_cycle_time_used += elapsed;
-        return elapsed;
+        /* Keys and hash fields both expire in the MAINT phase after crons(), every staged thread taking
+         * whole tables. No client is served between crons() and the phase, so the stall is the phase. One
+         * expire-cycle sample covers the phase (recorded in activeExpireLaneEnd). A fast cycle is
+         * requested only when the last lane run was cut off or the stale estimate is high. */
+        maintRequest(MAINT_JOB_EXPIRE, timelimit_us);
+        return 0;
     }
 
     if (expireCycleStartWithFields) {

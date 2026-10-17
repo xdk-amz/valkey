@@ -4174,7 +4174,12 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
 void dbLanePhaseBegin(void);
 void dbLanePhaseEnd(void);
 robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index);
+robj *dbUnlinkExpiredHashInLane(serverDb *db, robj *val, int dict_index);
 void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index);
+void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index,
+                                       int empty, robj *val);
+void propagateFieldsDeletionReplay(serverDb *db, robj *keyobj, robj **fields, int n_fields, int didx);
+#define EXPIRE_BULK_LIMIT ((size_t)1024) /* max fields active-expired per replicated HDEL command */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
 int shouldPropagateExpire(void);
