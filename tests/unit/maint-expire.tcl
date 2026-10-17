@@ -237,6 +237,25 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
             fail "dense field expiry did not drain"
         }
         assert_equal $loaded [s expired_fields]
+        # The field stale estimate follows the lanes as it follows the serial job.
+        assert_morethan [s expired_keys_with_volatile_items_stale_perc] 0
+    }
+
+    test "Active expire with cron-lanes $lanes opens no phase per loop iteration while nothing is due" {
+        r flushdb
+        # Keys and hash fields whose TTLs are an hour away: no phase stops on its budget, so a fast cycle
+        # must not open a MAINT phase on every event loop iteration; slow cycles open about hz a second.
+        me_load_volatile r far: 20000 3600000
+        r eval {for h=1,2000 do redis.call('hsetex', 'farh:'..h, 'EX', 3600, 'FIELDS', 2, 'a', 1, 'b', 2) end return 1} 0
+        after 300
+        set before [me_cron_calls r maint]
+        set t0 [clock milliseconds]
+        set n 0
+        while {[clock milliseconds] - $t0 < 1000} { r ping; incr n }
+        set phases [expr {[me_cron_calls r maint] - $before}]
+        assert_morethan $n 200
+        assert_lessthan $phases 60
+        r flushdb
     }
 
     test "Active expire with cron-lanes $lanes shrinks keys_with_volatile_items when a hash empties" {
