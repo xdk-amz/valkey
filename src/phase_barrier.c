@@ -8,10 +8,15 @@
 
 #include "fmacros.h"
 #include "phase_barrier.h"
+#include "monotonic.h"
 
 #include <string.h>
 
-#define PHASE_BARRIER_SPIN 1024
+/* A waiter allowed to spin does so this long before it sleeps. Under load the next phase opens within a
+ * few tens of microseconds, and waking a sleeper costs a syscall on both sides and delays the phase. The
+ * clock is read every PHASE_BARRIER_SPIN_CHECK relaxes. */
+#define PHASE_BARRIER_SPIN_US 100
+#define PHASE_BARRIER_SPIN_CHECK 64
 
 static inline void phaseBarrierRelax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -19,6 +24,12 @@ static inline void phaseBarrierRelax(void) {
 #elif defined(__aarch64__)
     __asm__ __volatile__("isb" ::: "memory");
 #endif
+}
+
+/* Spin step i (from 1) of a wait that started at start: 0 once the spin budget is spent. */
+static inline int phaseBarrierKeepSpinning(unsigned i, monotime start) {
+    phaseBarrierRelax();
+    return (i % PHASE_BARRIER_SPIN_CHECK) != 0 || getMonotonicUs() - start < PHASE_BARRIER_SPIN_US;
 }
 
 static inline uint32_t stateSeq(uint64_t st) {
@@ -88,9 +99,12 @@ int phaseBarrierOpen(phaseBarrier *b, int phase_id) {
 }
 
 void phaseBarrierWaitAllDone(phaseBarrier *b, int spin) {
-    for (int i = 0, n = spin ? PHASE_BARRIER_SPIN : 0; i < n; i++) {
-        if (atomic_load_explicit(&b->pending, memory_order_acquire) == 0) return;
-        phaseBarrierRelax();
+    if (spin) {
+        monotime start = getMonotonicUs();
+        for (unsigned i = 1;; i++) {
+            if (atomic_load_explicit(&b->pending, memory_order_acquire) == 0) return;
+            if (!phaseBarrierKeepSpinning(i, start)) break;
+        }
     }
     pthread_mutex_lock(&b->lock);
     while (atomic_load_explicit(&b->pending, memory_order_acquire) != 0) {
@@ -120,12 +134,15 @@ static inline int takePhase(uint64_t st, int worker_id, uint64_t *last_seen, int
 
 int phaseBarrierAwaitPhase(phaseBarrier *b, int worker_id, uint64_t *last_seen, int spin) {
     int phase;
-    for (int i = 0, n = spin ? PHASE_BARRIER_SPIN : 0; i < n; i++) {
-        if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
-        uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
-        if (takePhase(st, worker_id, last_seen, &phase)) return phase;
-        if (worker_id >= stateN(st)) break; /* not a participant now: park instead of spinning */
-        phaseBarrierRelax();
+    if (spin) {
+        monotime start = getMonotonicUs();
+        for (unsigned i = 1;; i++) {
+            if (atomic_load_explicit(&b->shutdown, memory_order_acquire)) return PHASE_BARRIER_EXIT;
+            uint64_t st = atomic_load_explicit(&b->state, memory_order_acquire);
+            if (takePhase(st, worker_id, last_seen, &phase)) return phase;
+            if (worker_id >= stateN(st)) break; /* not a participant now: park instead of spinning */
+            if (!phaseBarrierKeepSpinning(i, start)) break;
+        }
     }
     pthread_mutex_lock(&b->lock);
     for (;;) {

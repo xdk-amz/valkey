@@ -15,9 +15,15 @@
 
 extern "C" {
 #include "phase_barrier.h"
+#include "monotonic.h"
 }
 
 namespace {
+
+/* The barrier times its spins with the server's monotonic clock. */
+struct ClockInit {
+    ClockInit() { monotonicInit(); }
+} clock_init;
 
 /* Main publishes payload before each open; workers publish results before each done. */
 struct Harness {
