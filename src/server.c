@@ -3210,6 +3210,22 @@ bool dbsHaveNoKeys(void) {
     return true;
 }
 
+/* Resolve the configured keyspace-shard-bits into the effective value every caller reads.
+ * -1 means auto: split (8 bits) when more than one IO thread exists, otherwise one table (0 bits,
+ * no lane exists there and any split would only cost). Cluster mode shards by slot regardless, so
+ * the standalone value is 0 there. An explicit value, including 0, is used as given. Resolved once
+ * at startup before any database is created; io-threads can change at runtime but the effective
+ * value does not follow it. */
+void resolveKeyspaceShardBits(void) {
+    if (server.keyspace_shard_bits_config >= 0) {
+        server.keyspace_shard_bits = server.keyspace_shard_bits_config;
+    } else if (server.cluster_enabled || server.io_threads_num <= 1) {
+        server.keyspace_shard_bits = 0;
+    } else {
+        server.keyspace_shard_bits = 8;
+    }
+}
+
 serverDb *createDatabase(int id) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_HASHTABLES_ON_DEMAND;
@@ -3258,6 +3274,7 @@ void initServer(void) {
     }
 
     /* Initialization after setting defaults from the config system. */
+    resolveKeyspaceShardBits();
     server.aof_state = server.aof_enabled ? AOF_ON : AOF_OFF;
     server.fsynced_reploff = server.aof_enabled ? 0 : -1;
     server.in_fork_child = CHILD_TYPE_NONE;

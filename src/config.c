@@ -3514,7 +3514,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
-    createIntConfig("keyspace-shard-bits", NULL, IMMUTABLE_CONFIG, 0, CLUSTER_SLOT_MASK_BITS, server.keyspace_shard_bits, 0, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("keyspace-shard-bits", NULL, IMMUTABLE_CONFIG, -1, CLUSTER_SLOT_MASK_BITS, server.keyspace_shard_bits_config, -1, INTEGER_CONFIG, NULL, NULL),
     createBoolConfig("replica-parallel-apply", NULL, MODIFIABLE_CONFIG, server.replica_parallel_apply, 1, NULL, NULL),
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("cron-lanes-split-budget", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes_split_budget, 0, NULL, NULL),
