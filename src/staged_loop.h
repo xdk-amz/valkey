@@ -32,9 +32,10 @@
 /* Phase ids opened on the staged barrier. */
 #define STAGED_PHASE_READ 1
 #define STAGED_PHASE_REPLY 2
-#define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
-#define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
-#define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
+#define STAGED_PHASE_SYNC 3    /* workers leave the staged loop and recheck their enrollment */
+#define STAGED_PHASE_DRAIN 4   /* workers only drain their job inboxes */
+#define STAGED_PHASE_APPLY 5   /* workers apply their lane of held replicated writes */
+#define STAGED_PHASE_DELIVER 6 /* workers send the replies of each batch as soon as main has executed it */
 
 struct aeEventLoop;
 struct poller;

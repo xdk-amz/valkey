@@ -41,10 +41,16 @@ typedef struct fpThread {
     cmdBatch **sb[STAGED_MAX_DEPTH];
     int sbn[STAGED_MAX_DEPTH];
     int sbcap[STAGED_MAX_DEPTH];
+    int sbsent[STAGED_MAX_DEPTH]; /* leading batches of sb already delivered in the write phase */
     list staged_leaving;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
+
+/* Delivery during the write phase: main counts each thread's batches it has executed, with release, and
+ * sets fp_exec_stop once it executes no more; a worker sends what is counted. */
+static _Atomic int fp_exec_done[IO_THREADS_MAX_NUM];
+static _Atomic int fp_exec_stop;
 
 /* acl-offload admission seqlock, one per thread, written only by that thread: odd while the thread
  * reads a bound user's rule set (ACL tagging), even otherwise. Main bumps the ACL epoch, then waits
@@ -1008,8 +1014,10 @@ void fastpathStagedReadPhase(int tid) {
     }
 }
 
-/* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
-int fastpathStagedExecute(void) {
+/* Main, write phase: execute every batch the read phase published, filling each entry's reply. With
+ * deliver, main counts each thread's executed batches for the workers that send their replies meanwhile
+ * (fastpathStagedDeliverPhase). */
+int fastpathStagedExecute(int deliver) {
     int d = fpDepth();
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
@@ -1025,30 +1033,102 @@ int fastpathStagedExecute(void) {
             ec->origin = NULL;
             clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
             total += b->count;
+            if (deliver) atomic_store_explicit(&fp_exec_done[tid], i + 1, memory_order_release);
         }
     }
+    if (deliver) atomic_store_explicit(&fp_exec_stop, 1, memory_order_release);
     return total;
 }
 
 int fastpathStagedRepliesPending(void) {
     int d = fpDepth();
     for (int tid = 0; tid < fp_slots; tid++)
-        if (fp_threads[tid].sbn[d]) return 1;
+        if (fp_threads[tid].sbn[d] > fp_threads[tid].sbsent[d]) return 1;
     return 0;
 }
 
 /* Reply phase, on each IO thread and on main (tid 0): write the replies of the batches this thread
- * produced, in order. */
+ * produced that the write phase did not already send, in order. */
 void fastpathStagedReplyPhase(int tid) {
     fpThread *t = &fp_threads[tid];
     int d = fpDepth();
     fp_cur_tid = tid;
-    for (int i = 0; i < t->sbn[d]; i++) {
+    for (int i = t->sbsent[d]; i < t->sbn[d]; i++) {
         cmdBatch *b = t->sb[d][i];
         fpDeliverBatch(t, b);
         fpRecycleBatch(t, b);
     }
     t->sbn[d] = 0;
+    t->sbsent[d] = 0;
+}
+
+/* Main, before opening the delivery phase of an outer write phase. */
+void fastpathStagedDeliverBegin(void) {
+    for (int tid = 0; tid < fp_slots; tid++) atomic_store_explicit(&fp_exec_done[tid], 0, memory_order_relaxed);
+    atomic_store_explicit(&fp_exec_stop, 0, memory_order_relaxed);
+}
+
+/* Main: no more batches are executed while the delivery phase is open. */
+void fastpathStagedDeliverStop(void) {
+    atomic_store_explicit(&fp_exec_stop, 1, memory_order_release);
+}
+
+/* Main, after the delivery phase closed: a thread whose batches were all sent has none left. The rest go
+ * out in the reply phase. */
+void fastpathStagedDeliverFinish(void) {
+    for (int tid = 0; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->sbsent[0] == t->sbn[0]) t->sbn[0] = t->sbsent[0] = 0;
+    }
+}
+
+/* The write phase lasts as long as main executes; a worker waiting this long for a batch leaves the rest
+ * to the reply phase. */
+#define FP_DELIVER_IDLE_US 100
+
+/* Delivery phase, on each IO thread while main executes the outer write phase: send the replies of each
+ * batch of this thread as soon as main has executed it. IO thread 1 also sends main's batches (main
+ * reads a share of the clients but never writes to sockets in this phase). The clients of these batches
+ * were read in this iteration's read phase, by their batch's thread only, and main touches them now only
+ * through the entries it executes, which a batch's delivery follows. Returns the time spent waiting. */
+long long fastpathStagedDeliverPhase(int tid) {
+    fpThread *me = &fp_threads[tid];
+    int lists[2], nl = 0;
+    if (tid == 1 && fp_threads[0].ready) lists[nl++] = 0;
+    lists[nl++] = tid;
+    fp_cur_tid = tid;
+    long long waited = 0;
+    monotime idle_start = 0;
+    for (unsigned spins = 0;; spins++) {
+        int stop = atomic_load_explicit(&fp_exec_stop, memory_order_acquire);
+        int progressed = 0, left = 0;
+        for (int l = 0; l < nl; l++) {
+            fpThread *t = &fp_threads[lists[l]];
+            int done = atomic_load_explicit(&fp_exec_done[lists[l]], memory_order_acquire);
+            while (t->sbsent[0] < done) {
+                cmdBatch *b = t->sb[0][t->sbsent[0]++];
+                fpDeliverBatch(me, b);
+                fpRecycleBatch(t, b);
+                progressed = 1;
+            }
+            if (t->sbsent[0] < t->sbn[0]) left = 1;
+        }
+        if (!left || stop) break; /* stop was read before the counts, so they include every executed batch */
+        if (progressed) {
+            if (idle_start) waited += (long long)(getMonotonicUs() - idle_start);
+            idle_start = 0;
+            continue;
+        }
+        if (!idle_start) idle_start = getMonotonicUs();
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ __volatile__("isb" ::: "memory");
+#endif
+        if ((spins & 63) == 0 && getMonotonicUs() - idle_start >= FP_DELIVER_IDLE_US) break;
+    }
+    if (idle_start) waited += (long long)(getMonotonicUs() - idle_start);
+    return waited;
 }
 
 static void fpStagedHandoff(client *c) {

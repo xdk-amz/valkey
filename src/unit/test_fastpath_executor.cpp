@@ -151,7 +151,7 @@ TEST_F(FastpathExecutorTest, MainExecutesWithOriginOnlyWhileClientIsUnmapped) {
 
     /* The write phase runs while the client is unreachable: it must use the entries and origin only. */
     ASSERT_EQ(mprotect(c, maplen, PROT_NONE), 0);
-    EXPECT_EQ(fastpathStagedExecute(), 2);
+    EXPECT_EQ(fastpathStagedExecute(0), 2);
     ASSERT_EQ(mprotect(c, maplen, PROT_READ | PROT_WRITE), 0);
 
     /* The reply phase writes both replies to the client. */

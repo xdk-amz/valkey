@@ -33,6 +33,7 @@ static int sl_warned = 0;
 static int sl_main_lane = 1;        /* main has a CPU no worker is pinned to, so it works a share of each phase */
 static uint64_t sl_read_client = 0; /* client id whose read waits for the next read phase */
 static int sl_read_queued = 0;      /* that read went to the workers in this iteration's read phase */
+static int sl_deliver_open = 0;     /* the delivery phase is open while main executes the write phase */
 
 /* Main and the workers pinned to main's one CPU sleep at the barrier instead of spinning. Pinning
  * can change after start (taskset), so it is reread every STAGED_PINNING_READ_US. */
@@ -80,8 +81,19 @@ int stagedWorkerEnrolled(int tid, uint64_t *seen, uint32_t *gen) {
     return 1;
 }
 
+/* Main: wait for the workers to finish sending what main executed, so another phase can open. Batches
+ * main had not executed yet go out in the reply phase. */
+static void stagedDeliverClose(void) {
+    if (!sl_deliver_open) return;
+    fastpathStagedDeliverStop();
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    sl_deliver_open = 0;
+    fastpathStagedDeliverFinish();
+}
+
 /* Open one phase for the enrolled workers and wait until all of them are done. */
 static void stagedRunPhase(int phase) {
+    stagedDeliverClose();
     int rc = phaseBarrierOpen(&sl_barrier, phase);
     serverAssert(rc == 0);
     sl_opens++;
@@ -314,14 +326,34 @@ static void readPhase(void) {
     stagedRunPhase(STAGED_PHASE_READ);
 }
 
-/* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. */
+/* Workers send replies while main executes when main has a CPU of its own (they spin meanwhile) and no
+ * reply may wait for something after the write phase: appendfsync always holds every reply until the
+ * AOF fsync, and client eviction reads every client's buffers from inside command execution. */
+static int stagedDeliverWanted(void) {
+    if (!sl_main_lane || !sl_workers || sl_depth) return 0;
+    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
+    if (server.maxmemory_clients) return 0;
+    return fastpathStagedRepliesPending();
+}
+
+/* Write: main executes every batch, then serves main-affinity fds and all non-fast-path clients. Workers
+ * send each batch's replies as soon as main has executed it. */
 static void writePhase(aeEventLoop *el) {
     int ae_ready = pollerMainCount(sl_poller) > 0; /* read before a nested iteration takes the next batch */
     if (sl_read_queued) {
         sl_read_queued = 0;
         processIOThreadsResponses(); /* runs the primary's commands parsed in the read phase */
     }
-    fastpathStagedExecute();
+    int deliver = stagedDeliverWanted();
+    if (deliver) {
+        fastpathStagedDeliverBegin();
+        int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_DELIVER);
+        serverAssert(rc == 0);
+        sl_opens++;
+        sl_deliver_open = 1;
+    }
+    fastpathStagedExecute(deliver);
+    stagedDeliverClose();
     if (ae_ready) aeProcessEvents(el, AE_FILE_EVENTS | AE_DONT_WAIT);
 }
 
@@ -365,7 +397,7 @@ void stagedNestedIteration(void) {
     fastpathStagedSetDepth(1);
     if ((pollerGetNextBatch(sl_poller, 0) > 0 && pollerIOCount(sl_poller) > 0) || ioThreadsInboxPending())
         stagedRunPhase(STAGED_PHASE_READ);
-    fastpathStagedExecute();
+    fastpathStagedExecute(0);
     if (fastpathStagedRepliesPending() || ioThreadsInboxPending()) stagedRunPhase(STAGED_PHASE_REPLY);
     fastpathStagedSetDepth(0);
     sl_depth = 0;
@@ -405,6 +437,7 @@ void stagedRunApplyPhase(int with_workers) {
         replApplyRunLane(0);
         return;
     }
+    stagedDeliverClose();
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_APPLY);
     serverAssert(rc == 0);
     sl_opens++;

@@ -1337,16 +1337,19 @@ static void ioThreadStagedLoop(long id, void **batch_jobs, uint64_t *seen) {
         int phase = phaseBarrierAwaitPhase(b, (int)id - 1, seen, stagedWorkerSpins((int)id));
         if (phase == PHASE_BARRIER_EXIT) return;
         monotime start = getMonotonicUs();
+        long long idle = 0;
         ioThreadDrainInboxes(id, batch_jobs);
         if (phase == STAGED_PHASE_READ)
             fastpathStagedReadPhase((int)id);
         else if (phase == STAGED_PHASE_REPLY)
             fastpathStagedReplyPhase((int)id);
+        else if (phase == STAGED_PHASE_DELIVER)
+            idle = fastpathStagedDeliverPhase((int)id);
         else if (phase == STAGED_PHASE_APPLY)
             replApplyRunLane((int)id);
         if (pending_io_responses[JOB_PRIORITY_HIGH] || pending_io_responses[JOB_PRIORITY_NORMAL])
             flushPendingIOResponses(0);
-        atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start, memory_order_relaxed);
+        atomic_fetch_add_explicit(&used_active_time_io_thread[id], getMonotonicUs() - start - idle, memory_order_relaxed);
         phaseBarrierDone(b);
         if (phase == STAGED_PHASE_SYNC) return;
     }

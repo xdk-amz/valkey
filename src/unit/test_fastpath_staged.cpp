@@ -142,7 +142,7 @@ class FastpathStagedTest : public ::testing::Test {
     }
 
     static void writeAndReplyPhases() {
-        fastpathStagedExecute();
+        fastpathStagedExecute(0);
         if (fastpathStagedRepliesPending()) fastpathStagedReplyPhase(1);
         fastpathStagedFinish();
     }
@@ -262,7 +262,7 @@ TEST_F(FastpathStagedTest, CloseSkipsEntriesAndFreesAfterReplyBarrier) {
     EXPECT_EQ(freeClient(c), 0); /* main, write phase: recorded, not freed */
     EXPECT_EQ(c->flag.fastpath, 1u);
     EXPECT_EQ(freeClientsInAsyncFreeQueue(), 0);
-    fastpathStagedExecute();
+    fastpathStagedExecute(0);
     robj *key = createStringObject("st:e", 4);
     EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr); /* the closing client's entry did not run */
     decrRefCount(key);
@@ -287,7 +287,7 @@ TEST_F(FastpathStagedTest, AsyncFreeRecordsCloseAndFreesAfterReplyBarrier) {
     EXPECT_EQ(c->flag.fp_detach_sent, 1u);
     EXPECT_EQ(c->control->closing, 1u);
     EXPECT_EQ(freeClientsInAsyncFreeQueue(), 0);
-    fastpathStagedExecute();
+    fastpathStagedExecute(0);
     robj *key = createStringObject("st:f", 4);
     EXPECT_EQ(lookupKeyRead(server.db[0], key), nullptr);
     decrRefCount(key);
