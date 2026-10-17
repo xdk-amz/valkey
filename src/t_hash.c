@@ -168,8 +168,8 @@ static inline void hashTypeIgnoreTTL(robj *o, bool ignore, bool *oldstate) {
      * Setting, however, must NOT touch the flag for hashtable objects:
      * hashTypeFreeVolatileSet() uses ignore=true as steady-state (not
      * bracketed) configuration for hashes without volatile fields.
-     * The clear is conditional so a MAINT expire lane -- which only ever runs with the flag already
-     * false and no main-thread listpack bracket open -- performs no shared write. */
+     * The clear is conditional so a MAINT expire lane, which only ever runs with the flag already
+     * false and no main-thread listpack bracket open, performs no shared write. */
     if (!ignore && listpack_ttl_ignored) listpack_ttl_ignored = false;
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE) {
         /* prevent placing access function if not needed */

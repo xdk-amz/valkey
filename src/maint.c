@@ -347,7 +347,7 @@ static void maintReplay(void) {
 
 /* Main, after the phase (propagate-only mode): feed the DEL/UNLINK of every key the lanes logged to the
  * AOF and the replication stream, in the lanes' expiry order, with the exact framing propagateNow
- * produces -- feedAppendOnlyFile and replicationFeedReplicas each emit their own SELECT and account for
+ * produces: feedAppendOnlyFile and replicationFeedReplicas each emit their own SELECT and account for
  * offsets, one command per key, no MULTI. Bulk-adds stat_expiredkeys and dirty. */
 static void maintFeedPropagation(void) {
     monotime t0 = getMonotonicUs();
