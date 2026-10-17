@@ -911,13 +911,14 @@ void fastpathInfo(sds *info) {
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
                          "fastpath_workers_open:%d\r\n"
+                         "keyspace_shard_bits:%d\r\n"
                          "fastpath_reads:%lld\r\n"
                          "fastpath_writes:%lld\r\n"
                          "fastpath_batches:%lld\r\n"
                          "fastpath_speculated:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, stagedWorkerCount(), reads, writes, batches, speculated, in, out);
+                         fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches, speculated, in, out);
 }
 
 /* ---------------------------------------------------------------------------------------------
