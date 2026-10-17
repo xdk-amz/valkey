@@ -611,7 +611,7 @@ robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index) {
 }
 
 /* Lane: unlink a hash whose last volatile field just expired. Unlike dbUnlinkExpiredInLane this makes no
- * key-TTL assumption -- a field-TTL hash is usually absent from db->expires -- and the caller has already
+ * key-TTL assumption (a field-TTL hash is usually absent from db->expires), and the caller has already
  * removed it from keys_with_volatile_items. Removes it from db->keys (and db->expires only if it carried a
  * key TTL) and returns the value for the caller to free. */
 robj *dbUnlinkExpiredHashInLane(serverDb *db, robj *val, int dict_index) {
@@ -2144,7 +2144,7 @@ void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index) {
 }
 
 /* Main, after a MAINT phase: the observers for one batch of hash fields a lane deleted, matching the
- * per-batch block of dbReclaimExpiredFields in the same order -- HDEL propagation, the hexpired event,
+ * per-batch block of dbReclaimExpiredFields in the same order: HDEL propagation, the hexpired event,
  * and when the hash emptied the key's DEL/UNLINK and del event. The fields are already removed and, when
  * empty, the key is already unlinked and its value is val (freed here). The lane owns fields[0..n) and
  * frees them after this returns; this function propagates and signals only. */
@@ -2285,7 +2285,7 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         robj *entries[EXPIRE_BULK_LIMIT];
         size_t expired = hashTypeDeleteExpiredFields(o, now, batch_size, entries);
         if (expired == 0) break;
-        /* hashTypeDeleteExpiredFields no longer bumps the global (a MAINT lane calls it concurrently);
+        /* hashTypeDeleteExpiredFields leaves the global count alone (a MAINT lane calls it concurrently);
          * the serial path counts it here on main. */
         server.stat_expiredfields += expired;
 

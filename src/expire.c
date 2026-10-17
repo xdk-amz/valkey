@@ -631,7 +631,7 @@ static void laneExpireScanCallback(void *privdata, void *entry, int didx) {
                         lazyfreeGetFreeEffort(NULL, unlinked, d->db->id) <= LAZYFREE_THRESHOLD;
             if (lane_expire_propagate_only) {
                 /* Only propagation observes the delete: record the key's DEL/UNLINK for main to feed to
-                 * the stream after the phase, then free the value the way free-inline mode does -- cheap
+                 * the stream after the phase, then free the value the way free-inline mode does: cheap
                  * ones (or a reply-pinned one, dropping its reference) here, expensive ones through main. */
                 sds key = objectGetKey(unlinked);
                 maintLogPropagate(d->tid, sdsdup(key), d->db->id, server.lazyfree_lazy_expire);
@@ -741,10 +741,10 @@ uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, 
 }
 
 /* Field expiry in a lane: one table of keys_with_volatile_items. Each hash's expired fields are deleted
- * in batches (hashTypeDeleteExpiredFields, which also bumps stat_expiredfields), then dispatched by the
- * phase's mode -- freed in the lane with no main work, recorded for main to feed (propagate-only), or
- * logged for main's full replay. An emptied hash is unlinked in the lane; its value is freed in the lane
- * (cheap) or handed to main. bgIteration keeps a hash it is using serial (skipped here, next tick). */
+ * in batches with hashTypeDeleteExpiredFields (counted per lane, added to stat_expiredfields on main),
+ * then handled by the phase's mode: freed in the lane with no main work, recorded for main to feed
+ * (propagate-only), or logged for main's full replay. An emptied hash is unlinked in the lane; its value
+ * is freed in the lane (cheap) or handed to main. A forkless save keeps the whole lanes path off. */
 
 typedef struct {
     serverDb *db;
