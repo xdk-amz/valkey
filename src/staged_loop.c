@@ -337,15 +337,56 @@ static void crons(aeEventLoop *el) {
     aeProcessTimeEvents(el);
 }
 
+/* Diagnostics (not for upstream): per-step time of each iteration and a histogram of the busy part. */
+#define SL_DIAG_BUCKETS 10
+static const long long sl_diag_edges[SL_DIAG_BUCKETS - 1] = {25, 50, 100, 200, 300, 500, 1000, 2000, 5000};
+static long long sl_diag_iters = 0;
+static long long sl_diag_sum[6], sl_diag_max[6]; /* collect, read, write, aof, reply, crons */
+static long long sl_diag_busy_hist[SL_DIAG_BUCKETS], sl_diag_cron_hist[SL_DIAG_BUCKETS];
+
+static void slDiagHist(long long *h, long long us) {
+    int i = 0;
+    while (i < SL_DIAG_BUCKETS - 1 && us >= sl_diag_edges[i]) i++;
+    h[i]++;
+}
+
+void stagedLoopDiagInfo(sds *info) {
+    static const char *names[6] = {"collect", "read", "write", "aof", "reply", "crons"};
+    *info = sdscatprintf(*info, "staged_diag_iterations:%lld\r\n", sl_diag_iters);
+    for (int i = 0; i < 6; i++)
+        *info = sdscatprintf(*info, "staged_diag_%s:sum_us=%lld,max_us=%lld\r\n", names[i], sl_diag_sum[i], sl_diag_max[i]);
+    *info = sdscat(*info, "staged_diag_busy_hist:");
+    for (int i = 0; i < SL_DIAG_BUCKETS; i++) *info = sdscatprintf(*info, "%s%lld", i ? "," : "", sl_diag_busy_hist[i]);
+    *info = sdscat(*info, "\r\nstaged_diag_cron_hist:");
+    for (int i = 0; i < SL_DIAG_BUCKETS; i++) *info = sdscatprintf(*info, "%s%lld", i ? "," : "", sl_diag_cron_hist[i]);
+    *info = sdscat(*info, "\r\n");
+}
+
 static void stagedLoopIteration(aeEventLoop *el) {
+    monotime t[7];
+    t[0] = getMonotonicUs();
     collectFDs(el);
+    t[1] = getMonotonicUs();
     readPhase();
+    t[2] = getMonotonicUs();
     writePhase(el);
+    t[3] = getMonotonicUs();
     /* With appendfsync always a write is acknowledged only once it is on disk: the write phase's
      * commands reach the AOF before the reply phase sends their replies. */
     if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) flushAppendOnlyFile(0);
+    t[4] = getMonotonicUs();
     replyPhase();
+    t[5] = getMonotonicUs();
     crons(el);
+    t[6] = getMonotonicUs();
+    sl_diag_iters++;
+    for (int i = 0; i < 6; i++) {
+        long long d = (long long)(t[i + 1] - t[i]);
+        sl_diag_sum[i] += d;
+        if (d > sl_diag_max[i]) sl_diag_max[i] = d;
+    }
+    slDiagHist(sl_diag_busy_hist, (long long)(t[6] - t[1]));
+    slDiagHist(sl_diag_cron_hist, (long long)(t[6] - t[5]));
 }
 
 void stagedMain(aeEventLoop *el) {

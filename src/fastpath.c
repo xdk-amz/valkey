@@ -918,6 +918,8 @@ void fastpathInfo(sds *info) {
                          "fastpath_net_input_bytes:%lld\r\n"
                          "fastpath_net_output_bytes:%lld\r\n",
                          fastpath_clients, stagedWorkerCount(), reads, writes, batches, speculated, in, out);
+    extern void stagedLoopDiagInfo(sds * info);
+    stagedLoopDiagInfo(info);
 }
 
 /* ---------------------------------------------------------------------------------------------
