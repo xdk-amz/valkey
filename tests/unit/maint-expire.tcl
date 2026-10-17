@@ -15,6 +15,12 @@ proc me_cmdstat_calls {r cmd} {
     return 0
 }
 
+proc me_seq {n} {
+    set l {}
+    for {set i 1} {$i <= $n} {incr i} { lappend l $i }
+    return $l
+}
+
 proc me_load_volatile {r prefix n ttl_ms} {
     $r eval {for i=1,tonumber(ARGV[1]) do redis.call('set', KEYS[1]..i, i, 'px', tonumber(ARGV[2]) + (i % 100)) end return 1} 1 $prefix $n $ttl_ms
 }
@@ -126,17 +132,19 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         set rt [valkey_client]
         $rt select 0
         $rt client tracking on redirect $redir_id
-        me_load_volatile r t: 1000 150
-        # Read each key so the server tracks it for this client.
-        for {set i 1} {$i <= 1000} {incr i} { $rt get t:$i }
+        # One MGET tracks every key for this client well before the first one can expire, even on a slow
+        # (sanitizer) build; a key that expired before it was read would never be invalidated.
+        me_load_volatile r t: 1000 1000
+        $rt mget {*}[lmap i [me_seq 1000] {format t:%d $i}]
         me_wait_empty r
+        # Every invalidation was queued before this sentinel, so reading up to it cannot block forever.
+        r publish __redis__:invalidate me-done
         set keys {}
-        set deadline [expr {[clock milliseconds] + 5000}]
-        while {[llength [lsort -unique $keys]] < 1000 && [clock milliseconds] < $deadline} {
+        while 1 {
             set msg [$rd_redir read]
-            if {[lindex $msg 0] eq "message"} {
-                foreach k [lindex $msg 2] { lappend keys $k }
-            }
+            if {[lindex $msg 0] ne "message"} continue
+            if {[lindex $msg 2] eq "me-done"} break
+            foreach k [lindex $msg 2] { lappend keys $k }
         }
         assert_equal 1000 [llength [lsort -unique $keys]]
         $rt client tracking off
@@ -149,11 +157,14 @@ start_server [list tags {"maint expire external:skip tls:skip"} overrides [conca
         set rt [valkey_client]
         $rt select 0
         $rt client tracking on
+        # Active expiry stays off until the client has gone, so every key expires with no tracking client.
+        r debug set-active-expire 0
         me_load_volatile r st: 1000 300
-        for {set i 1} {$i <= 1000} {incr i} { $rt get st:$i }
+        $rt mget {*}[lmap i [me_seq 1000] {format st:%d $i}]
         assert_morethan_equal [s tracking_total_keys] 1000
         $rt close
         wait_for_condition 50 20 {[s tracking_clients] == 0} else { fail "tracking client still connected" }
+        r debug set-active-expire 1
         me_wait_empty r
         # With no client left, the tracking table still drops each expired key's entry.
         assert_equal 0 [s tracking_total_keys]
