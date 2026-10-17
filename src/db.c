@@ -610,6 +610,21 @@ robj *dbUnlinkExpiredInLane(serverDb *db, robj *val, int dict_index) {
     return val;
 }
 
+/* Lane: unlink a hash whose last volatile field just expired. Unlike dbUnlinkExpiredInLane this makes no
+ * key-TTL assumption -- a field-TTL hash is usually absent from db->expires -- and the caller has already
+ * removed it from keys_with_volatile_items. Removes it from db->keys (and db->expires only if it carried a
+ * key TTL) and returns the value for the caller to free. */
+robj *dbUnlinkExpiredHashInLane(serverDb *db, robj *val, int dict_index) {
+    sds key = objectGetKey(val);
+    hashtablePosition pos;
+    void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, key, &pos);
+    if (ref == NULL) return NULL;
+    serverAssert(*ref == val);
+    kvstoreHashtableTwoPhasePopDelete(db->keys, dict_index, &pos);
+    if (objectGetExpire(val) != -1) kvstoreHashtableDelete(db->expires, dict_index, key);
+    return val;
+}
+
 /* Helper for sync and async delete. */
 int dbGenericDelete(serverDb *db, robj *key, int async, int flags) {
     int dict_index = getKVStoreIndexForKey(objectGetVal(key));
@@ -2128,6 +2143,35 @@ void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index) {
     decrRefCount(keyobj);
 }
 
+/* Main, after a MAINT phase: the observers for one batch of hash fields a lane deleted, matching the
+ * per-batch block of dbReclaimExpiredFields in the same order -- HDEL propagation, the hexpired event,
+ * and when the hash emptied the key's DEL/UNLINK and del event. The fields are already removed and, when
+ * empty, the key is already unlinked and its value is val (freed here). The lane owns fields[0..n) and
+ * frees them after this returns; this function propagates and signals only. */
+void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int n_fields, int dict_index,
+                                       int empty, robj *val) {
+    robj *keyobj = createStringObject(key, sdslen(key));
+    enterExecutionUnit(1, 0);
+    /* HDEL (or whatever propagateFieldsDeletion emits) for the deleted fields, then the hexpired event,
+     * in the serial order. */
+    propagateFieldsDeletionReplay(db, keyobj, fields, n_fields, dict_index);
+    notifyKeyspaceEvent(NOTIFY_EXPIRED, "hexpired", keyobj, db->id);
+    if (empty) {
+        /* The lane already unlinked the key; emit the delete's propagation and events, free the value. */
+        signalDeletedKeyAsReady(db, keyobj, OBJ_HASH);
+        propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
+        server.dirty++;
+    } else {
+        server.dirty += n_fields;
+    }
+    signalModifiedKey(NULL, db, keyobj);
+    exitExecutionUnit();
+    postExecutionUnitOperations();
+    if (empty && val) freeValueNeverOnMain(keyobj, val, db->id);
+    decrRefCount(keyobj);
+}
+
 /* Delete the specified expired key from overwriting and propagate the DEL or UNLINK. */
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
     int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
@@ -2175,14 +2219,28 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
     server.replication_allowed = prev_replication_allowed;
 }
 
-#define EXPIRE_BULK_LIMIT ((size_t)1024) /* Maximum number of fields to active-expire (per replicated HDEL command */
-
 /* Propagate HDEL commands for deleted hash fields to AOF and replicas.
  *
  * This function builds and propagates a single HDEL command with multiple fields
  * for the given hash object `o`. It temporarily enables replication (if needed),
  * constructs the command using the field names, and sends it via alsoPropagate().
  * Returns how many fields where propagated */
+/* Main, after a MAINT phase: propagate the HDEL for fields a lane deleted, building the command from the
+ * key name and the deleted field objects directly (the hash object may be gone). Same framing as
+ * propagateFieldsDeletion: HDEL key field... via alsoPropagate, one command, no MULTI. */
+void propagateFieldsDeletionReplay(serverDb *db, robj *keyobj, robj **fields, int n_fields, int didx) {
+    int prev_replication_allowed = server.replication_allowed;
+    server.replication_allowed = 1;
+    robj *argv[EXPIRE_BULK_LIMIT + 2];
+    if ((size_t)n_fields > EXPIRE_BULK_LIMIT) n_fields = EXPIRE_BULK_LIMIT;
+    int argc = 0;
+    argv[argc++] = shared.hdel;
+    argv[argc++] = keyobj;
+    for (int i = 0; i < n_fields; i++) argv[argc++] = fields[i];
+    alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
+    server.replication_allowed = prev_replication_allowed;
+}
+
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx) {
     int prev_replication_allowed = server.replication_allowed;
     server.replication_allowed = 1;

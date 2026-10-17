@@ -91,6 +91,9 @@ void activeExpireLaneBegin(void);
 /* Lane tid: expire keys of table didx of db within budget_us; sets *hit_limit when the budget ran out
  * with expired keys left. Returns the microseconds spent. */
 uint64_t activeExpireTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
+/* Lane tid: expire hash fields of table didx of db (keys_with_volatile_items) within budget_us; sets
+ * *hit_limit when the budget ran out with more to do. Returns the microseconds spent. */
+uint64_t activeExpireFieldsTableInLane(int tid, serverDb *db, int didx, mstime_t now, uint64_t budget_us, int *hit_limit);
 /* Main, after the phase and its replay: merge the per-thread results into the server's stats. */
 void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_us);
 void expireReplicaKeys(void);
