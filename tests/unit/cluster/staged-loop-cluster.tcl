@@ -81,6 +81,30 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
     set remote [scl_key_on -1 "remote"]
     set port1 [srv -1 port]
 
+    test {Write lanes in cluster mode: local writes run on the lanes, remote ones get MOVED in order} {
+        set c [srv 0 client]
+        set nke [lindex [$c config get notify-keyspace-events] 1]
+        set wmin [lindex [$c config get io-threads-parallel-writes-min] 1]
+        $c config set notify-keyspace-events ""
+        $c config set io-threads-parallel-writes-min 1
+        set before [getInfoProperty [$c info fastpath] fastpath_write_lane_entries]
+        set fd [scl_socket 0]
+        assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
+        wait_for_condition 100 20 {[scl_fastpath_clients 0] >= 1} else { fail "client did not join the fast path" }
+        set cmds {}
+        for {set i 0} {$i < 20} {incr i} { lappend cmds [list SET $local $i] [list SET $remote $i] }
+        set i 0
+        foreach r [scl_pipeline $fd $cmds] {
+            if {$i % 2 == 0} { assert_equal {+OK} $r } else { assert_match "-MOVED * *:$port1" $r }
+            incr i
+        }
+        assert_equal 19 [$c get $local]
+        assert {[getInfoProperty [$c info fastpath] fastpath_write_lane_entries] > $before}
+        close $fd
+        $c config set io-threads-parallel-writes-min $wmin
+        $c config set notify-keyspace-events $nke
+    }
+
     test {Fast path: a pipeline of local and remote keys gets values and MOVED in order} {
         set fd [scl_socket 0]
         assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
@@ -137,6 +161,23 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
         assert_equal {+OK} [lindex [scl_pipeline $fd {{READWRITE}}] 0]
         set r [scl_pipeline $fd [list [list GET $local] [list GET $local]]]
         foreach x $r { assert_match {-MOVED *} $x }
+        close $fd
+    }
+
+    test {Fast path on a replica: a READONLY client's reads main executes stay on the fast path} {
+        set primary [srv 0 client]
+        set replica [srv -2 client]
+        $primary hset "{$local}h2" f hv2
+        wait_for_ofs_sync $primary $replica
+        set fd [scl_socket -2]
+        assert_equal {+OK} [lindex [scl_pipeline $fd {{READONLY}}] 0]
+        wait_for_condition 100 20 {[scl_fastpath_clients -2] >= 1} else { fail "replica client did not rejoin the fast path" }
+        set before [getInfoProperty [$replica info fastpath] fastpath_batches]
+        set cmds {}
+        for {set i 0} {$i < 10} {incr i} { lappend cmds [list HGET "{$local}h2" f] }
+        foreach r [scl_pipeline $fd $cmds] { assert_equal hv2 $r }
+        assert {[getInfoProperty [$replica info fastpath] fastpath_batches] > $before}
+        assert {[scl_fastpath_clients -2] >= 1}
         close $fd
     }
 

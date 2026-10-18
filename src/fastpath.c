@@ -390,14 +390,6 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
     return 1;
 }
 
-/* Cluster mode: main produces every redirect with the real client, so the fast path keeps only what
- * this node serves now: keyless commands, or keys in one slot it owns while nothing migrates. */
-static int fpClusterServes(int slot, int read_flags) {
-    if (!server.cluster_enabled) return 1;
-    if (read_flags & READ_FLAGS_CROSSSLOT) return 0;
-    return slot < 0 || clusterServesSlotStably(slot);
-}
-
 static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
@@ -519,6 +511,7 @@ static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc,
     if (!cmd->write_lane) return -1;
     *shard = fpKeysShard(c->db, cmd, argv, argc, slot);
     if (*shard < 0) return -1;
+    if (server.cluster_enabled && !clusterServesSlotStably(*shard)) return -1; /* main produces the redirect */
     return *shard % fp_nlanes;
 }
 
@@ -605,8 +598,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     cmdQueue *q = &c->cmd_queue;
 
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
-        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd) ||
-            !fpClusterServes(c->slot, c->read_flags)) {
+        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
             leave = 1;
         } else {
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
@@ -639,7 +631,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         }
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
-        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd) || !fpClusterServes(p->slot, p->read_flags)) {
+        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
             leave = 1;
             break;
         }
