@@ -1986,7 +1986,7 @@ static int fpExecuteWithLanes(void) {
     for (int l = 0; l < fp_nlanes; l++) memset(fp_lanes[l].cursor, 0, sizeof(int) * fp_slots);
     fp_nparts = 0;
     int pending = 0;
-    for (int tid = 1; tid < fp_slots; tid++) {
+    for (int tid = 0; tid < fp_slots; tid++) { /* 0: the commands main read in its share of the read phase */
         fpThread *t = &fp_threads[tid];
         if (t->sbn[0] == 0) continue;
         for (int s = 0; s <= t->nbarriers; s++) {
