@@ -446,6 +446,7 @@ static int stagedStreamEligible(void) {
     if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) return 0;
     if (!sl_main_spins || !sl_main_lane) return 0; /* a worker shares main's CPU */
     if (PrefixTable && raxSize(PrefixTable) > 0) return 0;
+    if (fastpathStagedLanesWillRun()) return 0; /* the IO threads execute write lanes instead */
     return 1;
 }
 

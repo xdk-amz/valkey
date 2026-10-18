@@ -88,6 +88,33 @@ proc pwl_wait_fastpath_clients {c n} {
     }
 }
 
+# SET pipelines on nsock fast-path sockets sent at once, so the read phase spreads them over the IO
+# threads; replies read.
+proc pwl_multi_load {c host port prefix nsock n} {
+    pwl_wait_fastpath_clients $c 0
+    set fds {}
+    for {set s 0} {$s < $nsock} {incr s} {
+        set fd [pwl_socket $host $port]
+        puts -nonewline $fd [pwl_resp ping]
+        flush $fd
+        assert_equal {+PONG} [pwl_read_reply $fd]
+        lappend fds $fd
+    }
+    pwl_wait_fastpath_clients $c $nsock
+    set s 0
+    foreach fd $fds {
+        set buf ""
+        for {set i 0} {$i < $n} {incr i} { append buf [pwl_resp set $prefix:$s:$i $i] }
+        puts -nonewline $fd $buf
+        flush $fd
+        incr s
+    }
+    foreach fd $fds {
+        pwl_read_replies $fd $n
+        close $fd
+    }
+}
+
 # A raw db-0 socket on the fast path, the only one open on that server.
 proc pwl_fast_socket {c host port} {
     pwl_wait_fastpath_clients $c 0
@@ -305,6 +332,22 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         pwl_read_replies $fd 50
         assert_equal $before [pwl_lane_entries r]
         close $fd
+        r config set io-threads-parallel-writes yes
+    }
+
+    test {Write lanes: replies stream only while the write phase runs on main} {
+        r config set staged-reply-overlap exec
+        set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
+        set streams [getInfoProperty [r info fastpath] staged_stream_phases]
+        pwl_multi_load r $host $port pwl:st 8 200
+        assert {[getInfoProperty [r info fastpath] fastpath_write_lane_phases] > $lanes}
+        assert_equal $streams [getInfoProperty [r info fastpath] staged_stream_phases]
+
+        r config set io-threads-parallel-writes no
+        set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
+        pwl_multi_load r $host $port pwl:st 8 200
+        assert_equal $lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
+        assert {[getInfoProperty [r info fastpath] staged_stream_phases] > $streams}
         r config set io-threads-parallel-writes yes
     }
 

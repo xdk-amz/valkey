@@ -1380,6 +1380,19 @@ void fastpathStagedPrepareLanes(void) {
     }
 }
 
+/* Main, after the read phase: the write phase has enough lane commands to run a lane phase, so the IO
+ * threads will be executing in it. A thread without batches did not read in this iteration. */
+int fastpathStagedLanesWillRun(void) {
+    if (fpDepth() != 0 || !fp_lanes_iter) return 0;
+    long long n = 0;
+    for (int tid = 0; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->sbn[0] == 0) continue;
+        for (int l = 0; l < fp_nlanes; l++) n += t->lane_n[l];
+    }
+    return n >= server.io_threads_parallel_writes_min;
+}
+
 static void fpLanePushClose(fpLane *L, cmdEntry *e) {
     e->obuf_close = 1;
     FP_GROW(L->closes, L->ncloses, L->closes_cap, 8);
