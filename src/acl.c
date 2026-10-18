@@ -791,6 +791,19 @@ void aclOffloadBeginRead(client *c) {
     (void)c;
 }
 
+/* u may run every command on every key, channel and database: no roles and a single selector that
+ * allows everything. Main changes users only outside the staged read phase, where IO threads ask. */
+int ACLUserUnrestricted(user *u) {
+    if (u == NULL) return 1;
+    list *roles = atomic_load_explicit(&u->roles, memory_order_acquire);
+    if (roles && listLength(roles)) return 0;
+    list *selectors = atomic_load_explicit(&u->selectors, memory_order_acquire);
+    if (!selectors || listLength(selectors) != 1) return 0;
+    aclSelector *s = listNodeValue(listFirst(selectors));
+    const uint32_t all = SELECTOR_FLAG_ALLCOMMANDS | SELECTOR_FLAG_ALLKEYS | SELECTOR_FLAG_ALLCHANNELS | SELECTOR_FLAG_ALLDBS;
+    return (s->flags & all) == all;
+}
+
 /* IO-thread side: evaluate and tag one command. Reads only the principal's rule
  * set (never main-owned client/socket/query/output state). Only ALLOW is recorded;
  * a denial leaves the bit clear so main runs the stock check and yields the exact
@@ -4119,7 +4132,7 @@ void addACLLogEntry(client *c, int reason, int context, int argpos, sds username
     }
 
     /* if we have a real client from the network, use it (could be missing on module timers) */
-    client *realclient = server.current_client ? server.current_client : c;
+    client *realclient = ectx->current_client ? ectx->current_client : c;
 
     le->cinfo = catClientInfoString(sdsempty(), realclient, 0);
 

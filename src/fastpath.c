@@ -16,7 +16,13 @@
 #include "staged_loop.h"
 #include "module.h"
 #include "bgiteration.h"
+#include "hotkeys.h"
 #include "throttle.h"
+#include "kvstore.h"
+#include "cluster.h"
+#include "cluster_migrateslots.h"
+#include "cluster_slot_stats.h"
+#include "hdr_histogram.h"
 #include <sys/uio.h>
 #include <sched.h>
 
@@ -31,6 +37,11 @@ static_assert(offsetof(cmdBatch, executed) / CACHE_LINE_SIZE != offsetof(cmdBatc
 
 #define FP_ARENA_SIZE (16 * 1024) /* reply bytes per batch before a slot spills to the heap */
 #define FP_FREELIST_MAX 64
+
+struct fpBarrier {
+    cmdEntry *e;
+    cmdBatch *b;
+};
 
 typedef struct fpThread {
     int ready;     /* initialized by fastpathInitThread */
@@ -48,9 +59,121 @@ typedef struct fpThread {
     int sbcap[STAGED_MAX_DEPTH];
     int sb_streamed[STAGED_MAX_DEPTH]; /* STREAM/REPLY: index of the first batch not fully delivered. */
     list staged_leaving;
+    /* Write lanes (depth 0). Written by this thread in the read phase: the entries it harvested per
+     * lane in harvest order, its barrier entries in order, and the lane entries of each of its
+     * segments. Read by the lanes and main in the write phase; reset by the next read phase. */
+    cmdEntry **lane_ents[FP_MAX_LANES];
+    int lane_n[FP_MAX_LANES];
+    int lane_cap[FP_MAX_LANES];
+    struct fpBarrier *barriers;
+    int nbarriers, barriers_cap;
+    int *seg_count;
+    int seg_cap;
+    /* Main, write phase: where serial execution of this thread's batches resumes. */
+    int scur_b, scur_e;
+    /* Main, merge after a lane phase: where the walk over this thread's entries in T order resumes. */
+    int mcur_b, mcur_e;
 } fpThread;
 
 static fpThread fp_threads[IO_THREADS_MAX_NUM];
+
+/* ---------------------------------------------------------------------------------------------
+ * Write lanes. See docs/parallel-write-stage.md.
+ * --------------------------------------------------------------------------------------------- */
+
+#define FP_LANE_CHUNK (64 * 1024)    /* reply arena chunk of a lane */
+#define FP_LANE_MIN_ROOM (4 * 1024)  /* below this, a reply starts a new chunk */
+
+/* Propagation one entry's execution unit produced on a lane; main replays it in T order. */
+typedef struct laneProp {
+    serverOp *ops;
+    int numops;
+    int wrap; /* MULTI/EXEC around the ops, as propagatePendingCommands would have decided */
+} laneProp;
+
+typedef struct laneCmdStat {
+    struct serverCommand *cmd;
+    long long calls, usec, failed;
+} laneCmdStat;
+
+typedef struct laneError {
+    sds msg; /* the reply's first bytes: enough to find the error prefix */
+    int flags;
+    struct serverCommand *cmd;
+} laneError;
+
+typedef struct laneLatency {
+    const char *event;
+    long long us;
+} laneLatency;
+
+typedef struct laneLog {
+    void *entry;
+    int type;
+} laneLog;
+
+typedef struct __attribute__((aligned(64))) fpLane {
+    execContext ctx; /* the lane thread's ectx inside a write phase */
+    client *ec;      /* executor, created by main */
+    client *sec;     /* replica: executor of the primary's stream, flagged as the primary, created by main */
+    /* Reply arena: chunks kept across iterations, refilled from the start every iteration. */
+    char **chunks;
+    int nchunks, chunk_cap, chunk;
+    size_t used;
+    int cursor[IO_THREADS_MAX_NUM]; /* per IO thread: next entry of its vector for this lane */
+    /* Replication frames of this phase's entries (FP_PROP_FRAMES); main feeds them in T order. */
+    sds frames;
+    /* Handed to main after each phase. */
+    laneError *errors;
+    int nerrors, errors_cap;
+    laneLatency *lat;
+    int nlat, lat_cap;
+    cmdEntry **closes;
+    int ncloses, closes_cap;
+    laneLog *logs;
+    int nlogs, logs_cap;
+    /* Commandstats by command id; cs_touched lists the ids this phase used, for the merge. */
+    laneCmdStat *cs;
+    int cs_cap;
+    int *cs_touched;
+    int ncs, cs_touched_cap;
+    long long dur_cnt, dur_sum, dur_max, executed;
+    /* Latency histograms by command id, kept across phases; main folds them before a reader. */
+    struct hdr_histogram **hist;
+    struct serverCommand **hist_cmd;
+    int hist_cap;
+} fpLane;
+
+static fpLane fp_lanes[FP_MAX_LANES];
+static _Thread_local fpLane *fp_cur_lane = NULL;
+/* Main writes these before the read phase; IO threads read them in it. */
+static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes */
+static int fp_nlanes = 0;     /* lanes of this iteration */
+static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
+/* Main writes these before each write phase; the lanes read them in it. */
+typedef struct fpSegPart {
+    int tid;
+    uint32_t seg;
+} fpSegPart;
+static fpSegPart *fp_parts = NULL;
+static int fp_nparts = 0, fp_parts_cap = 0;
+static mstime_t fp_phase_time = 0;
+/* How a lane hands an entry's propagation to main. Main sets it before each lane phase; it stays fixed
+ * through the phase and its merge, since only main-path commands and crons change the sinks. */
+#define FP_PROP_NONE 0   /* no sink is fed: the ops are dropped */
+#define FP_PROP_FRAMES 1 /* the replication backlog is the only sink: the lane formats the frames */
+#define FP_PROP_OPS 2    /* AOF or slot export too: main replays the ops through propagateNow */
+static int fp_prop_mode = FP_PROP_OPS;
+/* INFO, main only. */
+static long long fp_stat_lane_phases = 0, fp_stat_lane_entries = 0, fp_stat_barriers = 0, fp_stat_serial_segments = 0;
+
+#define FP_GROW(arr, n, cap, init)                                     \
+    do {                                                               \
+        if ((n) == (cap)) {                                            \
+            (cap) = (cap) ? (cap) * 2 : (init);                        \
+            (arr) = zrealloc((arr), sizeof(*(arr)) * (size_t)(cap));   \
+        }                                                              \
+    } while (0)
 
 /* acl-offload admission seqlock, one per thread, written only by that thread: odd while the thread
  * reads a bound user's rule set (ACL tagging), even otherwise. Main bumps the ACL epoch, then waits
@@ -173,6 +296,9 @@ void fastpathFreeThread(int tid) {
         t->sbcap[d] = 0;
     }
     serverAssert(listLength(&t->staged_leaving) == 0);
+    for (int l = 0; l < FP_MAX_LANES; l++) zfree(t->lane_ents[l]);
+    zfree(t->barriers);
+    zfree(t->seg_count);
     while (t->nfree > 0) {
         cmdBatch *b = t->freelist[--t->nfree];
         zfree(b->arena);
@@ -264,6 +390,14 @@ static int fpCommandAllowed(struct serverCommand *cmd) {
     return 1;
 }
 
+/* Cluster mode: main produces every redirect with the real client, so the fast path keeps only what
+ * this node serves now: keyless commands, or keys in one slot it owns while nothing migrates. */
+static int fpClusterServes(int slot, int read_flags) {
+    if (!server.cluster_enabled) return 1;
+    if (read_flags & READ_FLAGS_CROSSSLOT) return 0;
+    return slot < 0 || clusterServesSlotStably(slot);
+}
+
 static void fpSubmit(fpThread *t) {
     cmdBatch *b = t->cur;
     if (!b || b->count == 0) return;
@@ -286,7 +420,144 @@ static void fpBeginLeave(fpThread *t, client *c, int state) {
     listLinkNodeTail(&t->staged_leaving, &c->fp_stage_node);
 }
 
-static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum, unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
+/* IO thread, read phase: the write lane that may execute this command, or -1 when only main may. A
+ * lane runs a command only if every key it declares is in one keyspace hashtable, which the lane owns
+ * for the phase, and nothing about the command needs main: an ACL or auth failure, a retired user,
+ * an arity error. */
+/* Commands a lane may run: everything they touch outside their keys' hashtables is in the
+ * execution context, frozen for the phase, or a reason fpLanesAllowed turns the lanes off. Commands
+ * that draw random numbers (SPOP, SRANDMEMBER, HRANDFIELD, ZRANDMEMBER) stay off: the generators are
+ * process-wide. */
+static const char *fp_lane_commands[] = {
+    /* strings and keys */
+    "set", "setnx", "setex", "psetex", "getset", "getdel", "getex", "get", "mget", "mset",
+    "strlen", "append", "setrange", "getrange", "substr", "incr", "decr", "incrby", "decrby",
+    "incrbyfloat", "del", "unlink", "exists", "touch", "type", "ttl", "pttl", "expiretime",
+    "pexpiretime", "expire", "pexpire", "expireat", "pexpireat", "persist",
+    /* hashes, including field expiration */
+    "hset", "hsetnx", "hget", "hmset", "hmget", "hdel", "hlen", "hstrlen", "hexists", "hincrby",
+    "hincrbyfloat", "hkeys", "hvals", "hgetall", "hscan", "hexpire", "hpexpire", "hexpireat",
+    "hpexpireat", "httl", "hpttl", "hexpiretime", "hpexpiretime", "hpersist", "hsetex", "hgetex",
+    "hgetdel",
+    /* sets */
+    "sadd", "srem", "sismember", "smismember", "smembers", "scard", "smove", "sinter", "sintercard",
+    "sinterstore", "sunion", "sunionstore", "sdiff", "sdiffstore", "sscan",
+    /* sorted sets */
+    "zadd", "zincrby", "zrem", "zscore", "zmscore", "zcard", "zcount", "zlexcount", "zrange",
+    "zrangebyscore", "zrangebylex", "zrevrange", "zrevrangebyscore", "zrevrangebylex", "zrangestore",
+    "zrank", "zrevrank", "zremrangebyrank", "zremrangebyscore", "zremrangebylex", "zpopmin", "zpopmax",
+    "zmpop", "zunion", "zinter", "zdiff", "zunionstore", "zinterstore", "zdiffstore", "zintercard",
+    "zscan",
+    /* lists */
+    "lpush", "rpush", "lpushx", "rpushx", "linsert", "lset", "lrem", "ltrim", "lpop", "rpop", "lmpop",
+    "lindex", "llen", "lrange", "lpos", "lmove", "rpoplpush", NULL};
+
+/* Main: mark the lane commands, once (command renames apply first, so a renamed one stays off). */
+static void fpMarkLaneCommands(void) {
+    static int done = 0;
+    if (done) return;
+    for (int i = 0; fp_lane_commands[i]; i++) {
+        struct serverCommand *cmd = lookupCommandByCString(fp_lane_commands[i]);
+        if (cmd) cmd->write_lane = 1;
+    }
+    done = 1;
+}
+
+/* Main writes these before the read phase; IO threads read them in it. */
+static int fp_check_blocked = 0; /* clients are blocked on list, sorted set or stream keys */
+static int fp_check_watched = 0; /* clients watch keys */
+
+/* IO thread, read phase: a client is blocked on the key or watches it, so the command must run at its
+ * place on main, which serves or dirties that client. While lanes are on, none of these dicts is
+ * rehashing (fpKeyDictsSettled), so the lookups only read. The sets only shrink until the fast path's
+ * part of the write phase ends: no fast-path command blocks or watches. */
+static int fpKeyObserved(serverDb *db, robj *key) {
+    if (fp_check_blocked && dictFind(db->blocking_keys, key)) return 1;
+    if (fp_check_watched && dictFind(db->watched_keys, key)) return 1;
+    return 0;
+}
+
+/* IO thread: the keyspace hashtable of every key the command declares (the parser's slot in cluster
+ * mode), or -1 when it has none, they are in several, or one is observed (fpKeyObserved). */
+static int fpKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int slot) {
+    int checks = fp_check_blocked || fp_check_watched;
+    if (cmd->proc == setCommand || cmd->proc == getCommand) {
+        if (argc < 2 || (checks && fpKeyObserved(db, argv[1]))) return -1;
+        return server.cluster_enabled ? slot : getKVStoreIndexForKey(objectGetVal(argv[1]));
+    }
+    if (server.cluster_enabled && !checks) return slot;
+    getKeysResult result;
+    initGetKeysResult(&result);
+    int n = getKeysFromCommand(cmd, argv, argc, &result);
+    int shard = -1;
+    for (int i = 0; i < n; i++) {
+        robj *k = argv[result.keys[i].pos];
+        if (checks && fpKeyObserved(db, k)) {
+            shard = -1;
+            break;
+        }
+        int s = server.cluster_enabled ? slot : getKVStoreIndexForKey(objectGetVal(k));
+        if (i == 0) {
+            shard = s;
+        } else if (s != shard) {
+            shard = -1;
+            break;
+        }
+    }
+    getKeysFreeResult(&result);
+    return shard;
+}
+
+static int fpLaneOf(client *c, struct serverCommand *cmd, robj **argv, int argc, int slot, int read_flags, int *shard) {
+    if (read_flags & (READ_FLAGS_ERROR_MASK | READ_FLAGS_BAD_ARITY)) return -1;
+    if ((c->user->flags & USER_FLAG_RETIRED) || authRequired(c)) return -1;
+    if (!(read_flags & READ_FLAGS_ACL_ALLOWED) && !ACLUserUnrestricted(c->user)) return -1;
+    if (cmd->proc == pingCommand) {
+        *shard = -1;
+        return (int)(c->id % (uint64_t)fp_nlanes);
+    }
+    if (!cmd->write_lane) return -1;
+    *shard = fpKeysShard(c->db, cmd, argv, argc, slot);
+    if (*shard < 0) return -1;
+    return *shard % fp_nlanes;
+}
+
+/* IO thread, read phase: put the entry on its lane's vector, or record it as a barrier. A barrier
+ * closes this thread's current segment. */
+static void fpClassify(fpThread *t, int tid, cmdBatch *b, cmdEntry *e, client *c) {
+    UNUSED(tid);
+    e->seg = (uint32_t)t->nbarriers;
+    int shard = -1;
+    int lane = fpLaneOf(c, e->cmd, e->argv, e->argc, e->slot, e->read_flags, &shard);
+    if (lane >= 0) {
+        e->lane = lane;
+        e->shard = shard;
+        FP_GROW(t->lane_ents[lane], t->lane_n[lane], t->lane_cap[lane], 64);
+        t->lane_ents[lane][t->lane_n[lane]++] = e;
+        t->seg_count[t->nbarriers]++;
+    } else {
+        FP_GROW(t->barriers, t->nbarriers, t->barriers_cap, 16);
+        t->barriers[t->nbarriers++] = (struct fpBarrier){.e = e, .b = b};
+        FP_GROW(t->seg_count, t->nbarriers, t->seg_cap, 16);
+        t->seg_count[t->nbarriers] = 0;
+    }
+}
+
+/* IO thread, start of a depth-0 read phase: forget the previous iteration's lane vectors. */
+static void fpResetLaneVectors(fpThread *t) {
+    for (int l = 0; l < FP_MAX_LANES; l++) t->lane_n[l] = 0;
+    t->nbarriers = 0;
+    if (!t->seg_cap) {
+        t->seg_cap = 16;
+        t->seg_count = zmalloc(sizeof(int) * t->seg_cap);
+    }
+    t->seg_count[0] = 0;
+    t->scur_b = t->scur_e = 0;
+    t->mcur_b = t->mcur_e = 0;
+}
+
+static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int argv_len, size_t argv_len_sum,
+                          unsigned long long input_bytes, struct serverCommand *cmd, int slot, int read_flags) {
     cmdEntry *e = &b->e[b->count++];
     e->c = c;
     e->control = c->control;
@@ -315,6 +586,15 @@ static void fpAppendEntry(cmdBatch *b, client *c, robj **argv, int argc, int arg
     e->reply_big = NULL;
     e->reply_big_len = 0;
     e->requeued = 0;
+    e->obuf_close = 0;
+    e->reply_base = NULL;
+    e->prop = NULL;
+    e->lane = -1;
+    e->shard = -1;
+    e->seg = 0;
+    e->frames_off = e->frames_len = 0;
+    e->frames_wrap = 0;
+    if (fp_lanes_iter && fpDepth() == 0) fpClassify(&fp_threads[fp_cur_tid], fp_cur_tid, b, e, c);
     c->fp_inflight++;
 }
 
@@ -325,7 +605,8 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
     cmdQueue *q = &c->cmd_queue;
 
     if (c->argc > 0 && (c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
-        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd)) {
+        if ((c->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(c->parsed_cmd) ||
+            !fpClusterServes(c->slot, c->read_flags)) {
             leave = 1;
         } else {
             if (!t->cur) t->cur = fpAllocBatch(t, tid);
@@ -358,7 +639,7 @@ static void fpHarvest(fpThread *t, int tid, client *c) {
         }
         int complete = p->read_flags & READ_FLAGS_PARSING_COMPLETED;
         if (!complete && !(p->read_flags & READ_FLAGS_ERROR_MASK)) break; /* trailing partial */
-        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd)) {
+        if ((p->read_flags & READ_FLAGS_ERROR_MASK) || !fpCommandAllowed(p->cmd) || !fpClusterServes(p->slot, p->read_flags)) {
             leave = 1;
             break;
         }
@@ -622,7 +903,7 @@ static void fpDeliverRange(fpThread *t, cmdBatch *b, int from, int to) {
             } else if (e->reply_big) {
                 iov[n].iov_base = e->reply_big, iov[n].iov_len = e->reply_big_len, n++;
             } else if (e->reply_len) {
-                iov[n].iov_base = b->arena + e->reply_off, iov[n].iov_len = e->reply_len, n++;
+                iov[n].iov_base = (e->reply_base ? e->reply_base : b->arena) + e->reply_off, iov[n].iov_len = e->reply_len, n++;
             }
             j++;
         }
@@ -652,11 +933,13 @@ static int fpControlDetaching(ClientControl *cc) {
     return cc && cc->closing;
 }
 
-static cmdEntry *fp_exec_entry = NULL; /* main only: the entry an executor is running */
+static _Thread_local cmdEntry *fp_exec_entry = NULL; /* the entry this thread's executor is running */
+
+static void fpLanePushClose(fpLane *L, cmdEntry *e);
 
 /* Main, from closeClientOnOutputBufferLimitReached while an executor builds a reply: a reply past the
  * normal class hard limit closes its client, as on the main path. The reply is dropped and commands
- * that build long replies stop at close_asap. */
+ * that build long replies stop at close_asap. A write lane leaves the close to main. */
 int fastpathExecutorOutputLimitReached(client *ec) {
     cmdEntry *e = fp_exec_entry;
     if (!e || !e->control) return 0;
@@ -664,6 +947,10 @@ int fastpathExecutorOutputLimitReached(client *ec) {
     clientBufferLimitsConfig *l = &server.client_obuf_limits[CLIENT_TYPE_NORMAL];
     if (!l->hard_limit_bytes || getClientOutputBufferMemoryUsage(ec) < l->hard_limit_bytes) return 0;
     ec->flag.close_asap = 1;
+    if (exec_lane) {
+        fpLanePushClose(fp_cur_lane, e);
+        return 1;
+    }
     freeClientAsync(e->c); /* records the close; main frees it once it took the client back */
     serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
               (unsigned long long)e->control->client_id);
@@ -936,8 +1223,14 @@ void fastpathInfo(sds *info) {
                          "fastpath_batches:%lld\r\n"
                          "fastpath_speculated:%lld\r\n"
                          "fastpath_net_input_bytes:%lld\r\n"
-                         "fastpath_net_output_bytes:%lld\r\n",
-                         fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches, speculated, in, out);
+                         "fastpath_net_output_bytes:%lld\r\n"
+                         "fastpath_write_lane_phases:%lld\r\n"
+                         "fastpath_write_lane_entries:%lld\r\n"
+                         "fastpath_write_barriers:%lld\r\n"
+                         "fastpath_write_serial_segments:%lld\r\n",
+                         fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
+                         speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
+                         fp_stat_serial_segments);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1020,6 +1313,7 @@ void fastpathStagedReadPhase(int tid) {
     poller *p = stagedPoller();
     pollerEvent ev;
     fp_cur_tid = tid;
+    if (fpDepth() == 0) fpResetLaneVectors(t);
     while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
     fpSubmit(t);
     if (t->cur && t->cur->count == 0) {
@@ -1028,9 +1322,697 @@ void fastpathStagedReadPhase(int tid) {
     }
 }
 
+/* Main: no blocked-key or watched-key dict is rehashing, so lookups in them (fpKeyObserved on the IO
+ * threads, the lanes' own wake-up and WATCH checks) only read. A barrier entry can start a rehash
+ * (serving a blocked client deletes from them); main asks again after each one. */
+static int fpKeyDictsSettled(void) {
+    for (int j = 0; j < server.dbnum; j++) {
+        serverDb *db = server.db[j];
+        if (!db) continue;
+        if (dictIsRehashing(db->blocking_keys) || dictIsRehashing(db->blocking_keys_unblock_on_nokey) ||
+            dictIsRehashing(db->watched_keys))
+            return 0;
+    }
+    return 1;
+}
+
+/* Main: nothing outside a lane's own hashtables would observe or order the iteration's writes. Every
+ * condition is changed only by main between phases or by main-path commands, so it holds from the
+ * read phase until the fast path's part of the write phase is done, unless a barrier entry changes
+ * it; main re-checks after each one. */
+static int fpLanesAllowed(void) {
+    /* Cluster mode: one hashtable per slot already. An exporting slot's writes reach its export job
+     * through the replay, but keep the cutover simple: no lanes while one is exported. */
+    if (server.cluster_enabled ? clusterIsAnySlotExporting() : !server.keyspace_shard_bits) return 0;
+    if (server.primary_host || server.loading || server.async_loading) return 0;
+    if (server.paused_actions || listLength(server.monitors)) return 0;
+    if (!trackingIsIdle()) return 0;
+    if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
+    if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
+    if (server.maxmemory || server.maxmemory_clients) return 0;
+    /* A module can block a client on any key and wake it by its own rules. */
+    if (server.blocked_clients_by_type[BLOCKED_MODULE]) return 0;
+    int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+                  server.blocked_clients_by_type[BLOCKED_STREAM];
+    if ((blocked || server.watching_clients) && !fpKeyDictsSettled()) return 0;
+    if (hotkeysEnabled() || server.busy_module_yield_flags) return 0;
+    if (writeCommandsDeniedByDiskError() != DISK_ERROR_TYPE_NONE || !checkGoodReplicasStatus()) return 0;
+    return 1;
+}
+
+void fastpathStagedPrepareLanes(void) {
+    int n = 0;
+    if (fpDepth() == 0 && server.io_threads_parallel_writes) {
+        fpMarkLaneCommands();
+        n = stagedWorkerCount() + stagedMainTakesLane();
+        if (n > FP_MAX_LANES) n = FP_MAX_LANES;
+    }
+    fp_lane_main = stagedMainTakesLane();
+    fp_nlanes = n;
+    fp_lanes_iter = n >= 2 && fpLanesAllowed();
+    fp_check_blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+                       server.blocked_clients_by_type[BLOCKED_STREAM];
+    fp_check_watched = server.watching_clients > 0;
+    /* The previous iteration's replies were delivered in its reply phase. */
+    for (int l = 0; l < FP_MAX_LANES; l++) {
+        fp_lanes[l].chunk = 0;
+        fp_lanes[l].used = 0;
+    }
+}
+
+static void fpLanePushClose(fpLane *L, cmdEntry *e) {
+    e->obuf_close = 1;
+    FP_GROW(L->closes, L->ncloses, L->closes_cap, 8);
+    L->closes[L->ncloses++] = e;
+}
+
+static laneCmdStat *fpLaneCmdStat(fpLane *L, struct serverCommand *cmd);
+
+void fastpathLaneErrorReply(client *c, const char *s, size_t len, int flags) {
+    fpLane *L = fp_cur_lane;
+    if (flags & ERR_REPLY_FLAG_NO_STATS_UPDATE) {
+        /* No error stats; the command still counts as failed, as afterErrorReply counts it. */
+        fpLaneCmdStat(L, c->realcmd)->failed++;
+        return;
+    }
+    ectx->stat_total_error_replies++;
+    FP_GROW(L->errors, L->nerrors, L->errors_cap, 8);
+    L->errors[L->nerrors++] =
+        (laneError){.msg = sdsnewlen(s, len < 64 ? len : 64), .flags = flags, .cmd = c->realcmd};
+}
+
+void fastpathLaneLatencySample(const char *event, long long latency_us) {
+    fpLane *L = fp_cur_lane;
+    FP_GROW(L->lat, L->nlat, L->lat_cap, 8);
+    L->lat[L->nlat++] = (laneLatency){.event = event, .us = latency_us};
+}
+
+static laneCmdStat *fpLaneCmdStat(fpLane *L, struct serverCommand *cmd) {
+    if (cmd->id >= L->cs_cap) {
+        int cap = L->cs_cap ? L->cs_cap : 256;
+        while (cap <= cmd->id) cap *= 2;
+        L->cs = zrealloc(L->cs, sizeof(*L->cs) * cap);
+        memset(L->cs + L->cs_cap, 0, sizeof(*L->cs) * (cap - L->cs_cap));
+        L->cs_cap = cap;
+    }
+    laneCmdStat *cs = &L->cs[cmd->id];
+    if (!cs->cmd) {
+        cs->cmd = cmd;
+        FP_GROW(L->cs_touched, L->ncs, L->cs_touched_cap, 16);
+        L->cs_touched[L->ncs++] = cmd->id;
+    }
+    return cs;
+}
+
+static void fpLaneHistogram(fpLane *L, struct serverCommand *cmd, long long ns) {
+    if (cmd->id >= L->hist_cap) {
+        int cap = L->hist_cap ? L->hist_cap : 256;
+        while (cap <= cmd->id) cap *= 2;
+        L->hist = zrealloc(L->hist, sizeof(*L->hist) * cap);
+        L->hist_cmd = zrealloc(L->hist_cmd, sizeof(*L->hist_cmd) * cap);
+        memset(L->hist + L->hist_cap, 0, sizeof(*L->hist) * (cap - L->hist_cap));
+        memset(L->hist_cmd + L->hist_cap, 0, sizeof(*L->hist_cmd) * (cap - L->hist_cap));
+        L->hist_cap = cap;
+    }
+    L->hist_cmd[cmd->id] = cmd;
+    updateCommandLatencyHistogram(&L->hist[cmd->id], ns);
+}
+
+void fastpathFoldLaneHistograms(void) {
+    for (int l = 0; l < FP_MAX_LANES; l++) {
+        fpLane *L = &fp_lanes[l];
+        for (int id = 0; id < L->hist_cap; id++) {
+            struct hdr_histogram *h = L->hist[id];
+            if (!h || h->total_count == 0) continue;
+            struct serverCommand *cmd = L->hist_cmd[id];
+            if (cmd->latency_histogram == NULL)
+                hdr_init(LATENCY_HISTOGRAM_MIN_VALUE, LATENCY_HISTOGRAM_MAX_VALUE, LATENCY_HISTOGRAM_PRECISION,
+                         &cmd->latency_histogram);
+            hdr_add(cmd->latency_histogram, h);
+            hdr_reset(h);
+        }
+    }
+}
+
+void fastpathResetLaneStats(void) {
+    for (int l = 0; l < FP_MAX_LANES; l++) {
+        fpLane *L = &fp_lanes[l];
+        for (int id = 0; id < L->hist_cap; id++)
+            if (L->hist[id]) hdr_reset(L->hist[id]);
+    }
+}
+
+/* Lane thread: the arena slot the next reply goes to. */
+static char *fpLaneArena(fpLane *L, size_t *room) {
+    if (L->nchunks && FP_LANE_CHUNK - L->used < FP_LANE_MIN_ROOM) {
+        L->chunk++;
+        L->used = 0;
+    }
+    if (L->chunk >= L->nchunks) {
+        FP_GROW(L->chunks, L->nchunks, L->chunk_cap, 4);
+        L->chunks[L->nchunks++] = zmalloc(FP_LANE_CHUNK);
+    }
+    *room = FP_LANE_CHUNK - L->used;
+    return L->chunks[L->chunk] + L->used;
+}
+
+/* Lane thread: the part of processCommand and call() that applies to an entry the read phase found
+ * lane-eligible. Statistics go to the lane, propagation is captured for main, nothing is emitted. */
+static void fpLaneCall(fpLane *L, client *c) {
+    struct serverCommand *real_cmd = c->realcmd;
+    ectx->in_call++;
+    ectx->executing_client = c;
+    c->flag.force_aof = 0;
+    c->flag.force_repl = 0;
+    c->flag.prevent_prop = 0;
+    c->redact_arg_bitmap = 0;
+    long long dirty = ectx->dirty;
+    long long errors = ectx->stat_total_error_replies;
+    enterExecutionUnit(0, 0);
+    c->flag.executing_command = 1;
+    c->flag.buffered_reply = 0;
+    c->flag.keyspace_notified = 0;
+    monotime start = getMonotonicUs();
+
+    c->cmd->proc(c);
+
+    exitExecutionUnit();
+    c->flag.executing_command = 0;
+    ustime_t duration = getMonotonicUs() - start;
+    dirty = ectx->dirty - dirty;
+    if (dirty < 0) dirty = 0;
+
+    laneCmdStat *cs = fpLaneCmdStat(L, real_cmd);
+    if (ectx->stat_total_error_replies > errors || c->deferred_reply_errors) cs->failed++;
+    latencyAddSampleIfNeeded((real_cmd->flags & CMD_FAST) ? "fast-command" : "command", duration);
+    if (ectx->execution_nesting == 0) {
+        L->dur_cnt++;
+        L->dur_sum += duration;
+        if (duration > L->dur_max) L->dur_max = duration;
+    }
+    c->duration = duration;
+    void *entries[3];
+    int types[3];
+    int n = commandlogPrepareCurrentCommand(c, real_cmd, entries, types);
+    for (int i = 0; i < n; i++) {
+        FP_GROW(L->logs, L->nlogs, L->logs_cap, 4);
+        L->logs[L->nlogs++] = (laneLog){.entry = entries[i], .type = types[i]};
+    }
+    c->duration = 0;
+    cs->calls++;
+    cs->usec += duration;
+    if (server.latency_tracking_enabled) fpLaneHistogram(L, real_cmd, duration * 1000);
+    /* The lane owns the slot, so its CLUSTER SLOT-STATS counters are the lane's to write. */
+    clusterSlotStatsAddCpuDuration(c, duration);
+    clusterSlotStatsAddNetworkBytesOutForUserClient(c);
+
+    if (fp_prop_mode != FP_PROP_NONE && !c->flag.prevent_prop && !(c->cmd->flags & CMD_MODULE)) {
+        int flags = PROPAGATE_NONE;
+        if (dirty) flags |= (PROPAGATE_AOF | PROPAGATE_REPL);
+        if (c->flag.force_repl) flags |= PROPAGATE_REPL;
+        if (c->flag.force_aof) flags |= PROPAGATE_AOF;
+        if (c->flag.prevent_repl_prop || c->flag.module_prevent_repl_prop) flags &= ~PROPAGATE_REPL;
+        if (c->flag.prevent_aof_prop || c->flag.module_prevent_aof_prop) flags &= ~PROPAGATE_AOF;
+        /* In standalone the executor's slot is the lane shard, which no sink uses. */
+        if (flags != PROPAGATE_NONE)
+            alsoPropagate(c->db->id, c->argv, c->argc, flags, server.cluster_enabled ? c->slot : -1);
+    }
+    c->flag.force_aof = 0;
+    c->flag.force_repl = 0;
+    c->flag.prevent_prop = 0;
+    ectx->stat_numcommands++;
+    ectx->executing_client = NULL;
+    ectx->in_call--;
+}
+
+
+static int fpPropMode(void) {
+    if (server.aof_state != AOF_OFF || clusterIsAnySlotExporting()) return FP_PROP_OPS;
+    if (server.primary_host || (!server.repl_backlog && !listLength(server.replicas))) return FP_PROP_NONE;
+    return server.repl_backlog ? FP_PROP_FRAMES : FP_PROP_OPS;
+}
+
+/* Lane thread: take what the entry's execution unit would have propagated. */
+static void fpLaneTakeProp(fpLane *L, cmdEntry *e, client *ec) {
+    serverOpArray *oa = &ectx->also_propagate;
+    int n = oa->numops;
+    int wrap = n > 1 && !(ec->cmd->flags & CMD_TOUCHES_ARBITRARY_KEYS);
+    if (fp_prop_mode == FP_PROP_NONE) {
+        serverOpArrayFree(oa);
+        return;
+    }
+    if (fp_prop_mode == FP_PROP_FRAMES) {
+        int same_db = 1;
+        for (int j = 0; j < n; j++) same_db &= oa->ops[j].dbid == e->db->id;
+        if (same_db) {
+            if (!L->frames) L->frames = sdsempty();
+            size_t start = sdslen(L->frames);
+            for (int j = 0; j < n; j++) L->frames = replicationCatCommand(L->frames, oa->ops[j].argv, oa->ops[j].argc);
+            e->frames_off = (uint32_t)start;
+            e->frames_len = (uint32_t)(sdslen(L->frames) - start);
+            e->frames_wrap = (uint8_t)wrap;
+            serverOpArrayFree(oa);
+            return;
+        }
+    }
+    laneProp *p = zmalloc(sizeof(*p));
+    p->ops = zmalloc(sizeof(serverOp) * n);
+    memcpy(p->ops, oa->ops, sizeof(serverOp) * n);
+    p->numops = n;
+    p->wrap = wrap;
+    oa->numops = 0; /* the ops' argv now belong to p */
+    e->prop = p;
+}
+
+/* Lane thread: execute one entry on the lane's executor, its reply into the lane arena. */
+static void fpLaneExecute(fpLane *L, cmdEntry *e) {
+    client *ec = L->ec;
+    char *saved_buf = ec->buf;
+    size_t saved_usable = ec->buf_usable_size;
+
+    if (fpControlDetaching(e->control)) goto release_argv; /* no reply: main is closing it */
+
+    ec->user = e->origin.principal;
+    ec->flag.authenticated = ec->flag.ever_authenticated = e->origin.authenticated;
+    ec->argv = e->argv;
+    ec->argc = e->argc;
+    ec->argv_len = e->argv_len;
+    ec->argv_len_sum = e->argv_len_sum;
+    ec->net_input_bytes_curr_cmd = e->input_bytes;
+    ec->parsed_cmd = e->cmd;
+    ec->cmd = ec->lastcmd = ec->realcmd = e->cmd;
+    ec->slot = e->shard;
+    ec->read_flags = e->read_flags;
+    ec->acl_epoch_seen = e->origin.acl_epoch_seen;
+    ec->db = e->db;
+    ec->resp = e->resp;
+    ec->origin = &e->origin;
+    size_t room;
+    char *slot = fpLaneArena(L, &room);
+    ec->buf = slot;
+    ec->buf_usable_size = room;
+    ec->bufpos = 0;
+    ec->flag.buf_encoded = 0;
+    ec->flag.pending_command = 1;
+    ec->woff = 0;
+
+    fp_exec_entry = e;
+    ectx->current_client = ec;
+    fpLaneCall(L, ec);
+    if (ectx->also_propagate.numops) fpLaneTakeProp(L, e, ec);
+    commandProcessed(ec);
+    ectx->current_client = NULL;
+    fp_exec_entry = NULL;
+    L->executed++;
+
+    if (ec->flag.close_asap) {
+        /* Closed for the output buffer limit: nothing of this reply is sent. */
+        ec->flag.close_asap = 0;
+        listEmpty(ec->reply);
+        ec->reply_bytes = 0;
+        ec->bufpos = 0;
+    }
+    e->reply_base = L->chunks[L->chunk];
+    e->reply_off = (uint32_t)L->used;
+    e->reply_len = (uint32_t)ec->bufpos;
+    L->used += ec->bufpos;
+    if (listLength(ec->reply) > 0) {
+        size_t total = ec->bufpos;
+        listIter li;
+        listNode *ln;
+        listRewind(ec->reply, &li);
+        while ((ln = listNext(&li))) total += ((clientReplyBlock *)listNodeValue(ln))->used;
+        char *big = zmalloc(total);
+        memcpy(big, ec->buf, ec->bufpos);
+        size_t off = ec->bufpos;
+        listRewind(ec->reply, &li);
+        while ((ln = listNext(&li))) {
+            clientReplyBlock *o = listNodeValue(ln);
+            memcpy(big + off, o->buf, o->used);
+            off += o->used;
+        }
+        listEmpty(ec->reply);
+        ec->reply_bytes = 0;
+        L->used -= ec->bufpos;
+        e->reply_base = NULL;
+        e->reply_off = 0;
+        e->reply_len = 0;
+        e->reply_big = big;
+        e->reply_big_len = (uint32_t)total;
+    }
+    ec->bufpos = 0;
+    ec->buf = saved_buf;
+    ec->buf_usable_size = saved_usable;
+release_argv:
+    /* IO threads receive only sole-reference argv objects for terminal frees. */
+    for (int j = 0; j < e->argc; j++) {
+        robj *o = e->argv[j];
+        if (!o) continue;
+        unsigned rc = objectGetRefcount(o);
+        if (rc == 1) continue; /* sole reference: freed by the IO thread */
+        if (rc < OBJ_FIRST_SPECIAL_REFCOUNT) decrRefCount(o);
+        e->argv[j] = NULL;
+    }
+}
+
+void fastpathStagedWriteLane(int tid) {
+    int lane = fp_lane_main ? tid : tid - 1;
+    if (lane < 0 || lane >= fp_nlanes) return;
+    fpLane *L = &fp_lanes[lane];
+    execContext *saved = ectx;
+    ectx = &L->ctx;
+    ectx->cmd_time_snapshot = fp_phase_time;
+    fp_cur_lane = L;
+    exec_lane = 1;
+    if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
+    for (int p = 0; p < fp_nparts; p++) {
+        int t = fp_parts[p].tid;
+        uint32_t s = fp_parts[p].seg;
+        fpThread *th = &fp_threads[t];
+        int *cur = &L->cursor[t];
+        while (*cur < th->lane_n[lane]) {
+            cmdEntry *e = th->lane_ents[lane][*cur];
+            if (e->seg > s) break;
+            (*cur)++;
+            if (e->seg == s) fpLaneExecute(L, e); /* an earlier segment's entry ran serially on main */
+        }
+    }
+    exec_lane = 0;
+    fp_cur_lane = NULL;
+    ectx = saved;
+}
+
+/* Main, after a write or apply phase: fold what lanes [0, nlanes) accumulated. A lane error of the primary's
+ * stream is logged as main logs one for the primary client. */
+static void fpFoldLaneStats(int nlanes, int from_primary) {
+    execContext *m = &server.exec_ctx;
+    for (int l = 0; l < nlanes; l++) {
+        fpLane *L = &fp_lanes[l];
+        execContext *x = &L->ctx;
+        m->dirty += x->dirty;
+        m->stat_numcommands += x->stat_numcommands;
+        m->stat_keyspace_hits += x->stat_keyspace_hits;
+        m->stat_keyspace_misses += x->stat_keyspace_misses;
+        m->stat_expiredkeys += x->stat_expiredkeys;
+        m->stat_expiredfields += x->stat_expiredfields;
+        m->stat_total_error_replies += x->stat_total_error_replies;
+        x->dirty = x->stat_numcommands = x->stat_keyspace_hits = x->stat_keyspace_misses = 0;
+        x->stat_expiredkeys = x->stat_expiredfields = x->stat_total_error_replies = x->prev_err_count = 0;
+        for (int i = 0; i < L->ncs; i++) {
+            laneCmdStat *cs = &L->cs[L->cs_touched[i]];
+            cs->cmd->calls += cs->calls;
+            cs->cmd->microseconds += cs->usec;
+            cs->cmd->failed_calls += cs->failed;
+            *cs = (laneCmdStat){0};
+        }
+        L->ncs = 0;
+        if (L->dur_cnt) {
+            durationStats *ds = &server.duration_stats[EL_DURATION_TYPE_CMD];
+            ds->cnt += L->dur_cnt;
+            ds->sum += L->dur_sum;
+            if ((long long)ds->max < L->dur_max) ds->max = L->dur_max;
+            L->dur_cnt = L->dur_sum = L->dur_max = 0;
+        }
+        for (int i = 0; i < L->nerrors; i++) {
+            incrementErrorStatsForReply(L->errors[i].msg, sdslen(L->errors[i].msg), L->errors[i].flags);
+            if (from_primary) {
+                const char *cmdname = L->errors[i].cmd ? L->errors[i].cmd->fullname : "<unknown>";
+                serverLog(LL_WARNING,
+                          "== CRITICAL == This replica is sending an error to its primary: '%.*s' after processing "
+                          "the command '%s'",
+                          (int)sdslen(L->errors[i].msg), L->errors[i].msg, cmdname);
+                if (server.repl_backlog && server.repl_backlog->histlen > 0) showLatestBacklog();
+                server.stat_unexpected_error_replies++;
+                if (server.repl_replica_ro &&
+                    (server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC ||
+                     server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS))
+                    serverPanic("This replica panicked sending an error to its primary after processing the "
+                                "command '%s'",
+                                cmdname);
+            }
+            sdsfree(L->errors[i].msg);
+        }
+        L->nerrors = 0;
+        for (int i = 0; i < L->nlat; i++) latencyAddSample(L->lat[i].event, L->lat[i].us);
+        L->nlat = 0;
+        for (int i = 0; i < L->nlogs; i++) commandlogPushPrepared(L->logs[i].entry, L->logs[i].type);
+        L->nlogs = 0;
+        for (int i = 0; i < L->ncloses; i++) {
+            cmdEntry *e = L->closes[i];
+            freeClientAsync(e->c);
+            serverLog(LL_WARNING, "Client id=%llu closed for overcoming of output buffer limits.",
+                      (unsigned long long)e->control->client_id);
+            server.stat_client_outbuf_limit_disconnections++;
+        }
+        L->ncloses = 0;
+        fp_stat_lane_entries += L->executed;
+        L->executed = 0;
+        if (L->ec) {
+            L->ec->origin = NULL;
+            clientSetUser(L->ec, DefaultUser, 0); /* never keep a principal that may retire */
+        }
+    }
+}
+
+/* Main, after a write phase: fold what the lanes accumulated and replay their propagation in T order. */
+static void fpMergeLanes(void) {
+    fpFoldLaneStats(fp_nlanes, 0);
+    /* Propagation in T order: each part's entries in its IO thread's harvest order. A client's writes
+     * of one iteration are contiguous there, so its replication offset is stored once per run. With no
+     * sink fed the lanes kept nothing to propagate. */
+    if (fp_prop_mode == FP_PROP_NONE) return;
+    client *last = NULL;
+    long long last_woff = 0;
+    for (int p = 0; p < fp_nparts; p++) {
+        fpThread *t = &fp_threads[fp_parts[p].tid];
+        uint32_t s = fp_parts[p].seg;
+        while (t->mcur_b < t->sbn[0]) {
+            cmdBatch *b = t->sb[0][t->mcur_b];
+            while (t->mcur_e < b->count) {
+                cmdEntry *e = &b->e[t->mcur_e];
+                if (e->seg > s) goto next_part;
+                t->mcur_e++;
+                if (e->seg < s || e->lane < 0 || (!e->frames_len && !e->prop)) continue;
+                long long offset = server.primary_repl_offset;
+                /* CLUSTER SLOT-STATS attributes replication bytes to the current client's slot. */
+                client *attr = fp_lanes[e->lane].ec;
+                attr->slot = e->shard;
+                ectx->current_client = attr;
+                if (e->frames_len) {
+                    replicationFeedFrames(e->db->id, fp_lanes[e->lane].frames + e->frames_off, e->frames_len,
+                                          e->frames_wrap);
+                } else {
+                    replayLanePropagation(e->prop->ops, e->prop->numops, e->prop->wrap);
+                    zfree(e->prop->ops);
+                    zfree(e->prop);
+                    e->prop = NULL;
+                }
+                ectx->current_client = NULL;
+                attr->slot = -1;
+                /* WAIT and WAITAOF on the client wait for its last write's replication offset. */
+                if (server.primary_repl_offset != offset && e->c) {
+                    if (last && last != e->c) last->woff = last_woff;
+                    last = e->c;
+                    last_woff = server.primary_repl_offset;
+                }
+            }
+            t->mcur_b++;
+            t->mcur_e = 0;
+        }
+    next_part:;
+    }
+    if (last) last->woff = last_woff;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Replica: the primary's stream on the write lanes. repl_apply.c plans it and runs the segments;
+ * these run its commands on the lanes.
+ * --------------------------------------------------------------------------------------------- */
+
+static _Thread_local execContext *fp_stream_saved_ectx = NULL;
+
+/* As fpLanesAllowed, for the stream a replica applies. Main proxies the stream to the backlog and the
+ * sub-replicas itself, so of the sinks only the AOF, which execution feeds, needs stream order. */
+int fastpathStreamLanesAllowed(void) {
+    if (!server.io_threads_parallel_writes || fpDepth() != 0) return 0;
+    if (server.cluster_enabled ? (clusterIsAnySlotExporting() || clusterIsAnySlotImporting())
+                               : !server.keyspace_shard_bits)
+        return 0;
+    if (!server.primary_host || server.loading || server.async_loading) return 0;
+    if (server.aof_state != AOF_OFF) return 0;
+    if (server.paused_actions || listLength(server.monitors)) return 0;
+    if (!trackingIsIdle()) return 0;
+    if (server.notify_keyspace_events || moduleObservesWrites()) return 0;
+    if (bgIteration_iterationActive() || throttle_anyThrottlers()) return 0;
+    if (server.maxmemory || server.maxmemory_clients) return 0;
+    if (server.blocked_clients_by_type[BLOCKED_MODULE]) return 0;
+    int blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
+                  server.blocked_clients_by_type[BLOCKED_STREAM];
+    if ((blocked || server.watching_clients) && !fpKeyDictsSettled()) return 0;
+    if (hotkeysEnabled() || server.busy_module_yield_flags) return 0;
+    return 1;
+}
+
+int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int slot) {
+    return fpKeysShard(db, cmd, argv, argc, slot);
+}
+
+void fastpathStreamLanesPrepare(int nlanes, int main_lane) {
+    fpMarkLaneCommands();
+    for (int l = 0; l < nlanes; l++) {
+        fpLane *L = &fp_lanes[l];
+        if (!L->sec) {
+            client *ec = createClient(NULL);
+            ec->flag.primary = 1; /* what a command sees of the primary client: no reply, no expiry */
+            ec->user = NULL;      /* as the primary client: no ACL */
+            L->sec = ec;
+        }
+        L->sec->cur_tid = main_lane ? l : l + 1;
+    }
+    updateCachedTime(0);
+    fp_phase_time = server.mstime;
+    fp_prop_mode = FP_PROP_NONE;
+}
+
+void fastpathStreamLaneEnter(int lane) {
+    fpLane *L = &fp_lanes[lane];
+    fp_stream_saved_ectx = ectx;
+    ectx = &L->ctx;
+    ectx->cmd_time_snapshot = fp_phase_time;
+    fp_cur_lane = L;
+    exec_lane = 1;
+}
+
+void fastpathStreamLaneCall(int lane, serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int argv_len,
+                            size_t argv_len_sum, unsigned long long input_bytes, int shard) {
+    fpLane *L = &fp_lanes[lane];
+    client *ec = L->sec;
+    ec->argv = argv;
+    ec->argc = argc;
+    ec->argv_len = argv_len;
+    ec->argv_len_sum = argv_len_sum;
+    ec->net_input_bytes_curr_cmd = input_bytes;
+    ec->parsed_cmd = cmd;
+    ec->cmd = ec->lastcmd = ec->realcmd = cmd;
+    ec->slot = shard;
+    ec->db = db;
+    ec->flag.pending_command = 1;
+    ectx->current_client = ec;
+    fpLaneCall(L, ec);
+    if (ectx->also_propagate.numops) serverOpArrayFree(&ectx->also_propagate);
+    commandProcessed(ec); /* frees the arguments */
+    ectx->current_client = NULL;
+}
+
+void fastpathStreamLaneLeave(void) {
+    exec_lane = 0;
+    fp_cur_lane = NULL;
+    ectx = fp_stream_saved_ectx;
+}
+
+void fastpathStreamLanesMerge(int nlanes) {
+    fpFoldLaneStats(nlanes, 1);
+}
+
+/* Main: execute thread tid's segment s on main, in T order: its lane entries between the barriers
+ * that bound it. A thread's batches are walked once per write phase across all its segments. */
+static int fpSerialSegment(int tid, uint32_t s, int use_prefetch) {
+    fpThread *t = &fp_threads[tid];
+    client *ec = fpExecutor(tid);
+    int n = 0;
+    while (t->scur_b < t->sbn[0]) {
+        cmdBatch *b = t->sb[0][t->scur_b];
+        if (t->scur_e == 0 && use_prefetch) fpPrefetchBatch(b);
+        while (t->scur_e < b->count) {
+            cmdEntry *e = &b->e[t->scur_e];
+            if (e->seg > s || (e->lane < 0 && e->seg == s)) goto done; /* the next segment, or this one's barrier */
+            t->scur_e++;
+            if (e->seg < s) continue; /* ran earlier: on a lane, or as a barrier */
+            fpExecute(ec, b, e);
+            n++;
+        }
+        t->scur_b++;
+        t->scur_e = 0;
+    }
+done:
+    ec->origin = NULL;
+    clientSetUser(ec, DefaultUser, 0); /* never keep a principal that may retire */
+    return n;
+}
+
+/* Main: run the pending segment parts on the lanes, or on main when too small to pay for a phase. */
+static int fpRunSegment(int pending, int serial, int use_prefetch) {
+    if (!fp_nparts) return 0;
+    int n = 0;
+    if (pending == 0) {
+        /* nothing to run */
+    } else if (serial || pending < server.io_threads_parallel_writes_min) {
+        for (int p = 0; p < fp_nparts; p++) n += fpSerialSegment(fp_parts[p].tid, fp_parts[p].seg, use_prefetch);
+        fp_stat_serial_segments++;
+    } else {
+        for (int l = 0; l < fp_nlanes; l++) {
+            fpLane *L = &fp_lanes[l];
+            if (!L->ec) {
+                L->ec = createClient(NULL);
+                L->ec->flag.executor = 1;
+                L->ec->cur_tid = fp_lane_main ? l : l + 1;
+            }
+        }
+        updateCachedTime(0);
+        fp_phase_time = server.mstime;
+        fp_prop_mode = fpPropMode();
+        dbLanePhaseBegin();
+        stagedRunWritePhase();
+        dbLanePhaseEnd();
+        fpMergeLanes();
+        fp_stat_lane_phases++;
+        n = pending;
+    }
+    fp_nparts = 0;
+    return n;
+}
+
+static void fpAddPart(int tid, uint32_t seg) {
+    FP_GROW(fp_parts, fp_nparts, fp_parts_cap, 16);
+    fp_parts[fp_nparts++] = (fpSegPart){.tid = tid, .seg = seg};
+}
+
+/* Main, write phase with lanes: T split by the barrier entries into segments; each segment runs on the
+ * lanes in parallel, each barrier alone on main between them. */
+static int fpExecuteWithLanes(void) {
+    int total = 0;
+    int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
+    int serial = !fpLanesAllowed();
+    for (int l = 0; l < fp_nlanes; l++) memset(fp_lanes[l].cursor, 0, sizeof(int) * fp_slots);
+    fp_nparts = 0;
+    int pending = 0;
+    for (int tid = 1; tid < fp_slots; tid++) {
+        fpThread *t = &fp_threads[tid];
+        if (t->sbn[0] == 0) continue;
+        for (int s = 0; s <= t->nbarriers; s++) {
+            fpAddPart(tid, (uint32_t)s);
+            pending += t->seg_count[s];
+            if (s == t->nbarriers) break;
+            total += fpRunSegment(pending, serial, use_prefetch);
+            pending = 0;
+            struct fpBarrier *br = &t->barriers[s];
+            client *ec = fpExecutor(tid);
+            fpExecute(ec, br->b, br->e);
+            ec->origin = NULL;
+            clientSetUser(ec, DefaultUser, 0);
+            total++;
+            fp_stat_barriers++;
+            if (!serial && !fpLanesAllowed()) serial = 1;
+        }
+    }
+    total += fpRunSegment(pending, serial, use_prefetch);
+    return total;
+}
+
 /* Main, write phase: execute every batch the read phase published, filling each entry's reply. */
 int fastpathStagedExecute(void) {
     int d = fpDepth();
+    if (d == 0 && fp_lanes_iter) return fpExecuteWithLanes();
     int total = 0;
     int use_prefetch = prefetchBatchEnabled() && !ProcessingEventsWhileBlocked;
     int paused = isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE);

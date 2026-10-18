@@ -34,8 +34,8 @@ enum {
 };
 static const char *const sl_t_names[SL_T_COUNT] = {"beforesleep", "poll",   "read",   "exec",  "streamwait",
                                                    "events",      "aof",    "reply",  "finish", "crons"};
-static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none",  "read",  "reply", "sync",
-                                                               "drain", "apply", "maint", "stream"};
+static const char *const sl_phase_names[STAGED_PHASE_KINDS] = {"none",  "read",  "reply", "sync",  "drain",
+                                                               "apply", "maint", "stream", "write"};
 static uint64_t sl_main_ns[SL_T_COUNT];
 static uint64_t sl_iterations;
 static uint64_t sl_phases[STAGED_PHASE_KINDS];
@@ -427,6 +427,7 @@ static void stagedQueueDeferredRead(void) {
 
 /* Read: IO threads read and parse ready clients, answer the leading reads, and batch the rest. */
 static void readPhase(void) {
+    fastpathStagedPrepareLanes();
     stagedQueueDeferredRead();
     if (pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
     stagedRunPhase(STAGED_PHASE_READ);
@@ -614,6 +615,16 @@ void stagedRunApplyPhase(int with_workers) {
     stagedRunLanePhase(STAGED_PHASE_APPLY, with_workers);
 }
 
+void stagedRunWritePhase(void) {
+    stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
+    int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
+    serverAssert(rc == 0);
+    sl_opens++;
+    if (sl_main_lane) fastpathStagedWriteLane(0);
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+    stagedAccountPhase(STAGED_PHASE_WRITE, sl_workers);
+}
+
 void stagedStopWorkers(void) {
     stagedStreamClose(1);
     if (sl_barrier_ready) phaseBarrierShutdown(&sl_barrier);
@@ -693,6 +704,9 @@ void stagedRunLanePhase(int phase, int with_workers) {
 void stagedRunLane(int phase, int tid) {
     UNUSED(phase);
     UNUSED(tid);
+}
+void stagedRunWritePhase(void) {
+    fastpathStagedWriteLane(0);
 }
 void stagedStopWorkers(void) {
 }

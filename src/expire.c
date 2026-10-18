@@ -66,7 +66,7 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
  * If the key is found to be expired, it is removed from the database and
  * 1 is returned. Otherwise, no operation is performed and 0 is returned.
  *
- * When a key is expired, server.stat_expiredkeys is incremented.
+ * When a key is expired, ectx->stat_expiredkeys is incremented.
  *
  * The parameter 'now' is the current time in milliseconds as is passed
  * to the function to avoid too many gettimeofday() syscalls. */
@@ -79,7 +79,7 @@ int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) 
         robj *keyobj = createStringObject(key, sdslen(key));
         deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, didx);
         decrRefCount(keyobj);
-        server.dirty++;
+        ectx->dirty++;
         exitExecutionUnit();
         return 1;
     } else {
@@ -763,7 +763,7 @@ static void laneFieldExpireOneHash(laneFieldScanData *d, robj *o, int didx) {
         size_t expired = hashTypeDeleteExpiredFields(o, d->now, EXPIRE_BULK_LIMIT, entries);
         if (expired == 0) break;
         any = 1;
-        /* Count per lane; main bulk-adds to server.stat_expiredfields after the phase (the global write
+        /* Count per lane; main bulk-adds to stat_expiredfields after the phase (the global write
          * is removed from hashTypeDeleteExpiredFields so concurrent lanes do not race on it). */
         lane_expire_stats[d->tid].fields += expired;
         int empty = hashTypeLength(o) == 0;
@@ -895,14 +895,14 @@ void activeExpireLaneEnd(uint64_t lanes_us, uint64_t phase_us, uint64_t expire_u
     /* The lanes deleted hash fields without touching the global counter (that write races across lanes),
      * so main adds the total here. Field dirty increments the free-inline lane made are also added here;
      * the feed/replay paths account dirty on main themselves. */
-    if (fields) server.stat_expiredfields += fields;
-    if (lane_dirty) server.dirty += lane_dirty;
+    if (fields) ectx->stat_expiredfields += fields;
+    if (lane_dirty) ectx->dirty += lane_dirty;
     /* Keys the lanes freed themselves (free-inline mode) get no replay, so main bulk-adds their expired
      * and dirty counts here. In propagate-only mode the feed owns the count for every key (freed or not),
      * so the lane does not add it again. */
     if (freed && !lane_expire_propagate_only) {
-        server.stat_expiredkeys += freed;
-        server.dirty += freed;
+        ectx->stat_expiredkeys += freed;
+        ectx->dirty += freed;
     }
     lane_expire_hit_limit = hit;
     if (hit) server.stat_expired_time_cap_reached_count++;
@@ -1002,8 +1002,8 @@ ustime_t activeExpireCycle(int type) {
     static bool expireCycleStartWithFields = 0;
     ustime_t elapsed = 0;
 
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
-    serverAssert(server.also_propagate.numops == 0);
+    /* Try to smoke-out bugs (ectx->also_propagate should be empty here) */
+    serverAssert(ectx->also_propagate.numops == 0);
 
     if (activeExpireInLanes()) {
         /* Keys and hash fields both expire in the MAINT phase after crons(), every staged thread taking
@@ -1195,7 +1195,7 @@ int checkAlreadyExpired(mstime_t when) {
      *
      * If the server is receiving the key from a slot migration, we will accept
      * expired keys and wait for the source to propagate deletion. */
-    if (server.current_client && server.current_client->slot_migration_job) return 0;
+    if (ectx->current_client && ectx->current_client->slot_migration_job) return 0;
     return (when <= commandTimeSnapshot() && !server.loading && !server.primary_host && !server.import_mode);
 }
 
@@ -1380,7 +1380,7 @@ void expireGenericCommand(client *c, mstime_t basetime, int unit) {
         obj = setExpire(c, c->db, key, when);
         signalModifiedKey(c, c->db, key);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key, c->db->id);
-        server.dirty++;
+        ectx->dirty++;
         addReply(c, shared.cone);
         /* Propagate as PEXPIREAT millisecond-timestamp
          * Only rewrite the command arg if not already PEXPIREAT */
@@ -1470,7 +1470,7 @@ void persistCommand(client *c) {
             signalModifiedKey(c, c->db, c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", c->argv[1], c->db->id);
             addReply(c, shared.cone);
-            server.dirty++;
+            ectx->dirty++;
         } else {
             addReply(c, shared.czero);
         }
@@ -1517,9 +1517,9 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
      * When replicating commands from the primary, keys are never considered
      * expired, so we return POLICY_IGNORE_EXPIRE */
     if (server.primary_host != NULL) {
-        if (server.current_client && (server.current_client->flag.primary)) return POLICY_IGNORE_EXPIRE;
+        if (ectx->current_client && (ectx->current_client->flag.primary)) return POLICY_IGNORE_EXPIRE;
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return POLICY_KEEP_EXPIRED;
-    } else if (server.current_client && server.current_client->slot_migration_job) {
+    } else if (ectx->current_client && ectx->current_client->slot_migration_job) {
         /* Slot migration client should be treated like a primary */
         return POLICY_IGNORE_EXPIRE;
     } else if (server.import_mode) {
@@ -1538,7 +1538,7 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
          *
          * When receiving commands from the import source, keys are never considered
          * expired, so we return POLICY_IGNORE_EXPIRE */
-        if (server.current_client && (server.current_client->flag.import_source)) return POLICY_IGNORE_EXPIRE;
+        if (ectx->current_client && (ectx->current_client->flag.import_source)) return POLICY_IGNORE_EXPIRE;
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return POLICY_KEEP_EXPIRED;
     }
 

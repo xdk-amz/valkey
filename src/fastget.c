@@ -453,13 +453,13 @@ void fastGetAggregateStats(void) {
         if (n > seen_calls[i]) {
             calls_delta = n - seen_calls[i];
             seen_calls[i] = n;
-            server.stat_numcommands += calls_delta;
+            ectx->stat_numcommands += calls_delta;
             if (get_cmd) get_cmd->calls += calls_delta;
         }
         /* Keyspace hits, folded the same way. */
         long long h = fastget_thread_stats[i].keyspace_hits;
         if (h > seen_hits[i]) {
-            server.stat_keyspace_hits += h - seen_hits[i];
+            ectx->stat_keyspace_hits += h - seen_hits[i];
             seen_hits[i] = h;
         }
         long long us = fastget_thread_stats[i].usec;

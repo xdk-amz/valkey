@@ -1565,10 +1565,10 @@ int loadSingleAppendOnlyFile(char *filename) {
      * to the same file we're about to read. */
     server.aof_state = AOF_OFF;
 
-    client *old_cur_client = server.current_client;
-    client *old_exec_client = server.executing_client;
+    client *old_cur_client = ectx->current_client;
+    client *old_exec_client = ectx->executing_client;
     fakeClient = createAOFClient();
-    server.current_client = server.executing_client = fakeClient;
+    ectx->current_client = ectx->executing_client = fakeClient;
 
     /* Check if the AOF starts with a plain or streaming-compressed RDB (it may
      * be an RDB-encoded base AOF or old-style RDB-preamble AOF). In that case,
@@ -1777,8 +1777,8 @@ fmterr: /* Format error. */
 
 cleanup:
     if (fakeClient) freeClient(fakeClient);
-    server.current_client = old_cur_client;
-    server.executing_client = old_exec_client;
+    ectx->current_client = old_cur_client;
+    ectx->executing_client = old_exec_client;
     fclose(fp);
     sdsfree(aof_filepath);
     return ret;

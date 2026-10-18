@@ -374,8 +374,8 @@ static void maintFeedPropagation(void) {
         l->len = 0;
     }
     if (fed) {
-        server.stat_expiredkeys += fed;
-        server.dirty += fed;
+        ectx->stat_expiredkeys += fed;
+        ectx->dirty += fed;
     }
     mt_fed = fed;
     mt_feed_us = fed ? getMonotonicUs() - t0 : 0;
@@ -416,9 +416,9 @@ static void maintHandleFields(void) {
                     robj *del_argv[2] = {server.lazyfree_lazy_expire ? shared.unlink : shared.del, keyobj};
                     if (propagate_to_aof) feedAppendOnlyFile(e->dbid, del_argv, 2);
                     if (propagate_to_repl) replicationFeedReplicas(e->dbid, del_argv, 2);
-                    server.dirty++;
+                    ectx->dirty++;
                 } else {
-                    server.dirty += e->n_fields;
+                    ectx->dirty += e->n_fields;
                 }
                 decrRefCount(keyobj);
             } else {

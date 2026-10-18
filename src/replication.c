@@ -850,6 +850,43 @@ static sds catReplicationBulkLen(sds frame, size_t len) {
     return sdscatlen(frame, aux, n + 3);
 }
 
+/* Any thread: append the frame replicationFeedReplicas sends for argv, without its SELECT. */
+sds replicationCatCommand(sds buf, robj **argv, int argc) {
+    buf = sdscatfmt(buf, "*%i\r\n", argc);
+    for (int j = 0; j < argc; j++) {
+        robj *o = argv[j];
+        if (o->encoding == OBJ_ENCODING_INT) {
+            char aux[LONG_STR_SIZE];
+            size_t dlen = ll2string(aux, sizeof(aux), (long)objectGetVal(o));
+            buf = catReplicationBulkLen(buf, dlen);
+            buf = sdscatlen(buf, aux, dlen);
+        } else {
+            size_t objlen = stringObjectLen(o);
+            buf = catReplicationBulkLen(buf, objlen);
+            buf = sdscatlen(buf, objectGetVal(o), objlen);
+        }
+        buf = sdscatlen(buf, "\r\n", 2);
+    }
+    return buf;
+}
+
+/* Main: feed frames made by replicationCatCommand for commands of db dictid, as replicationFeedReplicas
+ * feeds them one by one, wrapped in MULTI/EXEC when wrap. Only for a top-level primary with a backlog. */
+void replicationFeedFrames(int dictid, const char *buf, size_t len, int wrap) {
+    serverAssert(server.primary_host == NULL && server.repl_backlog != NULL);
+    if (wrap) replicationFeedReplicas(-1, &shared.multi, 1);
+    prepareReplicasToWrite();
+    if (server.replicas_eldb != dictid) {
+        robj *selectcmd = generateSelectCommand(dictid);
+        feedReplicationBufferWithObject(selectcmd);
+        clusterSlotStatsDecrNetworkBytesOutForReplication(sdslen(objectGetVal(selectcmd)));
+        decrRefCount(selectcmd);
+        server.replicas_eldb = dictid;
+    }
+    feedReplicationBuffer((char *)buf, len);
+    if (wrap) replicationFeedReplicas(-1, &shared.exec, 1);
+}
+
 /* Propagate write commands to replication stream.
  *
  * This function is used if the instance is a primary: we use the commands
@@ -2962,7 +2999,7 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     }
 
     /* Inform about db change, as replication was diskless and didn't cause a save. */
-    server.dirty++;
+    ectx->dirty++;
 
     stopLoading(1);
 

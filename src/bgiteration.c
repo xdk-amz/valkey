@@ -2300,7 +2300,7 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     /* We might be within the context of a command execution.  This happens if the key is found to
      * be expired when attempting to execute the command.  In this case, we should treat the key as
      * missing.  If the key exists after the command executes, we can treat it like a new key. */
-    if (server.in_call) {
+    if (ectx->in_call) {
         robj *oKey = createObject(OBJ_STRING, sdsdup(key));
         listAddNodeHead(curCmdMissingKeys, oKey);
     }
@@ -2604,7 +2604,7 @@ void bgIteration_handleCommandReplication(int dbid,
             dbEntry *de = dbFind(server.db[dbid], key);
             serverAssert(de == NULL); // dbEntry should be removed before replication (self-check)
             if (it->keyset_iter->isKeyInScope(it->keyset_iter, key)) {
-                bool blockClientIfRequiredWasCalled = (server.in_call > 0);
+                bool blockClientIfRequiredWasCalled = (ectx->in_call > 0);
                 if (blockClientIfRequiredWasCalled && iteratorReplicationFlagsWereUpdated) {
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;

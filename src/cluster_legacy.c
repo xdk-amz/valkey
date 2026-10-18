@@ -8136,7 +8136,7 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
      * state so that we don't assert in propagateNow(). */
     server.server_del_keys_in_slot = 1;
     unsigned int j = 0;
-    int before_execution_nesting = server.execution_nesting;
+    int before_execution_nesting = ectx->execution_nesting;
 
     for (int i = 0; i < server.dbnum; i++) {
         kvstoreHashtableIterator *kvs_di = NULL;
@@ -8170,7 +8170,7 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
             postExecutionUnitOperations();
             decrRefCount(key);
             j++;
-            server.dirty++;
+            ectx->dirty++;
         }
         kvstoreReleaseHashtableIterator(kvs_di);
     }
@@ -8180,7 +8180,7 @@ unsigned int delKeysInSlot(unsigned int hashslot, int lazy, bool propagate_del, 
      * server_del_keys_in_slot (see hotkeysShouldRecord). */
     hotkeysPurgeSlot(hashslot);
     server.server_del_keys_in_slot = 0;
-    serverAssert(server.execution_nesting == before_execution_nesting);
+    serverAssert(ectx->execution_nesting == before_execution_nesting);
     return j;
 }
 
@@ -9105,6 +9105,13 @@ clusterNode *clusterNodeGetReplica(clusterNode *node, int replica_idx) {
 
 int isClusterHealthy(void) {
     return server.cluster->state == CLUSTER_OK;
+}
+
+/* This node serves slot, the cluster is ok, and no slot is migrating or importing. It does no dict
+ * lookup, so an IO thread may ask while main leaves the topology alone (the staged read phase). */
+int clusterServesSlotStably(int slot) {
+    return server.cluster->state == CLUSTER_OK && server.cluster->slots[slot] == server.cluster->myself &&
+           dictSize(server.cluster->migrating_slots_to) == 0 && dictSize(server.cluster->importing_slots_from) == 0;
 }
 
 clusterNode *getNodeBySlot(int slot) {

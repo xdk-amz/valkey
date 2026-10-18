@@ -46,7 +46,7 @@ TEST_F(CommandOriginTest, LayoutIsFixedSizeAndByValue) {
     EXPECT_EQ(sizeof(PeerIdentity), 20u);
     if (sizeof(void *) == 8) {
         EXPECT_EQ(sizeof(CommandOrigin), 64u);
-        EXPECT_EQ(sizeof(cmdEntry), 160u);
+        EXPECT_EQ(sizeof(cmdEntry), 200u);
     }
     EXPECT_EQ(offsetof(cmdEntry, c), 0u);
     EXPECT_EQ(offsetof(cmdEntry, origin) % alignof(CommandOrigin), 0u);

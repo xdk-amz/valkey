@@ -75,7 +75,7 @@
 #define rdbReportReadError(...) rdbReportError(0, __LINE__, __VA_ARGS__)
 
 /* This macro tells if we are in the context of a RESTORE command, and not loading an RDB or AOF. */
-#define isRestoreContext() ((server.current_client == NULL || server.current_client->id == CLIENT_ID_AOF) ? 0 : 1)
+#define isRestoreContext() ((ectx->current_client == NULL || ectx->current_client->id == CLIENT_ID_AOF) ? 0 : 1)
 
 char *rdbFileBeingLoaded = NULL; /* used for rdb checking on read error */
 extern int rdbCheckMode;
@@ -1816,7 +1816,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     }
 
     serverLog(LL_NOTICE, "DB saved on disk");
-    server.dirty = 0;
+    ectx->dirty = 0;
     server.lastsave = time(NULL);
     server.lastbgsave_status = C_OK;
     stopSaving(1);
@@ -4706,7 +4706,7 @@ int rdbWriteFooter(rio *rdb, int req) {
 
 /* Common state updates when a background save starts. */
 void rdbRecordStartMetrics(int bgsave_type) {
-    server.dirty_before_bgsave = server.dirty;
+    server.dirty_before_bgsave = ectx->dirty;
     server.lastbgsave_try = time(NULL);
     server.rdb_save_time_start = time(NULL);
     server.rdb_write_target = RDB_WRITE_TARGET_DISK;
@@ -4727,7 +4727,7 @@ void rdbRecordEndMetrics(int bgsave_type, int status, time_t save_end) {
     server.lastbgsave_status = status;
     server.lastbgsave_type = bgsave_type;
     if (status == C_OK) {
-        server.dirty = server.dirty - server.dirty_before_bgsave;
+        ectx->dirty = ectx->dirty - server.dirty_before_bgsave;
         server.lastsave = save_end;
     }
 }

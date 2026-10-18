@@ -724,7 +724,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             if (dbDelete(c->db, storekey)) {
                 signalModifiedKey(c, c->db, storekey);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
-                server.dirty++;
+                ectx->dirty++;
             }
             addReply(c, shared.czero);
         } else {
@@ -850,11 +850,11 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
             setKey(c, c->db, storekey, &zobj, 0);
             notifyKeyspaceEvent(NOTIFY_ZSET, flags & GEOSEARCH ? "geosearchstore" : "georadiusstore", storekey,
                                 c->db->id);
-            server.dirty += returned_items;
+            ectx->dirty += returned_items;
         } else if (dbDelete(c->db, storekey)) {
             signalModifiedKey(c, c->db, storekey);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
-            server.dirty++;
+            ectx->dirty++;
         }
         addReplyLongLong(c, returned_items);
     }

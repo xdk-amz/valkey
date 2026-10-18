@@ -9,9 +9,10 @@
 
 /* Staged main event loop for the IO-thread fast path.
  *
- * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2, no cluster), one
- * main iteration runs collect -> read -> write -> reply -> crons, and IO threads work only inside
- * the read and reply phases. Otherwise the loop is stock ae. Non-epoll builds are always stock.
+ * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2), one main iteration
+ * runs collect -> read -> write -> reply -> crons, and IO threads work only inside the read and reply
+ * phases, and in the write phase's lanes (docs/parallel-write-stage.md). Otherwise the loop is stock
+ * ae. Non-epoll builds are always stock.
  *
  * Invariants:
  * - IO threads read the keyspace only in the read phase; main mutates it only in the write phase
@@ -37,7 +38,8 @@
 #define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
 #define STAGED_PHASE_MAINT 6  /* workers run their lane of due table maintenance (rehash, resize, expire) */
 #define STAGED_PHASE_STREAM 7 /* workers deliver completed runs while main still executes */
-#define STAGED_PHASE_KINDS 8  /* phase ids are below this */
+#define STAGED_PHASE_WRITE 8  /* workers execute their lane of the write phase's current segment */
+#define STAGED_PHASE_KINDS 9  /* phase ids are below this */
 
 struct aeEventLoop;
 struct poller;
@@ -70,6 +72,8 @@ int stagedMainTakesLane(void);
 int stagedWorkerSpins(int tid);
 /* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
 void stagedRunApplyPhase(int with_workers);
+/* Main: run a WRITE phase, main taking lane 0 when stagedMainTakesLane(). */
+void stagedRunWritePhase(void);
 
 /* A phase's per-thread lane body, run by main (tid 0) and each enrolled worker (tid 1..n). */
 typedef void (*stagedLaneFn)(int tid);

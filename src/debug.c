@@ -679,7 +679,7 @@ void debugCommand(client *c) {
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
-        server.dirty = 0; /* Prevent AOF / replication */
+        ectx->dirty = 0; /* Prevent AOF / replication */
         serverLog(LL_NOTICE, "Append Only File loaded by DEBUG LOADAOF");
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "drop-cluster-packet-filter") && c->argc == 3) {
@@ -2603,8 +2603,8 @@ void printCrashReport(void) {
     logServerInfo();
 
     /* Log the current client */
-    logCurrentClient(server.current_client, "CURRENT");
-    logCurrentClient(server.executing_client, "EXECUTING");
+    logCurrentClient(ectx->current_client, "CURRENT");
+    logCurrentClient(ectx->executing_client, "EXECUTING");
 
     /* Log modules info. Something we wanna do last since we fear it may crash. */
     logModulesInfo();

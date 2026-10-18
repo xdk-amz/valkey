@@ -479,7 +479,7 @@ void pushGenericCommand(client *c, int where, int xx) {
     listTypeTryConversionAppend(lobj, c->argv, 2, c->argc - 1, NULL, NULL);
     for (j = 2; j < c->argc; j++) {
         listTypePush(lobj, c->argv[j], where);
-        server.dirty++;
+        ectx->dirty++;
     }
 
     signalModifiedKey(c, c->db, c->argv[1]);
@@ -550,7 +550,7 @@ void linsertCommand(client *c) {
     if (inserted) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST, "linsert", c->argv[1], c->db->id);
-        server.dirty++;
+        ectx->dirty++;
     } else {
         /* Notify client of a failed insert */
         addReplyLongLong(c, -1);
@@ -612,7 +612,7 @@ void lsetCommand(client *c) {
         listTypeTryConversion(o, LIST_CONV_SHRINKING, NULL, NULL);
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST, "lset", c->argv[1], c->db->id);
-        server.dirty++;
+        ectx->dirty++;
         addReply(c, shared.ok);
     } else {
         addReplyErrorObject(c, shared.outofrangeerr);
@@ -626,7 +626,7 @@ void lsetCommand(client *c) {
  *    2) element2
  *
  * And also actually pop out from the list by calling listElementsRemoved.
- * We maintain the server.dirty and notifications there.
+ * We maintain the ectx->dirty and notifications there.
  *
  * 'deleted' is an optional output argument to get an indication
  * if the key got deleted by this function. */
@@ -747,7 +747,7 @@ void listElementsRemoved(client *c, robj *key, int where, robj *o, long count, i
         if (deleted) *deleted = 0;
     }
     signalModifiedKey(c, c->db, key);
-    server.dirty += count;
+    ectx->dirty += count;
 }
 
 /* Implements the generic list pop operation for LPOP/RPOP.
@@ -913,7 +913,7 @@ void ltrimCommand(client *c) {
     }
     long long total_trim = ltrim + rtrim;
     if (total_trim) signalModifiedKey(c, c->db, c->argv[1]);
-    server.dirty += total_trim;
+    ectx->dirty += total_trim;
     addReply(c, shared.ok);
 }
 
@@ -1048,7 +1048,7 @@ void lremCommand(client *c) {
     while (listTypeNext(li, &entry)) {
         if (listTypeEqual(&entry, obj)) {
             listTypeDelete(li, &entry);
-            server.dirty++;
+            ectx->dirty++;
             removed++;
             if (toremove && removed == toremove) break;
         }

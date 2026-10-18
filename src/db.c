@@ -112,8 +112,8 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
         if ((flags & LOOKUP_NOTOUCH) == 0 &&
-            server.current_client && server.current_client->flag.no_touch &&
-            server.executing_client && server.executing_client->cmd->proc != touchCommand)
+            ectx->current_client && ectx->current_client->flag.no_touch &&
+            ectx->executing_client && ectx->executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
         if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
             /* Shared objects can't be stored in the database. */
@@ -121,11 +121,11 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
             val->lru = lrulfu_touch(val->lru);
         }
 
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_hits++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) ectx->stat_keyspace_hits++;
         /* TODO: Use separate hits stats for WRITE */
     } else {
         if (!(flags & (LOOKUP_NONOTIFY | LOOKUP_WRITE))) notifyKeyspaceEvent(NOTIFY_KEY_MISS, "keymiss", key, db->id);
-        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) server.stat_keyspace_misses++;
+        if (!(flags & (LOOKUP_NOSTATS | LOOKUP_WRITE))) ectx->stat_keyspace_misses++;
         /* TODO: Use separate misses stats and notify event for WRITE */
     }
 
@@ -275,7 +275,11 @@ int getKVStoreIndexForKey(sds key) {
  * Only valid for keys the currently executing command declared, since the cached slot is that command's. */
 int getKVStoreIndexUsingCachedSlot(sds key) {
     if (server.cluster_enabled) return getCachedKeySlot(key);
-    return server.keyspace_shard_bits ? getKVStoreIndexForKey(key) : 0;
+    if (!server.keyspace_shard_bits) return 0;
+    /* A write lane's executor carries the shard of every key its command declared. */
+    client *c = ectx->current_client;
+    if (exec_lane && c && c->slot >= 0 && c->flag.executing_command) return c->slot;
+    return getKVStoreIndexForKey(key);
 }
 
 /* Returns the slot cached on the client for the currently executing command, computing it from the key
@@ -296,20 +300,20 @@ int getCachedKeySlot(sds key) {
      * Modules and scripts executed on the primary may get replicated as multi-execs that operate on multiple slots,
      * so we must always recompute the slot for commands coming from the primary or AOF.
      */
-    if (server.current_client && server.current_client->slot >= 0 && server.current_client->flag.executing_command &&
-        !mustObeyClient(server.current_client) &&
-        server.current_client->cmd &&
-        !(server.current_client->cmd->flags & (CMD_MODULE | CMD_TOUCHES_ARBITRARY_KEYS))) {
-        debugServerAssertWithInfo(server.current_client, NULL,
-                                  (int)keyHashSlot(key, (int)sdslen(key)) == server.current_client->slot);
-        return server.current_client->slot;
+    if (ectx->current_client && ectx->current_client->slot >= 0 && ectx->current_client->flag.executing_command &&
+        !mustObeyClient(ectx->current_client) &&
+        ectx->current_client->cmd &&
+        !(ectx->current_client->cmd->flags & (CMD_MODULE | CMD_TOUCHES_ARBITRARY_KEYS))) {
+        debugServerAssertWithInfo(ectx->current_client, NULL,
+                                  (int)keyHashSlot(key, (int)sdslen(key)) == ectx->current_client->slot);
+        return ectx->current_client->slot;
     }
     int slot = keyHashSlot(key, (int)sdslen(key));
     /* For the case of commands from clients we must obey, getNodeByQuery() never gets called,
      * and thus c->slot never gets populated. That said, if this command ends up accessing
      * a key, we are able to backfill c->slot here, where the key's hash calculation is made. */
-    if (server.current_client && mustObeyClient(server.current_client)) {
-        server.current_client->slot = slot;
+    if (ectx->current_client && mustObeyClient(ectx->current_client)) {
+        ectx->current_client->slot = slot;
     }
     return slot;
 }
@@ -519,7 +523,7 @@ robj *dbRandomKey(serverDb *db) {
 int dbGenericDeleteWithDictIndex(serverDb *db, robj *key, int async, int flags, int dict_index) {
     /* Fast GET: keyspace deletes must run on main -- IO threads punt.
      * See expireIfNeededWithDictIndex for the rationale. */
-    debugServerAssert(inMainThread());
+    debugServerAssert(inMainThread() || exec_lane);
     hashtablePosition pos;
     void **ref = kvstoreHashtableTwoPhasePopFindRef(db->keys, dict_index, objectGetVal(key), &pos);
     if (ref != NULL) {
@@ -934,7 +938,7 @@ int parseFlushCommandFlagsOrReply(client *c, int *flags) {
 
 /* Flushes the whole server data set. */
 void flushAllDataAndResetRDB(int flags) {
-    server.dirty += emptyData(-1, flags, NULL);
+    ectx->dirty += emptyData(-1, flags, NULL);
     if (isForkBgsaveInProgress()) killRDBChild();
     if (isForklessSaveInProgress()) forklessSaveCancel();
     if (server.child_type == CHILD_TYPE_SLOT_MIGRATION) killSlotMigrationChild();
@@ -961,7 +965,7 @@ void flushdbCommand(client *c) {
     if (parseFlushCommandFlagsOrReply(c, &flags) == C_ERR) return;
 
     /* flushdb should not flush the functions */
-    server.dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
+    ectx->dirty += emptyData(c->db->id, flags | EMPTYDB_NOFUNCTIONS, NULL);
 
     /* Without the forceCommandPropagation, when DB was already empty,
      * FLUSHDB will neither be replicated nor put into the AOF. */
@@ -1004,7 +1008,7 @@ void delGenericCommand(client *c, int lazy) {
         if (deleted) {
             signalModifiedKey(c, c->db, c->argv[j]);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[j], c->db->id);
-            server.dirty++;
+            ectx->dirty++;
             numdel++;
         }
     }
@@ -1663,7 +1667,7 @@ void renameGenericCommand(client *c, int nx) {
     signalModifiedKey(c, c->db, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_from", c->argv[1], c->db->id);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "rename_to", c->argv[2], c->db->id);
-    server.dirty++;
+    ectx->dirty++;
     addReply(c, nx ? shared.cone : shared.ok);
 }
 
@@ -1744,7 +1748,7 @@ void moveCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_GENERIC, "move_from", c->argv[1], src->id);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "move_to", c->argv[1], dst->id);
 
-    server.dirty++;
+    ectx->dirty++;
     addReply(c, shared.cone);
 }
 
@@ -1839,7 +1843,7 @@ void copyCommand(client *c) {
     signalModifiedKey(c, dst, c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "copy_to", c->argv[2], dst->id);
 
-    server.dirty++;
+    ectx->dirty++;
     addReply(c, shared.cone);
 }
 
@@ -2019,7 +2023,7 @@ void swapdbCommand(client *c) {
     } else {
         ValkeyModuleSwapDbInfo si = {VALKEYMODULE_SWAPDBINFO_VERSION, id1, id2};
         moduleFireServerEvent(VALKEYMODULE_EVENT_SWAPDB, 0, &si);
-        server.dirty++;
+        ectx->dirty++;
         addReply(c, shared.ok);
     }
 }
@@ -2122,7 +2126,7 @@ void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int d
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
     signalModifiedKey(NULL, db, keyobj);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
-    server.stat_expiredkeys++;
+    ectx->stat_expiredkeys++;
 }
 
 /* Main, after a MAINT phase: the effects of deleteExpiredKeyAndPropagateWithDictIndex for a value a lane
@@ -2135,8 +2139,8 @@ void replayExpiredKeyUnlinkedInLane(serverDb *db, robj *val, int dict_index) {
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
     signalModifiedKey(NULL, db, keyobj);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
-    server.stat_expiredkeys++;
-    server.dirty++;
+    ectx->stat_expiredkeys++;
+    ectx->dirty++;
     exitExecutionUnit();
     postExecutionUnitOperations();
     freeValueNeverOnMain(keyobj, val, db->id);
@@ -2161,9 +2165,9 @@ void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int
         signalDeletedKeyAsReady(db, keyobj, OBJ_HASH);
         propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, dict_index);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
-        server.dirty++;
+        ectx->dirty++;
     } else {
-        server.dirty += n_fields;
+        ectx->dirty += n_fields;
     }
     signalModifiedKey(NULL, db, keyobj);
     exitExecutionUnit();
@@ -2176,14 +2180,14 @@ void replayExpiredFieldsUnlinkedInLane(serverDb *db, sds key, robj **fields, int
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
     int deleted = dbGenericDelete(c->db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED);
     serverAssertWithInfo(c, keyobj, deleted);
-    server.dirty++;
+    ectx->dirty++;
 
     /* Replicate/AOF this as an explicit DEL or UNLINK. */
     robj *aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
     rewriteClientCommandVector(c, 2, aux, keyobj);
     signalModifiedKey(c, c->db, keyobj);
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, c->db->id);
-    server.stat_expiredkeys++;
+    ectx->stat_expiredkeys++;
 }
 
 /* Propagate an implicit key deletion into replicas and the AOF file.
@@ -2199,7 +2203,7 @@ void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj) {
  * This function may be called from:
  * 1. Within call(): Example: Lazy-expire on key access.
  *    In this case the caller doesn't have to do anything
- *    because call() handles server.also_propagate(); or
+ *    because call() handles ectx->also_propagate(); or
  * 2. Outside of call(): Example: Active-expire, eviction, slot ownership changed.
  *    In this the caller must remember to call
  *    postExecutionUnitOperations, preferably just after a
@@ -2214,9 +2218,10 @@ void propagateDeletion(serverDb *db, robj *key, int lazy, int slot) {
     /* If the primary decided to delete a key we must propagate it to replicas no matter what.
      * Even if module executed a command without asking for propagation. */
     int prev_replication_allowed = server.replication_allowed;
-    server.replication_allowed = 1;
+    /* Written only when it changes: write lanes run this concurrently. */
+    if (!prev_replication_allowed) server.replication_allowed = 1;
     alsoPropagate(db->id, argv, 2, PROPAGATE_AOF | PROPAGATE_REPL, slot);
-    server.replication_allowed = prev_replication_allowed;
+    if (!prev_replication_allowed) server.replication_allowed = prev_replication_allowed;
 }
 
 /* Propagate HDEL commands for deleted hash fields to AOF and replicas.
@@ -2243,7 +2248,8 @@ void propagateFieldsDeletionReplay(serverDb *db, robj *keyobj, robj **fields, in
 
 int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int didx) {
     int prev_replication_allowed = server.replication_allowed;
-    server.replication_allowed = 1;
+    /* Written only when it changes: write lanes run this concurrently. */
+    if (!prev_replication_allowed) server.replication_allowed = 1;
 
     robj *argv[EXPIRE_BULK_LIMIT + 2]; /* HDEL + key + fields */
     if (n_fields > EXPIRE_BULK_LIMIT) n_fields = EXPIRE_BULK_LIMIT;
@@ -2258,7 +2264,7 @@ int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields
     }
 
     alsoPropagate(db->id, argv, argc, PROPAGATE_AOF | PROPAGATE_REPL, didx);
-    server.replication_allowed = prev_replication_allowed;
+    if (!prev_replication_allowed) server.replication_allowed = prev_replication_allowed;
     for (int i = 0; i < argc; i++) {
         decrRefCount(argv[i]);
     }
@@ -2287,7 +2293,7 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
         if (expired == 0) break;
         /* hashTypeDeleteExpiredFields leaves the global count alone (a MAINT lane calls it concurrently);
          * the serial path counts it here on main. */
-        server.stat_expiredfields += expired;
+        ectx->stat_expiredfields += expired;
 
         /* Clean up volatile set if no more volatile fields remain */
         if (!hashTypeHasVolatileFields(o)) {
@@ -2307,10 +2313,10 @@ size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long
             dbDelete(db, keyobj);
             propagateDeletion(db, keyobj, server.lazyfree_lazy_expire, didx);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyobj, db->id);
-            server.dirty++;
+            ectx->dirty++;
         } else {
             if (!hashTypeHasVolatileFields(o)) dbUntrackKeyWithVolatileItems(db, o);
-            server.dirty += (long long)expired;
+            ectx->dirty += (long long)expired;
         }
         signalModifiedKey(NULL, db, keyobj);
         exitExecutionUnit();
@@ -2330,7 +2336,7 @@ static int objectIsExpired(robj *val) {
     if (server.loading) return 0;
     if (!timestampIsExpired(objectGetExpire(val))) return 0;
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (ectx->current_client && ectx->current_client->flag.import_source) return 0;
     }
     return 1;
 }
@@ -2348,7 +2354,7 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index) {
 
     /* See expireIfNeededWithDictIndex for more details. */
     if (server.primary_host == NULL && server.import_mode) {
-        if (server.current_client && server.current_client->flag.import_source) return 0;
+        if (ectx->current_client && ectx->current_client->flag.import_source) return 0;
     }
     return 1;
 }
@@ -2361,7 +2367,7 @@ int keyIsExpired(serverDb *db, robj *key) {
 
 /* val is optional. Pass NULL if val is not yet fetched from the database. */
 static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val, int flags, int dict_index) {
-    if (server.lazy_expire_disabled) return KEY_VALID;
+    if (ectx->lazy_expire_disabled) return KEY_VALID;
     if (val != NULL) {
         if (!objectIsExpired(val)) return KEY_VALID;
     } else {
@@ -2378,7 +2384,7 @@ static keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, robj *val,
      * to main (fastget.c) -- they must never reach this point. Checked
      * invariant so any future IO-thread path that forgets the punt rule
      * trips immediately in debug builds instead of corrupting silently. */
-    debugServerAssert(inMainThread());
+    debugServerAssert(inMainThread() || exec_lane);
     /* The key needs to be converted from static to heap before deleted */
     int static_key = key->refcount == OBJ_STATIC_REFCOUNT;
     if (static_key) {

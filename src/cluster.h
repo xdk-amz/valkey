@@ -75,6 +75,7 @@ void clusterBroadcastPong(int target);
 
 unsigned long getClusterConnectionsCount(void);
 int isClusterHealthy(void);
+int clusterServesSlotStably(int slot);
 
 sds clusterGenNodesDescription(client *c, int filter, int tls_primary);
 sds genClusterInfoString(sds info);

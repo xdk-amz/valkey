@@ -108,7 +108,7 @@ void notifyKeyspaceEvent(int type, char *event, robj *key, int dbid) {
     sds chan;
     robj *chanobj, *eventobj;
     char buf[24];
-    client *c = server.executing_client;
+    client *c = ectx->executing_client;
     debugServerAssert(moduleNotifyKeyspaceSubscribersCnt() == 0 ||
                       (type & (NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST | NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_STREAM | NOTIFY_PATH_HASH)) == 0 ||
                       c == NULL ||
