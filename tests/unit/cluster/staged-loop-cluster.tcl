@@ -87,22 +87,25 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
         set wmin [lindex [$c config get io-threads-parallel-writes-min] 1]
         $c config set notify-keyspace-events ""
         $c config set io-threads-parallel-writes-min 1
-        set before [getInfoProperty [$c info fastpath] fastpath_write_lane_entries]
-        set fd [scl_socket 0]
-        assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
-        wait_for_condition 100 20 {[scl_fastpath_clients 0] >= 1} else { fail "client did not join the fast path" }
-        set cmds {}
-        for {set i 0} {$i < 20} {incr i} { lappend cmds [list SET $local $i] [list SET $remote $i] }
-        set i 0
-        foreach r [scl_pipeline $fd $cmds] {
-            if {$i % 2 == 0} { assert_equal {+OK} $r } else { assert_match "-MOVED * *:$port1" $r }
-            incr i
+        try {
+            set before [getInfoProperty [$c info fastpath] fastpath_write_lane_entries]
+            set fd [scl_socket 0]
+            assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
+            wait_for_condition 100 20 {[scl_fastpath_clients 0] >= 1} else { fail "client did not join the fast path" }
+            set cmds {}
+            for {set i 0} {$i < 20} {incr i} { lappend cmds [list SET $local $i] [list SET $remote $i] }
+            set i 0
+            foreach r [scl_pipeline $fd $cmds] {
+                if {$i % 2 == 0} { assert_equal {+OK} $r } else { assert_match "-MOVED * *:$port1" $r }
+                incr i
+            }
+            assert_equal 19 [$c get $local]
+            assert {[getInfoProperty [$c info fastpath] fastpath_write_lane_entries] > $before}
+            close $fd
+        } finally {
+            $c config set io-threads-parallel-writes-min $wmin
+            $c config set notify-keyspace-events $nke
         }
-        assert_equal 19 [$c get $local]
-        assert {[getInfoProperty [$c info fastpath] fastpath_write_lane_entries] > $before}
-        close $fd
-        $c config set io-threads-parallel-writes-min $wmin
-        $c config set notify-keyspace-events $nke
     }
 
     test {Fast path: a pipeline of local and remote keys gets values and MOVED in order} {

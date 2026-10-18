@@ -344,11 +344,14 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         assert_equal $streams [getInfoProperty [r info fastpath] staged_stream_phases]
 
         r config set io-threads-parallel-writes no
-        set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
-        pwl_multi_load r $host $port pwl:st 8 200
-        assert_equal $lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
-        assert {[getInfoProperty [r info fastpath] staged_stream_phases] > $streams}
-        r config set io-threads-parallel-writes yes
+        try {
+            set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
+            pwl_multi_load r $host $port pwl:st 8 200
+            assert_equal $lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
+            assert {[getInfoProperty [r info fastpath] staged_stream_phases] > $streams}
+        } finally {
+            r config set io-threads-parallel-writes yes
+        }
     }
 
     test {Write lanes: hash, set, sorted set and list commands run on the lanes with stock semantics} {
