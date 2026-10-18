@@ -87,7 +87,7 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
         set wmin [lindex [$c config get io-threads-parallel-writes-min] 1]
         $c config set notify-keyspace-events ""
         $c config set io-threads-parallel-writes-min 1
-        try {
+        set failed [catch {
             set before [getInfoProperty [$c info fastpath] fastpath_write_lane_entries]
             set fd [scl_socket 0]
             assert_equal +PONG [lindex [scl_pipeline $fd {{PING}}] 0]
@@ -102,10 +102,10 @@ start_cluster 2 1 {tags {external:skip cluster staged-loop tls:skip logreqres:sk
             assert_equal 19 [$c get $local]
             assert {[getInfoProperty [$c info fastpath] fastpath_write_lane_entries] > $before}
             close $fd
-        } finally {
-            $c config set io-threads-parallel-writes-min $wmin
-            $c config set notify-keyspace-events $nke
-        }
+        } err]
+        $c config set io-threads-parallel-writes-min $wmin
+        $c config set notify-keyspace-events $nke
+        if {$failed} { error $err $::errorInfo }
     }
 
     test {Fast path: a pipeline of local and remote keys gets values and MOVED in order} {
