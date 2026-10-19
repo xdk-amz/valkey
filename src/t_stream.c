@@ -2141,7 +2141,7 @@ void xaddCommand(client *c) {
     sds replyid = createStreamIDString(&id);
 
     notifyKeyspaceEvent(NOTIFY_STREAM, "xadd", c->argv[1], c->db->id);
-    server.dirty++;
+    ectx->dirty++;
     addReplyBulkCBuffer(c, replyid, sdslen(replyid));
 
     /* Trim if needed. */
@@ -2493,7 +2493,7 @@ void xreadCommand(client *c) {
             if (serve_history) flags |= STREAM_RWR_HISTORY;
             size_t delivered = streamReplyWithRange(c, s, &start, NULL, count, 0, groups ? groups[i] : NULL, consumer, flags, &spi);
             if (groups && delivered > 0) {
-                server.dirty++;
+                ectx->dirty++;
                 modified_stream = 1;
             }
         }
@@ -2656,7 +2656,7 @@ streamConsumer *streamCreateConsumer(streamCG *cg, sds name, robj *key, int dbid
     consumer->pel = raxNew();
     consumer->active_time = -1;
     consumer->seen_time = commandTimeSnapshot();
-    if (dirty) server.dirty++;
+    if (dirty) ectx->dirty++;
     if (notify) notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-createconsumer", key, dbid);
     return consumer;
 }
@@ -2803,7 +2803,7 @@ void xgroupCommand(client *c) {
         streamCG *cg = streamCreateCG(s, grpname, sdslen(grpname), &id, entries_read);
         if (cg) {
             signalModifiedKey(c, c->db, c->argv[2]);
-            server.dirty++;
+            ectx->dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-create", c->argv[2], c->db->id);
             addReply(c, shared.ok);
         } else {
@@ -2819,7 +2819,7 @@ void xgroupCommand(client *c) {
         cg->last_id = id;
         cg->entries_read = entries_read;
         signalModifiedKey(c, c->db, c->argv[2]);
-        server.dirty++;
+        ectx->dirty++;
         notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-setid", c->argv[2], c->db->id);
         addReply(c, shared.ok);
     } else if (!strcasecmp(opt, "DESTROY") && c->argc == 4) {
@@ -2827,7 +2827,7 @@ void xgroupCommand(client *c) {
             raxRemove(s->cgroups, (unsigned char *)grpname, sdslen(grpname), NULL);
             streamFreeCG(cg);
             signalModifiedKey(c, c->db, c->argv[2]);
-            server.dirty++;
+            ectx->dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-destroy", c->argv[2], c->db->id);
             addReply(c, shared.cone);
             /* We want to unblock any XREADGROUP consumers with -NOGROUP. */
@@ -2848,7 +2848,7 @@ void xgroupCommand(client *c) {
             pending = raxSize(consumer->pel);
             streamDelConsumer(cg, consumer);
             signalModifiedKey(c, c->db, c->argv[2]);
-            server.dirty++;
+            ectx->dirty++;
             notifyKeyspaceEvent(NOTIFY_STREAM, "xgroup-delconsumer", c->argv[2], c->db->id);
         }
         addReplyLongLong(c, pending);
@@ -2925,7 +2925,7 @@ void xsetidCommand(client *c) {
     if (entries_added != -1) s->entries_added = entries_added;
     if (!streamIDEqZero(&max_xdel_id)) s->max_deleted_entry_id = max_xdel_id;
     signalModifiedKey(c, c->db, c->argv[1]);
-    server.dirty++;
+    ectx->dirty++;
     notifyKeyspaceEvent(NOTIFY_STREAM, "xsetid", c->argv[1], c->db->id);
     addReply(c, shared.ok);
 }
@@ -2974,7 +2974,7 @@ void xackCommand(client *c) {
          * we are able to remove the entry from both PELs. */
         if (streamDeletePELEntry(group->pel, &ids[j - 3])) {
             acknowledged++;
-            server.dirty++;
+            ectx->dirty++;
         }
     }
     if (acknowledged) signalModifiedKey(c, c->db, c->argv[1]);
@@ -3355,7 +3355,7 @@ void xclaimCommand(client *c) {
                 /* Propagate this change (we are going to delete the NACK). */
                 streamPropagateXCLAIM(c, c->argv[1], group, c->argv[2], c->argv[j], nack);
                 propagate_last_id = 0; /* Will be propagated by XCLAIM itself. */
-                server.dirty++;
+                ectx->dirty++;
                 modified = 1;
                 /* Release the NACK */
                 raxRemove(group->pel, buf, sizeof(buf), NULL);
@@ -3421,13 +3421,13 @@ void xclaimCommand(client *c) {
             /* Propagate this change. */
             streamPropagateXCLAIM(c, c->argv[1], group, c->argv[2], c->argv[j], nack);
             propagate_last_id = 0; /* Will be propagated by XCLAIM itself. */
-            server.dirty++;
+            ectx->dirty++;
             modified = 1;
         }
     }
     if (propagate_last_id) {
         streamPropagateGroupID(c, c->argv[1], group, c->argv[2]);
-        server.dirty++;
+        ectx->dirty++;
         modified = 1;
     }
     if (modified) signalModifiedKey(c, c->db, c->argv[1]);
@@ -3547,7 +3547,7 @@ void xautoclaimCommand(client *c) {
             robj *idstr = createObjectFromStreamID(&id);
             streamPropagateXCLAIM(c, c->argv[1], group, c->argv[2], idstr, nack);
             decrRefCount(idstr);
-            server.dirty++;
+            ectx->dirty++;
             modified = 1;
             /* Clear this entry from the PEL, it no longer exists */
             raxRemove(group->pel, ri.key, ri.key_len, NULL);
@@ -3598,7 +3598,7 @@ void xautoclaimCommand(client *c) {
         robj *idstr = createObjectFromStreamID(&id);
         streamPropagateXCLAIM(c, c->argv[1], group, c->argv[2], idstr, nack);
         decrRefCount(idstr);
-        server.dirty++;
+        ectx->dirty++;
         modified = 1;
     }
 
@@ -3925,7 +3925,7 @@ sync:
     }
     if (deleted || acked) {
         signalModifiedKey(c, c->db, c->argv[1]);
-        server.dirty += deleted + acked;
+        ectx->dirty += deleted + acked;
     }
     if (deleted) notifyKeyspaceEvent(NOTIFY_STREAM, "xdel", c->argv[1], c->db->id);
 
@@ -4036,7 +4036,7 @@ void xtrimCommand(client *c) {
 
         /* Propagate the write. */
         signalModifiedKey(c, c->db, c->argv[1]);
-        server.dirty += deleted;
+        ectx->dirty += deleted;
     }
     addReplyLongLong(c, deleted);
 }

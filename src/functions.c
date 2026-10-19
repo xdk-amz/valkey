@@ -636,7 +636,7 @@ void functionDeleteCommand(client *c) {
     engineLibraryFree(li);
     /* Indicate that the command changed the data so it will be replicated and
      * counted as a data change (for persistence configuration) */
-    server.dirty++;
+    ectx->dirty++;
     addReply(c, shared.ok);
 }
 
@@ -836,7 +836,7 @@ void functionRestoreCommand(client *c) {
 
     /* Indicate that the command changed the data so it will be replicated and
      * counted as a data change (for persistence configuration) */
-    server.dirty++;
+    ectx->dirty++;
 
 load_error:
     if (err) {
@@ -871,7 +871,7 @@ void functionFlushCommand(client *c) {
 
     /* Indicate that the command changed the data so it will be replicated and
      * counted as a data change (for persistence configuration) */
-    server.dirty++;
+    ectx->dirty++;
     addReply(c, shared.ok);
 }
 
@@ -1156,7 +1156,7 @@ void functionLoadCommand(client *c) {
     }
     /* Indicate that the command changed the data so it will be replicated and
      * counted as a data change (for persistence configuration) */
-    server.dirty++;
+    ectx->dirty++;
     addReplyBulkSds(c, library_name);
 }
 

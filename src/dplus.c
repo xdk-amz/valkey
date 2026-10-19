@@ -460,7 +460,7 @@ void dplusConsumeSpeculated(client *c, int count, int tid) {
     dplus_thread_stats[tid].keyspace_hits += consumed;
 }
 
-/* Aggregate per-IO-thread command counters into server.stat_numcommands.
+/* Aggregate per-IO-thread command counters into ectx->stat_numcommands.
  * Called from beforeSleep once per event-loop iteration. The main thread
  * is the sole writer of stat_numcommands, so this is a plain add-and-zero
  * with no atomics needed on the server side. The IO threads only increment
@@ -499,7 +499,7 @@ void dplusAggregateStats(void) {
         if (n > seen_calls[i]) {
             calls_delta = n - seen_calls[i];
             seen_calls[i] = n;
-            server.stat_numcommands += calls_delta;
+            ectx->stat_numcommands += calls_delta;
             if (get_cmd) get_cmd->calls += calls_delta;
         }
         /* E3: fold speculative GET hits into stat_keyspace_hits (the worker path
@@ -508,7 +508,7 @@ void dplusAggregateStats(void) {
          * delta since its last snapshot; a racy read only under-reads, never loses. */
         long long h = dplus_thread_stats[i].keyspace_hits;
         if (h > seen_hits[i]) {
-            server.stat_keyspace_hits += h - seen_hits[i];
+            ectx->stat_keyspace_hits += h - seen_hits[i];
             seen_hits[i] = h;
         }
         long long us = dplus_thread_stats[i].usec;

@@ -492,8 +492,8 @@ int performEvictions(void) {
     monotime evictionTimer;
     elapsedStart(&evictionTimer);
 
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
-    serverAssert(server.also_propagate.numops == 0);
+    /* Try to smoke-out bugs (ectx->also_propagate should be empty here) */
+    serverAssert(ectx->also_propagate.numops == 0);
     /* Evictions are performed on random keys that have nothing to do with the current command slot. */
 
     while (mem_freed < (long long)mem_tofree) {

@@ -75,6 +75,10 @@ void latencyMonitorInit(void) {
  * is a macro that only adds the sample if the latency is above
  * server.latency_monitor_threshold. */
 void latencyAddSample(const char *event, ustime_t latency_us) {
+    if (exec_lane) {
+        fastpathLaneLatencySample(event, latency_us);
+        return;
+    }
     mstime_t latency = latency_us / 1000;
     struct latencyTimeSeries *ts = dictFetchValue(server.latency_events, event);
     time_t now = time(NULL);
@@ -530,6 +534,7 @@ void fillCommandCDF(client *c, struct hdr_histogram *histogram) {
 /* latencyCommand() helper to produce for all commands,
  * a per command cumulative distribution of latencies. */
 void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with_data) {
+    fastpathFoldLaneHistograms();
     hashtableIterator iter;
     hashtableInitIterator(&iter, commands, HASHTABLE_ITER_SAFE);
     void *next;
@@ -551,6 +556,7 @@ void latencyAllCommandsFillCDF(client *c, hashtable *commands, int *command_with
 /* latencyCommand() helper to produce for a specific command set,
  * a per command cumulative distribution of latencies. */
 void latencySpecificCommandsFillCDF(client *c) {
+    fastpathFoldLaneHistograms();
     void *replylen = addReplyDeferredLen(c);
     int command_with_data = 0;
     for (int j = 2; j < c->argc; j++) {

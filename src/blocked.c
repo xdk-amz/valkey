@@ -139,7 +139,7 @@ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int failed_
     clusterSlotStatsAddCpuDuration(c, c->duration);
     c->lastcmd->calls++;
     c->commands_processed++;
-    server.stat_numcommands++;
+    ectx->stat_numcommands++;
     debugServerAssertWithInfo(c, NULL, failed_or_rejected >= 0 && failed_or_rejected <= ERROR_COMMAND_FAILED);
     if (failed_or_rejected) {
         if (failed_or_rejected & ERROR_COMMAND_FAILED)
@@ -428,7 +428,7 @@ void handleClientsBlockedOnKeys(void) {
 
     /* This function is called only when also_propagate is in its basic state
      * (i.e. not from call(), module context, etc.) */
-    serverAssert(server.also_propagate.numops == 0);
+    serverAssert(ectx->also_propagate.numops == 0);
 
     /* If a command being unblocked causes another command to get unblocked,
      * like a BLMOVE would do, then the new unblocked command will get processed
@@ -768,13 +768,13 @@ static void unblockClientOnKey(client *c, robj *key) {
          * running the command, and exit the execution unit after calling the unblock handler (if exists).
          * Notice that we also must set the current client so it will be available
          * when we will try to send the client side caching notification (done on 'afterCommand'). */
-        client *old_client = server.current_client;
-        server.current_client = c;
+        client *old_client = ectx->current_client;
+        ectx->current_client = c;
         enterExecutionUnit(1, 0);
         if (processCommandAndResetClient(c) == C_ERR) {
             /* Client was freed during command processing, exit immediately */
             exitExecutionUnit();
-            server.current_client = old_client;
+            ectx->current_client = old_client;
             return;
         }
 
@@ -789,7 +789,7 @@ static void unblockClientOnKey(client *c, robj *key) {
         afterCommand(c);
         /* Clear the reexecuting_command flag after the proc is executed. */
         c->flag.reexecuting_command = 0;
-        server.current_client = old_client;
+        ectx->current_client = old_client;
     }
 }
 
@@ -798,22 +798,22 @@ static void unblockClientOnKey(client *c, robj *key) {
  * it will add the client to the list of module unblocked clients which will
  * be processed in moduleHandleBlockedClients. */
 static void moduleUnblockClientOnKey(client *c, robj *key) {
-    long long prev_error_replies = server.stat_total_error_replies;
-    client *old_client = server.current_client;
-    server.current_client = c;
+    long long prev_error_replies = ectx->stat_total_error_replies;
+    client *old_client = ectx->current_client;
+    ectx->current_client = c;
     monotime replyTimer;
     elapsedStart(&replyTimer);
 
     if (moduleTryServeClientBlockedOnKey(c, key)) {
         updateStatsOnUnblock(c, 0, elapsedUs(replyTimer),
-                             ((server.stat_total_error_replies != prev_error_replies) ? ERROR_COMMAND_FAILED : 0));
+                             ((ectx->stat_total_error_replies != prev_error_replies) ? ERROR_COMMAND_FAILED : 0));
         moduleUnblockClient(c);
     }
     /* We need to call afterCommand even if the client was not unblocked
      * in order to propagate any changes that could have been done inside
      * moduleTryServeClientBlockedOnKey */
     afterCommand(c);
-    server.current_client = old_client;
+    ectx->current_client = old_client;
 }
 
 /* Unblock a client which is currently Blocked on and provided a timeout.

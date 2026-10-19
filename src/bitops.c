@@ -723,7 +723,7 @@ void setbitCommand(client *c) {
         ((uint8_t *)objectGetVal(o))[byte] = byteval;
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING, "setbit", c->argv[1], c->db->id);
-        server.dirty++;
+        ectx->dirty++;
     }
 
     /* Return original value. */
@@ -931,11 +931,11 @@ void bitopCommand(client *c) {
         o = createObject(OBJ_STRING, res);
         setKey(c, c->db, targetkey, &o, 0);
         notifyKeyspaceEvent(NOTIFY_STRING, "set", targetkey, c->db->id);
-        server.dirty++;
+        ectx->dirty++;
     } else if (dbDelete(c->db, targetkey)) {
         signalModifiedKey(c, c->db, targetkey);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "del", targetkey, c->db->id);
-        server.dirty++;
+        ectx->dirty++;
     }
     addReplyLongLong(c, maxlen); /* Return the output string length in bytes. */
 }
@@ -1416,7 +1416,7 @@ void bitfieldGeneric(client *c, int flags) {
     if (changes) {
         signalModifiedKey(c, c->db, c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING, "setbit", c->argv[1], c->db->id);
-        server.dirty += changes;
+        ectx->dirty += changes;
     }
     commitDeferredReplyBuffer(c, 1);
     zfree(ops);

@@ -100,11 +100,11 @@ static int stagedInit(void) {
     return 1;
 }
 
-/* Staged mode needs the fast path, strict offload, no cluster, and at least one IO thread besides
- * main. With io-threads 1 there is none, so staged mode stays off (logged once) instead of starting
- * a thread the configuration did not ask for. */
+/* Staged mode needs the fast path, strict offload, and at least one IO thread besides main. With
+ * io-threads 1 there is none, so staged mode stays off (logged once) instead of starting a thread the
+ * configuration did not ask for. */
 static int stagedWanted(void) {
-    if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.cluster_enabled) return 0;
+    if (!server.io_threads_fast_path || !server.io_threads_strict_offload) return 0;
     if (server.io_threads_num < 2 || ioThreadsReadyNum() < 2) {
         if (server.io_threads_num < 2 && !sl_warned) {
             serverLog(LL_NOTICE, "io-threads-fast-path needs io-threads >= 2; the staged event loop stays off");
@@ -289,6 +289,7 @@ static void stagedQueueDeferredRead(void) {
 
 /* Read: IO threads read and parse ready clients, answer the leading reads, and batch the rest. */
 static void readPhase(void) {
+    fastpathStagedPrepareLanes();
     stagedQueueDeferredRead();
     if (pollerIOCount(sl_poller) == 0 && !ioThreadsInboxPending()) return;
     stagedRunPhase(STAGED_PHASE_READ);
@@ -392,6 +393,14 @@ void stagedRunApplyPhase(int with_workers) {
     phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
 }
 
+void stagedRunWritePhase(void) {
+    int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
+    serverAssert(rc == 0);
+    sl_opens++;
+    if (sl_main_lane) fastpathStagedWriteLane(0);
+    phaseBarrierWaitAllDone(&sl_barrier, sl_main_spins);
+}
+
 void stagedStopWorkers(void) {
     if (sl_barrier_ready) phaseBarrierShutdown(&sl_barrier);
     if (sl_poller) pollerStop(sl_poller);
@@ -457,6 +466,9 @@ int stagedWorkerSpins(int tid) {
 void stagedRunApplyPhase(int with_workers) {
     UNUSED(with_workers);
     replApplyRunLane(0);
+}
+void stagedRunWritePhase(void) {
+    fastpathStagedWriteLane(0);
 }
 void stagedStopWorkers(void) {
 }

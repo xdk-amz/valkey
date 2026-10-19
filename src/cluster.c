@@ -288,7 +288,7 @@ void restoreCommand(client *c) {
             rewriteClientCommandVector(c, 2, aux, key);
             signalModifiedKey(c, c->db, key);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "del", key, c->db->id);
-            server.dirty++;
+            ectx->dirty++;
         }
         decrRefCount(obj);
         addReply(c, shared.ok);
@@ -311,7 +311,7 @@ void restoreCommand(client *c) {
     signalModifiedKey(c, c->db, key);
     notifyKeyspaceEvent(NOTIFY_GENERIC, "restore", key, c->db->id);
     addReply(c, shared.ok);
-    server.dirty++;
+    ectx->dirty++;
 }
 /* MIGRATE socket cache implementation.
  *
@@ -663,7 +663,7 @@ try_again:
                 dbDelete(c->db, kv[j]);
                 signalModifiedKey(c, c->db, kv[j]);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", kv[j], c->db->id);
-                server.dirty++;
+                ectx->dirty++;
 
                 /* Populate the argument vector to replace the old one. */
                 newargv[del_idx++] = kv[j];
@@ -819,12 +819,12 @@ void clusterCommandMyShardId(client *c) {
 /* When a cluster command is called, we need to decide whether to return TLS info or
  * non-TLS info by the client's connection type. However if the command is called by
  * a Lua script or RM_call, there is no connection in the fake client, so we use
- * server.current_client here to get the real client if available. And if it is not
+ * ectx->current_client here to get the real client if available. And if it is not
  * available (modules may call commands without a real client), we return the default
  * info, which is determined by server.tls_cluster. */
 static int shouldReturnTlsInfo(void) {
-    if (server.current_client && server.current_client->conn) {
-        return connIsTLS(server.current_client->conn);
+    if (ectx->current_client && ectx->current_client->conn) {
+        return connIsTLS(ectx->current_client->conn);
     } else {
         return server.tls_cluster;
     }

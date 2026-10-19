@@ -60,7 +60,7 @@ static double avg_ttl_factor[16] = {0.98, 0.9604, 0.941192, 0.922368, 0.903921, 
  * If the key is found to be expired, it is removed from the database and
  * 1 is returned. Otherwise, no operation is performed and 0 is returned.
  *
- * When a key is expired, server.stat_expiredkeys is incremented.
+ * When a key is expired, ectx->stat_expiredkeys is incremented.
  *
  * The parameter 'now' is the current time in milliseconds as is passed
  * to the function to avoid too many gettimeofday() syscalls. */
@@ -73,7 +73,7 @@ int activeExpireCycleTryExpire(serverDb *db, robj *val, mstime_t now, int didx) 
         robj *keyobj = createStringObject(key, sdslen(key));
         deleteExpiredKeyAndPropagateWithDictIndex(db, keyobj, didx);
         decrRefCount(keyobj);
-        server.dirty++;
+        ectx->dirty++;
         exitExecutionUnit();
         return 1;
     } else {
@@ -496,8 +496,8 @@ ustime_t activeExpireCycle(int type) {
     static bool expireCycleStartWithFields = 0;
     ustime_t elapsed = 0;
 
-    /* Try to smoke-out bugs (server.also_propagate should be empty here) */
-    serverAssert(server.also_propagate.numops == 0);
+    /* Try to smoke-out bugs (ectx->also_propagate should be empty here) */
+    serverAssert(ectx->also_propagate.numops == 0);
 
     if (expireCycleStartWithFields) {
         elapsed += activeExpireCycleJob(FIELDS, type, timelimit_us - elapsed);
@@ -678,7 +678,7 @@ int checkAlreadyExpired(mstime_t when) {
      *
      * If the server is receiving the key from a slot migration, we will accept
      * expired keys and wait for the source to propagate deletion. */
-    if (server.current_client && server.current_client->slot_migration_job) return 0;
+    if (ectx->current_client && ectx->current_client->slot_migration_job) return 0;
     return (when <= commandTimeSnapshot() && !server.loading && !server.primary_host && !server.import_mode);
 }
 
@@ -863,7 +863,7 @@ void expireGenericCommand(client *c, mstime_t basetime, int unit) {
         obj = setExpire(c, c->db, key, when);
         signalModifiedKey(c, c->db, key);
         notifyKeyspaceEvent(NOTIFY_GENERIC, "expire", key, c->db->id);
-        server.dirty++;
+        ectx->dirty++;
         addReply(c, shared.cone);
         /* Propagate as PEXPIREAT millisecond-timestamp
          * Only rewrite the command arg if not already PEXPIREAT */
@@ -953,7 +953,7 @@ void persistCommand(client *c) {
             signalModifiedKey(c, c->db, c->argv[1]);
             notifyKeyspaceEvent(NOTIFY_GENERIC, "persist", c->argv[1], c->db->id);
             addReply(c, shared.cone);
-            server.dirty++;
+            ectx->dirty++;
         } else {
             addReply(c, shared.czero);
         }
@@ -1000,9 +1000,9 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
      * When replicating commands from the primary, keys are never considered
      * expired, so we return POLICY_IGNORE_EXPIRE */
     if (server.primary_host != NULL) {
-        if (server.current_client && (server.current_client->flag.primary)) return POLICY_IGNORE_EXPIRE;
+        if (ectx->current_client && (ectx->current_client->flag.primary)) return POLICY_IGNORE_EXPIRE;
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return POLICY_KEEP_EXPIRED;
-    } else if (server.current_client && server.current_client->slot_migration_job) {
+    } else if (ectx->current_client && ectx->current_client->slot_migration_job) {
         /* Slot migration client should be treated like a primary */
         return POLICY_IGNORE_EXPIRE;
     } else if (server.import_mode) {
@@ -1021,7 +1021,7 @@ expirationPolicy getExpirationPolicyWithFlags(int flags) {
          *
          * When receiving commands from the import source, keys are never considered
          * expired, so we return POLICY_IGNORE_EXPIRE */
-        if (server.current_client && (server.current_client->flag.import_source)) return POLICY_IGNORE_EXPIRE;
+        if (ectx->current_client && (ectx->current_client->flag.import_source)) return POLICY_IGNORE_EXPIRE;
         if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return POLICY_KEEP_EXPIRED;
     }
 

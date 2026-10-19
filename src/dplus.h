@@ -80,7 +80,7 @@ int dplusSpeculateBatch(struct client *c, int tid);
  * commands, advance the command queue and count them per thread. */
 void dplusConsumeSpeculated(struct client *c, int count, int tid);
 
-/* Aggregate per-IO-thread command counters into server.stat_numcommands.
+/* Aggregate per-IO-thread command counters into ectx->stat_numcommands.
  * Called once per event-loop iteration from beforeSleep. O(num_io_threads). */
 void dplusAggregateStats(void);
 

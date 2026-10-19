@@ -3,9 +3,10 @@
 
 /* Staged main event loop for the IO-thread fast path. See docs/staged-event-loop.md.
  *
- * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2, no cluster), one
- * main iteration runs collect -> read -> write -> reply -> crons, and IO threads work only inside
- * the read and reply phases. Otherwise the loop is stock ae. Non-epoll builds are always stock. */
+ * With io-threads-fast-path on (and io-threads-strict-offload, io-threads >= 2), one main iteration
+ * runs collect -> read -> write -> reply -> crons, and IO threads work only inside the read and reply
+ * phases, and in the write phase's lanes (docs/parallel-write-stage.md). Otherwise the loop is stock
+ * ae. Non-epoll builds are always stock. */
 
 #include "fastpath_no_epoll.h"
 #include <stdint.h>
@@ -18,6 +19,7 @@
 #define STAGED_PHASE_SYNC 3  /* workers leave the staged loop and recheck their enrollment */
 #define STAGED_PHASE_DRAIN 4 /* workers only drain their job inboxes */
 #define STAGED_PHASE_APPLY 5 /* workers apply their lane of held replicated writes */
+#define STAGED_PHASE_WRITE 6 /* workers execute their lane of the write phase's current segment */
 
 struct aeEventLoop;
 struct poller;
@@ -50,6 +52,8 @@ int stagedMainTakesLane(void);
 int stagedWorkerSpins(int tid);
 /* Main: run an APPLY phase; with_workers 0 runs lane 0 on main alone. */
 void stagedRunApplyPhase(int with_workers);
+/* Main: run a WRITE phase, main taking lane 0 when stagedMainTakesLane(). */
+void stagedRunWritePhase(void);
 
 /* Main: grow the poller with maxclients, as ae grows; 0 on success. */
 int stagedResize(int setsize);
