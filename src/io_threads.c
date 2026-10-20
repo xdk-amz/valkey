@@ -13,6 +13,7 @@
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
+#include "intern.h"
 #include <sys/resource.h>
 
 #define IO_MPSC_QUEUE_SIZE 16384
@@ -311,6 +312,7 @@ void cleanupThreadResources(void *dummy) {
 
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
+    internDeferFlush();
 
     /* Release response lists left when the flush stops early. */
     for (int i = 0; i < JOB_PRIORITY_COUNT; i++) {
@@ -371,6 +373,7 @@ static void *IOThreadMain(void *myid) {
     initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
+    internDeferCoalesce();
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
@@ -421,6 +424,7 @@ static void *IOThreadMain(void *myid) {
         }
 
         if (processed) {
+            internDeferFlush();
             atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
         }
 
@@ -706,6 +710,7 @@ int trySendReadToIOThreads(client *c) {
     io_jobs_submitted++;
     server.stat_io_reads_pending++;
     c->flag.pending_read = 1;
+    internReadDispatched(&c->intern_read_epoch);
     return C_OK;
 }
 

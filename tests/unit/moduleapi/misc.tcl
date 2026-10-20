@@ -594,6 +594,19 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
     test "Cluster keyslot" {
         assert_equal 12182 [r test.keyslot foo]
     }
+
+    test "Module in-place append to an interned argument" {
+        r flushall
+        set v [string repeat m 300]
+        for {set i 0} {$i < 500} {incr i} {r set k$i $v}
+        regexp {intern_hot_hits:(\d+)} [r info memory] -> hot
+        assert_equal "$v!" [r test.appendarg $v]
+        regexp {intern_hot_hits:(\d+)} [r info memory] -> hot2
+        # The argument pointed at the shared value.
+        assert_morethan $hot2 $hot
+        assert_equal $v [r get k0]
+        assert_equal $v [r get k499]
+    } {} {io-threads:skip} ; # IO threads share only SET-family arguments.
 }
 
 start_server {tags {"modules"}} {
