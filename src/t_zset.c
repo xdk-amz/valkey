@@ -841,9 +841,11 @@ int zsetScore(robj *zobj, sds member, double *score) {
     } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = objectGetVal(zobj);
         void *entry;
-        zsetMarkLookupKey(member);
-        int found = hashtableFind(zs->ht, member, &entry);
-        zsetUnmarkLookupKey(member);
+        sds key = zsetPrivateLookupKey(member);
+        zsetMarkLookupKey(key);
+        int found = hashtableFind(zs->ht, key, &entry);
+        zsetUnmarkLookupKey(key);
+        zsetFreePrivateLookupKey(key, member);
         if (!found) return C_ERR;
         OrderedIndexItem *setElement = entry;
         *score = orderedIndexItemGetScore(setElement);
@@ -970,9 +972,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
     if (zobj->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = objectGetVal(zobj);
 
-        zsetMarkLookupKey(ele);
-        void **node_ref_in_hashtable = hashtableFindRef(zs->ht, ele);
-        zsetUnmarkLookupKey(ele);
+        sds key = zsetPrivateLookupKey(ele);
+        zsetMarkLookupKey(key);
+        void **node_ref_in_hashtable = hashtableFindRef(zs->ht, key);
+        zsetUnmarkLookupKey(key);
+        zsetFreePrivateLookupKey(key, ele);
         if (node_ref_in_hashtable != NULL) {
             /* NX? Return, same element already exists. */
             if (nx) {
@@ -1029,9 +1033,11 @@ int zsetAdd(robj *zobj, double score, sds ele, int in_flags, int *out_flags, dou
  * element was not there). */
 static int zsetRemoveFromIndex(zset *zs, sds ele) {
     void *entry;
-    zsetMarkLookupKey(ele);
-    int popped = hashtablePop(zs->ht, ele, &entry);
-    zsetUnmarkLookupKey(ele);
+    sds key = zsetPrivateLookupKey(ele);
+    zsetMarkLookupKey(key);
+    int popped = hashtablePop(zs->ht, key, &entry);
+    zsetUnmarkLookupKey(key);
+    zsetFreePrivateLookupKey(key, ele);
     if (!popped) return 0;
     OrderedIndexItem *node = entry;
 
@@ -1110,9 +1116,11 @@ static long zsetRank(robj *zobj, sds ele, int reverse, double *output_score) {
         zset *zs = objectGetVal(zobj);
 
         void *entry;
-        zsetMarkLookupKey(ele);
-        int found = hashtableFind(zs->ht, ele, &entry);
-        zsetUnmarkLookupKey(ele);
+        sds key = zsetPrivateLookupKey(ele);
+        zsetMarkLookupKey(key);
+        int found = hashtableFind(zs->ht, key, &entry);
+        zsetUnmarkLookupKey(key);
+        zsetFreePrivateLookupKey(key, ele);
         if (!found) return -1;
         OrderedIndexItem *node = entry;
 
@@ -1794,9 +1802,11 @@ static int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
         } else if (op->encoding == OBJ_ENCODING_BTREE) {
             zset *zs = objectGetVal(op->subject);
             void *entry;
-            zsetMarkLookupKey(val->ele);
-            int found = hashtableFind(zs->ht, val->ele, &entry);
-            zsetUnmarkLookupKey(val->ele);
+            sds key = zsetPrivateLookupKey(val->ele);
+            zsetMarkLookupKey(key);
+            int found = hashtableFind(zs->ht, key, &entry);
+            zsetUnmarkLookupKey(key);
+            zsetFreePrivateLookupKey(key, val->ele);
             if (found) {
                 OrderedIndexItem *node = entry;
                 *score = orderedIndexItemGetScore(node);
@@ -2244,9 +2254,11 @@ static void zunionInterDiffGenericCommand(client *c, robj *dstkey, int numkeysIn
                 hashtablePosition position;
                 /* If we don't have it, we need to create a new entry. */
                 void *existing;
-                zsetMarkLookupKey(sdsval);
-                int is_new = hashtableFindPositionForInsert(dstzset->ht, sdsval, &position, &existing);
-                zsetUnmarkLookupKey(sdsval);
+                sds key = zsetPrivateLookupKey(sdsval);
+                zsetMarkLookupKey(key);
+                int is_new = hashtableFindPositionForInsert(dstzset->ht, key, &position, &existing);
+                zsetUnmarkLookupKey(key);
+                zsetFreePrivateLookupKey(key, sdsval);
                 if (is_new) {
                     sds tmp_ele = zuiNewSdsFromValue(&zval);
                     OrderedIndexItem *new_node = orderedIndexItemCreate(score, tmp_ele, sdslen(tmp_ele));
@@ -3205,6 +3217,7 @@ static_assert(ZMSCORE_FIND_BATCH_SIZE <= HASHTABLE_FIND_BATCH_MAX_SIZE,
 
 static void zmscoreReplyWithHashtable(client *c, hashtable *ht, robj **members, size_t count) {
     const void *keys[ZMSCORE_FIND_BATCH_SIZE];
+    sds owned[ZMSCORE_FIND_BATCH_SIZE];
     void *found_entries[ZMSCORE_FIND_BATCH_SIZE];
     while (count) {
         size_t batch = count > ZMSCORE_FIND_BATCH_SIZE ? ZMSCORE_FIND_BATCH_SIZE : count;
@@ -3212,6 +3225,8 @@ static void zmscoreReplyWithHashtable(client *c, hashtable *ht, robj **members, 
         /* The same SDS may appear more than once, so only mark it once. */
         for (size_t i = 0; i < batch; i++) {
             sds member = objectGetVal(members[i]);
+            owned[i] = sdsIsShared(member) ? sdsdup(member) : NULL;
+            if (owned[i]) member = owned[i];
             if (!zsetIsLookupKey(member)) zsetMarkLookupKey(member);
             keys[i] = member;
         }
@@ -3220,8 +3235,9 @@ static void zmscoreReplyWithHashtable(client *c, hashtable *ht, robj **members, 
 
         /* Unmark each SDS once; later duplicates are already unmarked. */
         for (size_t i = 0; i < batch; i++) {
-            sds member = objectGetVal(members[i]);
+            sds member = (sds)keys[i];
             if (zsetIsLookupKey(member)) zsetUnmarkLookupKey(member);
+            if (owned[i]) sdsfree(owned[i]);
         }
 
         for (size_t i = 0; i < batch; i++) {

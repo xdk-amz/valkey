@@ -120,6 +120,22 @@ proc assert_does_not_resync {body} {
     assert_equal $prev_syncs [get_cluster_total_syncs_count]
 }
 
+# Like populate, but every value is distinct, so the keys cannot share values.
+proc populate_unique {num prefix size idx {expires 0}} {
+    set val [string repeat A $size]
+    r $idx deferred 1
+    for {set j 0} {$j < $num} {incr j} {
+        if {$expires > 0} {
+            r $idx set $prefix$j "$prefix$j:$val" ex $expires
+        } else {
+            r $idx set $prefix$j "$prefix$j:$val"
+        }
+        if {$j >= 16} {r $idx read}
+    }
+    for {set j [expr {max(0, $num - 16)}]} {$j < $num} {incr j} {r $idx read}
+    r $idx deferred 0
+}
+
 # Helper to perform eviction related tests. It sets up the configs on idx so
 # that the node will begin evicting with the given policy once full. It will
 # require ~1 MiB of data to be added to fill up the repl-backlog first.
@@ -939,7 +955,7 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster network} overrides
                     set old_evictions [s -$target_idx evicted_keys]
                     set batch 1
                     while 1 {
-                        populate 1000 "$slot_to_test_tag:$batch:" 1000 -$target_idx false 1000
+                        populate_unique 1000 "$slot_to_test_tag:$batch:" 1000 -$target_idx 1000
                         incr batch
                         if {[s -$target_idx evicted_keys] > [expr $old_evictions + 1000]} {
                             break
@@ -2896,7 +2912,7 @@ proc fill_until_evicting {idx prefix} {
         if {$batch > 200} {
             fail "Node $idx did not start evicting"
         }
-        populate 100 "$prefix:$batch:" 1000 -$idx false 100000
+        populate_unique 100 "$prefix:$batch:" 1000 -$idx 100000
     }
 }
 
@@ -2968,7 +2984,7 @@ start_cluster 3 3 {tags {logreqres:skip external:skip cluster} overrides {cluste
 
             # More than the target can make room for: it evicts all the keys it
             # owns and then fails the import, dropping the imported keys.
-            populate 2000 "$16383_slot_tag:imported:" 1000 -2
+            populate_unique 2000 "$16383_slot_tag:imported:" 1000 -2
             assert_match "OK" [R 2 CLUSTER MIGRATESLOTS SLOTSRANGE 16383 16383 NODE $node0_id]
             set jobname [get_job_name 2 16383]
             wait_for_migration_field 0 $jobname state failed

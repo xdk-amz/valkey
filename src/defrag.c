@@ -39,6 +39,7 @@
  */
 
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "hashtable.h"
 #include "eval.h"
@@ -201,6 +202,7 @@ void *activeDefragAlloc(void *ptr) {
  * When it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
 sds activeDefragSds(sds sdsptr) {
+    if (sdsIsShared(sdsptr)) return internDefragShared(sdsptr, activeDefragAlloc);
     void *ptr = sdsAllocPtr(sdsptr);
     void *newptr = activeDefragAlloc(ptr);
     if (newptr) {

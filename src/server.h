@@ -1517,6 +1517,10 @@ typedef struct client {
     listNode *throttle_node;           /* Node in throttler's client_queue */
     monotime throttle_start;           /* When this client was queued for throttling */
     struct trendCalculator *cob_trend; /* Per-replica COB size trend (NULL if not replica) */
+    /* Arguments an IO thread parsed as shared strings; the main thread takes
+     * their references when it collects the read. */
+    struct internPending *intern_pending;
+    uint32_t intern_read_epoch; /* epoch of the read job in flight, plus one; 0 if none */
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
@@ -1618,13 +1622,23 @@ typedef struct zset {
 /* Lookup-key marking for fbtree hashtable disambiguation.
  * Packed fbtree items ([score][ele]) are stored in the hashtable. When doing
  * a lookup with a plain sds key, we mark it so the hash/compare callbacks
- * can distinguish it from a packed stored item. */
+ * can distinguish it from a packed stored item. A shared string must not be
+ * marked: callers swap it for a private copy with zsetPrivateLookupKey(). */
 #define ZSET_LOOKUP_TYPE5_MARKER 6
 static inline void zsetMarkLookupKey(sds s) {
     if (sdsType(s) == SDS_TYPE_5)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | ZSET_LOOKUP_TYPE5_MARKER;
     else
         sdsSetAuxBit(s, 0, 1);
+}
+
+/* Returns `s`, or a private copy of it if `s` is a shared string, which must
+ * not be marked. Pair with zsetFreePrivateLookupKey(). */
+static inline sds zsetPrivateLookupKey(sds s) {
+    return sdsIsShared(s) ? sdsdup(s) : s;
+}
+static inline void zsetFreePrivateLookupKey(sds key, sds orig) {
+    if (key != orig) sdsfree(key);
 }
 static inline void zsetUnmarkLookupKey(sds s) {
     unsigned char type = s[-1] & SDS_TYPE_MASK;
@@ -3343,6 +3357,7 @@ robj *createStringObjectFromSds(const_sds s);
 robj *createRawStringObject(const char *ptr, size_t len);
 robj *tryCreateRawStringObject(const char *ptr, size_t len);
 robj *tryCreateStringObject(const char *ptr, size_t len);
+bool stringObjectWouldEmbed(size_t len);
 robj *dupStringObject(const robj *o);
 int isSdsRepresentableAsLongLong(sds s, long long *llval);
 int isObjectRepresentableAsLongLong(robj *o, long long *llongval);
@@ -4013,6 +4028,7 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
     (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE | LOOKUP_NOHOTKEYS) /* Avoid any effects from fetching the key */
 
 void dbAdd(serverDb *db, robj *key, robj **valref);
+void dbInternValue(robj *val);
 int dbAddRDBLoad(serverDb *db, sds key, robj **valref);
 void dbReplaceValue(serverDb *db, robj *key, robj **valref);
 

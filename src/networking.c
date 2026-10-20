@@ -28,6 +28,7 @@
  */
 
 #include "server.h"
+#include "intern.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
@@ -415,6 +416,8 @@ client *createClient(connection *conn) {
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
     c->cur_tid = 0;
+    c->intern_pending = NULL;
+    c->intern_read_epoch = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -2515,6 +2518,7 @@ int freeClient(client *c) {
     if (c->lib_ver) decrRefCount(c->lib_ver);
     freeClientMultiState(c);
     if (c->cob_trend) trendCalculator_free(c->cob_trend);
+    internFreePending(c->intern_pending);
     sdsfree(c->peerid);
     sdsfree(c->sockname);
     zfree(c);
@@ -4021,9 +4025,18 @@ void parseInlineBuffer(client *c) {
     for (c->argc = 0, j = 0; j < argc; j++) {
         /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
-        c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
+        size_t len = sdslen(argv[j]);
+        robj *arg = NULL;
+        if (j > 0 && !intern_is_main && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+            arg = internParseArg(&c->intern_pending, argv[j], len, j);
+        if (arg) {
+            sdsfree(argv[j]);
+        } else {
+            arg = createObject(OBJ_STRING, argv[j]);
+        }
+        c->argv[c->argc] = arg;
         c->argc++;
-        c->argv_len_sum += sdslen(argv[j]);
+        c->argv_len_sum += len;
     }
     zfree(argv);
 
@@ -4341,7 +4354,16 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                (*argv)[(*argc)++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                robj *arg = NULL;
+                /* Sorted set commands mark their arguments in place during
+                 * lookups, so their arguments are never shared. */
+                if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
+                    const char *name = objectGetVal((*argv)[0]);
+                    if (intern_is_main ? (name[0] != 'z' && name[0] != 'Z')
+                                       : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
+                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, *argc);
+                }
+                (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;
             }
@@ -7112,6 +7134,7 @@ int processClientIOReadsDone(client *c) {
 
     c->flag.pending_read = 0;
     c->io_read_state = CLIENT_IDLE;
+    internReadCollected(c->intern_pending, &c->intern_read_epoch);
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return 0;

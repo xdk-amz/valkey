@@ -363,7 +363,7 @@ run_solo {defrag} {
                 set k 0
                 set f 0
                 for {set j 0} {$j < $n} {incr j} {
-                    $rd hset k$k f$f $val
+                    $rd hset k$k f$f $val$f
                     lassign [next_exp_kf $k $f] k f
                     if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
                 }
@@ -594,7 +594,7 @@ run_solo {defrag} {
                 $rd client reply off
                 set val [string repeat A 512]
                 for {set j 0} {$j < $n_keys} {incr j} {
-                    $rd set k$j $val
+                    $rd set k$j $val$j
                     if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
                 }
                 # Many RESP3 tracking clients read every key, registering their
@@ -660,6 +660,56 @@ run_solo {defrag} {
         }
     }
 
+    proc intern_stat {field} {
+        if {[regexp "\r\n$field:(\[0-9\]+)" [r info memory] -> v]} {return $v}
+        return 0
+    }
+
+    proc test_shared_strings {type} {
+        set title "Active Defrag shared strings: $type"
+        test $title {
+            set n 250000
+            set val [string repeat S 200]
+
+            perform_defrag_test $title populate {
+                # Each value has two holders, so it is shared.
+                set rd [valkey_deferring_client]
+                $rd client reply off
+                for {set j 0} {$j < $n} {incr j} {
+                    $rd set a$j $j$val
+                    $rd set b$j $j$val
+                    if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
+                }
+                client_reply_off_wait_for_server $rd
+                assert_morethan [intern_stat intern_strings] [expr {$n * 9 / 10}]
+            } fragment {
+                # Free every other value and leave the rest with one holder, the
+                # only shared strings defrag moves.
+                for {set j 0} {$j < $n} {incr j} {
+                    if {$j % 2 == 0} {$rd del a$j}
+                    $rd del b$j
+                    if {$j % 1000 == 999} {client_reply_off_wait_for_server $rd}
+                }
+                client_reply_off_wait_for_server $rd
+                $rd close
+            }
+
+            # Moved strings are still found: new writes of their bytes share them.
+            set strings [intern_stat intern_strings]
+            set hits [intern_stat intern_hits]
+            for {set j 1} {$j < 2001} {incr j 2} {r set c$j $j$val}
+            assert_equal $strings [intern_stat intern_strings]
+            assert_morethan [intern_stat intern_hits] [expr {$hits + 900}]
+            assert_equal 1999$val [r get a1999]
+            r flushall
+            wait_for_condition 50 100 {
+                [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
+            } else {
+                fail "intern references not released"
+            }
+        }
+    }
+
     set standalone_tags [list defrag external:skip standalone]
     set cluster_tags [list defrag external:skip cluster]
     set aof_overrides [list appendonly yes auto-aof-rewrite-percentage 0 save "" lazyfree-lazy-user-del no]
@@ -676,6 +726,8 @@ run_solo {defrag} {
     lappend tests [list test_stream standalone $std_overrides]
     lappend tests [list test_pubsub standalone $std_overrides]
     lappend tests [list test_tracking_table standalone $std_overrides]
+    # Indexed shared strings are not moved while IO threads are active.
+    lappend tests [list test_shared_strings standalone [concat $std_overrides io-threads 1]]
 
     lappend tests [list test_main_dictionary cluster $std_overrides]
     lappend tests [list test_eval_scripts cluster $std_overrides]
