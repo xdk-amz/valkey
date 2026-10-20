@@ -30,6 +30,7 @@
 
 #include "hashtable.h"
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "serverassert.h"
 #include "functions.h"
@@ -375,6 +376,11 @@ static bool shouldEmbedStringObject(size_t val_len, const_sds key, long long exp
     return size <= 128;
 }
 
+/* True if a string of this length is created embedded when it has no key. */
+bool stringObjectWouldEmbed(size_t len) {
+    return shouldEmbedStringObject(len, NULL, EXPIRY_NONE);
+}
+
 /* Create a string object with EMBSTR encoding if it is small; otherwise, RAW encoding */
 robj *createStringObject(const char *ptr, size_t len) {
     if (shouldEmbedStringObject(len, NULL, EXPIRY_NONE))
@@ -513,8 +519,8 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
         /* The pointer is not allocated memory. We can just copy the pointer. */
         ptr = o->val_ptr;
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW) {
-        /* Dup the string. */
-        ptr = sdsdup(o->val_ptr);
+        /* Dup the string. A shared string takes one more reference instead. */
+        ptr = internDupSds(o->val_ptr);
     } else {
         serverAssert(objectGetType(o) != OBJ_STRING);
         /* There are multiple references to this non-string object. Most types
@@ -798,6 +804,8 @@ void decrRefCount(robj *o) {
  * accumulate free buffers to free whole pages, while madvise is nop
  * if the buffer is less than a page.  */
 void dismissSds(sds s) {
+    /* Other keys the child has not dumped yet may reference a shared string. */
+    if (sdsIsShared(s)) return;
     sdsfree(s);
 }
 
@@ -1339,7 +1347,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
 
     if (objectGetType(o) == OBJ_STRING) {
         if (objectGetEncoding(o) == OBJ_ENCODING_RAW) {
-            asize += sdsAllocSize(objectGetVal(o));
+            asize += internSdsMemUsage(objectGetVal(o));
         } else if (objectGetEncoding(o) != OBJ_ENCODING_INT && objectGetEncoding(o) != OBJ_ENCODING_EMBSTR) {
             serverPanic("Unknown string encoding");
         }
@@ -1368,7 +1376,7 @@ size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid) {
             void *next;
             while (hashtableNext(&iter, &next) && samples < sample_size) {
                 sds element = next;
-                elesize += sdsAllocSize(element);
+                elesize += internSdsMemUsage(element);
                 samples++;
             }
             hashtableCleanupIterator(&iter);

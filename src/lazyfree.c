@@ -4,6 +4,7 @@
 #include "functions.h"
 #include "cluster.h"
 #include "module.h"
+#include "intern.h"
 
 #include <stdatomic.h>
 
@@ -14,7 +15,9 @@ static _Atomic size_t lazyfreed_objects = 0;
  * updating the count of objects to release. */
 void lazyfreeFreeObject(void *args[]) {
     robj *o = (robj *)args[0];
+    internDeferBegin();
     decrRefCount(o);
+    internDeferPublish();
     atomic_fetch_sub_explicit(&lazyfree_objects, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&lazyfreed_objects, 1, memory_order_relaxed);
 }
@@ -28,9 +31,11 @@ void lazyfreeFreeDatabase(void *args[]) {
     kvstore *da3 = args[2];
 
     size_t numkeys = kvstoreSize(da1);
+    internDeferBegin();
     kvstoreRelease(da1);
     kvstoreRelease(da2);
     kvstoreRelease(da3);
+    internDeferPublish();
     atomic_fetch_sub_explicit(&lazyfree_objects, numkeys, memory_order_relaxed);
     atomic_fetch_add_explicit(&lazyfreed_objects, numkeys, memory_order_relaxed);
 }

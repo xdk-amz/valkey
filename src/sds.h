@@ -118,6 +118,18 @@ static inline void sdsSetAuxBit(sds s, int bit, int value) {
     s[-1] = (char)flags;
 }
 
+/* Aux bit that marks a shared string owned by the intern table. Such a string is
+ * immutable and sdsfree() releases one reference through sdsSharedReleaseHook.
+ * The bit is set before the string is published and never changes after. */
+#define SDS_AUX_SHARED 4
+
+static inline int sdsIsShared(const_sds s) {
+    unsigned char flags = s[-1];
+    return (flags & SDS_TYPE_MASK) != SDS_TYPE_5 && ((flags >> (SDS_TYPE_BITS + SDS_AUX_SHARED)) & 1U);
+}
+
+extern void (*sdsSharedReleaseHook)(sds s);
+
 /* The maximum length of a string that can be stored with the given SDS type. */
 static inline size_t sdsTypeMaxSize(char type) {
     if (type == SDS_TYPE_5) return (1 << 5) - 1;

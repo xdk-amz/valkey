@@ -1785,8 +1785,9 @@ start_server {tags {"hashexpire"}} {
         r del memusagehfe
         r hset memusagehfe live v
         set value [string repeat x 1000]
+        # Distinct values, so string interning does not share them.
         for {set i 1} {$i <= 99} {incr i} {
-            r hset memusagehfe f$i $value
+            r hset memusagehfe f$i $i$value
         }
         assert_encoding hashtable memusagehfe
         set fields {}

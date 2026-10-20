@@ -44,6 +44,7 @@
 #include "forkless.h"
 #include "crc16_slottable.h"
 #include "bgiteration.h"
+#include "intern.h"
 
 /*-----------------------------------------------------------------------------
  * C-level DB API
@@ -55,6 +56,22 @@ static int keyIsExpiredWithDictIndex(serverDb *db, robj *key, int dict_index);
 static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
+
+/* Offers an out-of-line string value to the intern table before it is stored.
+ * Only an unshared object is changed, so no other reference sees its value
+ * pointer move. The caller must not modify the value in place afterwards. */
+void dbInternValue(robj *val) {
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
+        objectSetVal(val, internAdmit(objectGetVal(val)));
+    }
+}
+
+/* Same as dbInternValue() for a write that internGateDue() selected. */
+static void dbInternDueValue(robj *val) {
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
+        objectSetVal(val, internAdmitDue(objectGetVal(val)));
+    }
+}
 
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
@@ -301,6 +318,7 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
     }
     robj *val = *valref;
     val = objectSetKeyAndExpire(val, key, -1);
+    dbInternValue(val);
     kvstoreHashtableInsertAtPosition(db->keys, dict_index, val, &pos);
     initObjectLRUOrLFU(val);
 
@@ -450,6 +468,11 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else {
         dbSetValue(db, key, valref, 1, NULL);
     }
+    /* Offered after insertion, once the value has its final encoding. Values
+     * stored through setKey are not modified in place afterwards, unlike
+     * objects some commands create with dbAdd and then write into. A write
+     * that is not due for sampling only counts down the gate. */
+    if (internGateDue()) dbInternDueValue(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
@@ -607,7 +630,7 @@ int dbDelete(serverDb *db, robj *key) {
  */
 robj *dbUnshareStringValue(serverDb *db, robj *key, robj *o) {
     serverAssert(objectGetType(o) == OBJ_STRING);
-    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
+    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW || sdsIsShared(objectGetVal(o))) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(objectGetVal(decoded), sdslen(objectGetVal(decoded)));
         decrRefCount(decoded);
@@ -718,6 +741,9 @@ long long emptyData(int dbnum, int flags, void(callback)(hashtable *)) {
     }
 
     if (dbnum == -1) flushReplicaKeysWithExpireList(async);
+
+    /* The data that sampling learned from is gone. */
+    if (dbnum == -1) internResetSampling();
 
     if (with_functions) {
         serverAssert(dbnum == -1);
@@ -1751,6 +1777,7 @@ void copyCommand(client *c) {
     }
 
     dbAdd(dst, newkey, &newobj);
+    dbInternValue(newobj);
     if (expire != -1) newobj = setExpire(c, dst, newkey, expire);
 
     /* OK! key copied */

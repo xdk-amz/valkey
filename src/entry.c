@@ -1,6 +1,7 @@
 #include "server.h"
 #include "serverassert.h"
 #include "entry.h"
+#include "intern.h"
 
 /*-----------------------------------------------------------------------------
  * Entry Implementation
@@ -184,6 +185,7 @@ static void entryFreeValuePtr(entry *entry) {
 
 static void entrySetValueSds(entry *e, sds value) {
     serverAssert(entryHasValuePtr(e));
+    value = internAdmit(value);
     entryFreeValuePtr(e);
     if (entryHasStringRef(e)) sdsSetAuxBit(entryGetField(e), FIELD_SDS_AUX_BIT_ENTRY_HAS_STRING_REF, 0);
     sds *value_ref = entryGetSdsValueRef(e);
@@ -323,6 +325,7 @@ static entry *entryConstruct(size_t alloc_size,
     /* Set the value if exists */
     if (!embed_value) {
         /* The value is not embedded, the value pointer is written before the field data. */
+        if (sds_value) sds_value = internAdmit(sds_value);
         *(void **)buf = sds_value ? (void *)sds_value : (void *)stringref_value;
         buf += sizeof(void *);
         buf_size -= sizeof(void *);
@@ -506,7 +509,7 @@ size_t entryMemUsage(entry *entry) {
     if (entryHasStringRef(entry)) {
         mem += zmalloc_usable_size(entryGetStringRefRef(entry));
     } else {
-        mem += sdsAllocSize((sds)entryGetValue(entry, NULL));
+        mem += internSdsMemUsage((sds)entryGetValue(entry, NULL));
     }
     return mem;
 }
