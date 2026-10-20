@@ -703,6 +703,36 @@ tags "modules" {
             close_replication_stream $repl
         }
     }
+
+    test {Module command FLUSHALL ASYNC waits for the command's argv to be freed} {
+        start_server [list overrides [list loadmodule "$testmodule"]] {
+            set rd [valkey_deferring_client]
+            $rd propagate-test.set-flushall-async-block foo [string repeat x 100]
+            $rd flush
+            wait_for_blocked_client
+
+            # The lazy-free thread runs jobs in order, so once this set is
+            # freed, a keyspace handed over before it is freed too.
+            set members {}
+            for {set i 0} {$i < 200} {incr i} {lappend members m$i}
+            r sadd fence {*}$members
+            r unlink fence
+            wait_for_condition 50 100 {
+                [s lazyfreed_objects] >= 1
+            } else {
+                fail "lazyfree fence isn't done"
+            }
+            assert_equal 1 [s lazyfreed_objects]
+            # foo, and the counter this module INCRs on every keyspace event.
+            assert_equal 2 [s lazyfree_pending_objects]
+
+            r propagate-test.unblock
+            assert_equal OK [$rd read]
+            $rd close
+            wait_lazyfree_done r
+            assert_equal 3 [s lazyfreed_objects]
+        }
+    }
 }
 
 

@@ -211,16 +211,41 @@ typedef struct pendingDatabaseFree {
     kvstore *keys;
     kvstore *expires;
     kvstore *keys_with_volatile_items;
+    uint64_t id;
+    int waits;           /* Clients still holding objects of the old keyspace. */
+    int in_unit;         /* The execution unit that ran the flush has not ended. */
+    client *argv_holder; /* Client whose command argv may hold old keyspace objects. */
 } pendingDatabaseFree;
 
-/* Keyspaces flushed inside an execution unit are freed only when the unit
- * ends: until then the main thread can still use their objects (queued argv,
- * pending propagation). */
+typedef struct pendingDatabaseFreeWait {
+    uint64_t id;   /* Pending free this client delays. */
+    uint64_t refs; /* Released once bulk_str_refs_released reaches this. */
+} pendingDatabaseFreeWait;
+
+struct pendingDatabaseFreeWaits {
+    int holds_argv; /* Some pending free waits for this client's argv to be freed. */
+    int count;
+    int cap;
+    pendingDatabaseFreeWait waits[];
+};
+
+/* A flushed keyspace is freed only when the execution unit that flushed it
+ * ends, the argv of the command that ran it are freed, and the reply buffer
+ * references clients held at flush time are released: until then the main
+ * thread can still use its objects (argv, pending propagation, unwritten
+ * replies). */
 static pendingDatabaseFree *pending_db_frees = NULL;
 static int pending_db_free_count = 0;
 static int pending_db_free_cap = 0;
+static int pending_db_frees_in_unit = 0;
+static uint64_t next_pending_db_free_id = 0;
 
-static void enqueuePendingDatabaseFree(kvstore *keys, kvstore *expires, kvstore *keys_with_volatile_items) {
+static void enqueuePendingDatabaseFree(kvstore *keys,
+                                       kvstore *expires,
+                                       kvstore *keys_with_volatile_items,
+                                       uint64_t id,
+                                       int waits,
+                                       int in_unit) {
     if (pending_db_free_count == pending_db_free_cap) {
         pending_db_free_cap = pending_db_free_cap ? pending_db_free_cap * 2 : 8;
         pending_db_frees = zrealloc(pending_db_frees, (size_t)pending_db_free_cap * sizeof(pendingDatabaseFree));
@@ -229,19 +254,114 @@ static void enqueuePendingDatabaseFree(kvstore *keys, kvstore *expires, kvstore 
     pending->keys = keys;
     pending->expires = expires;
     pending->keys_with_volatile_items = keys_with_volatile_items;
+    pending->id = id;
+    pending->waits = waits;
+    pending->in_unit = in_unit;
+    pending->argv_holder = NULL;
+    if (in_unit) pending_db_frees_in_unit++;
+}
+
+/* Hands every pending free that no longer waits on anything to the BIO thread. */
+static void handOverReadyDatabaseFrees(void) {
+    int j = 0;
+    for (int i = 0; i < pending_db_free_count; i++) {
+        pendingDatabaseFree *pending = &pending_db_frees[i];
+        if (pending->waits == 0 && !pending->in_unit) {
+            bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, pending->keys, pending->expires,
+                                 pending->keys_with_volatile_items);
+        } else {
+            pending_db_frees[j++] = *pending;
+        }
+    }
+    pending_db_free_count = j;
+}
+
+static struct pendingDatabaseFreeWaits *getClientWaits(client *c, int room) {
+    struct pendingDatabaseFreeWaits *w = c->pending_db_free_waits;
+    if (!w || (room && w->count == w->cap)) {
+        int cap = w ? w->cap * 2 : 2;
+        w = zrealloc(w, sizeof(*w) + (size_t)cap * sizeof(pendingDatabaseFreeWait));
+        if (!c->pending_db_free_waits) {
+            w->holds_argv = 0;
+            w->count = 0;
+        }
+        w->cap = cap;
+        c->pending_db_free_waits = w;
+    }
+    return w;
+}
+
+static void freeClientWaitsIfEmpty(client *c) {
+    struct pendingDatabaseFreeWaits *w = c->pending_db_free_waits;
+    if (w->count || w->holds_argv) return;
+    zfree(w);
+    c->pending_db_free_waits = NULL;
+}
+
+static void addPendingDatabaseFreeWait(client *c, uint64_t id) {
+    struct pendingDatabaseFreeWaits *w = getClientWaits(c, 1);
+    w->waits[w->count].id = id;
+    w->waits[w->count].refs = c->bulk_str_refs_added;
+    w->count++;
 }
 
 bool lazyfreeHasPendingDatabaseFrees(void) {
-    return pending_db_free_count > 0;
+    return pending_db_frees_in_unit > 0;
 }
 
 void lazyfreeDrainPendingDatabaseFrees(void) {
+    client *c = server.current_client;
+    int hold = c && (c->argc || c->original_argv);
     for (int i = 0; i < pending_db_free_count; i++) {
         pendingDatabaseFree *pending = &pending_db_frees[i];
-        bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, pending->keys, pending->expires,
-                             pending->keys_with_volatile_items);
+        if (!pending->in_unit) continue;
+        pending->in_unit = 0;
+        if (hold) {
+            pending->argv_holder = c;
+            pending->waits++;
+        }
     }
-    pending_db_free_count = 0;
+    pending_db_frees_in_unit = 0;
+    if (hold) getClientWaits(c, 0)->holds_argv = 1;
+    handOverReadyDatabaseFrees();
+}
+
+/* Called once the client's argv are freed. */
+void lazyfreeReleaseClientArgv(client *c) {
+    struct pendingDatabaseFreeWaits *w = c->pending_db_free_waits;
+    if (!w->holds_argv) return;
+    int ready = 0;
+    for (int i = 0; i < pending_db_free_count; i++) {
+        pendingDatabaseFree *pending = &pending_db_frees[i];
+        if (pending->argv_holder != c) continue;
+        pending->argv_holder = NULL;
+        if (--pending->waits == 0 && !pending->in_unit) ready = 1;
+    }
+    w->holds_argv = 0;
+    freeClientWaitsIfEmpty(c);
+    if (ready) handOverReadyDatabaseFrees();
+}
+
+/* Drops the client's waits whose references were released, or all of them
+ * when 'all' is set. Waits are ordered by id and by references. */
+void lazyfreeReleaseClientWaits(client *c, int all) {
+    struct pendingDatabaseFreeWaits *w = c->pending_db_free_waits;
+    int done = 0, ready = 0;
+    while (done < w->count && (all || w->waits[done].refs <= c->bulk_str_refs_released)) {
+        for (int i = 0; i < pending_db_free_count; i++) {
+            pendingDatabaseFree *pending = &pending_db_frees[i];
+            if (pending->id != w->waits[done].id) continue;
+            if (--pending->waits == 0 && !pending->in_unit) ready = 1;
+            break;
+        }
+        done++;
+    }
+    if (done) {
+        memmove(w->waits, w->waits + done, (size_t)(w->count - done) * sizeof(pendingDatabaseFreeWait));
+        w->count -= done;
+    }
+    freeClientWaitsIfEmpty(c);
+    if (ready) handOverReadyDatabaseFrees();
 }
 
 /* Empty a DB asynchronously. What the function does actually is to
@@ -259,8 +379,21 @@ void emptyDbAsync(serverDb *db) {
     db->expires = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     db->keys_with_volatile_items = kvstoreCreate(&kvstoreExpiresHashtableType, slot_count_bits, flags);
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
-    if (server.execution_nesting) {
-        enqueuePendingDatabaseFree(oldkeys, oldexpires, oldkeyswithexpires);
+
+    uint64_t id = ++next_pending_db_free_id;
+    int waits = 0;
+    listIter li;
+    listNode *ln;
+    listRewind(server.clients, &li);
+    while ((ln = listNext(&li)) != NULL) {
+        client *c = listNodeValue(ln);
+        if (c->bulk_str_refs_added == c->bulk_str_refs_released) continue;
+        addPendingDatabaseFreeWait(c, id);
+        waits++;
+    }
+    int in_unit = server.execution_nesting > 0;
+    if (waits || in_unit) {
+        enqueuePendingDatabaseFree(oldkeys, oldexpires, oldkeyswithexpires, id, waits, in_unit);
     } else {
         bioCreateLazyFreeJob(lazyfreeFreeDatabase, 3, oldkeys, oldexpires, oldkeyswithexpires);
     }

@@ -1448,6 +1448,11 @@ typedef struct client {
     LastWrittenBuf io_last_written;      /* Track state for last written buffer */
     unsigned long long reply_bytes;      /* Tot bytes of objects in reply list. */
     listNode clients_pending_write_node; /* list node in clients_pending_write or in clients_pending_io_write list */
+
+    uint64_t bulk_str_refs_added;                           /* Object references ever added to the reply buffers. */
+    uint64_t bulk_str_refs_released;                        /* Object references ever released from them. */
+    struct pendingDatabaseFreeWaits *pending_db_free_waits; /* Async flushes waiting on this client's references. */
+
     size_t bufpos;
     payloadHeader *last_header; /* Pointer to the last header in a buffer when using copy avoidance */
     int original_argc;          /* Num of arguments of original command if arguments were rewritten. */
@@ -4053,6 +4058,8 @@ size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 bool lazyfreeHasPendingDatabaseFrees(void);
 void lazyfreeDrainPendingDatabaseFrees(void);
+void lazyfreeReleaseClientWaits(client *c, int all);
+void lazyfreeReleaseClientArgv(client *c);
 void freeObjAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
 void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
