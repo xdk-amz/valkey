@@ -57,41 +57,70 @@ typedef struct PrefetchCommandsBatch {
     KeyPrefetchInfo *prefetch_info; /* Prefetch info for each key */
 } PrefetchCommandsBatch;
 
-static PrefetchCommandsBatch *batch = NULL;
+/* Main's batch, and the batch a write lane thread installed for the command-level calls. A lane's
+ * batch only prefetches: it never holds clients and never touches server stats. */
+static PrefetchCommandsBatch *main_batch = NULL;
+static _Thread_local PrefetchCommandsBatch *lane_batch = NULL;
+#define batch (lane_batch ? lane_batch : main_batch)
+
+static PrefetchCommandsBatch *allocBatch(size_t max_prefetch_size) {
+    PrefetchCommandsBatch *b = zcalloc(sizeof(PrefetchCommandsBatch));
+    b->max_prefetch_size = max_prefetch_size;
+    b->clients = zcalloc(max_prefetch_size * sizeof(client *));
+    b->key_members = zcalloc(max_prefetch_size * sizeof(robj *));
+    b->keys = zcalloc(max_prefetch_size * sizeof(void *));
+    b->keys_tables = zcalloc(max_prefetch_size * sizeof(hashtable *));
+    b->dbs = zcalloc(max_prefetch_size * sizeof(struct serverDb *));
+    b->slots = zcalloc(max_prefetch_size * sizeof(int));
+    b->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
+    return b;
+}
+
+static void freeBatch(PrefetchCommandsBatch *b) {
+    zfree(b->clients);
+    zfree(b->key_members);
+    zfree(b->keys);
+    zfree(b->keys_tables);
+    zfree(b->dbs);
+    zfree(b->slots);
+    zfree(b->prefetch_info);
+    zfree(b);
+}
 
 void freePrefetchCommandsBatch(void) {
-    if (batch == NULL) {
-        return;
-    }
-
-    zfree(batch->clients);
-    zfree(batch->key_members);
-    zfree(batch->keys);
-    zfree(batch->keys_tables);
-    zfree(batch->dbs);
-    zfree(batch->slots);
-    zfree(batch->prefetch_info);
-    zfree(batch);
-    batch = NULL;
+    if (main_batch == NULL) return;
+    freeBatch(main_batch);
+    main_batch = NULL;
 }
 
 void prefetchCommandsBatchInit(void) {
-    if (batch) return;
+    if (main_batch) return;
     size_t max_prefetch_size = server.prefetch_batch_max_size;
 
     if (max_prefetch_size == 0) {
         return;
     }
+    main_batch = allocBatch(max_prefetch_size);
+}
 
-    batch = zcalloc(sizeof(PrefetchCommandsBatch));
-    batch->max_prefetch_size = max_prefetch_size;
-    batch->clients = zcalloc(max_prefetch_size * sizeof(client *));
-    batch->key_members = zcalloc(max_prefetch_size * sizeof(robj *));
-    batch->keys = zcalloc(max_prefetch_size * sizeof(void *));
-    batch->keys_tables = zcalloc(max_prefetch_size * sizeof(hashtable *));
-    batch->dbs = zcalloc(max_prefetch_size * sizeof(struct serverDb *));
-    batch->slots = zcalloc(max_prefetch_size * sizeof(int));
-    batch->prefetch_info = zcalloc(max_prefetch_size * sizeof(KeyPrefetchInfo));
+/* Lane thread: a batch of its own, sized by prefetch-batch-max-size; NULL when that is below 2. */
+void *prefetchLaneBatchCreate(void) {
+    size_t n = server.prefetch_batch_max_size;
+    return n > 1 ? allocBatch(n) : NULL;
+}
+
+void prefetchLaneBatchFree(void *b) {
+    if (b) freeBatch(b);
+}
+
+/* Lane thread: the size b was created with, to recreate it when the config changes. */
+int prefetchLaneBatchSize(void *b) {
+    return b ? (int)((PrefetchCommandsBatch *)b)->max_prefetch_size : 0;
+}
+
+/* Lane thread: route this thread's prefetchBatchAddCommand/Run/Reset to b, or back to main's with NULL. */
+void prefetchLaneBatchUse(void *b) {
+    lane_batch = b;
 }
 
 int onMaxBatchSizeChange(const char **err) {
@@ -113,7 +142,7 @@ static void moveToNextKey(void) {
 
 static void markKeyAsdone(KeyPrefetchInfo *info) {
     info->state = PREFETCH_DONE;
-    server.stat_total_prefetch_entries++;
+    if (!lane_batch) server.stat_total_prefetch_entries++;
     batch->keys_done++;
 }
 
@@ -482,13 +511,14 @@ void prefetchBatchRun(void) {
     for (size_t i = 0; i < batch->key_count; i++)
         batch->keys_tables[i] = kvstoreGetHashtable(batch->dbs[i]->keys, batch->slots[i]);
     if (batch->key_count > 1) {
-        server.stat_total_prefetch_batches++;
+        if (!lane_batch) server.stat_total_prefetch_batches++;
         hashtablePrefetch(batch->keys_tables);
     }
 }
 
 void prefetchBatchReset(void) {
     resetCommandsBatch();
+    if (lane_batch) return; /* the lane recreates its batch itself on a size change */
     size_t zmalloc_used = zmalloc_used_memory();
     if (zmalloc_used > server.stat_peak_memory) server.stat_peak_memory = zmalloc_used;
     if (batch->max_prefetch_size != (size_t)server.prefetch_batch_max_size) onMaxBatchSizeChange(NULL);

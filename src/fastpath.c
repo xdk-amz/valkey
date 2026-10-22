@@ -167,6 +167,11 @@ typedef struct __attribute__((aligned(64))) fpLane {
     int *cs_touched;
     int ncs, cs_touched_cap;
     long long dur_cnt, dur_sum, dur_max, executed;
+    /* Write phase: the lane's entries in T order, and its key prefetch batch (its thread's own). */
+    cmdEntry **run;
+    int nrun, run_cap;
+    void *pf;
+    long long prefetches; /* this phase: prefetch batches run */
     /* Latency histograms by command id, kept across phases; main folds them before a reader. */
     struct hdr_histogram **hist;
     struct serverCommand **hist_cmd;
@@ -196,6 +201,7 @@ static mstime_t fp_phase_time = 0;
 static int fp_prop_mode = FP_PROP_OPS;
 /* INFO, main only. */
 static long long fp_stat_lane_phases = 0, fp_stat_lane_entries = 0, fp_stat_barriers = 0, fp_stat_serial_segments = 0;
+static long long fp_stat_lane_prefetches = 0;
 
 #define FP_GROW(arr, n, cap, init)                                   \
     do {                                                             \
@@ -1493,10 +1499,11 @@ void fastpathInfo(sds *info) {
                          "fastpath_write_lane_phases:%lld\r\n"
                          "fastpath_write_lane_entries:%lld\r\n"
                          "fastpath_write_barriers:%lld\r\n"
-                         "fastpath_write_serial_segments:%lld\r\n",
+                         "fastpath_write_serial_segments:%lld\r\n"
+                         "fastpath_write_lane_prefetches:%lld\r\n",
                          fastpath_clients, stagedWorkerCount(), server.keyspace_shard_bits, reads, writes, batches,
                          speculated, in, out, fp_stat_lane_phases, fp_stat_lane_entries, fp_stat_barriers,
-                         fp_stat_serial_segments);
+                         fp_stat_serial_segments, fp_stat_lane_prefetches);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1972,6 +1979,8 @@ void fastpathStagedWriteLane(int tid) {
     fp_cur_lane = L;
     exec_lane = 1;
     if (L->frames) sdsclear(L->frames); /* main fed the previous phase's frames in its merge */
+    /* The lane's entries of this phase, in T order, so their keys can be prefetched ahead of them. */
+    L->nrun = 0;
     for (int p = 0; p < fp_nparts; p++) {
         int t = fp_parts[p].tid;
         uint32_t s = fp_parts[p].seg;
@@ -1981,9 +1990,39 @@ void fastpathStagedWriteLane(int tid) {
             cmdEntry *e = th->lane_ents[lane][*cur];
             if (e->seg > s) break;
             (*cur)++;
-            if (e->seg == s) fpLaneExecute(L, e); /* an earlier segment's entry ran serially on main */
+            if (e->seg != s) continue; /* an earlier segment's entry ran serially on main */
+            FP_GROW(L->run, L->nrun, L->run_cap, 256);
+            L->run[L->nrun++] = e;
         }
     }
+    int use_prefetch = server.io_threads_lane_prefetch && L->nrun > 1;
+    if (use_prefetch && prefetchLaneBatchSize(L->pf) != server.prefetch_batch_max_size) {
+        prefetchLaneBatchFree(L->pf);
+        L->pf = prefetchLaneBatchCreate();
+    }
+    if (!L->pf) use_prefetch = 0;
+    if (use_prefetch) prefetchLaneBatchUse(L->pf);
+    for (int i = 0; i < L->nrun;) {
+        int end = L->nrun;
+        if (use_prefetch) {
+            /* Prefetch the keys of the next entries until the batch is full, then run exactly those. */
+            getKeysResult result;
+            initGetKeysResult(&result);
+            int room = 1;
+            end = i;
+            while (end < L->nrun && room) {
+                cmdEntry *e = L->run[end++];
+                if (e->cmd && !(e->read_flags & READ_FLAGS_BAD_ARITY))
+                    room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
+            }
+            getKeysFreeResult(&result);
+            prefetchBatchRun();
+            prefetchBatchReset();
+            L->prefetches++;
+        }
+        for (; i < end; i++) fpLaneExecute(L, L->run[i]);
+    }
+    if (use_prefetch) prefetchLaneBatchUse(NULL);
     exec_lane = 0;
     fp_cur_lane = NULL;
     ectx = saved;
@@ -2048,6 +2087,8 @@ static void fpFoldLaneStats(int nlanes, int from_primary) {
         L->ncloses = 0;
         fp_stat_lane_entries += L->executed;
         L->executed = 0;
+        fp_stat_lane_prefetches += L->prefetches;
+        L->prefetches = 0;
         if (L->ec) {
             L->ec->origin = NULL;
             clientSetUser(L->ec, DefaultUser, 0); /* never keep a principal that may retire */

@@ -19,4 +19,10 @@ int prefetchBatchAddCommand(struct serverCommand *cmd, struct serverObject **arg
 void prefetchBatchRun(void);
 void prefetchBatchReset(void);
 
+/* Write lanes: a batch per lane thread for the command-level calls above. */
+void *prefetchLaneBatchCreate(void);
+void prefetchLaneBatchFree(void *b);
+int prefetchLaneBatchSize(void *b);
+void prefetchLaneBatchUse(void *b);
+
 #endif /* MEMORY_PREFETCH_H */

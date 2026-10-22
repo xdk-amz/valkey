@@ -440,6 +440,35 @@ start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 
         r config set io-threads-parallel-writes yes
     }
 
+    test {Write lanes: a lane prefetches its commands' keys, and replies match without it} {
+        r del pwl:pfs pwl:pfh pwl:pfz
+        r sadd pwl:pfs a b c
+        r hset pwl:pfh f v
+        r zadd pwl:pfz 1 m
+        set expect {}
+        set buf ""
+        for {set i 0} {$i < 100} {incr i} {
+            append buf [pwl_resp set pwl:pf$i v$i]
+            append buf [pwl_resp get pwl:pf$i]
+            append buf [pwl_resp sismember pwl:pfs b]
+            append buf [pwl_resp hget pwl:pfh f]
+            append buf [pwl_resp zscore pwl:pfz m]
+            lappend expect {+OK} v$i {:1} v 1
+        }
+        foreach pf {yes no} {
+            r config set io-threads-lane-prefetch $pf
+            set before [getInfoProperty [r info fastpath] fastpath_write_lane_prefetches]
+            set fd [pwl_fast_socket r $host $port]
+            puts -nonewline $fd $buf
+            flush $fd
+            assert_equal $expect [pwl_read_replies $fd 500]
+            close $fd
+            set after [getInfoProperty [r info fastpath] fastpath_write_lane_prefetches]
+            if {$pf eq "yes"} { assert_morethan $after $before } else { assert_equal $before $after }
+        }
+        r config set io-threads-lane-prefetch yes
+    }
+
     test {Write lanes: replies stream only while the write phase runs on main} {
         r config set staged-reply-overlap exec
         set lanes [getInfoProperty [r info fastpath] fastpath_write_lane_phases]
