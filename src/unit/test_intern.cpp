@@ -1,0 +1,108 @@
+/*
+ * Copyright (c) Valkey Contributors
+ * All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+#include "generated_wrappers.hpp"
+
+#include <climits>
+#include <cstdint>
+#include <cstring>
+
+extern "C" {
+#include "server.h"
+#include "intern.h"
+}
+
+/* Mirror of the private internHdr prefix in intern.c. The header sits
+ * immediately before the sds header, so a shared sds is reached as
+ * [ internHdr ][ sdshdrN ][ bytes ]. The test reconstructs the prefix address
+ * from the public sds helpers to read and poke the refcount without touching
+ * production code. */
+typedef struct testInternHdr {
+    uint32_t refcount;
+    uint32_t size : 24;
+    uint32_t where : 8;
+} testInternHdr;
+
+static testInternHdr *testHdrOf(const_sds s) {
+    char *p = (char *)s - sdsHdrSize(sdsType(s)) - sizeof(testInternHdr);
+    return (testInternHdr *)p;
+}
+
+class InternTest : public ::testing::Test {
+  protected:
+    void SetUp() override {
+        /* internInit() is idempotent for the fields the tests read: it rebuilds
+         * the index and probation tables and installs the release hook. */
+        internInit();
+    }
+
+    /* Produces an indexed shared string equal to `val` with refcount 2.
+     * The first admission makes a probation singleton; the second promotes it
+     * to the index and takes a reference, so the result is shared. */
+    sds makeShared(const char *val) {
+        size_t len = strlen(val);
+        sds a = sdsnewlen(val, len);
+        a = internAdmitSlow(a);
+        sds b = sdsnewlen(val, len);
+        b = internAdmitSlow(b);
+        EXPECT_TRUE(sdsIsShared(b));
+        sdsfree(a);
+        return b;
+    }
+};
+
+/* A string already at INTERN_REFS_MAX references is not shared further: a new
+ * holder gets a private copy and the capped count does not move. */
+TEST_F(InternTest, RefcountCapHandsBackPrivateCopy) {
+    const char *val = "intern-refcount-cap-boundary-value";
+    sds shared = makeShared(val);
+    ASSERT_TRUE(sdsIsShared(shared));
+
+    testInternHdr *h = testHdrOf(shared);
+    uint32_t capped = UINT32_MAX - 1; /* INTERN_REFS_MAX */
+    h->refcount = capped;
+
+    /* internDupSds() of a capped shared string must not take another reference;
+     * it returns an unshared private copy instead. */
+    sds dup = internDupSds(shared);
+    EXPECT_NE(dup, shared);
+    EXPECT_FALSE(sdsIsShared(dup));
+    EXPECT_EQ(h->refcount, capped);
+    EXPECT_EQ(internSharedRefcount(shared), capped);
+    sdsfree(dup);
+
+    /* A fresh admission of the same bytes must also decline to share with the
+     * capped string and hand back its own copy. */
+    sds fresh = sdsnewlen(val, strlen(val));
+    sds out = internAdmitSlow(fresh);
+    EXPECT_FALSE(sdsIsShared(out));
+    EXPECT_EQ(h->refcount, capped);
+    sdsfree(out);
+
+    /* Restore a releasable count before freeing. */
+    h->refcount = 1;
+    sdsfree(shared);
+}
+
+/* A fork child owns a copy-on-write image whose keys other dumped keys may
+ * still reference, so it must never release a shared string. */
+TEST_F(InternTest, ForkChildReleaseAborts) {
+    sds shared = makeShared("intern-fork-child-release-guard-value");
+    ASSERT_TRUE(sdsIsShared(shared));
+
+    int saved = server.in_fork_child;
+    server.in_fork_child = 1;
+    /* The release hook asserts it is not in a fork child; freeing a shared
+     * string there aborts. */
+    ASSERT_DEATH(sdsfree(shared), "");
+    server.in_fork_child = saved;
+
+    /* The death test runs the free in a forked subprocess, so the string is
+     * still live here; release it normally. */
+    testInternHdr *h = testHdrOf(shared);
+    h->refcount = 1;
+    sdsfree(shared);
+}
