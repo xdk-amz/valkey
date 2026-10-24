@@ -9,6 +9,7 @@ int clusterSlotStatsEnabled(int slot);
 
 /* cpu-usec metric. */
 void clusterSlotStatsAddCpuDuration(client *c, ustime_t duration);
+void clusterSlotStatsAddCpuDurationForSlot(int slot, ustime_t duration);
 
 /* network-bytes-in metric. */
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c);

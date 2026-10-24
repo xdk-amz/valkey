@@ -58,3 +58,31 @@ start_cluster 1 1 {tags {external:skip cluster repl staged-loop} overrides {io-t
         assert_equal -1 [$replica ttl "{t1}b"]
     }
 }
+
+# With per-slot stats on, the replica's deferred apply path reaches commandProcessed() with c->cmd
+# NULL (processCommand never ran). The slot-stats hook must tolerate that and still account the bytes.
+start_cluster 1 1 {tags {external:skip cluster repl staged-loop} overrides {io-threads 4 cluster-slot-stats-enabled yes}} {
+    set primary [srv 0 client]
+    set replica [srv -1 client]
+    $replica config set notify-keyspace-events ""
+
+    test {Cluster replica parallel apply: survives replicated SETs with cluster-slot-stats-enabled} {
+        wait_for_cluster_state ok
+        wait_for_ofs_sync $primary $replica
+        set before [rpac_parallel_applied -1]
+        set rd [valkey_deferring_client 0]
+        for {set i 0} {$i < 2000} {incr i} {
+            $rd set key:$i v$i
+        }
+        for {set i 0} {$i < 2000} {incr i} { $rd read }
+        $rd close
+        rpac_in_sync $primary $replica
+        assert_morethan [expr {[rpac_parallel_applied -1] - $before}] 0
+        # The primary accounts the user's bytes; the replica stays up and identical.
+        set slot [$primary cluster keyslot key:1]
+        set stats [lindex [lindex [$primary cluster slot-stats slotsrange $slot $slot] 0] 1]
+        assert_morethan [dict get $stats network-bytes-in] 0
+        $replica readonly
+        assert_equal v1 [$replica get key:1]
+    }
+}

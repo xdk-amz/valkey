@@ -228,6 +228,14 @@ void clusterSlotStatsAddCpuDuration(client *c, ustime_t duration) {
     server.cluster->slot_stats[c->slot].cpu_usec += duration;
 }
 
+/* For work done outside a client command, such as a replicated write applied on a lane. The caller
+ * guarantees that no other thread accounts to the same slot concurrently. */
+void clusterSlotStatsAddCpuDurationForSlot(int slot, ustime_t duration) {
+    if (!clusterSlotStatsEnabled(slot)) return;
+    serverAssert(slot >= 0 && slot < CLUSTER_SLOTS);
+    server.cluster->slot_stats[slot].cpu_usec += duration;
+}
+
 static int canAddNetworkBytesIn(client *c) {
     /* First, cluster mode must be enabled.
      * Second, command should target a specific slot.
@@ -246,7 +254,8 @@ static int canAddNetworkBytesIn(client *c) {
 void clusterSlotStatsAddNetworkBytesInForUserClient(client *c) {
     if (!canAddNetworkBytesIn(c)) return;
 
-    if (c->cmd->proc == execCommand) {
+    /* c->cmd is NULL for a replicated command deferred to an apply lane: the bytes still count. */
+    if (c->cmd && c->cmd->proc == execCommand) {
         /* Accumulate its corresponding MULTI RESP; *1\r\n$5\r\nmulti\r\n */
         c->net_input_bytes_curr_cmd += 15;
     }
