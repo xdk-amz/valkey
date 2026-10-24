@@ -77,6 +77,7 @@ typedef struct cmdBatch {
 } cmdBatch;
 
 int fastpathEligible(client *c);
+int fastpathDeferredByGate(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);
 int fastpathExecutorOutputLimitReached(client *ec);

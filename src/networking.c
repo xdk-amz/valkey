@@ -1973,8 +1973,10 @@ void clientAcceptHandler(connection *conn) {
 
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
         connSetReadHandler(conn, NULL);
-    } else if (!c->flag.close_asap && tryPartitionClient(c) == C_OK) {
-        connSetReadHandler(conn, NULL);
+    } else if (!c->flag.close_asap) {
+        /* Turned away by a transient server-wide gate only: it joins the fast path once the gate lifts. */
+        if (fastpathDeferredByGate(c)) c->flag.fp_readmit = 1;
+        if (tryPartitionClient(c) == C_OK) connSetReadHandler(conn, NULL);
     }
 }
 

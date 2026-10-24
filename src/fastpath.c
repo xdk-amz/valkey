@@ -361,17 +361,25 @@ void fastpathFreeThread(int tid) {
     while (fp_slots > 0 && !fp_threads[fp_slots - 1].ready) fp_slots--;
 }
 
+/* Server-wide conditions that keep every client off the fast path for a while and then lift again:
+ * a client pause, a forkless save, a replication throttler. None of them is about the client, so a
+ * client turned away by one of these keeps fp_readmit and rejoins once the gate lifts. */
+static int fpGlobalGate(void) {
+    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 1; /* paused clients are postponed on main */
+    if (bgIteration_iterationActive()) return 1;                                        /* a forkless save may block commands on keys in use */
+    if (throttle_anyThrottlers()) return 1;                                             /* a throttler may hold a command; main runs the check */
+    return 0;
+}
+
 /* Admitted clients carry only the session state a command entry can hold: user, db and RESP. */
-static int fpSessionEligible(client *c) {
+static int fpSessionEligibleEx(client *c, int ignore_gate) {
     if (!server.io_threads_fast_path || !fpStaged()) return 0; /* the staged loop is the only fast-path mode */
     if (!server.io_threads_strict_offload || ProcessingEventsWhileBlocked || server.io_threads_num < 2) return 0;
     if (!c->conn || c->flag.fake) return 0;
     if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
     if (authRequired(c)) return 0;                                                      /* main enforces a later default-user password change per entry */
     if (c->flag.asking) return 0;                                                       /* ASKING applies to the next command only, which main runs */
-    if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
-    if (bgIteration_iterationActive()) return 0;                                        /* a forkless save may block commands on keys in use */
-    if (throttle_anyThrottlers()) return 0;                                             /* a throttler may hold a command; main runs the check */
+    if (!ignore_gate && fpGlobalGate()) return 0;
     if (c->flag.replica || c->flag.primary || c->flag.monitor || c->slot_migration_job) return 0;
     if (c->flag.repl_rdb_channel || c->repl_data) return 0; /* a connection on its way to becoming a replica */
     if (c->flag.blocked || c->flag.unblocked || c->flag.protected || c->flag.lua_debug) return 0;
@@ -383,8 +391,18 @@ static int fpSessionEligible(client *c) {
     return 1;
 }
 
+static int fpSessionEligible(client *c) {
+    return fpSessionEligibleEx(c, 0);
+}
+
 int fastpathEligible(client *c) {
     return fpSessionEligible(c) && !c->flag.pending_read && !c->flag.partitioned;
+}
+
+/* True when the only thing keeping an otherwise eligible client off the fast path is a transient
+ * server-wide gate. The caller marks it fp_readmit so it joins when the gate lifts. */
+int fastpathDeferredByGate(client *c) {
+    return fpGlobalGate() && fpSessionEligibleEx(c, 1);
 }
 
 /* Both addresses are fixed for the life of the connection; a transport they cannot represent is not admitted. */
@@ -1409,6 +1427,10 @@ int fastpathReadmitAuthenticated(client *c) {
     }
     if (!fp_staged_admit) return 0; /* admission needs staged mode; the flag is kept until it starts */
     if (!fpQuiescent(c) || (c->flag.partitioned && c->flag.pending_read)) return 0;
+    /* A server-wide gate (pause, forkless save, throttler) is not this client's doing: keep the flag so
+     * beforeNextClient retries after its next command, and it rejoins once the gate lifts. Only a
+     * reason of its own (pubsub, MULTI, name, capa, ...) ends the retries. */
+    if (fpGlobalGate()) return 0;
     c->flag.fp_readmit = 0;
     if (!fpSessionEligible(c)) return 0;
     int was_partitioned = c->flag.partitioned;

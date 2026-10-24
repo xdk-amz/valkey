@@ -1321,7 +1321,7 @@ typedef struct ClientFlags {
     uint64_t fastpath : 1;                 /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
     uint64_t executor : 1;                 /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
     uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
-    uint64_t fp_readmit : 1;               /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
+    uint64_t fp_readmit : 1;               /* Authenticated on main, handed back when staged mode stopped, or turned away by a transient server-wide gate; joins the fast path once main has nothing further to do for it and the gate has lifted. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
