@@ -199,3 +199,133 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         assert_equal {v0 v1 {}} [r mget mg:0 mg:1 mg:none]
     }
 }
+
+# Keys answered on the reading thread are touched as main touches them: LRU idle time and LFU frequency
+# follow the reads, so eviction keeps a key that is only ever read there. Hot-key detection on sends
+# reads to main, which counts them.
+proc fastget_fill {prefix n} {
+    set val [string repeat c 1000]
+    for {set i 0} {$i < $n} {incr i} { r set $prefix:$i $val }
+}
+
+# Write new keys until at least min_evicted keys are evicted; returns the count.
+proc fastget_evict {min_evicted} {
+    set val [string repeat n 1000]
+    set base [s evicted_keys]
+    for {set i 0} {$i < 20000} {incr i} {
+        r set new:$i $val
+        if {$i % 100 == 99 && [s evicted_keys] - $base >= $min_evicted} break
+    }
+    return [expr {[s evicted_keys] - $base}]
+}
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} maxmemory-policy allkeys-lfu lfu-log-factor 0 lfu-decay-time 0}} {
+    r select 0
+    r config set io-threads-speculate-reads yes
+
+    test {LFU: GET, SISMEMBER, HGET and MGET on the reading thread raise the key's frequency} {
+        r set lfu:hot v
+        r set lfu:cold v
+        r sadd lfu:set a b
+        r hset lfu:hash f v
+        r set lfu:m1 v
+        r set lfu:m2 v
+        r set lfu:warm v
+        set rd [fastget_client]
+        ensure_engaged r $rd lfu:warm
+        set before [fastget_speculated r]
+        foreach cmd {{get lfu:hot} {sismember lfu:set a} {hget lfu:hash f} {mget lfu:m1 lfu:m2}} {
+            for {set round 0} {$round < 10} {incr round} {
+                for {set i 0} {$i < 20} {incr i} { $rd {*}$cmd }
+                for {set i 0} {$i < 20} {incr i} { $rd read }
+            }
+        }
+        $rd close
+        # Every command of the reads above ran on the reading thread.
+        assert_equal 800 [expr {[fastget_speculated r] - $before}]
+        # lfu-log-factor 0: each touch adds one, from the initial 5.
+        foreach key {lfu:hot lfu:set lfu:hash lfu:m1 lfu:m2} { assert_equal 205 [r object freq $key] }
+        assert_equal 5 [r object freq lfu:cold]
+    }
+
+    test {LFU: a key read only on the reading thread survives allkeys-lfu eviction} {
+        fastget_fill lfuc 2000
+        r config set maxmemory [expr {[s used_memory] + 100000}]
+        set evicted [fastget_evict 1000]
+        r config set maxmemory 0
+        assert_range $evicted 1000 1999
+        assert_equal 1 [r exists lfu:hot]
+        assert_equal 1 [r exists lfu:set]
+        assert_equal 1 [r exists lfu:hash]
+    }
+
+    test {CLIENT NO-TOUCH reads leave the frequency alone} {
+        r set lfu:nt v
+        set rd [fastget_client]
+        $rd client no-touch on
+        $rd read
+        for {set i 0} {$i < 50} {incr i} { $rd get lfu:nt }
+        for {set i 0} {$i < 50} {incr i} { $rd read }
+        $rd close
+        assert_equal 5 [r object freq lfu:nt]
+    }
+}
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {} maxmemory-policy allkeys-lru}} {
+    r select 0
+    r config set io-threads-speculate-reads yes
+
+    test {LRU: reads on the reading thread reset idle time, and the key survives allkeys-lru eviction} {
+        r set lru:hot v
+        r sadd lru:set a
+        fastget_fill lruc 2000
+        r set lru:warm v
+        set rd [fastget_client]
+        ensure_engaged r $rd lru:warm
+        after 2100
+        set before [fastget_speculated r]
+        foreach cmd {{get lru:hot} {sismember lru:set a}} {
+            for {set i 0} {$i < 50} {incr i} { $rd {*}$cmd }
+            for {set i 0} {$i < 50} {incr i} { $rd read }
+        }
+        $rd close
+        assert_equal 100 [expr {[fastget_speculated r] - $before}]
+        assert_range [r object idletime lru:hot] 0 1
+        assert_range [r object idletime lru:set] 0 1
+        assert {[r object idletime lruc:0] >= 2}
+        r config set maxmemory [expr {[s used_memory] + 100000}]
+        set evicted [fastget_evict 1000]
+        r config set maxmemory 0
+        assert_range $evicted 1000 1999
+        assert_equal 1 [r exists lru:hot]
+        assert_equal 1 [r exists lru:set]
+    }
+}
+
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    test {With hot-key detection on, reads go to main and the hot key is reported} {
+        r config set hotkeys-top-k 16
+        r config set hotkeys-sampling-percentage 100
+        r config set hotkeys-window-seconds 1
+        r hotkeys reset
+        r set hk:hot v
+        set rd [fastget_client]
+        set before [fastget_speculated r]
+        for {set round 0} {$round < 10} {incr round} {
+            for {set i 0} {$i < 30} {incr i} { $rd get hk:hot }
+            for {set i 0} {$i < 30} {incr i} { assert_equal v [$rd read] }
+        }
+        assert_equal $before [fastget_speculated r]
+        wait_for_condition 50 100 {
+            [string match {*hk:hot*} [r hotkeys get]]
+        } else {
+            fail "hk:hot was not reported by HOTKEYS GET"
+        }
+        # Detection off: the same client's reads run on the reading thread again.
+        r config set hotkeys-top-k 0
+        ensure_engaged r $rd hk:hot
+        $rd close
+    }
+}

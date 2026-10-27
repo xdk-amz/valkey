@@ -11,6 +11,7 @@
 #include "io_threads.h"
 #include "module.h"
 #include "cluster.h"
+#include "hotkeys.h"
 
 #include <string.h>
 #include <stdatomic.h>
@@ -194,6 +195,57 @@ static int fastGetWriteRaw(client *c, const char *s, size_t len) {
     return 1;
 }
 
+/* --- LRU/LFU touch ---
+ * A key answered here is touched as lookupKey touches it on main. Other IO threads may touch the same
+ * object in the same read phase, so the reader swaps the 32-bit word holding type, encoding and the
+ * LRU/LFU field only if the word is still what it read: a lost race drops one touch, never undoes
+ * another. Main changes objects only outside the read phase. */
+
+/* type, encoding and lru fill exactly the object's first 32 bits. Constant-folded. */
+static inline int fastGetTouchWordOk(void) {
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.type = 15;
+    probe.encoding = 15;
+    probe.lru = (1u << LRULFU_BITS) - 1;
+    uint32_t word;
+    memcpy(&word, &probe, sizeof(word));
+    if (word != UINT32_MAX) return 0;
+    const unsigned char *rest = (const unsigned char *)&probe + sizeof(word);
+    for (size_t i = 0; i < sizeof(probe) - sizeof(word); i++)
+        if (rest[i]) return 0;
+    return 1;
+}
+
+/* xorshift64*, one generator per thread: the LFU increment's rand() is not meant for IO threads. */
+static _Thread_local uint64_t fastget_touch_rng = 0;
+
+static double fastGetTouchRandom(void) {
+    uint64_t x = fastget_touch_rng;
+    if (x == 0) x = ((uint64_t)(uintptr_t)&fastget_touch_rng ^ (uint64_t)getMonotonicUs()) | 1;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    fastget_touch_rng = x;
+    return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
+}
+
+/* Touch a key answered on this thread, honoring CLIENT NO-TOUCH and a running child (copy on write). */
+static void fastGetTouch(client *c, robj *o) {
+    if (!fastGetTouchWordOk() || c->flag.no_touch || hasActiveChildProcess()) return;
+    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+    robj probe;
+    memset(&probe, 0, sizeof(probe));
+    memcpy(&probe, &seen, sizeof(seen));
+    uint32_t lru = lrulfu_touchWithRandom(probe.lru, fastGetTouchRandom());
+    if (lru == probe.lru) return;
+    probe.lru = lru;
+    uint32_t touched;
+    memcpy(&touched, &probe, sizeof(touched));
+    __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
 /* A string argument as sds, or NULL when it is not one. */
 static inline sds fastGetArgSds(robj *o) {
     return o && sdsEncodedObject(o) ? (sds)objectGetVal(o) : NULL;
@@ -207,7 +259,9 @@ static int fastGetReplySismember(client *c, robj *o, robj *arg) {
     if (!member) return 0;
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && hashtableIsRehashing(objectGetVal(o))) return 0;
     int is = setTypeIsMemberAux(o, member, sdslen(member), 0, 1);
-    return fastGetWriteRaw(c, is ? ":1\r\n" : ":0\r\n", 4);
+    if (!fastGetWriteRaw(c, is ? ":1\r\n" : ":0\r\n", 4)) return 0;
+    fastGetTouch(c, o);
+    return 1;
 }
 
 /* HGET key field. A hash with fields that expire goes to main, which may reap them; so does a hash
@@ -221,8 +275,11 @@ static int fastGetReplyHget(client *c, robj *o, robj *arg) {
     unsigned char *vstr = NULL;
     unsigned int vlen = 0;
     long long vll = 0;
-    if (hashTypeGetValue(o, field, &vstr, &vlen, &vll, NULL) != C_OK)
-        return c->resp == 2 ? fastGetWriteRaw(c, "$-1\r\n", 5) : fastGetWriteRaw(c, "_\r\n", 3);
+    if (hashTypeGetValue(o, field, &vstr, &vlen, &vll, NULL) != C_OK) {
+        if (!(c->resp == 2 ? fastGetWriteRaw(c, "$-1\r\n", 5) : fastGetWriteRaw(c, "_\r\n", 3))) return 0;
+        fastGetTouch(c, o);
+        return 1;
+    }
     char intbuf[LONG_STR_SIZE];
     if (!vstr) {
         vlen = ll2string(intbuf, sizeof(intbuf), vll);
@@ -231,7 +288,9 @@ static int fastGetReplyHget(client *c, robj *o, robj *arg) {
     if (vlen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) return 0;
     long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     if (reply_threshold >= 0 && (long long)(1 + digits10(vlen) + 2 + vlen + 2) >= reply_threshold) return 0;
-    return fastGetWriteBulkReply(c, (const char *)vstr, vlen) > 0;
+    if (fastGetWriteBulkReply(c, (const char *)vstr, vlen) <= 0) return 0;
+    fastGetTouch(c, o);
+    return 1;
 }
 
 /* Reply to one prefetched command from the keyspace. Returns 1 on success (reply
@@ -295,6 +354,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
     if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
+    fastGetTouch(c, o);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     FASTGET_STAT_ADD(speculative_hits, 1);
 #endif
@@ -341,12 +401,14 @@ static int fastGetAnswerMget(client *c, robj **argv, int argc, size_t input_byte
     char intbuf[FASTGET_MGET_MAX_KEYS][LONG_STR_SIZE];
     const char *val[FASTGET_MGET_MAX_KEYS];
     size_t vallen[FASTGET_MGET_MAX_KEYS];
+    robj *obj[FASTGET_MGET_MAX_KEYS];
     size_t total = 1 + 20 + 2;
     for (int i = 0; i < n; i++) {
         void *entry = NULL;
         /* A miss goes to main, which fires the keymiss notification and counts the miss. */
         if (!hashtableIncrementalFindGetResult(&fs[i], &entry)) return 0;
         if (!fastGetStringValue(entry, intbuf[i], &val[i], &vallen[i])) return 0;
+        obj[i] = entry;
         total += 1 + 20 + 2 + vallen[i] + 2;
     }
     long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
@@ -359,6 +421,7 @@ static int fastGetAnswerMget(client *c, robj **argv, int argc, size_t input_byte
     hdr[len + 2] = '\n';
     fastGetWriteRaw(c, hdr, len + 3);
     for (int i = 0; i < n; i++) fastGetWriteBulkReply(c, val[i], vallen[i]);
+    for (int i = 0; i < n; i++) fastGetTouch(c, obj[i]);
     return 1;
 }
 
@@ -424,6 +487,10 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
     /* An attached monitor (see fastGetOnMonitorsChanged). */
     if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
+
+    /* Hot-key detection counts lookups on main. hotkeys-top-k changes only on main, outside the read
+     * phase. */
+    if (hotkeysEnabled()) return 0;
 
     /* Only a read that starts with a GET, or a SISMEMBER or HGET with io-threads-speculate-reads, is
      * answered here. */
