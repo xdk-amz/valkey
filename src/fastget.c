@@ -31,39 +31,50 @@ uint64_t fastGetStatsSum(size_t field_offset) {
 }
 #endif
 
-/* Main only. GETs answered on IO threads skip processCommand, so they skip the NOAUTH and ACL checks;
- * this byte stands in for both. It is recomputed at every auth change (clientSetUser), on SELECT
- * (per-db ACLs) and when ACL rules change (fastGetOnAclRulesChanged).
+/* The command of each kind, resolved on first use. */
+static struct serverCommand *fastGetKindCmd(int kind) {
+    static struct serverCommand *cmds[FASTGET_KINDS];
+    static const char *names[FASTGET_KINDS] = {"get", "sismember", "hget"};
+    if (!cmds[kind]) cmds[kind] = lookupCommandByCString(names[kind]);
+    return cmds[kind];
+}
+
+static const int fastget_kind_argc[FASTGET_KINDS] = {2, 3, 3};
+
+/* Main only. Commands answered on IO threads skip processCommand, so they skip the NOAUTH and ACL checks;
+ * this byte stands in for both, one bit per kind. It is recomputed at every auth change (clientSetUser),
+ * on SELECT (per-db ACLs) and when ACL rules change (fastGetOnAclRulesChanged).
  *
- * A client qualifies when it is authenticated and some selector allows GET on every key (~*, %R~* or
- * allkeys). Users with key patterns go to main, since matching patterns on IO threads would race main
- * changing the user. flag.authenticated is used rather than authRequired(), which reads DefaultUser's
- * flags; those can change with no per-client event, and the flag can only make a client go to main,
- * never let it skip a check. */
+ * A kind's bit is set when the client is authenticated and some selector allows its command on every key
+ * (~*, %R~* or allkeys). Users with key patterns go to main, since matching patterns on IO threads would
+ * race main changing the user. flag.authenticated is used rather than authRequired(), which reads
+ * DefaultUser's flags; those can change with no per-client event, and the flag can only make a client go
+ * to main, never let it skip a check. */
 void fastGetRecomputeSpecAclOk(client *c) {
     uint8_t ok = 0;
     /* ACL LOAD retires the user a fast-path client still points at; its successor holds the rules. */
     user *u = c->user && (c->user->flags & USER_FLAG_RETIRED) ? ACLResolveUser(c->user) : c->user;
     if (c->flag.authenticated && (u || !c->user)) {
-        if (u == NULL) {
-            /* No associated user = unrestricted context (stock semantics). */
-            ok = 1;
-        } else {
-            static struct serverCommand *get_cmd = NULL;
-            if (!get_cmd) get_cmd = lookupCommandByCString("get");
-            if (!get_cmd) goto done; /* sentinel has no GET */
+        for (int k = 0; k < FASTGET_KINDS; k++) {
+            struct serverCommand *cmd = fastGetKindCmd(k);
+            if (!cmd) continue; /* sentinel has none of them */
+            if (u == NULL) {
+                /* No associated user = unrestricted context (stock semantics). */
+                ok |= 1 << k;
+                continue;
+            }
             /* The check needs only the command and db; key access is decided by the unrestricted-key
-             * requirement, so the placeholder key can only make the result stricter. */
-            robj *argv[2];
-            argv[0] = createStringObject("get", 3);
+             * requirement, so the placeholder arguments can only make the result stricter. */
+            robj *argv[3];
+            argv[0] = createStringObject(cmd->fullname, strlen(cmd->fullname));
             argv[1] = createStringObject("k", 1);
+            argv[2] = createStringObject("f", 1);
             int dbid = c->db ? c->db->id : 0;
-            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, get_cmd, argv, 2, dbid, CMD_KEY_ACCESS)) ok = 1;
-            decrRefCount(argv[0]);
-            decrRefCount(argv[1]);
+            if (ACLUserCheckCmdWithUnrestrictedKeyAccess(u, cmd, argv, fastget_kind_argc[k], dbid, CMD_KEY_ACCESS))
+                ok |= 1 << k;
+            for (int j = 0; j < 3; j++) decrRefCount(argv[j]);
         }
     }
-done:
     atomic_store_explicit(&c->spec_acl_ok, ok, memory_order_release);
 }
 
@@ -124,6 +135,7 @@ typedef struct fastGetBatchEntry {
     hashtableIncrementalFindState find_state; /* Incremental find state */
     int is_first_cmd;                         /* 1 if this is c->argv, 0 if queue */
     int queue_idx;                            /* Index in cmd_queue (if !is_first_cmd) */
+    robj *arg;                                /* SISMEMBER's member or HGET's field */
 } fastGetBatchEntry;
 
 /* IO thread, read phase: this node serves a GET on the slot for client c with no redirect or cluster
@@ -167,11 +179,60 @@ static long long fastGetCommandlogThreshold(int type) {
     return server.commandlog[type].threshold;
 }
 
-/* Reply to one prefetched GET from the keyspace. Returns 1 on success (reply
+/* Write a short fixed reply into the client's buffer. Returns 0 if it does not fit. */
+static int fastGetWriteRaw(client *c, const char *s, size_t len) {
+    if (len > c->buf_usable_size - c->bufpos) return 0;
+    memcpy(c->buf + c->bufpos, s, len);
+    c->bufpos += len;
+    if (c->buf_peak < c->bufpos) c->buf_peak = c->bufpos;
+    return 1;
+}
+
+/* A string argument as sds, or NULL when it is not one. */
+static inline sds fastGetArgSds(robj *o) {
+    return o && sdsEncodedObject(o) ? (sds)objectGetVal(o) : NULL;
+}
+
+/* SISMEMBER key member on a set nobody writes in the read phase. A set table mid-rehash goes to main,
+ * since a lookup there takes a rehash step. */
+static int fastGetReplySismember(client *c, robj *o, robj *arg) {
+    if (objectGetType(o) != OBJ_SET) return 0;
+    sds member = fastGetArgSds(arg);
+    if (!member) return 0;
+    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && hashtableIsRehashing(objectGetVal(o))) return 0;
+    int is = setTypeIsMemberAux(o, member, sdslen(member), 0, 1);
+    return fastGetWriteRaw(c, is ? ":1\r\n" : ":0\r\n", 4);
+}
+
+/* HGET key field. A hash with fields that expire goes to main, which may reap them; so does a hash
+ * table mid-rehash. */
+static int fastGetReplyHget(client *c, robj *o, robj *arg) {
+    if (objectGetType(o) != OBJ_HASH) return 0;
+    sds field = fastGetArgSds(arg);
+    if (!field) return 0;
+    if (hashTypeHasVolatileFields(o)) return 0;
+    if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && hashtableIsRehashing(objectGetVal(o))) return 0;
+    unsigned char *vstr = NULL;
+    unsigned int vlen = 0;
+    long long vll = 0;
+    if (hashTypeGetValue(o, field, &vstr, &vlen, &vll, NULL) != C_OK)
+        return c->resp == 2 ? fastGetWriteRaw(c, "$-1\r\n", 5) : fastGetWriteRaw(c, "_\r\n", 3);
+    char intbuf[LONG_STR_SIZE];
+    if (!vstr) {
+        vlen = ll2string(intbuf, sizeof(intbuf), vll);
+        vstr = (unsigned char *)intbuf;
+    }
+    if (vlen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) return 0;
+    long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)(1 + digits10(vlen) + 2 + vlen + 2) >= reply_threshold) return 0;
+    return fastGetWriteBulkReply(c, (const char *)vstr, vlen) > 0;
+}
+
+/* Reply to one prefetched command from the keyspace. Returns 1 on success (reply
  * written), 0 on punt. The keyspace is quiescent while IO threads read: main
  * mutates it only outside the read phase. */
-static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
-    /* A GET the large-request commandlog would record goes to main, which records it. */
+static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
+    /* A command the large-request commandlog would record goes to main, which records it. */
     long long request_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
     if (request_threshold >= 0) {
         size_t in = e->is_first_cmd ? c->net_input_bytes_curr_cmd : c->cmd_queue.cmds[e->queue_idx].input_bytes;
@@ -187,7 +248,6 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
     }
 
     robj *o = (robj *)entry;
-    if (objectGetType(o) != OBJ_STRING) return 0;
 
     /* Expired keys punt: only main may lazily delete them. */
     if (o->hasexpire) {
@@ -199,6 +259,10 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e) {
             return 0;
         }
     }
+
+    if (kind == FASTGET_KIND_SISMEMBER) return fastGetReplySismember(c, o, e->arg);
+    if (kind == FASTGET_KIND_HGET) return fastGetReplyHget(c, o, e->arg);
+    if (objectGetType(o) != OBJ_STRING) return 0;
 
     char intbuf[LONG_STR_SIZE];
     const char *val;
@@ -270,38 +334,47 @@ int fastGetSpeculateBatch(client *c, int tid) {
     /* An attached monitor (see fastGetOnMonitorsChanged). */
     if (atomic_load_explicit(&fastget_monitor_gate, memory_order_acquire)) return 0;
 
-    /* Only a read that starts with a GET is answered here. */
-    static struct serverCommand *fastget_get_cmd = NULL;
-    if (!fastget_get_cmd) fastget_get_cmd = lookupCommandByCString("get");
-    if (c->argc != 2 || c->parsed_cmd != fastget_get_cmd) return 0;
+    /* Only a read that starts with a GET, or a SISMEMBER or HGET with io-threads-speculate-reads, is
+     * answered here. */
+    int kind = -1;
+    for (int k = 0; k < FASTGET_KINDS; k++) {
+        if (c->parsed_cmd == fastGetKindCmd(k)) {
+            kind = k;
+            break;
+        }
+    }
+    if (kind < 0 || c->argc != fastget_kind_argc[kind]) return 0;
+    if (kind != FASTGET_KIND_GET && !server.io_threads_speculate_reads) return 0;
+    struct serverCommand *kind_cmd = c->parsed_cmd;
+    int kind_argc = fastget_kind_argc[kind];
 
-    /* Answer the read here only when every complete command in it is a GET. A prefix of GETs answered
-     * here while the rest waits for main splits one pipeline's replies into two writes; the client
-     * then refills its pipeline in pieces, the next reads are smaller, and under load the server
+    /* Answer the read here only when every complete command in it is of the same kind. A prefix
+     * answered here while the rest waits for main splits one pipeline's replies into two writes; the
+     * client then refills its pipeline in pieces, the next reads are smaller, and under load the server
      * settles into serving fragments of a couple of commands per read. */
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
-        if (p->cmd != fastget_get_cmd || p->argc != 2) return 0;
+        if (p->cmd != kind_cmd || p->argc != kind_argc) return 0;
     }
 
-    /* In cluster mode only a GET this node answers without a redirect: the same check main runs, on
+    /* In cluster mode only a command this node answers without a redirect: the same check main runs, on
      * cluster state main changes only outside the read phase. A slot being migrated or imported needs
-     * key-by-key checks and a possible ASK or TRYAGAIN, so its GETs go to main. With per-slot stats on,
-     * main runs every GET so the stats count it. */
+     * key-by-key checks and a possible ASK or TRYAGAIN, so its commands go to main. With per-slot stats
+     * on, main runs every command so the stats count it. */
     if (server.cluster_enabled && server.cluster_slot_stats_enabled) return 0;
     if (server.cluster_enabled && !fastGetClusterServes(c, c->parsed_cmd, c->slot, c->read_flags)) return 0;
 
     /* The client's ACL and auth gate (see fastGetRecomputeSpecAclOk). */
-    if (!atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire)) return 0;
+    if (!(atomic_load_explicit(&c->spec_acl_ok, memory_order_acquire) & (1 << kind))) return 0;
 
-    /* With a slow threshold of 0 the commandlog records every command, so every GET goes to main, which
-     * records it. Large requests and replies are checked per GET. */
+    /* With a slow threshold of 0 the commandlog records every command, so every command goes to main,
+     * which records it. Large requests and replies are checked per command. */
     if (fastGetCommandlogThreshold(COMMANDLOG_TYPE_SLOW) == 0) return 0;
 
-    /* Time the batch for commandstats parity: speculated GETs bypass call(),
+    /* Time the batch for commandstats parity: speculated commands bypass call(),
      * so their duration must be accumulated per-thread and folded into the
-     * GET command's microseconds by fastGetAggregateStats (as with calls). */
+     * command's microseconds by fastGetAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
 
     hashtable *ht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(objectGetVal(c->argv[1]), c->slot));
@@ -323,6 +396,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
 
     batch[0].is_first_cmd = 1;
     batch[0].queue_idx = -1;
+    batch[0].arg = kind_argc > 2 ? c->argv[2] : NULL;
     hashtableIncrementalFindInit(&batch[0].find_state, ht, objectGetVal(c->argv[1]));
     done[0] = 0;
 
@@ -330,7 +404,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
         /* Fill: top the window up from the queue. */
         while (prefix_open && tail - head < FASTGET_BATCH_DEPTH && queue_pos < queue->len) {
             parsedCommand *p = &queue->cmds[queue_pos];
-            if (p->cmd != fastget_get_cmd || p->argc != 2 ||
+            if (p->cmd != kind_cmd || p->argc != kind_argc ||
                 (server.cluster_enabled && !fastGetClusterServes(c, p->cmd, p->slot, p->read_flags))) {
                 prefix_open = 0; /* ineligible command ends the global prefix */
                 break;
@@ -343,6 +417,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
             fastGetBatchEntry *e = &batch[tail % FASTGET_BATCH_DEPTH];
             e->is_first_cmd = 0;
             e->queue_idx = queue_pos;
+            e->arg = kind_argc > 2 ? p->argv[2] : NULL;
             hashtableIncrementalFindInit(&e->find_state, pht, objectGetVal(p->argv[1]));
             done[tail % FASTGET_BATCH_DEPTH] = 0;
             tail++;
@@ -363,7 +438,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
 #ifdef IO_LOOKUP_OFFLOAD_STATS
             FASTGET_STAT_ADD(speculative_attempts, 1);
 #endif
-            if (!fastGetReplyFromEntry(c, e)) {
+            if (!fastGetReplyFromEntry(c, e, kind)) {
                 /* Contiguous-prefix rule: in-flight slots behind a punt are
                  * abandoned and their commands fall through to main. */
                 prefix_open = 0;
@@ -379,9 +454,11 @@ int fastGetSpeculateBatch(client *c, int tid) {
         }
     }
 
-    /* Commandstats parity: fold execution time into the per-thread counter
-     * (calls are accumulated in fastGetConsumeSpeculated). */
-    if (speculated > 0) fastget_thread_stats[tid].usec += (long long)(getMonotonicUs() - spec_start);
+    /* Commandstats parity: fold calls and execution time into the per-thread counters. */
+    if (speculated > 0) {
+        fastget_thread_stats[tid].calls[kind] += speculated;
+        fastget_thread_stats[tid].usec[kind] += (long long)(getMonotonicUs() - spec_start);
+    }
     return speculated;
 }
 
@@ -452,19 +529,15 @@ void fastGetAggregateStats(void) {
     /* IO threads only ever increase their counters; main folds the growth since its last snapshot.
      * Zeroing a counter from main would race an IO thread's increment and lose counts, while a stale
      * read here only defers counts to the next fold. */
-    static long long seen_calls[FASTGET_MAX_IO_THREADS] = {0};
-    static long long seen_usec[FASTGET_MAX_IO_THREADS] = {0};
+    static long long seen_n[FASTGET_MAX_IO_THREADS] = {0};
+    static long long seen_calls[FASTGET_MAX_IO_THREADS][FASTGET_KINDS] = {{0}};
+    static long long seen_usec[FASTGET_MAX_IO_THREADS][FASTGET_KINDS] = {{0}};
     static long long seen_hits[FASTGET_MAX_IO_THREADS] = {0};
-    static struct serverCommand *get_cmd = NULL;
-    if (!get_cmd) get_cmd = lookupCommandByCString("get");
     for (int i = 0; i < server.io_threads_num; i++) {
         long long n = fastget_thread_stats[i].commands_processed;
-        long long calls_delta = 0;
-        if (n > seen_calls[i]) {
-            calls_delta = n - seen_calls[i];
-            seen_calls[i] = n;
-            ectx->stat_numcommands += calls_delta;
-            if (get_cmd) get_cmd->calls += calls_delta;
+        if (n > seen_n[i]) {
+            ectx->stat_numcommands += n - seen_n[i];
+            seen_n[i] = n;
         }
         /* Keyspace hits, folded the same way. */
         long long h = fastget_thread_stats[i].keyspace_hits;
@@ -472,18 +545,28 @@ void fastGetAggregateStats(void) {
             ectx->stat_keyspace_hits += h - seen_hits[i];
             seen_hits[i] = h;
         }
-        long long us = fastget_thread_stats[i].usec;
-        long long us_delta = 0;
-        if (us > seen_usec[i]) {
-            us_delta = us - seen_usec[i];
-            seen_usec[i] = us;
-            if (get_cmd) get_cmd->microseconds += us_delta;
-        }
-        /* Speculated GETs count in LATENCY HISTOGRAM and latencystats at their average duration. */
-        if (get_cmd && calls_delta > 0 && server.latency_tracking_enabled) {
-            int64_t avg_ns = (int64_t)(us_delta * 1000 / calls_delta);
-            if (avg_ns < 1) avg_ns = 1;
-            updateCommandLatencyHistogramCount(&get_cmd->latency_histogram, avg_ns, calls_delta);
+        for (int k = 0; k < FASTGET_KINDS; k++) {
+            struct serverCommand *cmd = fastGetKindCmd(k);
+            long long calls = fastget_thread_stats[i].calls[k];
+            long long calls_delta = 0;
+            if (calls > seen_calls[i][k]) {
+                calls_delta = calls - seen_calls[i][k];
+                seen_calls[i][k] = calls;
+                if (cmd) cmd->calls += calls_delta;
+            }
+            long long us = fastget_thread_stats[i].usec[k];
+            long long us_delta = 0;
+            if (us > seen_usec[i][k]) {
+                us_delta = us - seen_usec[i][k];
+                seen_usec[i][k] = us;
+                if (cmd) cmd->microseconds += us_delta;
+            }
+            /* Speculated commands count in LATENCY HISTOGRAM and latencystats at their average duration. */
+            if (cmd && calls_delta > 0 && server.latency_tracking_enabled) {
+                int64_t avg_ns = (int64_t)(us_delta * 1000 / calls_delta);
+                if (avg_ns < 1) avg_ns = 1;
+                updateCommandLatencyHistogramCount(&cmd->latency_histogram, avg_ns, calls_delta);
+            }
         }
     }
 }

@@ -103,3 +103,61 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         assert_equal "PONG" [r ping]
     }
 }
+
+# SISMEMBER and HGET answered on the reading thread match main's replies in both protocols, and engage only
+# with io-threads-speculate-reads.
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    proc spec_reads_round {rd} {
+        set out {}
+        foreach cmd {
+            {sismember s:small a} {sismember s:small zz} {sismember s:small 3} {sismember s:big m7}
+            {sismember s:big none} {sismember s:none a}
+        } { $rd {*}$cmd }
+        for {set i 0} {$i < 6} {incr i} { lappend out [$rd read] }
+        foreach cmd {
+            {hget h:small f} {hget h:small n} {hget h:small none} {hget h:big f9} {hget h:none f}
+        } { $rd {*}$cmd }
+        for {set i 0} {$i < 5} {incr i} { lappend out [$rd read] }
+        $rd hget s:small x
+        lappend out [catch {$rd read} e] [string range $e 0 8]
+        return $out
+    }
+
+    test {SISMEMBER and HGET on the reading thread match main in RESP2 and RESP3} {
+        r sadd s:small a b 3
+        for {set i 0} {$i < 300} {incr i} { r sadd s:big m$i; r hset h:big f$i v$i }
+        r hset h:small f v n 42
+        set want {1 0 1 1 0 0 v 42 {} v9 {} 1 WRONGTYPE}
+        foreach proto {2 3} {
+            foreach mode {no yes} {
+                r config set io-threads-speculate-reads $mode
+                set rd [fastget_client]
+                $rd hello $proto
+                $rd read
+                set before [fastget_speculated r]
+                for {set round 0} {$round < 20} {incr round} { assert_equal $want [spec_reads_round $rd] }
+                set moved [expr {[fastget_speculated r] > $before}]
+                assert_equal [expr {$mode eq "yes"}] $moved
+                $rd close
+            }
+        }
+        assert_match {*calls=*} [cmdrstat sismember r]
+    }
+
+    test {HGET on a hash with expiring fields goes to main and stays correct} {
+        r config set io-threads-speculate-reads yes
+        r del h:ttl
+        r hset h:ttl f v g w
+        r hexpire h:ttl 100000 FIELDS 1 g
+        set rd [fastget_client]
+        set before [fastget_speculated r]
+        for {set round 0} {$round < 20} {incr round} {
+            for {set i 0} {$i < 8} {incr i} { $rd hget h:ttl f }
+            for {set i 0} {$i < 8} {incr i} { assert_equal v [$rd read] }
+        }
+        assert_equal $before [fastget_speculated r]
+        $rd close
+    }
+}

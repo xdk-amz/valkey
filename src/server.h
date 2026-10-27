@@ -1555,7 +1555,7 @@ typedef struct client {
     uint16_t write_flags;                 /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;       /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state;      /* Indicate the IO write state of the client */
-    _Atomic(uint8_t) spec_acl_ok;         /* fast GET ACL gate: 1 = authenticated AND user may run GET with
+    _Atomic(uint8_t) spec_acl_ok;         /* fast GET ACL gate, one bit per FASTGET_KIND: authenticated AND user may run it with
                                            * unrestricted key read access, so IO threads may speculate.
                                            * Written only on main at auth-state changes; read by IO threads. */
     uint8_t resp;                         /* RESP protocol version. Can be 2 or 3. */
@@ -2110,6 +2110,7 @@ struct valkeyServer {
     int io_threads_lane_prefetch;             /* A write lane prefetches its commands' keys before running them */
     int io_threads_free_on_bio;               /* Main's offloaded frees go to bio instead of the IO threads */
     int main_read_batch;                      /* io-threads 1: main runs ready clients' commands through one prefetch batch */
+    int io_threads_speculate_reads;           /* The reading thread also answers SISMEMBER and HGET, as it does GET */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
@@ -4118,6 +4119,7 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 long long hashTypeCurrentExpiry(robj *o, hashTypeIterator *hi);
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
 robj *hashTypeGetValueObject(robj *o, sds field);
+int hashTypeGetValue(robj *o, sds field, unsigned char **vstr, unsigned int *vlen, long long *vll, mstime_t *expiry);
 int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool *expired_overwritten);
 robj *hashTypeDup(robj *o);
 bool hashTypeHasVolatileFields(robj *o);

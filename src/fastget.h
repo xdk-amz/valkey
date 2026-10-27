@@ -36,10 +36,14 @@ struct client;
 
 /* Per-IO-thread counters: IO threads never write shared server stats; main
  * folds these into them once per event-loop iteration. */
+/* The commands a reading thread answers. A read is answered only when all its commands are one kind. */
+enum { FASTGET_KIND_GET = 0, FASTGET_KIND_SISMEMBER, FASTGET_KIND_HGET, FASTGET_KINDS };
+
 typedef struct fastGetThreadStats {
-    long long commands_processed; /* speculated commands consumed on this thread */
-    long long usec;               /* wall time spent executing them (for commandstats) */
-    long long keyspace_hits;      /* speculative GET hits (bypass main's stat_keyspace_hits) */
+    long long commands_processed;    /* speculated commands consumed on this thread */
+    long long keyspace_hits;         /* speculative hits (bypass main's stat_keyspace_hits) */
+    long long calls[FASTGET_KINDS];  /* per kind, for commandstats */
+    long long usec[FASTGET_KINDS];   /* wall time spent executing them, per kind */
 } __attribute__((aligned(FASTGET_CACHELINE))) fastGetThreadStats;
 
 extern fastGetThreadStats fastget_thread_stats[FASTGET_MAX_IO_THREADS];
