@@ -2320,6 +2320,12 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 /* This function is called immediately after the event loop multiplexing
  * API returned, and the control is going to soon return to the server by invoking
  * the different events callbacks. */
+/* main-read-batch: commands of the clients main read in this pass run before any time event. */
+void afterFileEvents(struct aeEventLoop *eventLoop) {
+    UNUSED(eventLoop);
+    if (!ProcessingEventsWhileBlocked) processClientsCommandsBatch();
+}
+
 void afterSleep(struct aeEventLoop *eventLoop, int numevents) {
     UNUSED(eventLoop);
     /********************* WARNING ********************
@@ -3477,6 +3483,7 @@ void initServer(void) {
      * before loading persistence since it is used by processEventsWhileBlocked. */
     aeSetBeforeSleepProc(server.el, beforeSleep);
     aeSetAfterSleepProc(server.el, afterSleep);
+    aeSetAfterFileEventsProc(server.el, afterFileEvents);
 
     /* 32 bit instances are limited to 4GB of address space, so if there is
      * no explicit limit in the user provided configuration we set a limit

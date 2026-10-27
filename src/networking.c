@@ -5063,6 +5063,40 @@ __attribute__((noinline)) static bool readAndDecodePrimaryStream(client *primary
     return true;
 }
 
+static int cmdMultiKey(struct serverCommand *cmd) {
+    if (!cmd || cmd->key_specs_num == 0) return 0;
+    if (cmd->key_specs_num > 1) return 1;
+    keySpec *ks = &cmd->key_specs[0];
+    return ks->find_keys_type != KSPEC_FK_RANGE || ks->fk.range.lastkey != 0;
+}
+
+/* io-threads 1: main reads and parses a client as an IO thread would and finishes it as an IO read completion,
+ * so the single commands of every client read in one pass of file events share key prefetch batches. A pipeline
+ * or a multi-key command already prefetches its own keys, so the client's next read runs directly. */
+static int mainBatchRead(client *c) {
+    if (!server.main_read_batch || server.io_threads_num != 1 || ProcessingEventsWhileBlocked) return 0;
+    if (c->flag.main_read_direct) return 0;
+    if (!c->conn || connIsTLS(c->conn) || c->flag.primary || getClientType(c) == CLIENT_TYPE_REPLICA ||
+        c->flag.lua_debug || c->flag.blocked || c->flag.unblocked || c->flag.close_asap || c->slot_migration_job)
+        return 0;
+    prefetchCommandsBatchInit();
+    if (!prefetchBatchEnabled()) return 0;
+
+    c->read_flags = (canParseCommand(c) ? 0 : READ_FLAGS_DONT_PARSE) |
+                    (authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0);
+    readToQueryBuf(c);
+    if (!c->flag.close_asap && c->nread > 0 && !(c->read_flags & (READ_FLAGS_DONT_PARSE | READ_FLAGS_QB_LIMIT_REACHED))) {
+        parseInputBuffer(c);
+        trimCommandQueue(c);
+        prepareCommandQueue(c);
+        if (c->cmd_queue.len > c->cmd_queue.off || cmdMultiKey(c->parsed_cmd)) c->flag.main_read_direct = 1;
+    }
+    trimClientQueryBuffer(c);
+    c->io_read_state = CLIENT_COMPLETED_IO;
+    processClientIOReadsDone(c);
+    return 1;
+}
+
 void readQueryFromClient(connection *conn) {
     client *c = connGetPrivateData(conn);
     /* Check if we can send the client to be handled by the IO-thread */
@@ -5074,6 +5108,8 @@ void readQueryFromClient(connection *conn) {
     }
 
     if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
+
+    if (mainBatchRead(c)) return;
 
     bool repeat = false;
     int iter = 0;
@@ -5101,7 +5137,10 @@ void readQueryFromClient(connection *conn) {
                 return;
             }
             decoded_bytes += (size_t)decoded_this_iteration;
+            unsigned long long ncmds = c->commands_processed;
             if (processInputBuffer(c) == C_ERR) return;
+            if (c->flag.main_read_direct && c->commands_processed - ncmds == 1 && !cmdMultiKey(c->lastcmd))
+                c->flag.main_read_direct = 0;
             trimCommandQueue(c);
             if (decode_repl_stream && replStreamHasPendingDecode()) full_read = false;
         }

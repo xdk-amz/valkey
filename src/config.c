@@ -3531,6 +3531,8 @@ standardConfig static_configs[] = {
     createBoolConfig("cron-lanes", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.cron_lanes, 1, NULL, NULL),
     createBoolConfig("io-threads-parallel-writes", NULL, MODIFIABLE_CONFIG, server.io_threads_parallel_writes, 1, NULL, NULL),
     createBoolConfig("io-threads-lane-prefetch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_lane_prefetch, 1, NULL, NULL),
+    createBoolConfig("io-threads-free-on-bio", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_free_on_bio, 0, NULL, NULL),
+    createBoolConfig("main-read-batch", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.main_read_batch, 0, NULL, NULL),
     createBoolConfig("io-threads-strict-offload", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_strict_offload, 1, NULL, applyIOThreadsStrictOffload),
     createBoolConfig("io-threads-fast-path", NULL, MODIFIABLE_CONFIG, server.io_threads_fast_path, 1, NULL, applyIOThreadsStrictOffload),
     createEnumConfig("repl-stream-sender", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, repl_stream_sender_enum, server.repl_stream_sender, REPL_STREAM_SENDER_NO, NULL, NULL),

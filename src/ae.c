@@ -96,6 +96,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->maxfd = -1;
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
+    eventLoop->afterfileevents = NULL;
     eventLoop->custompoll = NULL;
     eventLoop->flags = 0;
     eventLoop->priority_apidata = NULL;
@@ -628,6 +629,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
                 processed += aeProcessQoSEventsPreemptively(eventLoop);
             }
         }
+        if (eventLoop->afterfileevents != NULL) eventLoop->afterfileevents(eventLoop);
     }
     /* Check time events */
     if (flags & AE_TIME_EVENTS) processed += processTimeEvents(eventLoop);
@@ -692,6 +694,10 @@ void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep
 
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep) {
     eventLoop->aftersleep = aftersleep;
+}
+
+void aeSetAfterFileEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterfileevents) {
+    eventLoop->afterfileevents = afterfileevents;
 }
 
 /* This function allows setting a custom poll procedure to be used by the event loop.

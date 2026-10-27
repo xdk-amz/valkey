@@ -126,6 +126,7 @@ typedef struct aeEventLoop {
     aeApiState *apidata; /* Polling API specific state (owned by the backend) */
     aeBeforeSleepProc *beforesleep;
     aeAfterSleepProc *aftersleep;
+    aeBeforeSleepProc *afterfileevents; /* after one pass of file events, before time events */
     aeCustomPollProc *custompoll;
     pthread_mutex_t poll_mutex;
     int flags;
@@ -165,6 +166,7 @@ int aeGetPollFd(aeEventLoop *eventLoop);
 char *aeGetApiName(void);
 void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep);
 void aeSetAfterSleepProc(aeEventLoop *eventLoop, aeAfterSleepProc *aftersleep);
+void aeSetAfterFileEventsProc(aeEventLoop *eventLoop, aeBeforeSleepProc *afterfileevents);
 void aeSetCustomPollProc(aeEventLoop *eventLoop, aeCustomPollProc *custompoll);
 void aeSetPollProtect(aeEventLoop *eventLoop, int protect);
 int aePoll(aeEventLoop *eventLoop, struct timeval *tvp);

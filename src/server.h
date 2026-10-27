@@ -1322,6 +1322,7 @@ typedef struct ClientFlags {
     uint64_t executor : 1;                 /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
     uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
     uint64_t fp_readmit : 1;               /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
+    uint64_t main_read_direct : 1;         /* main-read-batch: the last read held more than one command or a multi-key one, so the next is run directly. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -2107,6 +2108,8 @@ struct valkeyServer {
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
     int io_threads_lane_prefetch;             /* A write lane prefetches its commands' keys before running them */
+    int io_threads_free_on_bio;               /* Main's offloaded frees go to bio instead of the IO threads */
+    int main_read_batch;                      /* io-threads 1: main runs ready clients' commands through one prefetch batch */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */

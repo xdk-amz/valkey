@@ -28,6 +28,7 @@ static inline void cpuRelax(void) {
 #include "connection.h"
 #include "queues.h"
 #include "server.h"
+#include "bio.h"
 #include <sys/resource.h>
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
@@ -338,7 +339,17 @@ static int submitSlabJob(void *slab, int spsc_type) {
     return 1;
 }
 
+static void ioThreadFreeSlab(freeSlab *slab);
+
+static void bioFreeSlab(void *args[]) {
+    ioThreadFreeSlab(args[0]);
+}
+
 static void submitFreeSlab(freeSlab *slab) {
+    if (server.io_threads_free_on_bio) {
+        bioCreateLazyFreeJob(bioFreeSlab, 1, slab);
+        return;
+    }
     if (submitSlabJob(slab, JOB_SPSC_FREE_SLAB)) return;
     if (pending_free_slabs_len == pending_free_slabs_cap) {
         size_t newcap = pending_free_slabs_cap ? pending_free_slabs_cap * 2 : 8;
