@@ -2768,8 +2768,9 @@ void fastpathStagedReleaseAll(void) {
     }
 }
 
-/* Main, right after staged mode turns on: clients accepted by the stock loop while it was turning on
- * join the fast path now instead of staying on main for good. */
+/* Main, right after staged mode turns on: every eligible client served by the stock loop, including
+ * ones connected before the IO threads were added, joins the fast path. One with a command in progress
+ * joins once main has nothing further to do for it. */
 void fastpathStagedAdoptClients(void) {
     listIter li;
     listNode *ln;
@@ -2777,11 +2778,10 @@ void fastpathStagedAdoptClients(void) {
     while ((ln = listNext(&li))) {
         client *c = listNodeValue(ln);
         if (c->flag.fastpath || c->flag.executor || !c->conn) continue;
-        /* Clients that have run nothing yet, or that left only because staged mode stopped; one that
-         * ran an unsupported command on main stays there. */
-        if (!c->flag.fp_readmit && (c->control || c->commands_processed || c->argc || c->flag.pending_command))
-            continue;
         if (!fpSessionEligible(c)) continue;
-        if (fpReadmit(c)) c->flag.fp_readmit = 0;
+        if (fpReadmit(c))
+            c->flag.fp_readmit = 0;
+        else
+            c->flag.fp_readmit = 1; /* beforeNextClient retries */
     }
 }
