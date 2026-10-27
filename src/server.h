@@ -2159,6 +2159,8 @@ struct valkeyServer {
     long long stat_repl_lane_plan_usec;            /* Main's time running those plans, APPLY phases included */
     long long stat_repl_lane_apply_usec;           /* Of which APPLY phases */
     long long stat_repl_lane_barriers;             /* Commands of those plans main ran in their place */
+    long long stat_repl_lane_splits;               /* Multi-key writes of those plans split into per-lane pieces */
+    long long stat_repl_lane_tx_transparent;       /* MULTI/EXEC pairs of those plans whose body ran on lanes */
     long long stat_numconnections;                 /* Number of connections received */
     double stat_expired_keys_stale_perc;           /* Percentage of keys probably expired */
     double stat_expired_keys_with_vola_stale_perc; /* Percentage of keys probably expired */

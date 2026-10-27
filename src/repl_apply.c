@@ -78,13 +78,31 @@ static int replApplySharded(void) {
         }                                                            \
     } while (0)
 
+#define RP_NOOP (-2) /* rpEntry.lane: consumed with its segment, run by nobody (a transparent MULTI or EXEC) */
+
+/* One lane's share of a multi-key write whose keys belong to several lanes: the command name and the
+ * key (and value) arguments of that lane's keys, run by the lane as the primary ran its own part. */
+typedef struct rpPiece {
+    robj **argv; /* NULL once a lane ran it (commandProcessed freed it) */
+    int argc;
+    size_t argv_len_sum;
+    int lane;
+} rpPiece;
+
 typedef struct rpEntry {
     size_t qb_end; /* querybuf offset just past the command */
     serverDb *db;
-    int shard;    /* lane entries: the keyspace hashtable of all its keys */
-    int lane;     /* -1: a barrier */
+    int shard;    /* lane entries: the keyspace hashtable of all its keys; -1: each key finds its own */
+    int lane;     /* -1: a barrier; RP_NOOP: nothing to run */
     uint32_t seg; /* barriers before it in its chunk */
+    rpPiece *pieces; /* a split entry: its pieces, each on its lane's vector in this entry's place */
+    int npieces;
 } rpEntry;
+
+/* A lane vector element: the plan position, and for a split entry which piece of it. */
+#define RP_LV(idx, piece) ((int)((idx) | ((piece) << 16)))
+#define RP_LV_IDX(v) ((v) & 0xFFFF)
+#define RP_LV_PIECE(v) ((v) >> 16)
 
 /* What a command leaves for the next ones' classification. */
 typedef struct rpState {
@@ -102,6 +120,7 @@ typedef struct __attribute__((aligned(64))) rpChunk {
     int lane_n[FP_MAX_LANES], lane_cap[FP_MAX_LANES];
     int *bpos; /* plan positions of its barriers */
     int nb, bcap;
+    int splits, txs; /* split entries and transparent transactions it classified; folded into the stats by main */
     uint32_t base; /* barriers of the chunks before it */
 } rpChunk;
 
@@ -128,6 +147,7 @@ static struct {
 } rp;
 
 static rpCursor rp_cur[FP_MAX_LANES];
+static robj *rp_mset_name = NULL; /* shared: pieces of one MSET run on several lanes at once */
 
 int replApplyPlanBegin(void) {
     if (!server.replica_parallel_apply || !stagedApplyReady() || !fastpathStreamLanesAllowed()) return 0;
@@ -137,6 +157,7 @@ int replApplyPlanBegin(void) {
     if (n < 2) return 0;
     rp.nlanes = n;
     rp.main_lane = main_lane;
+    if (!rp_mset_name) rp_mset_name = fastpathPartNameMset();
     return 1;
 }
 
@@ -174,27 +195,120 @@ static void rpTrack(rpState *st, const char *name, size_t nlen, const char *arg,
     }
 }
 
-/* The lane of the command at plan position idx, or a barrier. */
-static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **argv, int argc, int read_flags, int slot, size_t qb_end) {
+#define RP_SPLIT (-3) /* rpLaneOf: the entry's keys belong to several lanes; its pieces are built */
+
+static void rpFreePieces(rpEntry *e) {
+    for (int p = 0; p < e->npieces; p++) {
+        rpPiece *pc = &e->pieces[p];
+        if (!pc->argv) continue; /* a lane ran it */
+        for (int j = 0; j < pc->argc; j++) decrRefCount(pc->argv[j]);
+        zfree(pc->argv);
+        pc->argv = NULL;
+    }
+    zfree(e->pieces);
+    e->pieces = NULL;
+    e->npieces = 0;
+}
+
+/* An MSET (standalone, keyspace shards on) whose keys are in several hashtables: one lane when every key
+ * is that lane's, as the primary's part of the same command; otherwise one piece per lane with those
+ * keys and values, stored in e. Pieces hold their own references to the arguments. */
+static int rpSplit(rpChunk *k, rpEntry *e, struct serverCommand *cmd, robj **argv, int argc) {
+    if (server.cluster_enabled || !server.keyspace_shard_bits || cmd->proc != msetCommand) return -1;
+    if (argc < 5 || (argc - 1) % 2) return -1; /* one key, or the arity error, is main's */
+    int nkeys = (argc - 1) / 2;
+    int count[FP_MAX_LANES];
+    int8_t piece_of[FP_MAX_LANES];
+    memset(count, 0, sizeof(int) * (size_t)rp.nlanes);
+    memset(piece_of, -1, sizeof(piece_of));
+    int lanes[FP_MAX_LANES];
+    int npieces = 0;
+    int8_t *keypiece = zmalloc((size_t)nkeys);
+    for (int i = 0; i < nkeys; i++) {
+        robj *key = argv[1 + i * 2];
+        if (fastpathKeyObserved(k->st.db, key)) {
+            zfree(keypiece);
+            return -1;
+        }
+        int lane = getKVStoreIndexForKey(objectGetVal(key)) % rp.nlanes;
+        if (piece_of[lane] < 0) {
+            piece_of[lane] = (int8_t)npieces;
+            lanes[npieces++] = lane;
+        }
+        count[lane]++;
+        keypiece[i] = piece_of[lane];
+    }
+    e->shard = -1; /* each key finds its own hashtable */
+    if (npieces == 1) {
+        zfree(keypiece);
+        return lanes[0];
+    }
+    e->pieces = zmalloc(sizeof(rpPiece) * (size_t)npieces);
+    e->npieces = npieces;
+    for (int p = 0; p < npieces; p++) {
+        rpPiece *pc = &e->pieces[p];
+        pc->argv = zmalloc(sizeof(robj *) * (size_t)(1 + count[lanes[p]] * 2));
+        pc->argv[0] = rp_mset_name; /* shared: decrRefCount leaves it alone */
+        pc->argc = 1;
+        pc->argv_len_sum = 4;
+        pc->lane = lanes[p];
+    }
+    for (int i = 0; i < nkeys; i++) {
+        rpPiece *pc = &e->pieces[keypiece[i]];
+        for (int j = 0; j < 2; j++) {
+            robj *o = argv[1 + i * 2 + j];
+            pc->argv[pc->argc++] = o;
+            incrRefCount(o);
+            pc->argv_len_sum += sdsEncodedObject(o) ? sdslen(objectGetVal(o)) : 0;
+        }
+    }
+    zfree(keypiece);
+    return RP_SPLIT;
+}
+
+/* The lane of a lane-eligible command, RP_SPLIT with its pieces built in e, or -1 for a barrier. Leaves the
+ * chunk's state alone. */
+static int rpLaneOf(rpChunk *k, rpEntry *e, struct serverCommand *cmd, robj **argv, int argc, int read_flags, int slot) {
+    if (k->st.stop || !cmd || !cmd->write_lane || (read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY)))
+        return -1;
+    int shard = fastpathKeysShard(k->st.db, cmd, argv, argc, slot);
+    if (shard >= 0) {
+        e->shard = shard;
+        return shard % rp.nlanes;
+    }
+    return rpSplit(k, e, cmd, argv, argc);
+}
+
+static void rpInitEntry(rpChunk *k, int idx, size_t qb_end) {
     rpEntry *e = &rp.e[idx];
     e->qb_end = qb_end;
     e->db = k->st.db;
     e->shard = -1;
     e->lane = -1;
     e->seg = (uint32_t)k->nb;
-    if (!k->st.stop && !k->st.in_multi && cmd && cmd->write_lane &&
-        !(read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY))) {
-        int shard = fastpathKeysShard(k->st.db, cmd, argv, argc, slot);
-        if (shard >= 0) {
-            e->shard = shard;
-            e->lane = shard % rp.nlanes;
-        }
+    e->pieces = NULL;
+    e->npieces = 0;
+}
+
+static void rpPushLane(rpChunk *k, int lane, int v) {
+    RP_GROW(k->lane_idx[lane], k->lane_n[lane], k->lane_cap[lane], 256);
+    k->lane_idx[lane][k->lane_n[lane]++] = v;
+}
+
+/* Put the entry at idx on its lane, or each of its pieces on theirs. */
+static void rpCommitLane(rpChunk *k, int idx, int lane) {
+    rpEntry *e = &rp.e[idx];
+    if (lane == RP_SPLIT) {
+        e->lane = e->pieces[0].lane;
+        for (int p = 0; p < e->npieces; p++) rpPushLane(k, e->pieces[p].lane, RP_LV(idx, p));
+        k->splits++;
+    } else {
+        e->lane = lane;
+        rpPushLane(k, lane, RP_LV(idx, 0));
     }
-    if (e->lane >= 0) {
-        RP_GROW(k->lane_idx[e->lane], k->lane_n[e->lane], k->lane_cap[e->lane], 256);
-        k->lane_idx[e->lane][k->lane_n[e->lane]++] = idx;
-        return;
-    }
+}
+
+static void rpCommitBarrier(rpChunk *k, int idx, robj **argv, int argc) {
     RP_GROW(k->bpos, k->nb, k->bcap, 16);
     k->bpos[k->nb++] = idx;
     if (argc > 0 && sdsEncodedObject(argv[0])) {
@@ -202,6 +316,16 @@ static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **ar
         rpTrack(&k->st, objectGetVal(argv[0]), sdslen(objectGetVal(argv[0])), a ? objectGetVal(argv[1]) : NULL,
                 a ? sdslen(objectGetVal(argv[1])) : 0, argc);
     }
+}
+
+/* The lane of the command at plan position idx, or a barrier. */
+static void rpClassify(rpChunk *k, int idx, struct serverCommand *cmd, robj **argv, int argc, int read_flags, int slot, size_t qb_end) {
+    rpInitEntry(k, idx, qb_end);
+    int lane = k->st.in_multi ? -1 : rpLaneOf(k, &rp.e[idx], cmd, argv, argc, read_flags, slot);
+    if (lane != -1)
+        rpCommitLane(k, idx, lane);
+    else
+        rpCommitBarrier(k, idx, argv, argc);
 }
 
 /* A RESP integer ending at the next \r\n of [p, end). Returns the position after the \n, or 0 when the
@@ -243,7 +367,8 @@ static int rpScan(client *c, rpState st) {
             q = d + (size_t)len + 2;
         }
         if (j < n) break;
-        if (k->n > 0 && p - k->start >= target && t + 1 < rp.nlanes) {
+        /* A cut inside a transaction would hide its end from the chunk that classifies it. */
+        if (k->n > 0 && p - k->start >= target && t + 1 < rp.nlanes && !st.in_multi) {
             t++;
             k = &rp.ch[t];
             k->start = p;
@@ -283,6 +408,47 @@ static size_t rpParseOne(const char *qb, size_t p, parsedCommand *pc) {
     return q - p;
 }
 
+static int rpCmdIs(parsedCommand *pc, void (*proc)(client *)) {
+    return pc->cmd && pc->cmd->proc == proc && !(pc->read_flags & (READ_FLAGS_COMMAND_NOT_FOUND | READ_FLAGS_BAD_ARITY));
+}
+
+/* Chunk position i holds a MULTI outside a transaction. When the EXEC that closes it is in this chunk and
+ * every command between them has a lane, the transaction is transparent: MULTI and EXEC are consumed with
+ * the body's segment and nothing runs them, and the body runs on the lanes. The body is one segment, so
+ * it lands in one APPLY phase, which no reader observes part-way: the primary's atomicity is kept without
+ * main running the pair. Returns the chunk position of the EXEC, or i when the transaction stays as it is
+ * (a barrier MULTI, whose body the usual classification makes barriers). */
+static int rpTryTransparentTx(rpChunk *k, int i) {
+    client *c = rp.c;
+    int j;
+    for (j = i + 1; j < k->n; j++) {
+        int idx = k->first + j;
+        parsedCommand *pc = &c->cmd_queue.cmds[idx - 1];
+        if (rpCmdIs(pc, execCommand)) break;
+        if (rpCmdIs(pc, multiCommand) || rpCmdIs(pc, discardCommand)) goto fail;
+        rpEntry *e = &rp.e[idx];
+        rpInitEntry(k, idx, e->qb_end);
+        int lane = rpLaneOf(k, e, pc->cmd, pc->argv, pc->argc, pc->read_flags, pc->slot);
+        if (lane == -1) goto fail;
+        e->lane = lane; /* RP_SPLIT until committed */
+    }
+    if (j == k->n) goto fail; /* the EXEC is not in this chunk */
+    for (int m = i; m <= j; m++) {
+        int idx = k->first + m;
+        if (m == i || m == j) {
+            rpInitEntry(k, idx, rp.e[idx].qb_end);
+            rp.e[idx].lane = RP_NOOP;
+        } else {
+            rpCommitLane(k, idx, rp.e[idx].lane);
+        }
+    }
+    k->txs++;
+    return j;
+fail:
+    for (int m = i + 1; m < j; m++) rpFreePieces(&rp.e[k->first + m]);
+    return i;
+}
+
 /* Thread of lane t: parse and classify chunk t into its slice of the command queue. */
 static void rpParseChunk(int t) {
     rpChunk *k = &rp.ch[t];
@@ -290,15 +456,27 @@ static void rpParseChunk(int t) {
     size_t p = k->start;
     for (int i = 0; i < k->n; i++) {
         int idx = k->first + i;
+        p += rpParseOne(c->querybuf, p, &c->cmd_queue.cmds[idx - 1]);
+        rp.e[idx].qb_end = p;
+    }
+    for (int i = 0; i < k->n; i++) {
+        int idx = k->first + i;
         parsedCommand *pc = &c->cmd_queue.cmds[idx - 1];
-        p += rpParseOne(c->querybuf, p, pc);
-        rpClassify(k, idx, pc->cmd, pc->argv, pc->argc, pc->read_flags, pc->slot, p);
+        if (!k->st.in_multi && !k->st.stop && rpCmdIs(pc, multiCommand)) {
+            int j = rpTryTransparentTx(k, i);
+            if (j > i) {
+                i = j;
+                continue;
+            }
+        }
+        rpClassify(k, idx, pc->cmd, pc->argv, pc->argc, pc->read_flags, pc->slot, rp.e[idx].qb_end);
     }
 }
 
 static void rpResetChunk(rpChunk *k) {
     for (int l = 0; l < rp.nlanes; l++) k->lane_n[l] = 0;
     k->nb = 0;
+    k->splits = k->txs = 0;
 }
 
 void replApplyPlanRead(client *c) {
@@ -348,6 +526,8 @@ static void rpMerge(void) {
     for (int t = 0; t < rp.nchunks; t++) {
         rpChunk *k = &rp.ch[t];
         k->base = base;
+        server.stat_repl_lane_splits += k->splits;
+        server.stat_repl_lane_tx_transparent += k->txs;
         for (int i = 0; i < k->nb; i++) {
             RP_GROW(rp.bpos, rp.nb, rp.bcap, 64);
             rp.bpos[rp.nb++] = k->bpos[i];
@@ -366,7 +546,8 @@ static void rpRunLane(int lane) {
         rpChunk *k = &rp.ch[cur->chunk];
         int n = k->lane_n[lane];
         while (cur->pos < n) {
-            int idx = k->lane_idx[lane][cur->pos];
+            int v = k->lane_idx[lane][cur->pos];
+            int idx = RP_LV_IDX(v);
             rpEntry *e = &rp.e[idx];
             uint32_t seg = k->base + e->seg;
             if (seg > rp.seg) goto done;
@@ -376,7 +557,15 @@ static void rpRunLane(int lane) {
                 fastpathStreamLaneEnter(lane);
                 entered = 1;
             }
-            if (idx == 0) {
+            if (e->npieces) {
+                int pi = RP_LV_PIECE(v);
+                rpPiece *pc = &e->pieces[pi];
+                struct serverCommand *cmd = idx == 0 ? c->parsed_cmd : c->cmd_queue.cmds[idx - 1].cmd;
+                unsigned long long bytes = idx == 0 ? c->net_input_bytes_curr_cmd : c->cmd_queue.cmds[idx - 1].input_bytes;
+                fastpathStreamLaneCall(lane, e->db, cmd, pc->argv, pc->argc, pc->argc, pc->argv_len_sum,
+                                       pi == 0 ? bytes : 0, -1);
+                pc->argv = NULL; /* commandProcessed freed it */
+            } else if (idx == 0) {
                 fastpathStreamLaneCall(lane, e->db, c->parsed_cmd, c->argv, c->argc, c->argv_len, c->argv_len_sum,
                                        c->net_input_bytes_curr_cmd, e->shard);
             } else {
@@ -417,6 +606,13 @@ static void rpAdvance(client *c) {
 /* Main: the lanes applied the commands at positions [from, to); take them off the client. */
 static void rpConsume(client *c, int from, int to) {
     if (from == 0) {
+        rpEntry *e0 = &rp.e[0];
+        if (e0->npieces) {
+            /* The lanes ran its pieces; the command itself nobody freed. */
+            for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+            zfree(c->argv);
+            rpFreePieces(e0);
+        }
         /* The lane freed the arguments of the client's current command. */
         c->argv = NULL;
         c->argc = 0;
@@ -428,6 +624,18 @@ static void rpConsume(client *c, int from, int to) {
     }
     if (to > 1) {
         cmdQueue *q = &c->cmd_queue;
+        /* A split entry's lanes ran its pieces, and nothing runs a transparent MULTI or EXEC: free the
+         * command as the lane would have. */
+        for (int i = from > 0 ? from : 1; i < to; i++) {
+            rpEntry *e = &rp.e[i];
+            if (!e->npieces && e->lane != RP_NOOP) continue;
+            parsedCommand *p = &q->cmds[i - 1];
+            for (int j = 0; j < p->argc; j++) decrRefCount(p->argv[j]);
+            zfree(p->argv);
+            p->argv = NULL;
+            p->argc = 0;
+            if (e->npieces) rpFreePieces(e);
+        }
         q->off = (uint16_t)(to - 1);
         if (q->off == q->len) q->off = q->len = 0;
     }
@@ -447,6 +655,7 @@ static int rpQueueAt(client *c, int idx, int qlen) {
 /* Main: run the command at position idx as the primary client, the usual way. C_ERR: the client is gone. */
 static int rpRunOnMain(client *c, int idx, int qlen) {
     if (!rpQueueAt(c, idx, qlen)) return RP_STOP;
+    if (rp.e[idx].npieces) rpFreePieces(&rp.e[idx]); /* main runs it whole */
     int r = processPlannedCommand(c, idx > 0);
     return r == C_OK || r == C_ERR ? r : RP_STOP;
 }
@@ -507,6 +716,9 @@ static int rpRun(client *c) {
         replApplyFlush(c);
     else
         serverAssert(!replApplyPending());
+    /* A plan left part-way (rpQueueAt): whatever the lanes did not run goes the usual way, whole. */
+    for (int i = 0; i < rp.n; i++)
+        if (rp.e[i].npieces) rpFreePieces(&rp.e[i]);
     return rc;
 }
 

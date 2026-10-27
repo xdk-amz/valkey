@@ -2193,6 +2193,17 @@ int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int 
     return fpKeysShard(db, cmd, argv, argc, slot);
 }
 
+int fastpathKeyObserved(serverDb *db, robj *key) {
+    return fpKeyObserved(db, key);
+}
+
+/* Main: the shared MSET part name, creating the lane command set if a lane phase has not yet. Pieces of
+ * one command run on several lanes at once, so their common name must not carry a refcount. */
+robj *fastpathPartNameMset(void) {
+    fpMarkLaneCommands();
+    return fp_part_name_mset;
+}
+
 void fastpathStreamLanesPrepare(int nlanes, int main_lane) {
     fpMarkLaneCommands();
     for (int l = 0; l < nlanes; l++) {

@@ -3109,6 +3109,8 @@ void resetServerStats(void) {
     server.stat_repl_lane_plan_usec = 0;
     server.stat_repl_lane_apply_usec = 0;
     server.stat_repl_lane_barriers = 0;
+    server.stat_repl_lane_splits = 0;
+    server.stat_repl_lane_tx_transparent = 0;
     server.stat_numconnections = 0;
     ectx->stat_expiredkeys = 0;
     ectx->stat_expiredfields = 0;
@@ -7173,6 +7175,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "repl_lane_plan_usec:%lld\r\n", server.stat_repl_lane_plan_usec,
                 "repl_lane_apply_usec:%lld\r\n", server.stat_repl_lane_apply_usec,
                 "repl_lane_barriers:%lld\r\n", server.stat_repl_lane_barriers,
+                "repl_lane_splits:%lld\r\n", server.stat_repl_lane_splits,
+                "repl_lane_tx_transparent:%lld\r\n", server.stat_repl_lane_tx_transparent,
                 "instantaneous_ops_per_sec:%lld\r\n", getInstantaneousMetric(STATS_METRIC_COMMAND),
                 "total_net_input_bytes:%lld\r\n", server.stat_net_input_bytes + server.stat_net_repl_input_bytes + atomic_load_explicit(&server.bio_stat_net_repl_input_bytes, memory_order_relaxed) + server.stat_net_cluster_slot_import_bytes,
                 "total_net_output_bytes:%lld\r\n", server.stat_net_output_bytes + server.stat_net_repl_output_bytes + server.stat_net_cluster_slot_export_bytes,

@@ -132,6 +132,8 @@ int fastpathStreamLanesAllowed(void);
 /* IO thread, read phase: the keyspace hashtable of every key the command declares, or -1 when it has
  * none, they are in several, or a client is blocked on or watches one. */
 int fastpathKeysShard(serverDb *db, struct serverCommand *cmd, robj **argv, int argc, int slot);
+int fastpathKeyObserved(serverDb *db, robj *key);
+robj *fastpathPartNameMset(void);
 /* Main, before an APPLY phase of the stream on lanes [0, nlanes). */
 void fastpathStreamLanesPrepare(int nlanes, int main_lane);
 /* Lane thread, APPLY phase: enter the lane, apply commands of the stream on it, leave. */
