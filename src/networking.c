@@ -327,17 +327,16 @@ static int shouldDeferPushMessage(client *c) {
  * that use _writeToClient handler to write replies to client connection */
 static int isCopyAvoidPreferred(client *c, robj *obj) {
     if (server.copy_avoid_mode == COPY_AVOID_MODE_OFF) return 0;
+    if (obj) {
+        if (obj->encoding != OBJ_ENCODING_RAW) return 0;
+        if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
+    }
     if (c->flag.fake || c->flag.executor || isDeferredReplyEnabled(c)) return 0;
     /* Skip copy avoidance when push bytes would be deferred into pending_push_messages. */
     if (shouldDeferPushMessage(c)) return 0;
 
     int type = getClientType(c);
     if (type != CLIENT_TYPE_NORMAL && type != CLIENT_TYPE_PUBSUB) return 0;
-
-    if (obj) {
-        if (obj->encoding != OBJ_ENCODING_RAW) return 0;
-        if (obj->refcount == OBJ_STATIC_REFCOUNT) return 0;
-    }
 
     if (server.copy_avoid_mode == COPY_AVOID_MODE_ADAPTIVE) {
         /* NULL asks whether plain reply buffers may carry references. */

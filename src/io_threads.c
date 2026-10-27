@@ -2353,7 +2353,11 @@ void freeValueNeverOnMain(robj *key, robj *val, int dbid) {
         return;
     }
 
-    /* Single-threaded mode preserves freeObjAsync behavior. */
+    /* Single-threaded mode preserves freeObjAsync behavior; a string's free effort is always 1. */
+    if (val->type == OBJ_STRING) {
+        decrRefCount(val);
+        return;
+    }
     freeObjAsync(key, val, dbid);
 }
 
