@@ -11,8 +11,8 @@
 #include <cstring>
 
 extern "C" {
-#include "server.h"
 #include "intern.h"
+#include "server.h"
 }
 
 /* Mirror of the private internHdr prefix in intern.c. The header sits
