@@ -2501,6 +2501,7 @@ struct valkeyServer {
     int repl_replica_ignore_maxmemory;    /* If true replicas do not evict. */
     time_t repl_down_since;               /* Unix time at which link with primary went down */
     int repl_disable_tcp_nodelay;         /* Disable TCP_NODELAY after SYNC? */
+    long long repl_sndbuf_bytes;          /* SO_SNDBUF for replica links; 0 = kernel default */
     int repl_mptcp;                       /* Use Multipath TCP for replica on client side */
     int replica_priority;                 /* Reported in INFO and used by Sentinel. */
     int replica_announced;                /* If true, replica is announced by Sentinel */
@@ -3684,6 +3685,7 @@ int replicationCountAOFAcksByOffset(long long offset);
 void replicationSendNewlineToPrimary(void);
 long long replicationGetReplicaOffset(void);
 char *replicationGetReplicaName(client *c);
+void replicationApplyReplicaSndbuf(client *c);
 long long getPsyncInitialOffset(void);
 int replicationSetupReplicaForFullResync(client *replica, long long offset);
 void changeReplicationId(void);

@@ -526,6 +526,11 @@ int connSendTimeout(connection *conn, long long ms) {
     return anetSendTimeout(NULL, conn->fd, ms);
 }
 
+int connSetSendBuffer(connection *conn, int bytes, int *effective) {
+    if (conn->fd == -1) return C_ERR;
+    return anetSetSendBuffer(NULL, conn->fd, bytes, effective);
+}
+
 int connRecvTimeout(connection *conn, long long ms) {
     return anetRecvTimeout(NULL, conn->fd, ms);
 }

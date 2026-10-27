@@ -456,6 +456,7 @@ int connNonBlock(connection *conn);
 int connKeepAlive(connection *conn, int interval);
 int connSendTimeout(connection *conn, long long ms);
 int connRecvTimeout(connection *conn, long long ms);
+int connSetSendBuffer(connection *conn, int bytes, int *effective);
 
 /* Get cert for the secure connection */
 static inline sds connGetPeerCert(connection *conn) {

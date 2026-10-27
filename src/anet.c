@@ -321,6 +321,49 @@ int anetSendTimeout(char *err, int fd, long long ms) {
     return ANET_OK;
 }
 
+/* Set the socket send buffer (SO_SNDBUF) to 'bytes'. The kernel clamps the
+ * request to its per-socket ceiling (net.core.wmem_max on Linux) and, on
+ * Linux, stops autotuning the buffer for this socket. If 'effective' is not
+ * NULL it receives the value the kernel reports back through getsockopt, which
+ * on Linux is twice the usable payload size (the extra half accounts for
+ * socket overhead). */
+int anetSetSendBuffer(char *err, int fd, int bytes, int *effective) {
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes)) == -1) {
+        anetSetError(err, "setsockopt SO_SNDBUF: %s", strerror(errno));
+        return ANET_ERR;
+    }
+    if (effective) {
+        int val = 0;
+        socklen_t len = sizeof(val);
+        if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, &len) == -1) {
+            anetSetError(err, "getsockopt SO_SNDBUF: %s", strerror(errno));
+            return ANET_ERR;
+        }
+        *effective = val;
+    }
+    return ANET_OK;
+}
+
+/* Read the two kernel limits that decide what SO_SNDBUF can do for a socket:
+ * 'wmem_max' (net.core.wmem_max, the per-socket request ceiling) and
+ * 'autotune_max' (the last field of net.ipv4.tcp_wmem, the size autotuning can
+ * grow an untouched socket to). Linux only; ANET_ERR where the files are not
+ * readable, in which case the caller cannot tell and should just apply its
+ * request. */
+int anetSendBufferHostLimits(int *wmem_max, int *autotune_max) {
+    FILE *fp = fopen("/proc/sys/net/core/wmem_max", "r");
+    if (!fp) return ANET_ERR;
+    int ok = fscanf(fp, "%d", wmem_max) == 1;
+    fclose(fp);
+    if (!ok) return ANET_ERR;
+    fp = fopen("/proc/sys/net/ipv4/tcp_wmem", "r");
+    if (!fp) return ANET_ERR;
+    int lo, def;
+    ok = fscanf(fp, "%d %d %d", &lo, &def, autotune_max) == 3;
+    fclose(fp);
+    return ok ? ANET_OK : ANET_ERR;
+}
+
 /* Set the socket receive timeout (SO_RCVTIMEO socket option) to the specified
  * number of milliseconds, or disable it if the 'ms' argument is zero. */
 int anetRecvTimeout(char *err, int fd, long long ms) {
