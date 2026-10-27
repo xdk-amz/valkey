@@ -41,6 +41,7 @@
 #include "fastget.h"
 #include "sds.h"
 #include "module.h"
+#include "throttle.h"
 
 #include "tls.h"
 
@@ -405,6 +406,12 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+/* DEBUG THROTTLE-RATE: the same criteria as the replication throttler, write commands. */
+static bool debugWriteThrottleCriteria(client *c, void *priv_data) {
+    UNUSED(priv_data);
+    return (c->cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE)) != 0;
+}
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "help")) {
         const char *help[] = {
@@ -552,6 +559,8 @@ void debugCommand(client *c) {
             "    Grace period in seconds for replica main channel to establish psync.",
             "DICT-RESIZING <0|1>",
             "    Enable or disable the main dict and expire dict resizing.",
+            "THROTTLE-RATE <ops-per-sec|off>",
+            "    Install a write-command throttler at a fixed rate (or remove it); drives the fast-path lane budget deterministically.",
             "HASHTABLE-CAN-ABORT-SHRINK <0|1>",
             "    Enable or disable the hashtable shrink abort.",
             "CLIENT-ENFORCE-REPLY-LIST <0|1>",
@@ -1188,6 +1197,25 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "dict-resizing") && c->argc == 3) {
         server.dict_resizing = atoi(objectGetVal(c->argv[2]));
         updateDictResizePolicy();
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(objectGetVal(c->argv[1]), "throttle-rate") && c->argc == 3) {
+        /* A fixed-rate throttler over write commands, for tests of the throttle path without a
+         * lagging replica. One at a time; a new rate replaces the previous debug throttler. */
+        static throttler *debug_throttler = NULL;
+        if (!strcasecmp(objectGetVal(c->argv[2]), "off")) {
+            if (debug_throttler) throttle_deregister(debug_throttler);
+            debug_throttler = NULL;
+            addReply(c, shared.ok);
+            return;
+        }
+        double rate;
+        if (getDoubleFromObjectOrReply(c, c->argv[2], &rate, NULL) != C_OK) return;
+        if (rate <= 0) {
+            addReplyError(c, "rate must be positive");
+            return;
+        }
+        if (!debug_throttler) debug_throttler = throttle_register(debugWriteThrottleCriteria, NULL, "debug_throttle");
+        throttle_setRate(debug_throttler, rate);
         addReply(c, shared.ok);
     } else if (!strcasecmp(objectGetVal(c->argv[1]), "hashtable-can-abort-shrink") && c->argc == 3) {
         hashtableSetCanAbortShrink(atoi(objectGetVal(c->argv[2])));

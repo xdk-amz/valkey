@@ -305,6 +305,80 @@ bool throttle_anyThrottlers(void) {
     return throttler_list != NULL && listLength(throttler_list) > 0;
 }
 
+/* The live throttler with the lowest rate, or NULL. Without a client there is no criteria to apply, so
+ * the lane budget is drawn from the strictest throttler of all: a write admitted on a lane is one every
+ * installed throttler would have had to pass. */
+static throttler *strictestThrottler(void) {
+    if (!throttle_anyThrottlers()) return NULL;
+    throttler *strictest = NULL;
+    listNode *ln;
+    listIter li;
+    listRewind(throttler_list, &li);
+    while ((ln = listNext(&li))) {
+        throttler *t = ln->value;
+        if (t->cleanup) continue;
+        if (strictest == NULL || tokenBucket_getRate(t->bucket) < tokenBucket_getRate(strictest->bucket)) strictest = t;
+    }
+    return strictest;
+}
+
+long long throttle_takeTokens(long long max_tokens) {
+    throttler *t = strictestThrottler();
+    if (!t || max_tokens <= 0) return 0;
+    /* Two consumers share this bucket: the lanes, drawing a window at a time here, and main's queue,
+     * drawing one unit per released client from its timer. With nothing queued on main the lanes may
+     * take everything available. With a queue, they leave main its share of what the bucket holds:
+     * neither side waits for the other's queue to empty (a queue that is never empty would starve the
+     * other side for good), and both advance in the configured proportion. */
+    if (listLength(t->client_queue) > 0) {
+        double avail = tokenBucket_getTokens(t->bucket) * server.io_threads_throttle_lane_share / 100.0;
+        if (avail < 1.0) return 0;
+        if ((double)max_tokens > avail) max_tokens = (long long)avail;
+    }
+    return (long long)tokenBucket_consumeUpTo(t->bucket, (double)max_tokens);
+}
+
+void throttle_strictestState(double *tokens, int *queued) {
+    throttler *t = strictestThrottler();
+    *tokens = t ? tokenBucket_getTokens(t->bucket) : 0.0;
+    *queued = t ? (int)listLength(t->client_queue) : 0;
+}
+
+void throttle_refundTokens(long long n) {
+    throttler *t = strictestThrottler();
+    if (!t || n <= 0) return;
+    tokenBucket_refund(t->bucket, (double)n);
+    /* A queue waiting on an empty bucket is woken by its timer at the rate's cadence; the refund may
+     * let it release sooner, which the timer picks up on its next tick. */
+}
+
+double throttle_strictestRate(void) {
+    throttler *t = strictestThrottler();
+    return t ? tokenBucket_getRate(t->bucket) : 0.0;
+}
+
+long long throttle_usUntilTokens(long long n) {
+    throttler *t = strictestThrottler();
+    if (!t) return -1;
+    double ms = tokenBucket_msUntilAvailable(t->bucket, (double)(n < 1 ? 1 : n));
+    if (ms < 0) return -1;
+    long long us = (long long)(ms * 1000.0) + 1; /* round up: waking a hair late beats waking early and finding nothing */
+    return us;
+}
+
+void throttle_recordIncoming(long long n) {
+    if (n <= 0 || metrics_table == NULL) return;
+    throttler *t = strictestThrottler();
+    if (t) {
+        tpsCalculator_record(t->metrics->incoming_tps, (unsigned long)n);
+        return;
+    }
+    /* No throttler installed: the lanes' writes are replication traffic all the same, and the replication
+     * throttler's first rate cut after install is clamped to this measurement. Its metrics entry outlives
+     * the throttler (findMetrics by name), so the window is warm when it installs. */
+    tpsCalculator_record(findMetrics("repl_throttle")->incoming_tps, (unsigned long)n);
+}
+
 bool throttle_throttleClientIfNeeded(client *c) {
     /* Skip internal clients and clients already checked for this command.
      * Prevents re-throttling after unblocking. */

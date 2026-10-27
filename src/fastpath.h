@@ -16,6 +16,7 @@
 #define FP_LEAVING 1  /* stopped reading; main takes it back after the reply phase */
 #define FP_CLOSING 2  /* stopped reading; main frees it after the reply phase */
 #define FP_DETACHED 3 /* main owns it again */
+#define FP_LEAVING_REJOIN 4 /* FP_LEAVING for a reason not its own (throttle budget): main marks it fp_readmit on handback */
 
 /* Separately allocated fast-path state of one connection: identity and lifecycle. Main reads it while
  * executing an entry so it never touches the client itself; never place connection, socket, parser,
@@ -77,6 +78,7 @@ typedef struct cmdBatch {
 } cmdBatch;
 
 int fastpathEligible(client *c);
+int fastpathDeferredByGate(client *c);
 int fastpathAttach(client *c);
 int fastpathReadmitAuthenticated(client *c);
 int fastpathExecutorOutputLimitReached(client *ec);
@@ -121,6 +123,10 @@ void fastpathStagedAdoptClients(void);
 #define FP_MAX_LANES 64 /* write lanes; more IO threads than this leave the rest idle in the write phase */
 /* Main, before the read phase: decide whether this iteration's entries are sorted into write lanes. */
 void fastpathStagedPrepareLanes(void);
+/* Main, before sleeping: us until a writer parked for lack of throttle budget may be read again; -1 if
+ * none is parked or no budget is coming. Bounds the loop's sleep so parked clients are not left until
+ * some unrelated fd fires. */
+long long fastpathThrottleWakeUs(void);
 /* Main, after the read phase: the write phase will run lane phases on the IO threads. */
 int fastpathStagedLanesWillRun(void);
 /* Thread tid (0 = main): run its lane of the current write segment. */

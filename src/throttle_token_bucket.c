@@ -81,3 +81,23 @@ double tokenBucket_msUntilAvailable(tokenBucket *bucket, double target_tokens) {
     double needed = target_tokens - bucket->token_count;
     return needed * 1000.0 / bucket->tokens_per_sec;
 }
+
+double tokenBucket_consumeUpTo(tokenBucket *bucket, double max_tokens) {
+    replenishTokenBucket(bucket);
+    if (bucket->token_count < 1.0 || max_tokens < 1.0) return 0.0;
+    double take = bucket->token_count < max_tokens ? bucket->token_count : max_tokens;
+    take = (double)(long long)take; /* whole tokens: the fraction stays and accumulates in the bucket */
+    bucket->token_count -= take;
+    return take;
+}
+
+double tokenBucket_getTokens(tokenBucket *bucket) {
+    replenishTokenBucket(bucket);
+    return bucket->token_count;
+}
+
+void tokenBucket_refund(tokenBucket *bucket, double tokens) {
+    replenishTokenBucket(bucket);
+    bucket->token_count += tokens;
+    trimTokenBucket(bucket); /* a refund never exceeds what the bucket could have held */
+}

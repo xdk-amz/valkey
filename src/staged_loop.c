@@ -404,6 +404,9 @@ static void collectFDs(aeEventLoop *el) {
     uint64_t t1 = stagedNowNs();
     /* Write jobs queued by the pre-sleep hook run in the next phase; do not sleep on them. */
     long long timeout = ((el->flags & AE_DONT_WAIT) || ioThreadsInboxPending() || sl_read_client) ? 0 : aeUsUntilEarliestTimer(el);
+    /* Writers parked for throttle budget: wake when the bucket has a token for them. */
+    long long thr_wake = fastpathThrottleWakeUs();
+    if (thr_wake >= 0 && (timeout < 0 || thr_wake < timeout)) timeout = thr_wake;
     monotime pl = getMonotonicUs();
     int n = pollerGetNextBatch(sl_poller, timeout);
     cronStatsRecord(CRON_JOB_SL_POLL, getMonotonicUs() - pl); /* includes sleep when idle */

@@ -1973,8 +1973,10 @@ void clientAcceptHandler(connection *conn) {
 
     if (!c->flag.close_asap && fastpathEligible(c) && fastpathAttach(c) == C_OK) {
         connSetReadHandler(conn, NULL);
-    } else if (!c->flag.close_asap && tryPartitionClient(c) == C_OK) {
-        connSetReadHandler(conn, NULL);
+    } else if (!c->flag.close_asap) {
+        /* Turned away by a transient server-wide gate only: it joins the fast path once the gate lifts. */
+        if (fastpathDeferredByGate(c)) c->flag.fp_readmit = 1;
+        if (tryPartitionClient(c) == C_OK) connSetReadHandler(conn, NULL);
     }
 }
 
@@ -2678,6 +2680,10 @@ void beforeNextClient(client *c) {
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
+
+    /* Rejoined the fast path mid-pipeline (processInputBufferLoop): its buffer, replies and read
+     * interest are the IO threads' from here. */
+    if (c->flag.fastpath) return;
 
     /* Trim the query buffer to the current position. */
     if (isReplicatedClient(c)) {
@@ -4871,6 +4877,13 @@ static int processInputBufferLoop(client *c) {
     /* Parse the query buffer and/or execute already parsed commands. */
     while ((c->querybuf && c->qb_pos < sdslen(c->querybuf)) ||
            c->cmd_queue.off < c->cmd_queue.len) {
+        /* A fast-path client sent here for throttle budget (fp_readmit) goes back as soon as main has run
+         * what it came with; the rest of its pipeline is parsed and paced on the fast path. Done before
+         * parsing the next command, which would otherwise be main's to run (and to queue again). */
+        if (c->flag.fp_readmit && c->argc == 0 && !c->flag.pending_command &&
+            c->cmd_queue.off >= c->cmd_queue.len && fastpathReadmitAuthenticated(c))
+            return C_OK;
+
         if (!canParseCommand(c)) {
             break;
         }

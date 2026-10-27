@@ -1321,7 +1321,7 @@ typedef struct ClientFlags {
     uint64_t fastpath : 1;                 /* Read and written by IO threads in the staged phases; main executes its commands from batches. */
     uint64_t executor : 1;                 /* Main's per-IO-thread executor client: no socket, replies go to a batch arena. */
     uint64_t fp_detach_sent : 1;           /* freeClient recorded a close; main frees it once it took the client back after a reply phase. */
-    uint64_t fp_readmit : 1;               /* Authenticated on main, or handed back when staged mode stopped; joins the fast path once main has nothing further to do for it. */
+    uint64_t fp_readmit : 1;               /* Authenticated on main, handed back when staged mode stopped, or turned away by a transient server-wide gate; joins the fast path once main has nothing further to do for it and the gate has lifted. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1562,6 +1562,8 @@ typedef struct client {
     uint8_t io_tid;                       /* IO thread whose epoll set watches this client's socket (partitioned clients only) */
     uint8_t ring_seen;                    /* Commands of this client seen so far in the ring batch being formed (main thread only) */
     uint32_t fp_inflight;                 /* Fast path: commands of this client batched for main and not yet replied */
+    uint8_t fp_thr_stop;                  /* Fast path, IO thread only: this read stopped at a write with no throttle budget; the leave rejoins */
+    uint8_t fp_thr_writer;                /* Fast path, IO thread only: the last read appended a budgeted write; the next read is admitted before parsing */
     uint16_t fp_held;                     /* Fast path: commands main handed back unexecuted, now first in argv + cmd_queue */
     sds fp_out;                           /* Fast path: output not yet written */
     listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
@@ -2106,6 +2108,7 @@ struct valkeyServer {
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
     int io_threads_parallel_writes;           /* Run the staged write phase's commands in parallel lanes by shard */
     int io_threads_parallel_writes_min;       /* Fewest entries in a segment worth a parallel write phase */
+    int io_threads_throttle_lane_share;       /* Percent of a throttler's rate reserved for writes admitted on the fast path; the rest serves main's queue */
     int io_threads_strict_offload;            /* When set and io-threads >= 2, never read/parse/write a regular
                                                * client on the main thread: on offload decline the socket op is
                                                * deferred to a FIFO retry list and re-dispatched to an IO thread. */
