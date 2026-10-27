@@ -161,3 +161,41 @@ start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
         $rd close
     }
 }
+
+# MGET answered on the reading thread matches main's replies, including keys that send it to main.
+start_server {tags {"fastget-correctness"} overrides {io-threads 4 save {}}} {
+    r select 0
+
+    test {MGET on the reading thread matches main in RESP2 and RESP3} {
+        for {set i 0} {$i < 20} {incr i} { r set mg:$i v$i }
+        r set mg:int 12345
+        r set mg:big [string repeat x 2000]
+        r rpush mg:list a
+        set cmds {
+            {mget mg:0 mg:1 mg:2} {mget mg:3 mg:int mg:4} {mget mg:5 mg:none mg:6} {mget mg:7 mg:list}
+            {mget mg:8 mg:big} {mget mg:0 mg:1 mg:2 mg:3 mg:4 mg:5 mg:6 mg:7 mg:8 mg:9 mg:10 mg:11 mg:12 mg:13 mg:14 mg:15 mg:16}
+            {mget mg:9}
+        }
+        foreach proto {2 3} {
+            set ref {}
+            foreach mode {no yes} {
+                r config set io-threads-speculate-reads $mode
+                set rd [fastget_client]
+                $rd hello $proto
+                $rd read
+                set before [fastget_speculated r]
+                set out {}
+                for {set round 0} {$round < 20} {incr round} {
+                    foreach c $cmds { $rd {*}$c }
+                    foreach c $cmds { lappend out [$rd read] }
+                    for {set i 0} {$i < 8} {incr i} { $rd mget mg:$i mg:[expr {$i + 1}] }
+                    for {set i 0} {$i < 8} {incr i} { lappend out [$rd read] }
+                }
+                if {$mode eq "no"} { set ref $out } else { assert_equal $ref $out }
+                assert_equal [expr {$mode eq "yes"}] [expr {[fastget_speculated r] > $before}]
+                $rd close
+            }
+        }
+        assert_equal {v0 v1 {}} [r mget mg:0 mg:1 mg:none]
+    }
+}

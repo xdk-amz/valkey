@@ -37,7 +37,10 @@ struct client;
 /* Per-IO-thread counters: IO threads never write shared server stats; main
  * folds these into them once per event-loop iteration. */
 /* The commands a reading thread answers. A read is answered only when all its commands are one kind. */
-enum { FASTGET_KIND_GET = 0, FASTGET_KIND_SISMEMBER, FASTGET_KIND_HGET, FASTGET_KINDS };
+enum { FASTGET_KIND_GET = 0, FASTGET_KIND_SISMEMBER, FASTGET_KIND_HGET, FASTGET_KIND_MGET, FASTGET_KINDS };
+
+/* Most keys of an MGET answered on the reading thread. */
+#define FASTGET_MGET_MAX_KEYS 16
 
 typedef struct fastGetThreadStats {
     long long commands_processed;    /* speculated commands consumed on this thread */

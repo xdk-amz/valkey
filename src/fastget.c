@@ -34,12 +34,18 @@ uint64_t fastGetStatsSum(size_t field_offset) {
 /* The command of each kind, resolved on first use. */
 static struct serverCommand *fastGetKindCmd(int kind) {
     static struct serverCommand *cmds[FASTGET_KINDS];
-    static const char *names[FASTGET_KINDS] = {"get", "sismember", "hget"};
+    static const char *names[FASTGET_KINDS] = {"get", "sismember", "hget", "mget"};
     if (!cmds[kind]) cmds[kind] = lookupCommandByCString(names[kind]);
     return cmds[kind];
 }
 
-static const int fastget_kind_argc[FASTGET_KINDS] = {2, 3, 3};
+static const int fastget_kind_argc[FASTGET_KINDS] = {2, 3, 3, 2}; /* MGET: the fewest */
+
+/* A command of a kind has an argument count the reading thread answers. */
+static inline int fastGetKindArgcOk(int kind, int argc) {
+    if (kind == FASTGET_KIND_MGET) return argc >= 2 && argc - 1 <= FASTGET_MGET_MAX_KEYS;
+    return argc == fastget_kind_argc[kind];
+}
 
 /* Main only. Commands answered on IO threads skip processCommand, so they skip the NOAUTH and ACL checks;
  * this byte stands in for both, one bit per kind. It is recomputed at every auth change (clientSetUser),
@@ -295,6 +301,91 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
     return 1;
 }
 
+/* The value of a found string key, or 0 when the reading thread does not answer it. */
+static int fastGetStringValue(robj *o, char *intbuf, const char **val, size_t *vallen) {
+    if (objectGetType(o) != OBJ_STRING) return 0;
+    if (o->hasexpire) {
+        mstime_t when = objectGetExpire(o);
+        if (when >= 0 && mstime() >= when) return 0;
+    }
+    int encoding = objectGetEncoding(o);
+    if (encoding == OBJ_ENCODING_INT) {
+        *vallen = ll2string(intbuf, LONG_STR_SIZE, (long long)(long)objectGetVal(o));
+        *val = intbuf;
+    } else if (encoding == OBJ_ENCODING_EMBSTR || encoding == OBJ_ENCODING_RAW) {
+        *val = objectGetVal(o);
+        *vallen = sdslen((sds)*val);
+        if (*vallen > FASTGET_MAX_SPECULATIVE_VALUE_LEN) return 0;
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+/* Answer one MGET whose keys all exist as strings: their finds run interleaved, and the reply is written
+ * only once every key is known, so a punt leaves nothing behind. Returns 1 when answered. */
+static int fastGetAnswerMget(client *c, robj **argv, int argc, size_t input_bytes) {
+    long long request_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REQUEST);
+    if (request_threshold >= 0 && (long long)input_bytes >= request_threshold) return 0;
+    int n = argc - 1;
+    hashtableIncrementalFindState fs[FASTGET_MGET_MAX_KEYS];
+    for (int i = 0; i < n; i++) {
+        hashtable *ht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(objectGetVal(argv[i + 1]), -1));
+        if (!ht) return 0;
+        hashtableIncrementalFindInit(&fs[i], ht, objectGetVal(argv[i + 1]));
+    }
+    for (int pending = n; pending;) {
+        pending = 0;
+        for (int i = 0; i < n; i++) pending += hashtableIncrementalFindStep(&fs[i]);
+    }
+    char intbuf[FASTGET_MGET_MAX_KEYS][LONG_STR_SIZE];
+    const char *val[FASTGET_MGET_MAX_KEYS];
+    size_t vallen[FASTGET_MGET_MAX_KEYS];
+    size_t total = 1 + 20 + 2;
+    for (int i = 0; i < n; i++) {
+        void *entry = NULL;
+        /* A miss goes to main, which fires the keymiss notification and counts the miss. */
+        if (!hashtableIncrementalFindGetResult(&fs[i], &entry)) return 0;
+        if (!fastGetStringValue(entry, intbuf[i], &val[i], &vallen[i])) return 0;
+        total += 1 + 20 + 2 + vallen[i] + 2;
+    }
+    long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
+    if (reply_threshold >= 0 && (long long)total >= reply_threshold) return 0;
+    if (total > c->buf_usable_size - c->bufpos) return 0; /* the bound overestimates: main replies */
+    char hdr[32];
+    hdr[0] = '*';
+    int len = ll2string(hdr + 1, sizeof(hdr) - 3, n);
+    hdr[len + 1] = '\r';
+    hdr[len + 2] = '\n';
+    fastGetWriteRaw(c, hdr, len + 3);
+    for (int i = 0; i < n; i++) fastGetWriteBulkReply(c, val[i], vallen[i]);
+    return 1;
+}
+
+/* fastGetSpeculateBatch for a read of MGETs: answer them in order until the first that goes to main. */
+static int fastGetSpeculateMget(client *c, int tid, monotime spec_start) {
+    if (server.cluster_enabled) return 0;
+    int speculated = 0, keys = 0;
+    cmdQueue *queue = &c->cmd_queue;
+    if (!fastGetAnswerMget(c, c->argv, c->argc, c->net_input_bytes_curr_cmd)) return 0;
+    c->read_flags |= READ_FLAGS_FASTGET_SPECULATED;
+    speculated++;
+    keys += c->argc - 1;
+    for (int i = queue->off; i < queue->len; i++) {
+        parsedCommand *p = &queue->cmds[i];
+        if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break;
+        if (!fastGetAnswerMget(c, p->argv, p->argc, p->input_bytes)) break;
+        p->read_flags |= READ_FLAGS_FASTGET_SPECULATED;
+        speculated++;
+        keys += p->argc - 1;
+    }
+    /* fastGetConsumeSpeculated counts one keyspace hit per command; an MGET hit every key. */
+    fastget_thread_stats[tid].keyspace_hits += keys - speculated;
+    fastget_thread_stats[tid].calls[FASTGET_KIND_MGET] += speculated;
+    fastget_thread_stats[tid].usec[FASTGET_KIND_MGET] += (long long)(getMonotonicUs() - spec_start);
+    return speculated;
+}
+
 /* Called from the IO thread after parsing is complete. Executes a contiguous
  * prefix of GET commands, using batched incremental finds to overlap memory
  * prefetches across keys before replying in command order.
@@ -343,7 +434,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
             break;
         }
     }
-    if (kind < 0 || c->argc != fastget_kind_argc[kind]) return 0;
+    if (kind < 0 || !fastGetKindArgcOk(kind, c->argc)) return 0;
     if (kind != FASTGET_KIND_GET && !server.io_threads_speculate_reads) return 0;
     struct serverCommand *kind_cmd = c->parsed_cmd;
     int kind_argc = fastget_kind_argc[kind];
@@ -355,7 +446,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
     for (int i = c->cmd_queue.off; i < c->cmd_queue.len; i++) {
         parsedCommand *p = &c->cmd_queue.cmds[i];
         if (!(p->read_flags & READ_FLAGS_PARSING_COMPLETED)) break; /* the trailing partial */
-        if (p->cmd != kind_cmd || p->argc != kind_argc) return 0;
+        if (p->cmd != kind_cmd || !fastGetKindArgcOk(kind, p->argc)) return 0;
     }
 
     /* In cluster mode only a command this node answers without a redirect: the same check main runs, on
@@ -376,6 +467,7 @@ int fastGetSpeculateBatch(client *c, int tid) {
      * so their duration must be accumulated per-thread and folded into the
      * command's microseconds by fastGetAggregateStats (as with calls). */
     monotime spec_start = getMonotonicUs();
+    if (kind == FASTGET_KIND_MGET) return fastGetSpeculateMget(c, tid, spec_start);
 
     hashtable *ht = kvstoreGetHashtable(c->db->keys, fastGetTableIndex(objectGetVal(c->argv[1]), c->slot));
     if (!ht) return 0;
