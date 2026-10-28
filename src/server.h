@@ -2101,7 +2101,7 @@ struct valkeyServer {
     int io_threads_num;                       /* Number of IO threads to use. */
     int active_io_threads_num;                /* Current number of active IO threads, includes main thread. */
     int io_threads_always_active;             /* Activate all IO threads regardless of load size. */
-    int keyspace_shard_bits_config;           /* Configured value: -1 means auto (resolve at startup from io-threads and cluster mode). */
+    int keyspace_shard_bits_config;           /* Configured value: -1 means auto (resolve at startup from cluster mode). */
     int keyspace_shard_bits;                  /* Standalone: split each db into 2^bits hashtables by key slot. Effective value resolved once at startup. */
     int replica_parallel_apply;               /* Replica: apply eligible replicated writes on the staged IO threads. */
     int cron_lanes;                           /* Run due table maintenance (rehash, resize, expire) in a parallel MAINT phase. */
