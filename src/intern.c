@@ -671,6 +671,32 @@ sds internNewFrom(const char *buf, size_t len) {
     return internAdmitBufSlow(buf, len);
 }
 
+/* Moves a shareable string that just gained a holder, and is in probation or
+ * no longer in it, into the index, so it is counted and found. */
+__attribute__((cold, noinline)) static void indexHeld(sds s) {
+    internHdr *h = internHdrOf(s);
+    size_t len = sdslen(s);
+    uint64_t hash = internHash(s, len);
+    if (h->where == INTERN_IN_PROBATION) {
+        probRemove(s);
+    }
+    h->where = 0;
+    memo_key = s;
+    memo_hash = hash;
+    int added = hashtableAdd(intern_index, s);
+    memo_key = NULL;
+    /* An equal copy is already indexed; this one stays outside. */
+    if (!added) return;
+    filterAdd(hash);
+    h->where = INTERN_IN_INDEX;
+    size_t sz = internSize(s);
+    st.refs += h->refcount;
+    st.shared_bytes += sz;
+    st.saved_bytes += (size_t)(h->refcount - 1) * sz;
+    st.promotions++;
+    hotStore(s, len, s);
+}
+
 sds internDupSds(const_sds s) {
     if (!intern_is_main) return sdsdup(s);
     if (sdsIsShared(s)) {
@@ -680,6 +706,8 @@ sds internDupSds(const_sds s) {
             if (h->where == INTERN_IN_INDEX) {
                 st.refs++;
                 st.saved_bytes += h->size;
+            } else if (h->where != INTERN_RETIRED) {
+                indexHeld((sds)s);
             }
             return (sds)s;
         }
