@@ -20,11 +20,12 @@
 typedef struct internHdr {
     uint32_t refcount;
     uint32_t size : 24; /* usable bytes of the whole allocation, as used_memory counts them */
-    uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION (possibly evicted since) or 0 */
+    uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION or INTERN_IN_LOAD (possibly gone since) or 0 */
 } internHdr;
 
 #define INTERN_IN_INDEX 1
 #define INTERN_IN_PROBATION 2
+#define INTERN_IN_LOAD 4 /* in the load map, if it was not freed since */
 #define INTERN_RETIRED 3 /* dead or revived, freed or released by internEpochTick() */
 
 /* A string at this many references is not shared further. */
@@ -43,6 +44,27 @@ typedef struct internHdr {
 
 internState intern_state __attribute__((aligned(4096))) = {.gate = {1, 1}};
 int intern_load_ready = 0;
+
+/* While the server loads a dataset, every string is offered and a miss becomes
+ * a singleton in the load map, which has no size bound, so a value repeated
+ * anywhere in the load is shared however far apart its copies are. A miss whose
+ * shareable copy needs a bigger allocation than a private one is only made a
+ * singleton once load_seen says its hash was seen before. Both are freed when
+ * the load ends; singletons left in the map stay as unindexed strings.
+ *
+ * The map is an open-addressed array of hash and string, so a lookup touches a
+ * string only when the hashes match, and growing it needs no string at all. */
+typedef struct loadSlot {
+    uint64_t hash;
+    sds s; /* NULL when free */
+} loadSlot;
+
+static int intern_loading;
+static int load_index_check; /* the index was not empty when the load started */
+static loadSlot *load_map;
+static size_t load_cap, load_used;
+static uint64_t *load_seen;
+#define LOAD_SEEN_BITS (1u << 24)
 
 /* Set on the main thread at init; a forked child inherits it for its only thread. */
 __thread int intern_is_main;
@@ -470,6 +492,22 @@ static void setSelLevel(int level) {
     intern_sel_mask = (1ull << level) - 1;
 }
 
+void internLoadBegin(void) {
+    if (intern_index == NULL) return;
+    internResetSampling();
+    intern_loading = 1;
+    load_index_check = hashtableSize(intern_index) != 0;
+}
+
+void internLoadEnd(void) {
+    intern_loading = 0;
+    zfree(load_map);
+    load_map = NULL;
+    load_cap = load_used = 0;
+    zfree(load_seen);
+    load_seen = NULL;
+}
+
 void internResetSampling(void) {
     /* The check tools load without internInit(); loading must stay plain. */
     if (intern_index == NULL) return;
@@ -482,6 +520,11 @@ void internResetSampling(void) {
 
 /* Ends a sampling window: moves the levels and changes the salt. */
 __attribute__((cold, noinline)) static void observeWindow(void) {
+    /* A load offers every string, so the levels stay at 0 until it ends. */
+    if (intern_loading) {
+        win_sel = win_benefit = win_evict = win_created = win_promoted = 0;
+        return;
+    }
     if (win_benefit * 10 >= win_sel * 3) {
         if (intern_level > 0) setLevel(intern_level - 1);
         if (win_evict * 2 > win_sel && prob_nsets < PROB_MAX_SETS) probResize(prob_nsets * 2);
@@ -545,12 +588,9 @@ static inline size_t privateSize(size_t len) {
     return sdsHdrSize(sdsReqType(len)) + len + 1;
 }
 
-/* Promotes a probation singleton equal to buf[0..len) to the index, or returns
- * NULL. */
-static sds promote(uint64_t h, const char *buf, size_t len) {
-    if (!prob_count) return NULL;
-    sds cand = probTake(h, buf, len);
-    if (!cand) return NULL;
+/* Moves the singleton `cand`, which a new holder of buf[0..len) is taking, into
+ * the index. */
+static sds promoteCand(sds cand, uint64_t h, const char *buf, size_t len) {
     internHdr *ch = internHdrOf(cand);
     ch->refcount++;
     memo_key = cand;
@@ -572,6 +612,15 @@ static sds promote(uint64_t h, const char *buf, size_t len) {
     return cand;
 }
 
+/* Promotes a probation singleton equal to buf[0..len) to the index, or returns
+ * NULL. */
+static sds promote(uint64_t h, const char *buf, size_t len) {
+    if (!prob_count) return NULL;
+    sds cand = probTake(h, buf, len);
+    if (!cand) return NULL;
+    return promoteCand(cand, h, buf, len);
+}
+
 /* Looks buf[0..len) up in the index. */
 static sds indexFind(const char *buf, size_t len, uint64_t h) {
     sds found = NULL;
@@ -583,6 +632,122 @@ static sds indexFind(const char *buf, size_t len, uint64_t h) {
     hashtableFind(intern_index, &probe_key, (void **)&found);
     memo_key = NULL;
     return found;
+}
+
+#define LOAD_MIN_CAP 4096
+
+/* Returns the slot holding bytes equal to buf[0..len), or NULL. */
+static loadSlot *loadFind(uint64_t h, const char *buf, size_t len) {
+    if (load_used == 0) return NULL;
+    size_t mask = load_cap - 1;
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
+        loadSlot *e = &load_map[i];
+        if (e->s == NULL) return NULL;
+        if (e->hash == h && sdslen(e->s) == len && memcmp(e->s, buf, len) == 0) return e;
+    }
+}
+
+/* Returns the slot holding exactly `s`, found by the hash of `content`. */
+static loadSlot *loadFindPtr(const_sds content, sds s) {
+    if (load_used == 0) return NULL;
+    size_t mask = load_cap - 1;
+    for (size_t i = internHash(content, sdslen(content)) & mask;; i = (i + 1) & mask) {
+        if (load_map[i].s == NULL) return NULL;
+        if (load_map[i].s == s) return &load_map[i];
+    }
+}
+
+static void loadPut(uint64_t h, sds s) {
+    size_t mask = load_cap - 1;
+    size_t i = h & mask;
+    while (load_map[i].s) i = (i + 1) & mask;
+    load_map[i].hash = h;
+    load_map[i].s = s;
+}
+
+static void loadInsert(uint64_t h, sds s) {
+    if ((load_used + 1) * 2 > load_cap) {
+        loadSlot *old = load_map;
+        size_t old_cap = load_cap;
+        load_cap = old_cap ? old_cap * 2 : LOAD_MIN_CAP;
+        load_map = zcalloc(load_cap * sizeof(loadSlot));
+        for (size_t i = 0; i < old_cap; i++) {
+            if (old[i].s) loadPut(old[i].hash, old[i].s);
+        }
+        zfree(old);
+    }
+    loadPut(h, s);
+    load_used++;
+}
+
+/* Frees a slot, moving later entries of its probe run back over the hole. */
+static void loadDelete(loadSlot *e) {
+    size_t mask = load_cap - 1;
+    size_t i = e - load_map, j = i;
+    load_used--;
+    for (;;) {
+        load_map[i].s = NULL;
+        for (;;) {
+            j = (j + 1) & mask;
+            if (load_map[j].s == NULL) return;
+            size_t k = load_map[j].hash & mask;
+            /* An entry whose home lies cyclically in (i, j] stays where it is. */
+            if (i <= j ? (i < k && k <= j) : (i < k || k <= j)) continue;
+            break;
+        }
+        load_map[i] = load_map[j];
+        i = j;
+    }
+}
+
+/* Removes `s` from the load map if it is still there. */
+static void loadForget(sds s) {
+    loadSlot *e = loadFindPtr(s, s);
+    if (e) loadDelete(e);
+}
+
+/* Returns non-zero if the hash was seen before by this load, and marks it. */
+static int loadSeen(uint64_t h) {
+    if (load_seen == NULL) load_seen = zcalloc(LOAD_SEEN_BITS / 8);
+    uint64_t bit = (h >> 8) & (LOAD_SEEN_BITS - 1);
+    uint64_t mask = 1ull << (bit & 63);
+    int seen = (load_seen[bit >> 6] & mask) != 0;
+    load_seen[bit >> 6] |= mask;
+    return seen;
+}
+
+/* A miss while loading: takes the singleton made earlier in the load for equal
+ * bytes, or makes buf[0..len) one. Returns NULL when the value stays private. */
+__attribute__((cold, noinline)) static sds loadAdmit(const char *buf, size_t len, size_t priv_size) {
+    uint64_t h = internHash(buf, len);
+    loadSlot *e = loadFind(h, buf, len);
+    if (e) {
+        sds c = e->s;
+        internHdr *ch = internHdrOf(c);
+        if (ch->where == INTERN_IN_INDEX) {
+            if (ch->refcount >= INTERN_REFS_MAX) return NULL;
+            return shareIndexed(c, NULL);
+        }
+        /* A singleton of this load. It stays in the map once indexed, so the
+         * map is the only table a load looks in. */
+        ch->where = 0;
+        sds r = promoteCand(c, h, buf, len);
+        if (ch->where != INTERN_IN_INDEX) loadDelete(e);
+        return r;
+    }
+    if (load_index_check) {
+        /* The index held strings when this load started. */
+        sds found = indexFind(buf, len, h);
+        if (found && internHdrOf(found)->refcount < INTERN_REFS_MAX) {
+            loadInsert(h, found);
+            return shareIndexed(found, NULL);
+        }
+    }
+    if (!shareableFits(len, priv_size) && !loadSeen(h)) return NULL;
+    sds sh = newShareable(buf, len);
+    internHdrOf(sh)->where = INTERN_IN_LOAD;
+    loadInsert(h, sh);
+    return sh;
 }
 
 /* Looks `s` up in the index and probation, for a hash the filter may hold.
@@ -616,6 +781,12 @@ sds internAdmitSlow(sds s) {
     size_t len = sdslen(s);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
     st.sampled++;
+    if (unlikely(intern_loading)) {
+        sds r = loadAdmit(s, len, sdsAllocSize(s));
+        if (r == NULL) return s;
+        sdsfree(s);
+        return r;
+    }
 
     sds c = hotFind(s, len);
     if (unlikely(c != NULL)) {
@@ -671,14 +842,16 @@ sds internNewFrom(const char *buf, size_t len) {
     return internAdmitBufSlow(buf, len);
 }
 
-/* Moves a shareable string that just gained a holder, and is in probation or
- * no longer in it, into the index, so it is counted and found. */
+/* Moves a shareable string that just gained a holder, and is in probation, in
+ * the load map or in neither, into the index, so it is counted and found. */
 __attribute__((cold, noinline)) static void indexHeld(sds s) {
     internHdr *h = internHdrOf(s);
     size_t len = sdslen(s);
     uint64_t hash = internHash(s, len);
     if (h->where == INTERN_IN_PROBATION) {
         probRemove(s);
+    } else if (h->where == INTERN_IN_LOAD && !intern_loading) {
+        loadForget(s);
     }
     h->where = 0;
     memo_key = s;
@@ -686,7 +859,10 @@ __attribute__((cold, noinline)) static void indexHeld(sds s) {
     int added = hashtableAdd(intern_index, s);
     memo_key = NULL;
     /* An equal copy is already indexed; this one stays outside. */
-    if (!added) return;
+    if (!added) {
+        if (intern_loading) loadForget(s);
+        return;
+    }
     filterAdd(hash);
     h->where = INTERN_IN_INDEX;
     size_t sz = internSize(s);
@@ -722,6 +898,13 @@ sds internDupSds(const_sds s) {
 static sds internAdmitBufSlow(const char *buf, size_t len) {
     if (intern_index == NULL) return sdsnewlen(buf, len);
     st.sampled++;
+    if (unlikely(intern_loading)) {
+        sds r = loadAdmit(buf, len, privateSize(len));
+        if (r) return r;
+        sds p = sdsnewlen(buf, len);
+        intern_offered = p;
+        return p;
+    }
     sds c = hotFind(buf, len);
     if (c && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
         st.hot_hits++;
@@ -772,6 +955,7 @@ static void releaseOnMain(sds s, uint32_t n) {
     if (h->refcount) return;
     if (h->where == INTERN_IN_INDEX) {
         hotForget(s);
+        if (intern_loading) loadForget(s);
         uint64_t hash = internHash(s, sdslen(s));
         memo_key = s;
         memo_hash = hash;
@@ -785,6 +969,8 @@ static void releaseOnMain(sds s, uint32_t n) {
         }
     } else if (h->where == INTERN_IN_PROBATION) {
         probRemove(s);
+    } else if (h->where == INTERN_IN_LOAD) {
+        loadForget(s);
     } else if (h->where == INTERN_RETIRED) {
         return; /* freed by internEpochTick() */
     }
@@ -1182,12 +1368,19 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     uint8_t where = ((internHdr *)np)->where;
     if (where == INTERN_IN_INDEX) {
         serverAssert(hashtableReplaceReallocatedEntry(intern_index, s, ns));
+        if (intern_loading) {
+            loadSlot *e = loadFindPtr(ns, s);
+            if (e) e->s = ns;
+        }
         size_t i = hotSlot(ns, sdslen(ns));
         if (hot[i].s == s) __atomic_store_n(&hot[i].s, ns, __ATOMIC_RELEASE);
     } else if (where == INTERN_IN_PROBATION) {
         /* The old copy is freed; hash the moved one. */
         probSlot *slot = probFind(ns, s);
         if (slot) slot->s = ns;
+    } else if (where == INTERN_IN_LOAD) {
+        loadSlot *e = loadFindPtr(ns, s);
+        if (e) e->s = ns;
     }
     return ns;
 }
@@ -1241,11 +1434,13 @@ size_t internSdsMemUsage(const_sds s) {
 
 void internGetInfo(internInfo *info) {
     info->shared = hashtableSize(intern_index);
-    info->singletons = prob_count;
+    info->singletons = prob_count + load_used;
     info->refs = st.refs;
     info->shared_bytes = st.shared_bytes;
     info->saved_bytes = st.saved_bytes;
     info->table_bytes = hashtableMemUsage(intern_index) + prob_nsets * PROB_WAYS * sizeof(probSlot);
+    info->table_bytes += load_cap * sizeof(loadSlot);
+    if (load_seen) info->table_bytes += LOAD_SEEN_BITS / 8;
     info->hits = st.hits;
     info->hot_hits = st.hot_hits;
     info->promotions = st.promotions;

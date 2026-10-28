@@ -13,6 +13,21 @@ proc wait_intern_released {{client r}} {
     }
 }
 
+# Writes n values of `size` bytes as string values, hash values or set members.
+# With dup set, value i equals value i+1 for even i < n/2; the rest are unique.
+proc intern_fill_pairs {client holder n size {dup 1}} {
+    set pad [string repeat p $size]
+    for {set i 0} {$i < $n} {incr i} {
+        if {$dup && $i < $n / 2} {set id "d[expr {$i / 2}]"} else {set id "u$i"}
+        set v [string range "$id$pad" 0 [expr {$size - 1}]]
+        switch $holder {
+            string {$client set k$i $v}
+            hash {$client hset h[expr {$i % 64}] f$i $v}
+            set {$client sadd s[expr {$i % 64}] $v}
+        }
+    }
+}
+
 start_server {tags {"intern"}} {
 
     test {Identical string values are stored once} {
@@ -82,6 +97,59 @@ start_server {tags {"intern"}} {
         r debug reload
         assert_equal $d [debug_digest]
         assert_morethan [intern_stat intern_refs] 1000
+    } {} {needs:debug}
+
+    foreach holder {string hash set} {
+        test "DEBUG RELOAD shares every repeated $holder value" {
+            set n 8000
+            r flushall sync
+            intern_fill_pairs r $holder $n 300 0
+            r debug reload
+            set distinct [s used_memory]
+            r flushall sync
+            # Half the keys hold a value that exactly one other key holds.
+            intern_fill_pairs r $holder $n 300
+            r debug reload
+            wait_for_condition 50 100 {
+                [intern_stat intern_strings] == $n / 4 && [intern_stat intern_refs] == $n / 2
+            } else {
+                fail "reload did not share every pair: [r info memory]"
+            }
+            assert_lessthan [s used_memory] [expr {$distinct - $n / 4 * 300}]
+        } {} {needs:debug}
+    }
+
+    test {DEBUG RELOAD shares values bigger as a shared copy from the second holder} {
+        r flushall sync
+        # A shared copy of 250 bytes needs the next allocation size class.
+        for {set g 0} {$g < 1000} {incr g} {
+            set v [string range "[string repeat w 250]$g" end-249 end]
+            for {set j 0} {$j < 3} {incr j} {r set k$g:$j $v}
+        }
+        # A synchronous flush leaves no old copy for the load to share.
+        r config set replica-lazy-flush no
+        r debug reload
+        r config set replica-lazy-flush yes
+        assert_equal 1000 [intern_stat intern_strings]
+        assert_range [intern_stat intern_refs] 2000 2020
+    } {} {needs:debug}
+
+    test {intern_saved_bytes matches the memory saved} {
+        set n 20000
+        r flushall sync
+        intern_fill_pairs r string $n 1024 0
+        r debug reload
+        set distinct [s used_memory]
+        r flushall sync
+        intern_fill_pairs r string $n 1024
+        r debug reload
+        wait_for_condition 50 100 {
+            [intern_stat intern_refs] == $n / 2 && [s lazyfree_pending_objects] == 0
+        } else {
+            fail "references did not settle: [r info memory]"
+        }
+        set saved [intern_stat intern_saved_bytes]
+        assert_range [expr {$distinct - [s used_memory]}] [expr {$saved * 0.97}] [expr {$saved * 1.03}]
     } {} {needs:debug}
 
     test {intern_saved_bytes counts whole allocations} {
@@ -415,6 +483,39 @@ start_server {tags {"intern"} overrides {io-threads 1}} {
             [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
         } else {
             fail "intern references not released"
+        }
+    }
+}
+
+start_server {tags {"intern repl external:skip"}} {
+    set replica [srv 0 client]
+    start_server {} {
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+
+        foreach load {disabled swapdb} {
+            test "Full sync shares every repeated value (repl-diskless-load $load)" {
+                $master flushall
+                $master debug change-repl-id
+                intern_fill_pairs $master string 8000 300
+                set full [s 0 sync_full]
+                $replica config set repl-diskless-load $load
+                $replica replicaof $master_host $master_port
+                wait_for_condition 100 100 {
+                    [s 0 sync_full] > $full && [s -1 master_link_status] eq "up"
+                } else {
+                    fail "Replica did not full sync"
+                }
+                wait_for_ofs_sync $master $replica
+                assert_equal [$master debug digest] [$replica debug digest]
+                wait_for_condition 50 100 {
+                    [intern_stat intern_strings $replica] == 2000 && [intern_stat intern_refs $replica] == 4000
+                } else {
+                    fail "replica did not share every pair: [$replica info memory]"
+                }
+                assert_equal OK [$replica replicaof no one]
+            } {} {needs:debug}
         }
     }
 }
