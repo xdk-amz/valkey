@@ -1786,10 +1786,13 @@ void spopWithCountCommand(client *c) {
     propargv[1] = c->argv[1];
     unsigned long propindex = 2;
     void *replylen = NULL;
-    if (sampler.hides)
+    /* A set that hides members may pop none, so it notifies after the pops. */
+    if (sampler.hides) {
         replylen = addReplyDeferredLen(c);
-    else
+    } else {
+        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
         addReplySetLen(c, count);
+    }
     unsigned long popped = 0;
     bool set_replaced = false;
 
@@ -1988,7 +1991,7 @@ void spopWithCountCommand(client *c) {
      * the alsoPropagate() API. */
     preventCommandPropagation(c);
     if (popped) {
-        notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
+        if (sampler.hides) notifyKeyspaceEvent(NOTIFY_SET, "spop", c->argv[1], c->db->id);
         if (set_emptied) notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
         signalModifiedKey(c, c->db, c->argv[1]);
     }
