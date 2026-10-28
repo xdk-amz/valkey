@@ -115,7 +115,9 @@ start_server {tags {"intern"}} {
             } else {
                 fail "reload did not share every pair: [r info memory]"
             }
-            assert_lessthan [s used_memory] [expr {$distinct - $n / 4 * 300}]
+            # Each pair keeps one copy. Without size classes, as with libc malloc,
+            # shared copies and singletons pay their header.
+            assert_lessthan [s used_memory] [expr {$distinct - $n / 4 * 300 * 8 / 10}]
         } {} {needs:debug}
     }
 
