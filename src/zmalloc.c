@@ -157,6 +157,14 @@ static inline size_t zmallocCacheAlignedDataSize(size_t size) {
 
 
 #ifdef HAVE_MALLOC_SIZE
+/* The usable size of a block the allocator just returned for a request of 'req' bytes. jemalloc
+ * computes it from the size class alone, without looking the block up. */
+#ifdef USE_JEMALLOC
+#define zmalloc_new_size(ptr, req) je_nallocx((req), 0)
+#else
+#define zmalloc_new_size(ptr, req) zmalloc_size(ptr)
+#endif
+
 void *extend_to_usable(void *ptr, size_t size) {
     UNUSED(size);
     return ptr;
@@ -172,7 +180,7 @@ static inline void *ztrymalloc_usable_internal(size_t size, size_t *usable) {
 
     if (!ptr) return NULL;
 #ifdef HAVE_MALLOC_SIZE
-    size = zmalloc_size(ptr);
+    size = zmalloc_new_size(ptr, MALLOC_MIN_SIZE(size) + PREFIX_SIZE);
     update_zmalloc_stat_alloc(size);
     if (usable) *usable = size;
     return ptr;
@@ -282,7 +290,7 @@ static inline void *ztrycalloc_usable_internal(size_t size, size_t *usable) {
     if (ptr == NULL) return NULL;
 
 #ifdef HAVE_MALLOC_SIZE
-    size = zmalloc_size(ptr);
+    size = zmalloc_new_size(ptr, MALLOC_MIN_SIZE(size) + PREFIX_SIZE);
     update_zmalloc_stat_alloc(size);
     if (usable) *usable = size;
     return ptr;
@@ -379,7 +387,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     }
 
     update_zmalloc_stat_free(oldsize);
-    size = zmalloc_size(newptr);
+    size = zmalloc_new_size(newptr, size);
     update_zmalloc_stat_alloc(size);
     if (usable) *usable = size;
     return newptr;
