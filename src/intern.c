@@ -19,7 +19,7 @@
  * space and is never grown. */
 typedef struct internHdr {
     uint32_t refcount;
-    uint32_t size : 24; /* bytes requested for the whole allocation */
+    uint32_t size : 24; /* usable bytes of the whole allocation, as used_memory counts them */
     uint32_t where : 8; /* INTERN_IN_INDEX, INTERN_IN_PROBATION (possibly evicted since) or 0 */
 } internHdr;
 
@@ -519,10 +519,11 @@ static sds newShareable(const char *buf, size_t len) {
     if (type == SDS_TYPE_5) type = SDS_TYPE_8;
     int hdrlen = sdsHdrSize(type);
     size_t size = sizeof(internHdr) + hdrlen + len + 1;
-    char *p = zmalloc(size);
+    size_t usable;
+    char *p = zmalloc_usable(size, &usable);
     internHdr *h = (internHdr *)p;
     h->refcount = 1;
-    h->size = size;
+    h->size = usable;
     h->where = 0;
     sds s = sdswrite(p + sizeof(internHdr), hdrlen + len + 1, type, buf, len);
     s[-1] |= (char)(1 << (SDS_TYPE_BITS + SDS_AUX_SHARED));
