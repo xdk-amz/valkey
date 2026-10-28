@@ -2016,6 +2016,17 @@ void fastpathStagedWriteLane(int tid) {
                     room = prefetchBatchAddCommand(e->cmd, e->argv, e->argc, e->db, e->slot, &result);
             }
             getKeysFreeResult(&result);
+            /* As main's batch does: bring in the arguments the IO thread that parsed them left in its own
+             * cache, then their strings, while the keys are looked up. */
+            for (int j = i; j < end; j++) {
+                cmdEntry *e = L->run[j];
+                for (int a = 1; a < e->argc; a++) valkey_prefetch(e->argv[a]);
+            }
+            for (int j = i; j < end; j++) {
+                cmdEntry *e = L->run[j];
+                for (int a = 1; a < e->argc; a++)
+                    if (e->argv[a]->encoding == OBJ_ENCODING_RAW) valkey_prefetch(objectGetVal(e->argv[a]));
+            }
             prefetchBatchRun();
             prefetchBatchReset();
             L->prefetches++;
