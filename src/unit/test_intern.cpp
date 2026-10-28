@@ -106,3 +106,25 @@ TEST_F(InternTest, ForkChildReleaseAborts) {
     h->refcount = 1;
     sdsfree(shared);
 }
+
+/* A shareable string outside the index that gains a holder is indexed, so both
+ * holders are counted and later writes find it. */
+TEST_F(InternTest, DupOfSingletonIsIndexed) {
+    const char *val = "intern-dup-of-a-probation-singleton";
+    internInfo before, after;
+    internGetInfo(&before);
+    sds a = internAdmitSlow(sdsnew(val));
+    ASSERT_TRUE(sdsIsShared(a));
+    sds d = internDupSds(a);
+    EXPECT_EQ(d, a);
+    internGetInfo(&after);
+    EXPECT_EQ(after.shared, before.shared + 1);
+    EXPECT_EQ(after.refs, before.refs + 2);
+
+    sds b = internAdmitSlow(sdsnew(val));
+    EXPECT_EQ(b, a);
+    EXPECT_EQ(internSharedRefcount(a), 3u);
+    sdsfree(a);
+    sdsfree(d);
+    sdsfree(b);
+}
