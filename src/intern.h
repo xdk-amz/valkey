@@ -109,6 +109,12 @@ void internInit(void);
  * only. */
 void internResetSampling(void);
 
+/* Called when a dataset load starts and ends. In between, every string is
+ * offered and every repeated value is shared, whatever the sampling level would
+ * be. Main thread only. */
+void internLoadBegin(void);
+void internLoadEnd(void);
+
 /* RDB loading. While every write is being probed, the loader reads a candidate
  * string into the scratch buffer instead of a fresh allocation, so a string that
  * is already shared costs no allocation:

@@ -3391,7 +3391,7 @@ void startLoading(size_t size, int rdbflags, int async) {
     server.loading_rdb_used_mem = 0;
     server.rdb_last_load_keys_expired = 0;
     server.rdb_last_load_keys_loaded = 0;
-    internResetSampling();
+    internLoadBegin();
     blockingOperationStarts();
 
     /* Cleanup slot migrations (we need a clean state for the incoming load) */
@@ -3437,6 +3437,7 @@ void updateLoadingFileName(char *filename) {
 void stopLoading(int success) {
     server.loading = 0;
     server.async_loading = 0;
+    internLoadEnd();
     blockingOperationEnds();
     rdbFileBeingLoaded = NULL;
 

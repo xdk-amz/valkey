@@ -128,3 +128,57 @@ TEST_F(InternTest, DupOfSingletonIsIndexed) {
     sdsfree(d);
     sdsfree(b);
 }
+
+/* Values whose shared copy fits the allocation size class of a private one: 80
+ * bytes need 84 bytes privately and 92 shared, both in the 96-byte class. */
+static sds loadValue(char *buf, int i) {
+    snprintf(buf, 96, "load-value-%010d-padding-padding-padding-padding-padding-padding-padding", i);
+    return internNewFrom(buf, 80);
+}
+
+/* While loading, a value is shared with its first copy however many other
+ * values came between them, and removing singletons from the load map keeps
+ * the rest findable. */
+TEST_F(InternTest, LoadSharesAcrossTheWholeLoad) {
+    const int n = 50000;
+    char buf[96];
+    sds *first = (sds *)zmalloc(sizeof(sds) * n);
+    internLoadBegin();
+    for (int i = 0; i < n; i++) {
+        first[i] = loadValue(buf, i);
+        ASSERT_TRUE(sdsIsShared(first[i]));
+    }
+    for (int i = 0; i < n; i += 2) sdsfree(first[i]);
+    internInfo before, after;
+    internGetInfo(&before);
+    for (int i = 1; i < n; i += 2) {
+        sds again = loadValue(buf, i);
+        ASSERT_EQ(again, first[i]);
+        sdsfree(again);
+    }
+    internGetInfo(&after);
+    EXPECT_EQ(after.promotions, before.promotions + n / 2);
+    internLoadEnd();
+    for (int i = 1; i < n; i += 2) sdsfree(first[i]);
+    zfree(first);
+}
+
+/* A value whose shared copy needs a bigger allocation stays private for its
+ * first holder while loading, and is shared from the second holder on. */
+TEST_F(InternTest, LoadMisfitSharesFromSecondHolder) {
+    /* 40 bytes: 44 bytes privately in the 48-byte class, 52 shared in the 56. */
+    const char *val = "load-misfit-value-forty-bytes-long-xxxxx";
+    ASSERT_EQ(strlen(val), 40u);
+    internLoadBegin();
+    sds a = internNewFrom(val, 40);
+    sds b = internNewFrom(val, 40);
+    sds c = internNewFrom(val, 40);
+    internLoadEnd();
+    EXPECT_FALSE(sdsIsShared(a));
+    EXPECT_TRUE(sdsIsShared(b));
+    EXPECT_EQ(b, c);
+    EXPECT_EQ(internSharedRefcount(b), 2u);
+    sdsfree(a);
+    sdsfree(b);
+    sdsfree(c);
+}
