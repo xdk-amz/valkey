@@ -84,6 +84,19 @@ start_server {tags {"intern"}} {
         assert_morethan [intern_stat intern_refs] 1000
     } {} {needs:debug}
 
+    test {intern_saved_bytes counts whole allocations} {
+        set n 4000
+        set pad [string repeat q 1024]
+        r flushall sync
+        for {set i 0} {$i < $n} {incr i} {r set k$i [string range "$i$pad" 0 1023]}
+        set distinct [s used_memory]
+        r flushall sync
+        for {set i 0} {$i < $n} {incr i} {r set k$i $pad}
+        set saved [intern_stat intern_saved_bytes]
+        assert_morethan [intern_stat intern_refs] [expr {$n * 9 / 10}]
+        assert_range [expr {$distinct - [s used_memory]}] [expr {$saved * 0.95}] [expr {$saved * 1.05}]
+    }
+
     test {MEMORY USAGE charges a share of a shared value} {
         r flushall
         set v [string repeat u 1000]
