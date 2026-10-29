@@ -448,3 +448,30 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         foreach c $clients { catch {$c close} }
     }
 }
+
+start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 1 io-threads-always-active yes enable-debug-command yes}} {
+    test {Lifecycle: each IO thread added at runtime gets its own allocator arena, kept across restarts} {
+        if {![string match {*jemalloc*} [s mem_allocator]]} {
+            return
+        }
+        set base [r debug mallctl arenas.narenas]
+        r config set io-threads 4
+        wait_for_condition 500 20 {
+            [lc_running] == 3
+        } else {
+            fail "IO threads did not start: [r info server]"
+        }
+        r set lc:arena x
+        assert_equal [expr {$base + 3}] [r debug mallctl arenas.narenas]
+        r config set io-threads 1
+        lc_wait_settled
+        r config set io-threads 4
+        wait_for_condition 500 20 {
+            [lc_running] == 3
+        } else {
+            fail "IO threads did not restart: [r info server]"
+        }
+        assert_equal [expr {$base + 3}] [r debug mallctl arenas.narenas]
+        assert_equal x [r get lc:arena]
+    }
+}

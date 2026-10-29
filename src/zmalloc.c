@@ -882,6 +882,26 @@ int zmalloc_purge(void) {
     return ret;
 }
 
+/* Bind the calling thread to a jemalloc arena of its own, one per slot (1 <= slot < ZMALLOC_ARENA_SLOTS).
+ * jemalloc sizes its automatic arena pool from the CPUs the process may use when it starts: started on
+ * one CPU, it has a single arena, and threads added later all share it with main. A slot's arena is
+ * created the first time the slot binds and reused when the slot's thread is started again. */
+void zmalloc_bind_thread_arena(int slot) {
+#if defined(USE_JEMALLOC)
+    static unsigned slot_arena[ZMALLOC_ARENA_SLOTS];
+    if (slot < 1 || slot >= ZMALLOC_ARENA_SLOTS) return;
+    unsigned ind = slot_arena[slot];
+    if (!ind) {
+        size_t sz = sizeof(ind);
+        if (je_mallctl("arenas.create", &ind, &sz, NULL, 0) != 0) return;
+        slot_arena[slot] = ind;
+    }
+    je_mallctl("thread.arena", NULL, NULL, &ind, sizeof(ind));
+#else
+    (void)slot;
+#endif
+}
+
 /* Release free pages of the libc main arena back to the OS via malloc_trim(3).
  * Even with jemalloc, libc-internal allocations (getaddrinfo(3), NSS, pthread,
  * stdio, or modules calling malloc() directly) live in the [heap] segment and
