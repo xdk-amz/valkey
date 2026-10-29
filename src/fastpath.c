@@ -1385,9 +1385,16 @@ int fastpathDetachConsumed(client *c) {
 /* A client that left to authenticate returns once main has nothing further to do for it;
  * any other unsupported command keeps it on the main path, as before. */
 static int fpQuiescent(client *c) {
-    if (c->argc > 0 || c->flag.pending_command || c->cmd_queue.off < c->cmd_queue.len) return 0;
-    if (c->querybuf && sdslen(c->querybuf) > c->qb_pos) return 0;
+    if (c->flag.pending_command || c->cmd_queue.off < c->cmd_queue.len) return 0;
     if (c->io_read_state != CLIENT_IDLE || c->io_write_state != CLIENT_IDLE) return 0;
+    /* A multibulk command still arriving: every byte past qb_pos belongs to it, and the fast path's
+     * parser resumes it from the same state. A pipeline of large commands is rarely between commands
+     * when main finishes a read, so without this such a client would never join. */
+    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen > 0 && c->cmd_queue.len == 0 &&
+        !(c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG))
+        return 1;
+    if (c->argc > 0) return 0;
+    if (c->querybuf && sdslen(c->querybuf) > c->qb_pos) return 0;
     return 1;
 }
 

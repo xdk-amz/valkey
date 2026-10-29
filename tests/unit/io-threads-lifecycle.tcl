@@ -475,3 +475,37 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io
         assert_equal x [r get lc:arena]
     }
 }
+
+start_server {tags {"io-threads-lifecycle external:skip tls:skip"} overrides {io-threads 1 io-threads-always-active yes}} {
+    test {Lifecycle: a client whose command is still arriving joins the fast path on scale-up} {
+        set fd [socket [srv 0 host] [srv 0 port]]
+        fconfigure $fd -translation binary -buffering none
+        puts -nonewline $fd "*3\r\n\$3\r\nSET\r\n\$6\r\nlc:mid\r\n\$5\r\nva"
+        flush $fd
+        wait_for_condition 100 10 {
+            [getInfoProperty [r info clients] connected_clients] == 2
+        } else {
+            fail "partial client not connected"
+        }
+        after 50
+        r config set io-threads 2
+        wait_for_condition 500 20 {
+            [lc_running] == 1
+        } else {
+            fail "IO thread did not start: [r info server]"
+        }
+        wait_for_condition 500 20 {
+            [lc_fastpath_clients] == 1
+        } else {
+            fail "the client with a command in flight did not join the fast path: [r info fastpath]"
+        }
+        puts -nonewline $fd "lue\r\n"
+        flush $fd
+        assert_equal "+OK" [string trim [gets $fd]]
+        puts -nonewline $fd "*2\r\n\$3\r\nGET\r\n\$6\r\nlc:mid\r\n"
+        flush $fd
+        assert_equal "\$5" [string trim [gets $fd]]
+        assert_equal value [string trim [gets $fd]]
+        close $fd
+    }
+}
