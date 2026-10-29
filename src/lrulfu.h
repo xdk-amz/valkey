@@ -87,4 +87,8 @@ uint32_t lrulfu_touch(uint32_t lrulfu);
  * for a caller with its own generator. */
 uint32_t lrulfu_touchWithRandom(uint32_t lrulfu, double r);
 
+/* Under LRU a touch sets the value to the current clock whatever it was: returns true and sets *value
+ * to that clock. Under LFU returns false. */
+bool lrulfu_touchIsConstant(uint32_t *value);
+
 #endif

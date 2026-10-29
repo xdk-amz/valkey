@@ -199,22 +199,26 @@ static int fastGetWriteRaw(client *c, const char *s, size_t len) {
  * A key answered here is touched as lookupKey touches it on main. Other IO threads may touch the same
  * object in the same read phase, so the reader swaps the 32-bit word holding type, encoding and the
  * LRU/LFU field only if the word is still what it read: a lost race drops one touch, never undoes
- * another. Main changes objects only outside the read phase. */
+ * another. Main changes objects, the LRU clock and the policy only outside the read phase, so what
+ * fastGetTouchBegin reads holds for the whole read. */
 
-/* type, encoding and lru fill exactly the object's first 32 bits. Constant-folded. */
-static inline int fastGetTouchWordOk(void) {
+/* The lru field's bits within the object's first 32-bit word, or 0 when type, encoding and lru do not
+ * fill exactly that word. */
+static uint32_t fastGetTouchProbeMask(void) {
     robj probe;
     memset(&probe, 0, sizeof(probe));
+    probe.lru = (1u << LRULFU_BITS) - 1;
+    uint32_t lru_bits;
+    memcpy(&lru_bits, &probe, sizeof(lru_bits));
     probe.type = 15;
     probe.encoding = 15;
-    probe.lru = (1u << LRULFU_BITS) - 1;
     uint32_t word;
     memcpy(&word, &probe, sizeof(word));
     if (word != UINT32_MAX) return 0;
     const unsigned char *rest = (const unsigned char *)&probe + sizeof(word);
     for (size_t i = 0; i < sizeof(probe) - sizeof(word); i++)
         if (rest[i]) return 0;
-    return 1;
+    return lru_bits;
 }
 
 /* xorshift64*, one generator per thread: the LFU increment's rand() is not meant for IO threads. */
@@ -230,19 +234,53 @@ static double fastGetTouchRandom(void) {
     return (double)((x * UINT64_C(0x2545F4914F6CDD1D)) >> 11) / (double)(UINT64_C(1) << 53);
 }
 
-/* Touch a key answered on this thread, honoring CLIENT NO-TOUCH and a running child (copy on write). */
-static void fastGetTouch(client *c, robj *o) {
-    if (!fastGetTouchWordOk() || c->flag.no_touch || hasActiveChildProcess()) return;
+/* What touching means for the read being answered: off (CLIENT NO-TOUCH, or a running child, whose
+ * pages a write would copy), set the LRU field to a fixed clock value, or an LFU increment. */
+static _Thread_local struct {
+    int on;
+    int lru;
+    int shift;         /* of the lru field within the word */
+    uint32_t mask;     /* the lru field's bits */
+    uint32_t lru_word; /* the clock value in the lru field's bits */
+} fastget_touch;
+
+static void fastGetTouchBegin(client *c) {
+    static uint32_t mask = UINT32_MAX; /* not probed yet; every thread probes the same value */
+    uint32_t m = __atomic_load_n(&mask, __ATOMIC_RELAXED);
+    if (m == UINT32_MAX) {
+        m = fastGetTouchProbeMask();
+        __atomic_store_n(&mask, m, __ATOMIC_RELAXED);
+    }
+    uint32_t clock = 0;
+    fastget_touch.on = m && !c->flag.no_touch && !hasActiveChildProcess();
+    fastget_touch.lru = lrulfu_touchIsConstant(&clock);
+    fastget_touch.mask = m;
+    fastget_touch.shift = m ? __builtin_ctz(m) : 0;
+    fastget_touch.lru_word = (clock << fastget_touch.shift) & m;
+}
+
+static __attribute__((noinline, cold)) void fastGetTouchLfu(robj *o) {
     uint32_t *word = (uint32_t *)(void *)o;
     uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
-    robj probe;
-    memset(&probe, 0, sizeof(probe));
-    memcpy(&probe, &seen, sizeof(seen));
-    uint32_t lru = lrulfu_touchWithRandom(probe.lru, fastGetTouchRandom());
-    if (lru == probe.lru) return;
-    probe.lru = lru;
-    uint32_t touched;
-    memcpy(&touched, &probe, sizeof(touched));
+    uint32_t lfu = (seen & fastget_touch.mask) >> fastget_touch.shift;
+    uint32_t next = lrulfu_touchWithRandom(lfu, fastGetTouchRandom());
+    if (next == lfu) return;
+    uint32_t touched = (seen & ~fastget_touch.mask) | ((next << fastget_touch.shift) & fastget_touch.mask);
+    __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+/* Touch a key answered on this thread. Under LRU a key already at the current clock is left unwritten,
+ * so a key is written at most once per clock tick, as on main. */
+static inline __attribute__((always_inline)) void fastGetTouch(robj *o) {
+    if (!fastget_touch.on) return;
+    if (!fastget_touch.lru) {
+        fastGetTouchLfu(o);
+        return;
+    }
+    uint32_t *word = (uint32_t *)(void *)o;
+    uint32_t seen = __atomic_load_n(word, __ATOMIC_RELAXED);
+    if ((seen & fastget_touch.mask) == fastget_touch.lru_word) return;
+    uint32_t touched = (seen & ~fastget_touch.mask) | fastget_touch.lru_word;
     __atomic_compare_exchange_n(word, &seen, touched, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
@@ -260,7 +298,7 @@ static int fastGetReplySismember(client *c, robj *o, robj *arg) {
     if (objectGetEncoding(o) == OBJ_ENCODING_HASHTABLE && hashtableIsRehashing(objectGetVal(o))) return 0;
     int is = setTypeIsMemberAux(o, member, sdslen(member), 0, 1);
     if (!fastGetWriteRaw(c, is ? ":1\r\n" : ":0\r\n", 4)) return 0;
-    fastGetTouch(c, o);
+    fastGetTouch(o);
     return 1;
 }
 
@@ -277,7 +315,7 @@ static int fastGetReplyHget(client *c, robj *o, robj *arg) {
     long long vll = 0;
     if (hashTypeGetValue(o, field, &vstr, &vlen, &vll, NULL) != C_OK) {
         if (!(c->resp == 2 ? fastGetWriteRaw(c, "$-1\r\n", 5) : fastGetWriteRaw(c, "_\r\n", 3))) return 0;
-        fastGetTouch(c, o);
+        fastGetTouch(o);
         return 1;
     }
     char intbuf[LONG_STR_SIZE];
@@ -289,7 +327,7 @@ static int fastGetReplyHget(client *c, robj *o, robj *arg) {
     long long reply_threshold = fastGetCommandlogThreshold(COMMANDLOG_TYPE_LARGE_REPLY);
     if (reply_threshold >= 0 && (long long)(1 + digits10(vlen) + 2 + vlen + 2) >= reply_threshold) return 0;
     if (fastGetWriteBulkReply(c, (const char *)vstr, vlen) <= 0) return 0;
-    fastGetTouch(c, o);
+    fastGetTouch(o);
     return 1;
 }
 
@@ -354,7 +392,7 @@ static int fastGetReplyFromEntry(client *c, fastGetBatchEntry *e, int kind) {
     if (reply_threshold >= 0 && (long long)(1 + digits10(vallen) + 2 + vallen + 2) >= reply_threshold) return 0;
 
     if (fastGetWriteBulkReply(c, val, vallen) <= 0) return 0;
-    fastGetTouch(c, o);
+    fastGetTouch(o);
 #ifdef IO_LOOKUP_OFFLOAD_STATS
     FASTGET_STAT_ADD(speculative_hits, 1);
 #endif
@@ -421,7 +459,7 @@ static int fastGetAnswerMget(client *c, robj **argv, int argc, size_t input_byte
     hdr[len + 2] = '\n';
     fastGetWriteRaw(c, hdr, len + 3);
     for (int i = 0; i < n; i++) fastGetWriteBulkReply(c, val[i], vallen[i]);
-    for (int i = 0; i < n; i++) fastGetTouch(c, obj[i]);
+    for (int i = 0; i < n; i++) fastGetTouch(obj[i]);
     return 1;
 }
 
@@ -491,6 +529,8 @@ int fastGetSpeculateBatch(client *c, int tid) {
     /* Hot-key detection counts lookups on main. hotkeys-top-k changes only on main, outside the read
      * phase. */
     if (hotkeysEnabled()) return 0;
+
+    fastGetTouchBegin(c);
 
     /* Only a read that starts with a GET, or a SISMEMBER or HGET with io-threads-speculate-reads, is
      * answered here. */

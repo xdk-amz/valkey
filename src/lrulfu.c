@@ -190,3 +190,10 @@ uint32_t lrulfu_touchWithRandom(uint32_t lrulfu, double r) {
         return lru_import(0);
     }
 }
+
+
+bool lrulfu_touchIsConstant(uint32_t *value) {
+    if (lrulfu_isUsingLFU()) return false;
+    *value = lru_import(0);
+    return true;
+}
