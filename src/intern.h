@@ -159,19 +159,21 @@ sds internDupSds(const_sds s);
  * Returns NULL otherwise. The argument must be long enough that it would not be
  * embedded; `argi` is its position in the command.
  *
- * On the main thread, which parses only while every write is being probed, the
- * object holds a reference. On an IO thread the object is recorded in *pending
- * without one; the main thread takes the references when it collects the read
- * with internReadCollected(). */
+ * On the main thread the object holds a reference. The main thread shares
+ * arguments of the commands internIOShares() accepts, and of every command
+ * except sorted set ones while every write is being probed. On an IO thread
+ * the object is recorded in *pending without one; the main thread takes the
+ * references when it collects the read with internReadCollected(). */
 struct serverObject;
 typedef struct internPending internPending;
 struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len, int argi);
 extern __thread int intern_is_main;
 static inline int internParseReady(void) {
-    return intern_is_main ? intern_load_ready : 1;
+    return __atomic_load_n(&intern_state.hot_count, __ATOMIC_RELAXED) != 0;
 }
 void internFreePending(internPending *pending);
-/* IO threads share only arguments of these commands. */
+/* Below the probing level, request parsing shares only arguments of these
+ * commands. */
 int internIOShares(const char *name, size_t len);
 
 /* Read jobs. An IO thread reads hot shared strings while it parses, and holds

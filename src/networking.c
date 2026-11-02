@@ -4027,7 +4027,7 @@ void parseInlineBuffer(client *c) {
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
         size_t len = sdslen(argv[j]);
         robj *arg = NULL;
-        if (j > 0 && !intern_is_main && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+        if (j > 0 && internParseReady() && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
             arg = internParseArg(&c->intern_pending, argv[j], len, j);
         if (arg) {
             sdsfree(argv[j]);
@@ -4359,8 +4359,8 @@ static int parseMultibulk(client *c,
                  * lookups, so their arguments are never shared. */
                 if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
                     const char *name = objectGetVal((*argv)[0]);
-                    if (intern_is_main ? (name[0] != 'z' && name[0] != 'Z')
-                                       : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
+                    if ((intern_is_main && intern_load_ready) ? (name[0] != 'z' && name[0] != 'Z')
+                                                              : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
                         arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, *argc);
                 }
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
