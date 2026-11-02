@@ -1029,6 +1029,12 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 
     /* Prepare the argv */
     for (int j = 0; j < argc; j++) {
+        /* A shared value was just referenced by this command, so its header is
+         * in cache here; an IO thread would have to send the release back. */
+        if (argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(argv[j]))) {
+            sdsfree(objectGetVal(argv[j]));
+            objectSetVal(argv[j], NULL);
+        }
         if (argv[j]->refcount > 1) {
             decrRefCount(argv[j]);
             /* Set argv[j] to NULL to avoid double free */
