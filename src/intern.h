@@ -55,6 +55,7 @@ typedef struct internState {
         size_t hits, hot_hits, promotions, sampled, deferred;
     } stats;
     uint64_t hot_used[INTERN_HOT_SLOTS / 64]; /* hot cache slots in use */
+    uint32_t hot_count;                       /* hot cache slots in use; written on main only */
     uint64_t *filter;                         /* fingerprints of indexed and probation strings */
     uint64_t filter_mask;                     /* buckets in the filter, minus one */
 } internState;
