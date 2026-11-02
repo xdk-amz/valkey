@@ -250,7 +250,10 @@ typedef struct hotSlotEntry {
     sds s;
 } hotSlotEntry;
 
-static hotSlotEntry hot[1 << HOT_BITS];
+/* Two ways per set, in one cache line, so two hot strings whose mix picks the
+ * same set do not keep evicting each other. */
+static hotSlotEntry hot[1 << HOT_BITS] __attribute__((aligned(64)));
+static unsigned hot_victim;
 
 /* intern_state.hot_used has one bit per slot, set while the slot holds a
  * string, so a lookup of an empty slot does not touch the slot's page. */
@@ -264,8 +267,9 @@ static inline uint64_t hotMix(const char *p, size_t len) {
     return mix(rd64((const unsigned char *)p) ^ K1 ^ len, rd64((const unsigned char *)p + len - 8) ^ K2);
 }
 
-static inline size_t hotSlot(const char *p, size_t len) {
-    return hotMix(p, len) >> (64 - HOT_BITS);
+/* First of the two slots of the set for mix m. */
+static inline size_t hotSet(uint64_t m) {
+    return (size_t)(m >> (64 - HOT_BITS + 1)) << 1;
 }
 
 /* Slots are written only on the main thread. IO threads read them while they
@@ -273,17 +277,27 @@ static inline size_t hotSlot(const char *p, size_t len) {
  * reader that pairs a tag with another slot's string fails the compare. */
 static inline void hotStore(const char *p, size_t len, sds s) {
     uint64_t m = hotMix(p, len);
-    size_t i = m >> (64 - HOT_BITS);
+    size_t i = hotSet(m);
+    if (hotUsed(i) && hot[i].tag != m) {
+        if (!hotUsed(i + 1) || hot[i + 1].tag == m)
+            i++;
+        else
+            i += hot_victim++ & 1;
+    }
     __atomic_store_n(&hot[i].tag, m, __ATOMIC_RELAXED);
     __atomic_store_n(&hot[i].s, s, __ATOMIC_RELEASE);
-    hot_used[i >> 6] |= 1ull << (i & 63);
+    if (!hotUsed(i)) __atomic_store_n(&intern_state.hot_count, intern_state.hot_count + 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&hot_used[i >> 6], hot_used[i >> 6] | (1ull << (i & 63)), __ATOMIC_RELAXED);
 }
 
 static inline void hotForget(sds s) {
-    size_t i = hotSlot(s, sdslen(s));
-    if (hotUsed(i) && hot[i].s == s) {
-        __atomic_store_n(&hot[i].s, (sds)NULL, __ATOMIC_RELAXED);
-        hot_used[i >> 6] &= ~(1ull << (i & 63));
+    size_t set = hotSet(hotMix(s, sdslen(s)));
+    for (size_t i = set; i < set + 2; i++) {
+        if (hotUsed(i) && hot[i].s == s) {
+            __atomic_store_n(&hot[i].s, (sds)NULL, __ATOMIC_RELAXED);
+            __atomic_store_n(&hot_used[i >> 6], hot_used[i >> 6] & ~(1ull << (i & 63)), __ATOMIC_RELAXED);
+            __atomic_store_n(&intern_state.hot_count, intern_state.hot_count - 1, __ATOMIC_RELAXED);
+        }
     }
 }
 
@@ -291,12 +305,14 @@ static inline void hotForget(sds s) {
  * returns without the memcmp, so a value the cache has not seen is cheap. */
 static inline sds hotFind(const char *buf, size_t len) {
     uint64_t m = hotMix(buf, len);
-    size_t i = m >> (64 - HOT_BITS);
-    if (!hotUsed(i)) return NULL;
-    hotSlotEntry *e = &hot[i];
-    sds c = e->s;
-    if (!c || e->tag != m || sdslen(c) != len || memcmp(c, buf, len) != 0) return NULL;
-    return c;
+    size_t set = hotSet(m);
+    for (size_t i = set; i < set + 2; i++) {
+        if (!hotUsed(i)) continue;
+        hotSlotEntry *e = &hot[i];
+        sds c = e->s;
+        if (c && e->tag == m && sdslen(c) == len && memcmp(c, buf, len) == 0) return c;
+    }
+    return NULL;
 }
 
 /*-----------------------------------------------------------------------------
@@ -608,14 +624,23 @@ static sds newShareable(const char *buf, size_t len) {
     return s;
 }
 
-static inline sds shareIndexed(sds found, sds s) {
+/* Takes a reference on the indexed string `found` for a new holder, freeing
+ * the holder's private copy `s` if there is one. */
+static inline sds takeIndexed(sds found, sds s) {
     internHdrOf(found)->refcount++;
     st.refs++;
     st.saved_bytes += internSize(found);
     st.hits++;
     if (s) sdsfree(s);
-    observe(1);
     return found;
+}
+
+/* Same as takeIndexed() for a string a table probe found, which the sampling
+ * level counts. Hot cache hits are not counted, so the level follows what
+ * probing finds and backs off while the hot cache shares the repeated values. */
+static inline sds shareIndexed(sds found, sds s) {
+    observe(1);
+    return takeIndexed(found, s);
 }
 
 /* Allocation size of a private copy of a len-byte string made by sdsnewlen(). */
@@ -827,7 +852,7 @@ sds internAdmitSlow(sds s) {
     if (unlikely(c != NULL)) {
         if (internHdrOf(c)->refcount >= INTERN_REFS_MAX) return s;
         st.hot_hits++;
-        return shareIndexed(c, s);
+        return takeIndexed(c, s);
     }
 
     uint64_t h = internHash(s, len);
@@ -943,7 +968,7 @@ static sds internAdmitBufSlow(const char *buf, size_t len) {
     sds c = hotFind(buf, len);
     if (c && internHdrOf(c)->refcount < INTERN_REFS_MAX) {
         st.hot_hits++;
-        return shareIndexed(c, NULL);
+        return takeIndexed(c, NULL);
     }
 
     uint64_t h = internHash(buf, len);
@@ -1194,7 +1219,6 @@ int internDrainPending(void) {
 
 struct internPending {
     uint32_t n, cap; /* shared arguments waiting for their references */
-    uint32_t hits;   /* sampled arguments that were shared */
     robj **o;
 };
 
@@ -1213,31 +1237,30 @@ static int pendingGrow(void **arr, uint32_t n, uint32_t *cap, size_t entry) {
     return 1;
 }
 
-/* Each IO thread samples one eligible argument in 2^level, the main sampling
- * rate, so the sampling level sees the hits parse-time sharing finds. Misses
- * are left to setKey: handing them to the main thread per read costs more
- * throughput than the main thread reading their bytes. */
-static __thread uint32_t io_sel_tick = 1;
+/* Hits found here are not counted by the sampler: the sampling level follows
+ * what the main thread's own probes find, so it backs off when the hot cache
+ * already shares the repeated values. Misses are left to setKey: handing them
+ * to the main thread per read costs more throughput than the main thread
+ * reading their bytes. */
 
 static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int argi) {
+    UNUSED(argi);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return NULL;
-    /* The command name and, usually, the key come first; values follow. */
-    int sampled = 0;
-    if (argi >= 2 && --io_sel_tick == 0) {
-        io_sel_tick = 1u << __atomic_load_n(&intern_level, __ATOMIC_RELAXED);
-        sampled = 1;
-    }
     uint64_t m = hotMix(buf, len);
-    hotSlotEntry *e = &hot[m >> (64 - HOT_BITS)];
-    sds c = __atomic_load_n(&e->s, __ATOMIC_ACQUIRE);
-    if (c && __atomic_load_n(&e->tag, __ATOMIC_RELAXED) == m && sdslen(c) == len && memcmp(c, buf, len) == 0) {
-        internPending *p = pendingGet(pp);
-        if (!pendingGrow((void **)&p->o, p->n, &p->cap, sizeof(robj *))) return NULL;
-        robj *o = createObject(OBJ_STRING, c);
-        p->o[p->n++] = o;
-        /* A sampled hit, so the sampling level sees what parse-time sharing found. */
-        p->hits += sampled;
-        return o;
+    size_t set = hotSet(m);
+    /* A stale bit only misses a share or reads an empty slot. */
+    uint64_t used = __atomic_load_n(&hot_used[set >> 6], __ATOMIC_RELAXED) >> (set & 63);
+    if ((used & 3) == 0) return NULL;
+    for (size_t i = set; i < set + 2; i++) {
+        hotSlotEntry *e = &hot[i];
+        sds c = __atomic_load_n(&e->s, __ATOMIC_ACQUIRE);
+        if (c && __atomic_load_n(&e->tag, __ATOMIC_RELAXED) == m && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+            internPending *p = pendingGet(pp);
+            if (!pendingGrow((void **)&p->o, p->n, &p->cap, sizeof(robj *))) return NULL;
+            robj *o = createObject(OBJ_STRING, c);
+            p->o[p->n++] = o;
+            return o;
+        }
     }
     return NULL;
 }
@@ -1322,7 +1345,6 @@ void internReadCollected(internPending *pending, uint32_t *epoch) {
     if (pending && pending->n) {
         for (uint32_t i = 0; i < pending->n; i++) takePendingRef(pending->o[i]);
         pending->n = 0;
-        for (; pending->hits; pending->hits--) observe(1);
     }
     /* A long pipeline grows the array; do not keep it for an idle client. */
     if (pending && pending->cap > 64) {
@@ -1445,8 +1467,10 @@ sds internDefragShared(sds s, void *(*defragfn)(void *)) {
             loadSlot *e = loadFindPtr(ns, s);
             if (e) e->s = ns;
         }
-        size_t i = hotSlot(ns, sdslen(ns));
-        if (hot[i].s == s) __atomic_store_n(&hot[i].s, ns, __ATOMIC_RELEASE);
+        size_t set = hotSet(hotMix(ns, sdslen(ns)));
+        for (size_t i = set; i < set + 2; i++) {
+            if (hot[i].s == s) __atomic_store_n(&hot[i].s, ns, __ATOMIC_RELEASE);
+        }
     } else if (where == INTERN_IN_PROBATION) {
         /* The old copy is freed; hash the moved one. */
         probSlot *slot = probFind(ns, s);
