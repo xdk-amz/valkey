@@ -42,7 +42,14 @@ typedef struct internHdr {
 #define PROB_MIN_SETS 256
 #define PROB_MAX_SETS 16384
 
-internState intern_state __attribute__((aligned(4096))) = {.gate = {1, 1}};
+#define FILTER_MIN_BUCKETS 256
+static uint64_t filter_min[FILTER_MIN_BUCKETS];
+
+internState intern_state __attribute__((aligned(4096))) = {
+    .gate = {1, 1},
+    .filter = filter_min,
+    .filter_mask = FILTER_MIN_BUCKETS - 1,
+};
 int intern_load_ready = 0;
 
 /* While the server loads a dataset, every string is offered and a miss becomes
@@ -298,13 +305,29 @@ static inline sds hotFind(const char *buf, size_t len) {
  * the strings that did not fit. A lookup whose fingerprint is not in its bucket,
  * when that count is zero, skips both tables and their pages. A full count
  * stays full.
+ *
+ * The filter is sized from the strings it holds, so a full bucket stays rare
+ * and the filter stays small enough to be cached. It is rebuilt at a new size
+ * from internEpochTick(), a few index buckets at a time. While it is rebuilt,
+ * added strings go into both filters and removed ones only leave the old one,
+ * so the new filter holds every string at least once.
  *----------------------------------------------------------------------------*/
 
 #define FILTER_WAYS 7
 #define FILTER_LOW 0x0001010101010101ull
+#define FILTER_MAX_BUCKETS (1u << 22)
+#define FILTER_SCAN_STEPS 64
+
+static uint64_t *filter_next; /* the filter being built, or NULL */
+static uint64_t filter_next_mask;
+static size_t filter_cursor;
+
+static inline uint64_t *filterBucketIn(uint64_t *f, uint64_t mask, uint64_t h) {
+    return &f[(h >> 8) & mask];
+}
 
 static inline uint64_t *filterBucket(uint64_t h) {
-    return &intern_state.filter[(h >> 8) & (INTERN_FILTER_BUCKETS - 1)];
+    return filterBucketIn(intern_state.filter, intern_state.filter_mask, h);
 }
 
 static inline uint64_t filterFp(uint64_t h) {
@@ -312,8 +335,8 @@ static inline uint64_t filterFp(uint64_t h) {
     return f ? f : 1;
 }
 
-static void filterAdd(uint64_t h) {
-    uint64_t *b = filterBucket(h);
+static void filterAddTo(uint64_t *f, uint64_t mask, uint64_t h) {
+    uint64_t *b = filterBucketIn(f, mask, h);
     for (int i = 0; i < FILTER_WAYS; i++) {
         if (((*b >> (8 * i)) & 0xff) == 0) {
             *b |= filterFp(h) << (8 * i);
@@ -321,6 +344,11 @@ static void filterAdd(uint64_t h) {
         }
     }
     if ((*b >> 56) != 0xff) *b += 1ull << 56;
+}
+
+static void filterAdd(uint64_t h) {
+    filterAddTo(intern_state.filter, intern_state.filter_mask, h);
+    if (filter_next) filterAddTo(filter_next, filter_next_mask, h);
 }
 
 static void filterRemove(uint64_t h) {
@@ -342,6 +370,13 @@ static inline int filterMayHave(uint64_t h) {
     if (b >> 56) return 1;
     uint64_t x = b ^ (filterFp(h) * FILTER_LOW);
     return ((x - FILTER_LOW) & ~x & (FILTER_LOW << 7)) != 0;
+}
+
+/* About two strings per bucket. */
+static uint64_t filterBucketsFor(size_t n) {
+    uint64_t nb = FILTER_MIN_BUCKETS;
+    while (nb < FILTER_MAX_BUCKETS && nb * 2 < n) nb *= 2;
+    return nb;
 }
 
 /*-----------------------------------------------------------------------------
@@ -1312,7 +1347,45 @@ static void retire(sds s) {
     retired[retired_count++] = (retiredString){s, read_epoch};
 }
 
+static void filterScanEntry(void *privdata, void *entry) {
+    UNUSED(privdata);
+    sds s = entry;
+    filterAddTo(filter_next, filter_next_mask, internHash(s, sdslen(s)));
+}
+
+/* Starts rebuilding the filter when it holds too many or too few strings for its
+ * size, and continues a rebuild in progress. Main thread only. */
+static void filterMaintain(void) {
+    if (intern_index == NULL) return;
+    if (filter_next == NULL) {
+        size_t n = hashtableSize(intern_index) + prob_count;
+        uint64_t nb = intern_state.filter_mask + 1;
+        int grow = n > nb * 4 && nb < FILTER_MAX_BUCKETS;
+        int shrink = n < nb / 4 && nb > FILTER_MIN_BUCKETS;
+        if (!grow && !shrink) return;
+        uint64_t nnb = filterBucketsFor(n);
+        if (nnb == nb) return;
+        filter_next = zcalloc(nnb * sizeof(uint64_t));
+        filter_next_mask = nnb - 1;
+        filter_cursor = 0;
+        for (size_t i = 0; i < prob_nsets * PROB_WAYS; i++) {
+            if (prob[i].s) filterAddTo(filter_next, filter_next_mask, prob[i].hash);
+        }
+    }
+    for (int i = 0; i < FILTER_SCAN_STEPS; i++) {
+        filter_cursor = hashtableScan(intern_index, filter_cursor, filterScanEntry, NULL);
+        if (filter_cursor == 0) {
+            if (intern_state.filter != filter_min) zfree(intern_state.filter);
+            intern_state.filter = filter_next;
+            intern_state.filter_mask = filter_next_mask;
+            filter_next = NULL;
+            return;
+        }
+    }
+}
+
 void internEpochTick(void) {
+    filterMaintain();
     while (read_oldest < read_epoch && read_inflight[read_oldest % READ_EPOCHS] == 0) read_oldest++;
     if (read_inflight[(read_epoch + 1) % READ_EPOCHS] == 0) {
         read_epoch++;
@@ -1408,6 +1481,12 @@ void internInit(void) {
     memcpy(&intern_seed, seed + 8, sizeof(intern_seed));
     intern_salt = mix(intern_seed, K2);
     intern_index = hashtableCreate(&internIndexType);
+    if (intern_state.filter != filter_min) zfree(intern_state.filter);
+    zfree(filter_next);
+    filter_next = NULL;
+    memset(filter_min, 0, sizeof(filter_min));
+    intern_state.filter = filter_min;
+    intern_state.filter_mask = FILTER_MIN_BUCKETS - 1;
     prob_nsets = PROB_MIN_SETS;
     prob = zcalloc(prob_nsets * PROB_WAYS * sizeof(probSlot));
     setLevel(INTERN_LEVEL_START);
@@ -1440,6 +1519,8 @@ void internGetInfo(internInfo *info) {
     info->saved_bytes = st.saved_bytes;
     info->table_bytes = hashtableMemUsage(intern_index) + prob_nsets * PROB_WAYS * sizeof(probSlot);
     info->table_bytes += load_cap * sizeof(loadSlot);
+    info->table_bytes += (intern_state.filter_mask + 1) * sizeof(uint64_t);
+    if (filter_next) info->table_bytes += (filter_next_mask + 1) * sizeof(uint64_t);
     if (load_seen) info->table_bytes += LOAD_SEEN_BITS / 8;
     info->hits = st.hits;
     info->hot_hits = st.hot_hits;
