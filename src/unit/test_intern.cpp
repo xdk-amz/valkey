@@ -129,6 +129,54 @@ TEST_F(InternTest, DupOfSingletonIsIndexed) {
     sdsfree(b);
 }
 
+static void resizeValue(char *buf, size_t size, int i) {
+    snprintf(buf, size, "filter-resize-value-%08d-xxxxxxxxxxxxxxxx", i);
+}
+
+/* The filter is rebuilt as the index grows and shrinks, a few buckets per epoch
+ * tick, while strings are added and released. No indexed string is missed. */
+TEST_F(InternTest, FilterResizeKeepsStringsFindable) {
+    const int n = 20000;
+    char buf[64];
+    sds *s = (sds *)zmalloc(sizeof(sds) * n);
+    internInfo base, grown, shrunk;
+    internGetInfo(&base);
+    for (int i = 0; i < n; i++) {
+        resizeValue(buf, sizeof(buf), i);
+        s[i] = makeShared(buf);
+        if (i % 50 == 0) internEpochTick();
+    }
+    for (int i = 0; i < 10000; i++) internEpochTick();
+    internGetInfo(&grown);
+    EXPECT_EQ(grown.shared, base.shared + n);
+    for (int i = 0; i < n; i++) {
+        resizeValue(buf, sizeof(buf), i);
+        sds again = internAdmitSlow(sdsnew(buf));
+        ASSERT_EQ(again, s[i]) << "value " << i;
+        sdsfree(again);
+    }
+
+    /* Release most of them, ticking while they go, and check the rest. */
+    for (int i = 0; i < n; i++) {
+        if (i % 10 != 0) {
+            sdsfree(s[i]);
+            s[i] = NULL;
+        }
+        if (i % 50 == 0) internEpochTick();
+    }
+    for (int i = 0; i < 10000; i++) internEpochTick();
+    internGetInfo(&shrunk);
+    EXPECT_LT(shrunk.table_bytes, grown.table_bytes);
+    for (int i = 0; i < n; i += 10) {
+        resizeValue(buf, sizeof(buf), i);
+        sds again = internAdmitSlow(sdsnew(buf));
+        ASSERT_EQ(again, s[i]) << "value " << i;
+        sdsfree(again);
+        sdsfree(s[i]);
+    }
+    zfree(s);
+}
+
 /* Values whose shared copy fits the allocation size class of a private one: 80
  * bytes need 84 bytes privately and 92 shared, both in the 96-byte class. */
 static sds loadValue(char *buf, int i) {

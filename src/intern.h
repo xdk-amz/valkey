@@ -26,7 +26,6 @@ typedef struct internGate {
 } internGate;
 
 #define INTERN_HOT_SLOTS 4096
-#define INTERN_FILTER_BUCKETS 256
 
 struct hashtable;
 struct probSlot;
@@ -56,7 +55,8 @@ typedef struct internState {
         size_t hits, hot_hits, promotions, sampled, deferred;
     } stats;
     uint64_t hot_used[INTERN_HOT_SLOTS / 64]; /* hot cache slots in use */
-    uint64_t filter[INTERN_FILTER_BUCKETS];   /* fingerprints of indexed and probation strings */
+    uint64_t *filter;                         /* fingerprints of indexed and probation strings */
+    uint64_t filter_mask;                     /* buckets in the filter, minus one */
 } internState;
 
 extern internState intern_state;
