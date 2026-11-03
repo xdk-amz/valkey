@@ -826,6 +826,11 @@ void clusterCommandMyShardId(client *c) {
  * available (modules may call commands without a real client), we return the default
  * info, which is determined by server.tls_cluster. */
 static int shouldReturnTlsInfo(void) {
+    /* The executor runs fast-path clients' commands: answer in the transport of the client. */
+    if (ectx->current_client && ectx->current_client->flag.executor && ectx->current_client->origin &&
+        ectx->current_client->origin->conn_type != CONN_TYPE_INVALID) {
+        return ectx->current_client->origin->conn_type == CONN_TYPE_TLS;
+    }
     if (ectx->current_client && ectx->current_client->conn) {
         return connIsTLS(ectx->current_client->conn);
     } else {
