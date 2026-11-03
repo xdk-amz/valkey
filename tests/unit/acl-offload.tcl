@@ -10,7 +10,7 @@
 # which avoids the AUTH-then-eligible admission race a password user would introduce.
 
 proc ao_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+    return [valkey_handshaken_client [srv 0 host] [srv 0 port] 1]
 }
 proc ao_hits {} { getInfoProperty [r info stats] acl_offload_hits }
 proc ao_punts {} { getInfoProperty [r info stats] acl_offload_punts }
@@ -25,7 +25,7 @@ proc ao_wait_fastpath_clients {n} {
 proc ao_default_allow {rules} { r acl setuser default on nopass resetkeys resetchannels -@all {*}$rules }
 
 
-start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload yes enable-debug-command yes}} {
+start_server {tags {"acl acl-offload external:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload yes enable-debug-command yes}} {
     assert_equal {acl-offload yes} [r config get acl-offload]
     r client setname ao-control
     r client tracking on ;# tracking keeps the control connection on the main path
@@ -306,7 +306,7 @@ start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-thre
     }
 }
 
-start_server {tags {"acl acl-offload external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload no}} {
+start_server {tags {"acl acl-offload external:skip"} overrides {io-threads 4 io-threads-always-active yes acl-offload no}} {
     test {acl-offload disabled: no hits are recorded} {
         r client setname ao-control
         r select 0

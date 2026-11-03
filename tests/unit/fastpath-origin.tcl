@@ -5,7 +5,7 @@
 # A deferring client that sends nothing before its first command, so it stays
 # on the fast path (SELECT would move it to the main path).
 proc fp_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+    return [valkey_handshaken_client [srv 0 host] [srv 0 port] 1]
 }
 
 proc fp_peer_of {rd} {
@@ -85,7 +85,7 @@ proc fp_monitor_line_matching {m pattern} {
     fail "no MONITOR line matching $pattern"
 }
 
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 enable-debug-command yes}} {
+start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     # Named clients stay on the main path, so the control connection is never counted.
@@ -479,7 +479,7 @@ proc fp_write_acl {dir bob_rules} {
 }
 fp_write_acl $fp_acl_dir {~* &* +@all}
 
-start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2]] {
+start_server [list tags {"fastpath origin external:skip"} overrides [list dir $fp_acl_dir aclfile users.acl io-threads 2]] {
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients
 
@@ -556,7 +556,7 @@ start_server [list tags {"fastpath origin external:skip tls:skip"} overrides [li
 }
 
 # With the default user password-protected no client is admitted at accept; it joins the fast path after AUTH.
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {requirepass fppw io-threads 2}} {
+start_server {tags {"fastpath origin external:skip"} overrides {requirepass fppw io-threads 2}} {
     r auth fppw
     r client setname fp-control
     r select 0
@@ -695,7 +695,7 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {require
 # the offloaded write reaches. A correct woff makes WAIT 1 wait on that new offset and time out at 0
 # while the replica is behind; a stale woff (0, the origin's pre-write value the replica already
 # acked) would return 1 at once. Release the replica and WAIT 1 returns 1.
-start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-threads 2 enable-debug-command yes}} {
+start_server {tags {"fastpath origin external:skip"} overrides {io-threads 2 enable-debug-command yes}} {
     start_server {overrides {io-threads 2}} {
         set replica [srv 0 client]
         set replica_pid [srv 0 pid]
@@ -711,7 +711,7 @@ start_server {tags {"fastpath origin external:skip tls:skip"} overrides {io-thre
 
         # A raw db-0 fast-path client on the master (SELECT would move it to the main path).
         proc fp_master_client {host port} {
-            return [valkey $host $port 1 $::tls]
+            return [valkey_handshaken_client $host $port 1]
         }
 
         # fp_wait_fastpath_clients polls the default client r, which is the replica in this nested

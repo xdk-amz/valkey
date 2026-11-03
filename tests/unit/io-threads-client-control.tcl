@@ -92,7 +92,7 @@ proc cc_assert_healthy {} {
     assert_equal 0 [string match {*=== ASSERTION FAILED ===*} $log]
 }
 
-start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
+start_server {tags {"io-threads-client-control external:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes enable-debug-command yes io-threads-epoll-thread no}} {
     assert_equal {io-threads 4} [r config get io-threads]
     r select 0
 
@@ -384,7 +384,7 @@ start_server {tags {"io-threads-client-control external:skip tls:skip logreqres:
     }
 }
 
-start_server {tags {"io-threads-client-control external:skip tls:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread no}} {
+start_server {tags {"io-threads-client-control external:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread no}} {
     test {Control: shutdown while reconfiguring under load exits with no worker-destruction assert} {
         r select 0
         set clients {}

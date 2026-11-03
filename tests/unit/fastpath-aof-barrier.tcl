@@ -5,7 +5,7 @@
 # A deferring client that sends nothing before its first command, so it stays on the fast path
 # (a SELECT would move it to the main path).
 proc fp_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+    return [valkey_handshaken_client [srv 0 host] [srv 0 port] 1]
 }
 
 proc fp_wait_fastpath_clients {n} {
@@ -16,7 +16,7 @@ proc fp_wait_fastpath_clients {n} {
     }
 }
 
-start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly yes appendfsync always io-threads 2 enable-debug-command yes}} {
+start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appendfsync always io-threads 2 enable-debug-command yes}} {
     assert_equal {io-threads 2} [r config get io-threads]
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     assert_equal {appendfsync always} [r config get appendfsync]
@@ -70,7 +70,7 @@ start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly
     }
 }
 
-start_server {tags {"fastpath aof external:skip tls:skip"} overrides {appendonly yes appendfsync everysec io-threads 4 io-threads-always-active yes save ""}} {
+start_server {tags {"fastpath aof external:skip"} overrides {appendonly yes appendfsync everysec io-threads 4 io-threads-always-active yes save ""}} {
     r select 0
     waitForBgrewriteaof r
     proc fpa_speculated {} { getInfoProperty [r info fastpath] fastpath_speculated }

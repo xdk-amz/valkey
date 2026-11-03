@@ -6,7 +6,7 @@
 # A client that sends nothing before its first command stays on the fast path (a SELECT would move it to
 # the main path).
 proc fpmm_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+    return [valkey_handshaken_client [srv 0 host] [srv 0 port] 1]
 }
 
 proc fpmm_wait_fastpath_clients {n} {
@@ -21,7 +21,7 @@ proc fpmm_evicted {} {
     return [getInfoProperty [r info stats] evicted_clients]
 }
 
-start_server {tags {"fastpath maxmemory-clients external:skip tls:skip"} overrides {io-threads 2}} {
+start_server {tags {"fastpath maxmemory-clients external:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fpmm-control
     r select 0 ;# the same db as the raw fast-path clients

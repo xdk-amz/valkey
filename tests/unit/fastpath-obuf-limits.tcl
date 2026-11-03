@@ -5,7 +5,7 @@
 # A deferring client that sends nothing before its first command, so it stays on the fast path
 # (a SELECT would move it to the main path).
 proc fpol_client {} {
-    return [valkey [srv 0 host] [srv 0 port] 1 $::tls]
+    return [valkey_handshaken_client [srv 0 host] [srv 0 port] 1]
 }
 
 proc fpol_wait_fastpath_clients {n} {
@@ -20,7 +20,7 @@ proc fpol_disconnections {} {
     return [getInfoProperty [r info stats] client_output_buffer_limit_disconnections]
 }
 
-start_server {tags {"fastpath obuf-limits external:skip tls:skip"} overrides {io-threads 2}} {
+start_server {tags {"fastpath obuf-limits external:skip"} overrides {io-threads 2}} {
     assert_equal {io-threads-fast-path yes} [r config get io-threads-fast-path]
     r client setname fp-control
     r select 0 ;# the same db as the raw fast-path clients

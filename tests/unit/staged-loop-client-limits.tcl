@@ -1,6 +1,6 @@
 # Client limits with the staged loop running: a main-path client whose replies wait for the socket.
 
-start_server {tags {"staged-loop external:skip tls:skip"} overrides {io-threads 2}} {
+start_server {tags {"staged-loop external:skip"} overrides {io-threads 2}} {
     r select 0
 
     test {Staged: maxmemory-clients evicts a main-path client with unread replies} {

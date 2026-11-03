@@ -24,6 +24,15 @@ proc randstring {min max {type binary}} {
 
 # Read and write files without applying Tcl text translations. These helpers
 # are shared by persistence tests that inspect or mutate serialized data.
+# A client whose TLS handshake is done, so the server has accepted it before its first command.
+proc valkey_handshaken_client {host port defer} {
+    set c [valkey $host $port $defer $::tls]
+    if {$::tls} {
+        while {![::tls::handshake [$c channel]]} {}
+    }
+    return $c
+}
+
 proc read_binary_file_prefix {path count} {
     set fd [open $path r]
     fconfigure $fd -translation binary
