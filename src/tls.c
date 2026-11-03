@@ -1194,6 +1194,8 @@ static ConnectionType CT_TLS;
 #define TLS_CONN_FLAG_HAS_PENDING (1 << 4)
 #define TLS_CONN_FLAG_ACCEPT_ERROR (1 << 5)
 #define TLS_CONN_FLAG_ACCEPT_SUCCESS (1 << 6)
+#define TLS_CONN_FLAG_READ_AHEAD (1 << 7) /* read-ahead on: whole records may wait in OpenSSL's buffer */
+#define TLS_CONN_FLAG_IO_OWNED (1 << 8)   /* an IO thread owns the socket: the main event loop is not updated */
 
 typedef struct tls_connection {
     connection c;
@@ -1205,6 +1207,9 @@ typedef struct tls_connection {
      * we must make subsequent write calls with the same length. We use this field to keep track of
      * the previous write length. */
     size_t last_failed_write_data_len;
+    /* While an IO thread owns the socket: the last read from the socket filled what OpenSSL asked
+     * for, so the socket may hold more that no edge-triggered event will report. */
+    int socket_read_full;
 } tls_connection;
 
 /* Fetch the latest OpenSSL error and store it in the connection */
@@ -1364,7 +1369,7 @@ static void postPoneUpdateSSLState(connection *conn_, int postpone_mask) {
 }
 
 static void updatePendingData(tls_connection *conn) {
-    if (conn->flags & TLS_CONN_FLAG_POSTPONE_UPDATE_STATE) return;
+    if (conn->flags & (TLS_CONN_FLAG_POSTPONE_UPDATE_STATE | TLS_CONN_FLAG_IO_OWNED)) return;
 
     /* If SSL has pending data, already read from the socket, we're at risk of not calling the read handler again, make
      * sure to add it to a list of pending connection that should be handled anyway. */
@@ -1388,7 +1393,7 @@ void updateSSLPendingFlag(tls_connection *conn) {
 }
 
 static void updateSSLEvent(tls_connection *conn) {
-    if (conn->flags & TLS_CONN_FLAG_POSTPONE_UPDATE_STATE) return;
+    if (conn->flags & (TLS_CONN_FLAG_POSTPONE_UPDATE_STATE | TLS_CONN_FLAG_IO_OWNED)) return;
 
     int priority_flag = connGetAEPriorityFlag(&conn->c);
     int mask = aeGetFileEvents(server.el, conn->c.fd);
@@ -1910,9 +1915,88 @@ static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
+    /* A read served from OpenSSL's buffer says nothing of the socket, which may have received more
+     * since the last socket read; only a socket read that comes back short shows it drained. */
+    if (conn->flags & TLS_CONN_FLAG_READ_AHEAD) conn->socket_read_full = 1;
     ret = SSL_read(conn->ssl, buf, buf_len);
     updateSSLPendingFlag(conn);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+    /* With read-ahead the records after this one may already be off the socket, where no event
+     * reports them. After a read that stopped short of WANT_READ, any buffered record bytes are
+     * worth another read; after WANT_READ they are a partial record and the socket is drained. */
+    if (ret > 0 && (conn->flags & TLS_CONN_FLAG_READ_AHEAD) && SSL_has_pending(conn->ssl))
+        conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
+#endif
     return updateStateAfterSSLIO(conn, ret, 1);
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined(LIBRESSL_VERSION_NUMBER)
+#define TLS_IO_OWNER_SUPPORTED 1
+/* Records, for the owning IO thread, whether the socket read OpenSSL just made came back full. */
+static long tlsSocketReadCallback(BIO *b, int oper, const char *argp, size_t len, int argi, long argl, int ret, size_t *processed) {
+    UNUSED(argp);
+    UNUSED(argi);
+    UNUSED(argl);
+    if (oper == (BIO_CB_READ | BIO_CB_RETURN)) {
+        tls_connection *conn = (tls_connection *)BIO_get_callback_arg(b);
+        conn->socket_read_full = ret > 0 && processed && *processed == len;
+    }
+    return ret;
+}
+#endif
+
+/* Main thread: an IO thread takes over the socket. Nothing here touches the main event loop again
+ * until connTLSIOOwnerEnd, and the connection leaves the pending list, which only the main thread
+ * walks. Read-ahead takes several records per socket read; the owner learns from
+ * CONN_IO_BUFFERED_INPUT that input may be waiting where no event reports it. */
+static int connTLSIOOwnerBegin(connection *conn_) {
+#ifdef TLS_IO_OWNER_SUPPORTED
+    tls_connection *conn = (tls_connection *)conn_;
+    if (conn->c.state != CONN_STATE_CONNECTED || !conn->ssl) return -1;
+    BIO *rbio = SSL_get_rbio(conn->ssl);
+    if (!rbio) return -1;
+    /* A write OpenSSL must retry with the same bytes finishes on main. Otherwise no write is
+     * outstanding (main has none queued; a completed handshake leaves the flag set), and a read
+     * waiting for the socket to be writable is reported to the new owner by io_owner_state. */
+    if (conn->last_failed_write_data_len) return -1;
+    conn->flags &= ~TLS_CONN_FLAG_WRITE_WANT_READ;
+    aeDeleteFileEvent(server.el, conn->c.fd, AE_READABLE | AE_WRITABLE);
+    conn->flags |= TLS_CONN_FLAG_IO_OWNED;
+    if (conn->pending_list_node) {
+        listDelNode(pending_list, conn->pending_list_node);
+        conn->pending_list_node = NULL;
+    }
+    if (BIO_get_callback_ex(rbio) != tlsSocketReadCallback) {
+        BIO_set_callback_arg(rbio, (char *)conn);
+        BIO_set_callback_ex(rbio, tlsSocketReadCallback);
+    }
+    conn->socket_read_full = 1; /* unknown: read until a socket read comes back short */
+    SSL_set_read_ahead(conn->ssl, 1);
+    conn->flags |= TLS_CONN_FLAG_READ_AHEAD;
+    if (SSL_pending(conn->ssl) > 0 || SSL_has_pending(conn->ssl))
+        conn->flags |= TLS_CONN_FLAG_HAS_PENDING;
+    else
+        conn->flags &= ~TLS_CONN_FLAG_HAS_PENDING;
+    return 0;
+#else
+    UNUSED(conn_);
+    return -1; /* no SSL_has_pending or BIO_set_callback_ex: input waiting could not be found */
+#endif
+}
+
+/* Main thread: the socket is the main thread's again. The caller sets the handlers it needs and
+ * calls connUpdateState, which registers the events and the pending data. */
+static void connTLSIOOwnerEnd(connection *conn_) {
+    ((tls_connection *)conn_)->flags &= ~TLS_CONN_FLAG_IO_OWNED;
+}
+
+static int connTLSIOOwnerState(connection *conn_) {
+    tls_connection *conn = (tls_connection *)conn_;
+    int st = 0;
+    if ((conn->flags & TLS_CONN_FLAG_HAS_PENDING) || conn->socket_read_full) st |= CONN_IO_BUFFERED_INPUT;
+    if (conn->flags & TLS_CONN_FLAG_READ_WANT_WRITE) st |= CONN_IO_READ_WANTS_WRITE;
+    if (conn->flags & TLS_CONN_FLAG_WRITE_WANT_READ) st |= CONN_IO_WRITE_WANTS_READ;
+    return st;
 }
 
 static const char *connTLSGetLastError(connection *conn_) {
@@ -2172,6 +2256,9 @@ static ConnectionType CT_TLS = {
     .process_pending_data = tlsProcessPendingData,
     .postpone_update_state = postPoneUpdateSSLState,
     .update_state = updateSSLState,
+    .io_owner_begin = connTLSIOOwnerBegin,
+    .io_owner_end = connTLSIOOwnerEnd,
+    .io_owner_state = connTLSIOOwnerState,
 
     /* TLS specified methods */
     .get_peer_cert = connTLSGetPeerCert,

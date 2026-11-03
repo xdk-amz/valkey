@@ -372,7 +372,9 @@ static int fpSessionEligible(client *c) {
     if (!server.io_threads_fast_path || !fpStaged()) return 0; /* the staged loop is the only fast-path mode */
     if (!server.io_threads_strict_offload || ProcessingEventsWhileBlocked || server.io_threads_num < 2) return 0;
     if (!c->conn || c->flag.fake) return 0;
-    if (c->conn->type != connectionByType(CONN_TYPE_SOCKET)) return 0;
+    int conn_type = connGetType(c->conn);
+    if (conn_type != CONN_TYPE_SOCKET && conn_type != CONN_TYPE_TLS) return 0;
+    if (conn_type == CONN_TYPE_TLS && server.debug_force_tls_write_error) return 0;     /* tests main's TLS write path */
     if (authRequired(c)) return 0;                                                      /* main enforces a later default-user password change per entry */
     if (c->flag.asking) return 0;                                                       /* ASKING applies to the next command only, which main runs */
     if (isPausedActions(PAUSE_ACTION_CLIENT_ALL | PAUSE_ACTION_CLIENT_WRITE)) return 0; /* paused clients are postponed on main */
@@ -887,17 +889,40 @@ static void fpSpeculate(fpThread *t, int tid, client *c) {
     fpSend(t, c, &iov, 1);
 }
 
+static void fpEnableWriteInterest(client *c, int on);
+
+/* TLS, after a read that would block: a read that needs the socket writable (a key update reply the
+ * kernel could not take) waits for a writable event, and an interrupted one reads again. */
+static void fpTLSReadWait(client *c, int interrupted) {
+    int rww = (connIOOwnerState(c->conn) & CONN_IO_READ_WANTS_WRITE) != 0;
+    if (rww != c->fp_read_wants_write) {
+        c->fp_read_wants_write = rww;
+        fpEnableWriteInterest(c, rww || (c->fp_out && sdslen(c->fp_out) > 0));
+    }
+    if (interrupted) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
+}
+
+/* TLS: reads per event while input may still be waiting where no event reports it. Each read
+ * returns at most one record. */
+#define FP_TLS_READS_PER_EVENT 16
+
 static void fpRead(fpThread *t, int tid, client *c) {
+    int tls_reads = 0;
+again:
     c->read_flags = 0; /* authenticated at admission, not replicated; parse state lives in multibulklen/bulklen */
     /* The fd is edge-triggered: a read that filled its buffer may have left bytes in the socket that
      * no new edge will report, so the next batch reads the client again. */
     int more = readToQueryBuf(c);
+    int tls = c->fp_conn_type == CONN_TYPE_TLS;
     t->reads++;
     if (c->nread <= 0) {
         /* The client may still point at this thread's shared query buffer:
          * give it back before anyone else can free it with the client. */
         trimClientQueryBuffer(c);
-        if (c->nread < 0 && connGetState(c->conn) == CONN_STATE_CONNECTED) return; /* EAGAIN */
+        if (c->nread < 0 && connGetState(c->conn) == CONN_STATE_CONNECTED) { /* EAGAIN */
+            if (tls) fpTLSReadWait(c, errno == EINTR);
+            return;
+        }
         /* EOF or error: the client closes. Nothing more is read; entries in
          * flight return first, then the main thread frees the client. */
         fpBeginLeave(t, c, FP_CLOSING);
@@ -930,6 +955,12 @@ static void fpRead(fpThread *t, int tid, client *c) {
         c->read_flags = 0;
     }
     trimClientQueryBuffer(c);
+    /* TLS: input OpenSSL took off the socket, or that reached the socket since its last read, raises
+     * no event. It is read now, up to a bound, then in the next batch. */
+    if (tls && (connIOOwnerState(c->conn) & CONN_IO_BUFFERED_INPUT)) {
+        if (!more && c->control->lifecycle == FP_ACTIVE && ++tls_reads < FP_TLS_READS_PER_EVENT) goto again;
+        more = 1;
+    }
     if (more && c->control->lifecycle == FP_ACTIVE) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
 }
 
@@ -937,7 +968,48 @@ static void fpEnableWriteInterest(client *c, int on) {
     pollerModify(stagedPoller(), c->conn->fd, on ? (POLLER_READABLE | POLLER_WRITABLE) : POLLER_READABLE);
 }
 
+/* TLS writes are at most this long, as on main: after a write that would block, OpenSSL needs the
+ * retry to offer at least as many bytes, and the bytes left over always start with the ones of the
+ * blocked write and are at least as many, whether this thread or main retries them. */
+#define FP_TLS_WRITE_MAX NET_MAX_WRITES_PER_EVENT
+
+/* One TLS write. Returns the bytes written, 0 when it would block, -1 once the connection failed. */
+static ssize_t fpTLSWrite(fpThread *t, client *c, const char *p, size_t len) {
+    if (len > FP_TLS_WRITE_MAX) len = FP_TLS_WRITE_MAX;
+    int n = connWrite(c->conn, p, len);
+    if (n <= 0) {
+        if (connGetState(c->conn) != CONN_STATE_CONNECTED) return -1;
+        /* A forced failure leaves the socket writable, so no writable event would follow. */
+        if (server.debug_force_tls_write_error) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_WRITABLE);
+        return 0;
+    }
+    t->net_output_bytes += n;
+    c->net_output_bytes += n;
+    t->writes++;
+    return n;
+}
+
+static int fpFlushOutTLS(fpThread *t, client *c) {
+    size_t len = sdslen(c->fp_out), off = 0;
+    int drained = 1;
+    while (off < len) {
+        ssize_t n = fpTLSWrite(t, c, c->fp_out + off, len - off);
+        if (n <= 0) {
+            if (n < 0) fpBeginLeave(t, c, FP_CLOSING);
+            drained = 0;
+            break;
+        }
+        off += n;
+    }
+    if (off == len)
+        sdsclear(c->fp_out);
+    else if (off)
+        sdsrange(c->fp_out, off, -1);
+    return drained;
+}
+
 static int fpFlushOut(fpThread *t, client *c) {
+    if (c->fp_conn_type == CONN_TYPE_TLS && c->fp_out && !fpFlushOutTLS(t, c)) return 0;
     while (c->fp_out && sdslen(c->fp_out) > 0) {
         ssize_t n = write(c->conn->fd, c->fp_out, sdslen(c->fp_out));
         if (n <= 0) {
@@ -969,12 +1041,72 @@ static void fpCheckOutLimit(fpThread *t, client *c) {
         fpBeginLeave(t, c, FP_LEAVING);
 }
 
+/* Writes the gathered bytes; an unwritten tail leads what is left in fp_out. */
+static int fpSendTLSGathered(fpThread *t, client *c, const char *buf, size_t *bl, int *stop) {
+    ssize_t n = fpTLSWrite(t, c, buf, *bl);
+    if (n < 0) {
+        fpBeginLeave(t, c, FP_CLOSING);
+        return -1;
+    }
+    if ((size_t)n < *bl) {
+        if (!c->fp_out) c->fp_out = sdsempty();
+        c->fp_out = sdscatlen(c->fp_out, buf + n, *bl - n);
+        *stop = 1;
+    }
+    *bl = 0;
+    return 0;
+}
+
+/* TLS: small replies are gathered into one record-sized write, a large one is written from where it
+ * is. Whatever is not written goes to fp_out, in order. */
+static void fpSendTLS(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
+    char buf[PROTO_IOBUF_LEN];
+    size_t bl = 0;
+    int i = 0;
+    size_t off = 0; /* into iov[i] */
+    int stop = 0;
+    while (!stop && i < iovcnt) {
+        const char *p = (const char *)iov[i].iov_base + off;
+        size_t left = iov[i].iov_len - off;
+        if (left == 0) {
+            i++, off = 0;
+            continue;
+        }
+        if (bl == 0 && left >= sizeof(buf)) {
+            ssize_t n = fpTLSWrite(t, c, p, left);
+            if (n < 0) {
+                fpBeginLeave(t, c, FP_CLOSING);
+                return;
+            }
+            off += n;
+            if ((size_t)n < left && (size_t)n < FP_TLS_WRITE_MAX) stop = 1;
+            continue;
+        }
+        size_t take = left < sizeof(buf) - bl ? left : sizeof(buf) - bl;
+        memcpy(buf + bl, p, take);
+        bl += take, off += take;
+        if (bl == sizeof(buf) && fpSendTLSGathered(t, c, buf, &bl, &stop) < 0) return;
+    }
+    if (!stop && bl > 0 && fpSendTLSGathered(t, c, buf, &bl, &stop) < 0) return;
+    if (stop) {
+        if (!c->fp_out) c->fp_out = sdsempty();
+        for (; i < iovcnt; i++, off = 0)
+            c->fp_out = sdscatlen(c->fp_out, (char *)iov[i].iov_base + off, iov[i].iov_len - off);
+        fpEnableWriteInterest(c, 1);
+        fpCheckOutLimit(t, c);
+    }
+}
+
 /* Buffered bytes always precede newly returned replies. */
 static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     if (c->control->lifecycle == FP_CLOSING) return;
     if (c->fp_out && sdslen(c->fp_out) > 0) {
         for (int i = 0; i < iovcnt; i++) c->fp_out = sdscatlen(c->fp_out, iov[i].iov_base, iov[i].iov_len);
         fpCheckOutLimit(t, c);
+        return;
+    }
+    if (c->fp_conn_type == CONN_TYPE_TLS) {
+        fpSendTLS(t, c, iov, iovcnt);
         return;
     }
     ssize_t n = writev(c->conn->fd, iov, iovcnt);
@@ -1434,6 +1566,7 @@ int fastpathReadmitAuthenticated(client *c) {
 void fastpathHandoffDone(client *c, int closing) {
     serverAssert(fastpath_clients > 0);
     c->flag.fastpath = 0;
+    connIOOwnerEnd(c->conn);
     /* Main is the owner again; publish the terminal state on the single source of truth. control is
      * still live here (reclaimed only at freeClient), so the read/write is safe. */
     c->control->lifecycle = FP_DETACHED;
@@ -1452,6 +1585,7 @@ void fastpathHandoffDone(client *c, int closing) {
         return;
     }
     connSetReadHandler(c->conn, readQueryFromClient);
+    connUpdateState(c->conn); /* TLS: input taken off the socket while on the fast path is read next */
     if (out) {
         /* Replies the IO thread could not write yet precede anything main produces for this client. */
         if (sdslen(out) > 0) addReplyProto(c, out, sdslen(out));
@@ -1537,8 +1671,14 @@ int fastpathAttach(client *c) {
     if (!fp_staged_admit) return C_ERR;
     if (c->fp_peer.family == 0 && fpCaptureAddrs(c) != C_OK) return C_ERR;
     if (fastpathControlEnsure(c) != C_OK) return C_ERR;
-    if (pollerRegister(stagedPoller(), c->conn->fd, POLLER_READABLE, fastpathStagedEvent, c, POLLER_AFF_IO) != 0)
+    /* The transport stops using the main event loop (TLS) before its fd joins the IO threads' poller. */
+    if (connIOOwnerBegin(c->conn) != 0) return C_ERR;
+    if (pollerRegister(stagedPoller(), c->conn->fd, POLLER_READABLE, fastpathStagedEvent, c, POLLER_AFF_IO) != 0) {
+        connIOOwnerEnd(c->conn);
+        connUpdateState(c->conn);
         return C_ERR;
+    }
+    c->fp_read_wants_write = 0;
     c->io_tid = 0;
     c->flag.fastpath = 1;
     c->fp_inflight = 0;
@@ -1550,6 +1690,14 @@ int fastpathAttach(client *c) {
     c->control->closing = 0;
     listLinkNodeTail(&fp_staged_clients, &c->io_owner_node);
     fastpath_clients++;
+    /* Input the transport already took off the socket raises no event; a read the transport left
+     * waiting for the socket to be writable continues on a writable event. */
+    int st = connIOOwnerState(c->conn);
+    if (st & CONN_IO_READ_WANTS_WRITE) {
+        c->fp_read_wants_write = 1;
+        fpEnableWriteInterest(c, 1);
+    }
+    if (st & CONN_IO_BUFFERED_INPUT) pollerRequeue(stagedPoller(), c->conn->fd, POLLER_READABLE);
     return C_OK;
 }
 
@@ -1577,6 +1725,23 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
      * edge it consumed is handed to the next batch. */
     if (c->fp_inflight > 0) {
         pollerRequeue(stagedPoller(), fd, mask);
+        return;
+    }
+    if (c->fp_conn_type == CONN_TYPE_TLS) {
+        /* A read can wait for the socket to be writable and a write for it to be readable, so either
+         * event may continue either. Writes go first: a reply already produced leads. */
+        int pending_out = c->fp_out && sdslen(c->fp_out) > 0;
+        if (pending_out && (mask & (POLLER_WRITABLE | POLLER_READABLE))) {
+            pending_out = !fpFlushOut(t, c);
+            if (c->control->lifecycle != FP_ACTIVE) return;
+        }
+        if ((mask & POLLER_READABLE) || ((mask & POLLER_WRITABLE) && c->fp_read_wants_write)) {
+            c->fp_read_wants_write = 0;
+            fpRead(t, tid, c);
+            if (c->control->lifecycle != FP_ACTIVE) return;
+            pending_out = c->fp_out && sdslen(c->fp_out) > 0;
+        }
+        if ((mask & POLLER_WRITABLE) && !pending_out && !c->fp_read_wants_write) fpEnableWriteInterest(c, 0);
         return;
     }
     if (mask & POLLER_WRITABLE) {

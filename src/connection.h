@@ -164,6 +164,14 @@ typedef struct ConnectionType {
      * command batching; leave 0 for transports that do not need that. */
     int sync_handlers_in_update_state;
 
+    /* An IO thread owns the connection's socket for a while (the staged fast path). Called by the
+     * main thread. Begin returns -1 when the transport cannot be owned that way; end hands the
+     * connection back to the main thread's event loop, which the caller then re-registers. */
+    int (*io_owner_begin)(struct connection *conn);
+    void (*io_owner_end)(struct connection *conn);
+    /* Called by the owning IO thread: CONN_IO_* bits for what the last read or write left behind. */
+    int (*io_owner_state)(struct connection *conn);
+
     /* TLS specified methods */
     sds (*get_peer_cert)(struct connection *conn);
 
@@ -581,6 +589,23 @@ static inline void connSetPostponeUpdateState(connection *conn, int postpone_mas
 
 static inline int connUpdateStateMayInvokeHandlers(connection *conn) {
     return conn && conn->type && conn->type->sync_handlers_in_update_state;
+}
+
+/* io_owner_state bits. */
+#define CONN_IO_BUFFERED_INPUT (1 << 0)   /* input may be waiting where no socket event reports it */
+#define CONN_IO_READ_WANTS_WRITE (1 << 1) /* the last read needs the socket writable to continue */
+#define CONN_IO_WRITE_WANTS_READ (1 << 2) /* the last write needs the socket readable to continue */
+
+static inline int connIOOwnerBegin(connection *conn) {
+    return conn->type->io_owner_begin ? conn->type->io_owner_begin(conn) : 0;
+}
+
+static inline void connIOOwnerEnd(connection *conn) {
+    if (conn->type->io_owner_end) conn->type->io_owner_end(conn);
+}
+
+static inline int connIOOwnerState(connection *conn) {
+    return conn->type->io_owner_state ? conn->type->io_owner_state(conn) : 0;
 }
 
 static inline int connIsIntegrityChecked(connection *conn) {
