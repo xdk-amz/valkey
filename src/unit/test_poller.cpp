@@ -374,7 +374,8 @@ TEST_F(PollerTest, PriorityClaimedBeforeIO) {
     for (int i = 2; i < 6; i++) EXPECT_EQ(got[i].affinity, POLLER_AFF_IO);
 }
 
-static void concurrentClaims(poller *p, std::vector<int> &readers, std::vector<int> &writers, int rounds) {
+static void concurrentClaims(poller *p, std::vector<int> &readers, std::vector<int> &writers, int rounds,
+                             bool batched = false) {
     const int nthreads = 8;
     int npipes = (int)readers.size();
     for (int round = 0; round < rounds; round++) {
@@ -396,6 +397,17 @@ static void concurrentClaims(poller *p, std::vector<int> &readers, std::vector<i
                     while (!go.load(std::memory_order_acquire)) {
                     }
                     pollerEvent e;
+                    if (batched) {
+                        pollerClaim cl;
+                        while (pollerClaimIOBatch(p, &cl, nthreads)) {
+                            for (int i = 0; i < cl.n; i++) {
+                                if (!pollerClaimResolve(p, &cl, i, &e)) continue;
+                                hits[e.fd].fetch_add(1, std::memory_order_relaxed);
+                                total.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        return;
+                    }
                     while (pollerClaimIO(p, &e)) {
                         hits[e.fd].fetch_add(1, std::memory_order_relaxed);
                         total.fetch_add(1, std::memory_order_relaxed);
@@ -423,6 +435,78 @@ TEST_F(PollerTest, ConcurrentClaimTakesEachEntryOnce) {
     concurrentClaims(p, readers, writers, 10);
     ASSERT_EQ(pollerStart(p), 0);
     concurrentClaims(p, readers, writers, 10);
+}
+
+TEST_F(PollerTest, ConcurrentBatchClaimTakesEachEntryOnce) {
+    const int npipes = 1000;
+    std::vector<int> readers, writers;
+    for (int i = 0; i < npipes; i++) {
+        auto [r, w] = makePipe();
+        ASSERT_EQ(pollerRegister(p, r, POLLER_READABLE, noopHandler, nullptr, POLLER_AFF_IO), 0);
+        readers.push_back(r);
+        writers.push_back(w);
+    }
+    concurrentClaims(p, readers, writers, 10, true);
+    ASSERT_EQ(pollerStart(p), 0);
+    concurrentClaims(p, readers, writers, 10, true);
+}
+
+/* Batch claims return what single claims would, in the same order, PRIORITY first, with fewer
+ * entries per step as the buffer runs out; an entry whose fd changed generation after the claim
+ * resolves to nothing. */
+TEST_F(PollerTest, BatchClaimOrderSizesAndStaleEntries) {
+    const int nio = 37, nprio = 3;
+    std::vector<int> io, prio, w;
+    for (int i = 0; i < nio + nprio; i++) {
+        auto [r, wr] = makePipe();
+        bool is_prio = i < nprio;
+        ASSERT_EQ(pollerRegister(p, r, POLLER_READABLE, noopHandler, nullptr,
+                                 is_prio ? POLLER_AFF_PRIORITY : POLLER_AFF_IO),
+                  0);
+        (is_prio ? prio : io).push_back(r);
+        w.push_back(wr);
+    }
+    for (int wr : w) poke(wr);
+    ASSERT_EQ(pollerGetNextBatch(p, 0), nio + nprio);
+    std::vector<pollerEvent> single = claimAll();
+    ASSERT_EQ((int)single.size(), nio + nprio);
+    for (int i = 0; i < nprio; i++) EXPECT_EQ(single[i].affinity, POLLER_AFF_PRIORITY);
+
+    for (int r : io) drain(r);
+    for (int r : prio) drain(r);
+    for (int wr : w) poke(wr);
+    ASSERT_EQ(pollerGetNextBatch(p, 0), nio + nprio);
+    std::vector<pollerEvent> batched;
+    std::vector<int> sizes;
+    pollerClaim cl;
+    int unregistered = -1;
+    while (pollerClaimIOBatch(p, &cl, 1)) {
+        ASSERT_GE(cl.n, 1);
+        ASSERT_LE(cl.n, POLLER_CLAIM_MAX);
+        sizes.push_back(cl.n);
+        if (unregistered < 0 && cl.n > 1) {
+            /* The second entry of this claim goes away before it is resolved. */
+            unregistered = cl.s[1].fd;
+            ASSERT_EQ(pollerUnregister(p, unregistered), 0);
+        }
+        pollerEvent e;
+        for (int i = 0; i < cl.n; i++)
+            if (pollerClaimResolve(p, &cl, i, &e)) batched.push_back(e);
+    }
+    EXPECT_EQ(pollerClaimIOBatch(p, &cl, 1), 0);
+    ASSERT_GE(unregistered, 0);
+    ASSERT_EQ((int)batched.size(), nio + nprio - 1);
+    size_t j = 0;
+    for (const pollerEvent &e : single) {
+        if (e.fd == unregistered) continue;
+        ASSERT_LT(j, batched.size());
+        EXPECT_EQ(batched[j].fd, e.fd);
+        EXPECT_EQ(batched[j].affinity, e.affinity);
+        j++;
+    }
+    EXPECT_GT(sizes.front(), 1);
+    EXPECT_EQ(sizes.back(), 1);
+    EXPECT_TRUE(std::is_sorted(sizes.rbegin(), sizes.rend()));
 }
 
 TEST_F(PollerTest, StopEmptiesBuffersAndRestarts) {

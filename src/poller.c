@@ -450,6 +450,40 @@ int pollerClaimIO(poller *p, pollerEvent *out) {
     }
 }
 
+/* A step claims a quarter of each claimer's share of what is left, so claimers meet on the cursor once per
+ * several fds while the last fds still go out one at a time and no claimer holds work the others could run. */
+#define POLLER_CLAIM_SPREAD 4
+
+int pollerClaimIOBatch(poller *p, pollerClaim *cl, int claimers) {
+    const pollerBuf *b = &p->buf[p->active];
+    int np = b->n[POLLER_AFF_PRIORITY];
+    int total = np + b->n[POLLER_AFF_IO];
+    cl->n = 0;
+    int cur = atomic_load_explicit(&p->cursor, memory_order_relaxed);
+    if (cur >= total) return 0;
+    int k = (total - cur) / (POLLER_CLAIM_SPREAD * (claimers > 1 ? claimers : 1));
+    if (k < 1) k = 1;
+    if (k > POLLER_CLAIM_MAX) k = POLLER_CLAIM_MAX;
+    int idx = atomic_fetch_add_explicit(&p->cursor, k, memory_order_relaxed);
+    if (idx >= total) return 0;
+    int end = idx + k < total ? idx + k : total;
+    for (int i = idx; i < end; i++) {
+        const pollerSlot *s = i < np ? &b->e[POLLER_AFF_PRIORITY][i] : &b->e[POLLER_AFF_IO][i - np];
+        cl->s[cl->n].fd = s->fd;
+        cl->s[cl->n].gen = s->gen;
+        cl->s[cl->n].mask = s->mask;
+        cl->n++;
+        if (s->fd >= 0 && s->fd < p->regs_cap) __builtin_prefetch(&p->regs[s->fd]);
+    }
+    return cl->n;
+}
+
+int pollerClaimResolve(const poller *p, const pollerClaim *cl, int i, pollerEvent *out) {
+    if (i < 0 || i >= cl->n) return 0;
+    pollerSlot s = {.fd = cl->s[i].fd, .gen = cl->s[i].gen, .mask = cl->s[i].mask};
+    return resolveSlot(p, &s, out);
+}
+
 int pollerIOCount(const poller *p) {
     const pollerBuf *b = &p->buf[p->active];
     return b->n[POLLER_AFF_PRIORITY] + b->n[POLLER_AFF_IO];
@@ -687,6 +721,15 @@ void pollerRequeue(poller *p, int fd, int mask) {
 }
 int pollerClaimIO(poller *p, pollerEvent *out) {
     (void)p, (void)out;
+    return 0;
+}
+int pollerClaimIOBatch(poller *p, pollerClaim *cl, int claimers) {
+    (void)p, (void)claimers;
+    cl->n = 0;
+    return 0;
+}
+int pollerClaimResolve(const poller *p, const pollerClaim *cl, int i, pollerEvent *out) {
+    (void)p, (void)cl, (void)i, (void)out;
     return 0;
 }
 int pollerIOCount(const poller *p) {

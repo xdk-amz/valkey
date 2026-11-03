@@ -1702,6 +1702,29 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
     if (mask & POLLER_READABLE) fpRead(t, tid, c, mask & (POLLER_HUP | POLLER_ERROR));
 }
 
+/* Several claimers: claim a few fds per cursor step. Kept out of line so the read phase stays small when
+ * main reads alone. */
+static __attribute__((noinline)) void fpClaimBatched(poller *p, int claimers) {
+    pollerEvent ev;
+    pollerClaim cl;
+    while (pollerClaimIOBatch(p, &cl, claimers)) {
+        /* Bring in the claimed clients and their controls together; handling one at a time would wait
+         * on each client's cold lines in turn. */
+        client *cs[POLLER_CLAIM_MAX];
+        int nc = 0;
+        for (int i = 0; i < cl.n; i++) {
+            if (!pollerClaimResolve(p, &cl, i, &ev) || ev.handler != fastpathStagedEvent) continue;
+            client *c = ev.privdata;
+            __builtin_prefetch(&c->control);
+            __builtin_prefetch(&c->fp_inflight);
+            cs[nc++] = c;
+        }
+        for (int i = 0; i < nc; i++) __builtin_prefetch(cs[i]->control);
+        for (int i = 0; i < cl.n; i++)
+            if (pollerClaimResolve(p, &cl, i, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+    }
+}
+
 /* Read phase, on each IO thread and on main (tid 0): claim ready client fds until none are left, then
  * publish the open batch. */
 void fastpathStagedReadPhase(int tid) {
@@ -1710,7 +1733,14 @@ void fastpathStagedReadPhase(int tid) {
     pollerEvent ev;
     fp_cur_tid = tid;
     if (fpDepth() == 0) fpResetLaneVectors(t);
-    while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+    int claimers = server.active_io_threads_num;
+    if (claimers <= 1) {
+        /* Main alone: nobody contends on the cursor, and handling an fd overlaps the next one's misses as
+         * well as a prefetch pass would. */
+        while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+    } else {
+        fpClaimBatched(p, claimers);
+    }
     fpSubmit(t);
     if (t->cur && t->cur->count == 0) {
         fpRecycleBatch(t, t->cur);

@@ -27,6 +27,7 @@
  * stubs that register nothing and report no events, and staged mode never turns on. */
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* Interest and fired masks. Independent of ae's AE_* so the poller does not depend on ae.h. */
 #define POLLER_NONE 0
@@ -89,6 +90,24 @@ void pollerRequeue(poller *p, int fd, int mask);
  * Entries whose fd changed generation since they were queued are skipped. Safe from many threads. */
 int pollerClaimIO(poller *p, pollerEvent *out);
 int pollerIOCount(const poller *p); /* PRIORITY plus IO entries in the active buffer */
+
+/* Several active PRIORITY/IO entries claimed with one cursor step, in the order pollerClaimIO would
+ * return them, with their registrations prefetched. Each is resolved by pollerClaimResolve just before
+ * it is handled, so a registration changed by an earlier handler is seen as it would be one at a time. */
+#define POLLER_CLAIM_MAX 8
+typedef struct pollerClaim {
+    int n;
+    struct {
+        int fd;
+        uint32_t gen;
+        int mask;
+    } s[POLLER_CLAIM_MAX];
+} pollerClaim;
+/* Returns the number of entries claimed into cl, 0 when both classes are exhausted. claimers is how many
+ * threads claim from this buffer; each step takes less as it grows. Safe from many threads. */
+int pollerClaimIOBatch(poller *p, pollerClaim *cl, int claimers);
+/* Returns 1 and fills out for entry i of cl, 0 when its fd changed generation since it was queued. */
+int pollerClaimResolve(const poller *p, const pollerClaim *cl, int i, pollerEvent *out);
 
 /* Active MAIN entries: walked by main. pollerMainAt returns 1 and fills out, 0 for a stale entry
  * or an index out of range. */
