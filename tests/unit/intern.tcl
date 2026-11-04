@@ -456,6 +456,35 @@ start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-a
         for {set i 0} {$i < 3000} {incr i 97} {assert_equal [lindex $vals [expr {($i * 7 + 1) % 50}]] [r get k$i]}
     }
 
+    test {Hash values and set members parsed by IO threads are shared} {
+        r flushall
+        set v [string repeat h 300]
+        set m [string repeat m 300]
+        for {set i 0} {$i < 3000} {incr i} {
+            r hset h$i f $v
+            r sadd s$i $m
+        }
+        assert_morethan [intern_stat intern_refs] 5000
+        for {set i 0} {$i < 3000} {incr i 97} {
+            assert_equal $v [r hget h$i f]
+            assert_equal 1 [r sismember s$i $m]
+        }
+        # A member that is already present leaves the reference count as it was.
+        set before [intern_stat intern_refs]
+        for {set i 0} {$i < 3000} {incr i} {assert_equal 0 [r sadd s$i $m]}
+        wait_for_condition 50 100 {
+            [intern_stat intern_refs] == $before
+        } else {
+            fail "duplicate SADD changed intern_refs"
+        }
+        r flushall
+        wait_for_condition 50 100 {
+            [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
+        } else {
+            fail "intern references not released"
+        }
+    }
+
     test {Values shared by IO threads are released on overwrite and flush} {
         set w [string repeat z 300]
         for {set i 0} {$i < 3000} {incr i} {r set k$i $w}

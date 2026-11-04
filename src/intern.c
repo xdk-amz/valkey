@@ -1291,7 +1291,7 @@ void internFreePending(internPending *pending) {
  * when it is shared. Other commands copy their arguments, so sharing those on
  * an IO thread would only add reference work on the main thread. */
 int internIOShares(const char *name, size_t len) {
-    static const char *cmds[] = {"set", "setex", "psetex", "setnx", "getset", "mset", "msetnx", "hset", "hsetnx", "hmset"};
+    static const char *cmds[] = {"set", "setex", "psetex", "setnx", "getset", "mset", "msetnx", "hset", "hsetnx", "hmset", "sadd"};
     if (len < 3 || len > 6) return 0;
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         if (strlen(cmds[i]) == len && strncasecmp(cmds[i], name, len) == 0) return 1;
