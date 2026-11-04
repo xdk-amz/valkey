@@ -111,7 +111,9 @@ double R_Zero, R_PosInf, R_NegInf, R_Nan;
 /*================================= Globals ================================= */
 
 /* Global vars */
-struct valkeyServer server; /* Server global state */
+/* Line-aligned so that the fields main and IO threads write keep the same cache
+ * lines whatever is linked before it. */
+struct valkeyServer server __attribute__((aligned(64))); /* Server global state */
 
 /*============================ Internal prototypes ========================== */
 
