@@ -208,6 +208,15 @@ static _Thread_local uint64_t fp_stream_pos = 0; /* replica lane: stream positio
 static int fp_lanes_iter = 0; /* this iteration's entries are sorted into lanes */
 static int fp_nlanes = 0;     /* lanes of this iteration */
 static int fp_lane_main = 0;  /* main runs lane 0, IO thread i lane i; otherwise IO thread i lane i - 1 */
+static int fp_replies_deferred = 0; /* the last iteration's replies go out in this read phase */
+
+/* Main, between phases, once no reply points into the lane arenas. */
+static void fpResetLaneArenas(void) {
+    for (int l = 0; l < FP_MAX_LANES; l++) {
+        fp_lanes[l].chunk = 0;
+        fp_lanes[l].used = 0;
+    }
+}
 /* Main writes these before each write phase; the lanes read them in it. */
 typedef struct fpSegPart {
     int tid;
@@ -1242,10 +1251,12 @@ static void fpDeliverRange(fpThread *t, cmdBatch *b, int from, int to) {
             j++;
         }
         if (n) fpSend(t, c, iov, n);
-        c->fp_inflight -= (j - i);
         c->commands_processed += (j - i) - requeued;
         if (j - i > requeued) c->lastcmd = b->e[j - requeued - 1].cmd; /* CLIENT LIST cmd= */
         if (requeued) fpRequeue(t, c, &b->e[j - requeued], requeued); /* main stops executing a client at its first held entry */
+        /* Last touch of the client: a read phase that delivers deferred replies lets another thread
+         * claim the client once this reaches 0 (fastpathStagedEvent). */
+        __atomic_sub_fetch(&c->fp_inflight, (uint32_t)(j - i), __ATOMIC_RELEASE);
         fpFreeEntries(&b->e[i], j - i);
         i = j;
     }
@@ -1689,9 +1700,10 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
     int tid = fp_cur_tid;
     fpThread *t = &fp_threads[tid];
     if (c->control->lifecycle != FP_ACTIVE || fpCloseRecorded(c->control)) return;
-    /* A nested iteration skips clients whose entries of the outer iteration are still on main; the
-     * edge it consumed is handed to the next batch. */
-    if (c->fp_inflight > 0) {
+    /* A nested iteration skips clients whose entries of the outer iteration are still on main, and a
+     * read phase skips clients whose deferred replies another thread has not delivered yet; the edge
+     * it consumed is handed to the next batch. */
+    if (__atomic_load_n(&c->fp_inflight, __ATOMIC_ACQUIRE) > 0) {
         pollerRequeue(stagedPoller(), fd, mask);
         return;
     }
@@ -1709,6 +1721,8 @@ void fastpathStagedReadPhase(int tid) {
     poller *p = stagedPoller();
     pollerEvent ev;
     fp_cur_tid = tid;
+    /* The previous iteration's replies, when it deferred them, go out before this thread reads. */
+    if (fp_replies_deferred && fpDepth() == 0) fastpathStagedReplyPhase(tid);
     if (fpDepth() == 0) fpResetLaneVectors(t);
     while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
     fpSubmit(t);
@@ -1769,11 +1783,35 @@ void fastpathStagedPrepareLanes(void) {
     fp_check_blocked = server.blocked_clients_by_type[BLOCKED_LIST] || server.blocked_clients_by_type[BLOCKED_ZSET] ||
                        server.blocked_clients_by_type[BLOCKED_STREAM];
     fp_check_watched = server.watching_clients > 0;
-    /* The previous iteration's replies were delivered in its reply phase. */
-    for (int l = 0; l < FP_MAX_LANES; l++) {
-        fp_lanes[l].chunk = 0;
-        fp_lanes[l].used = 0;
-    }
+    /* The previous iteration's replies were delivered in its reply phase, or are delivered from the
+     * lane arenas in this read phase, which then resets them (fastpathStagedDeferredDelivered). */
+    if (!fp_replies_deferred) fpResetLaneArenas();
+}
+
+/* Main, at the end of the write phase: leave this iteration's replies for the next read phase. */
+void fastpathStagedDeferReplies(void) {
+    serverAssert(fpDepth() == 0);
+    fp_replies_deferred = 1;
+}
+
+int fastpathStagedRepliesDeferred(void) {
+    return fp_replies_deferred;
+}
+
+/* Main, after the read phase that delivered the deferred replies. */
+void fastpathStagedDeferredDelivered(void) {
+    if (!fp_replies_deferred) return;
+    fp_replies_deferred = 0;
+    fpResetLaneArenas();
+}
+
+/* Main, at the end of the write phase: no client is leaving or closing, so nothing waits for the
+ * reply barrier to be handed back to the main path. */
+int fastpathStagedHandoffsPending(void) {
+    if (fp_staged_closing && listLength(fp_staged_closing)) return 1;
+    for (int tid = 0; tid < fp_slots; tid++)
+        if (listLength(&fp_threads[tid].staged_leaving)) return 1;
+    return 0;
 }
 
 /* Main, after the read phase: some segment of the write phase has enough lane commands to run a lane
