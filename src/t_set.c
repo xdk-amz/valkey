@@ -147,8 +147,14 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         hashtable *ht = objectGetVal(set);
         hashtablePosition position;
         if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
-            /* Key doesn't already exist in the set. Add it but dup the key. */
-            sdsval = (sdsval == str) ? internNewFrom(str, len) : internAdmit(sdsval);
+            /* Key doesn't already exist in the set. Add it but dup the key. A
+             * member shared when the request was parsed is referenced. */
+            if (sdsval != str)
+                sdsval = internAdmit(sdsval);
+            else if (sdsIsShared(sdsval))
+                sdsval = internDupSds(sdsval);
+            else
+                sdsval = internNewFrom(str, len);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
         } else if (sdsval != str) {

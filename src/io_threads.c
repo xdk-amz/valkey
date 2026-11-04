@@ -1027,11 +1027,15 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 
     int last_arg_to_free = -1;
 
+    /* Arguments are shared only from the hot cache; skip the check while it is
+     * empty. A skipped one is released by the IO thread. */
+    int may_share = intern_state.hot_count != 0;
     /* Prepare the argv */
     for (int j = 0; j < argc; j++) {
         /* A shared value was just referenced by this command, so its header is
          * in cache here; an IO thread would have to send the release back. */
-        if (argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(argv[j]))) {
+        if (may_share && argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW &&
+            sdsIsShared(objectGetVal(argv[j]))) {
             sdsfree(objectGetVal(argv[j]));
             objectSetVal(argv[j], NULL);
         }
