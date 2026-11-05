@@ -119,6 +119,13 @@ int setTypeAdd(robj *subject, sds value) {
     return setTypeAddAux(subject, value, sdslen(value), 0, 1);
 }
 
+/* The copy of a new member for a hashtable-encoded set. A member shared when
+ * the request was parsed is referenced, also when adding it converts the set. */
+static sds setNewMember(char *str, size_t len, int str_is_sds) {
+    if (str_is_sds && sdsIsShared((sds)str)) return internDupSds((sds)str);
+    return internNewFrom(str, len);
+}
+
 /* Add member. This function is optimized for the different encodings. The
  * value can be provided as an sds string (indicated by passing str_is_sds =
  * 1), as string and length (str_is_sds = 0) or as an integer in which case str
@@ -149,12 +156,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
             /* Key doesn't already exist in the set. Add it but dup the key. A
              * member shared when the request was parsed is referenced. */
-            if (sdsval != str)
-                sdsval = internAdmit(sdsval);
-            else if (sdsIsShared(sdsval))
-                sdsval = internDupSds(sdsval);
-            else
-                sdsval = internNewFrom(str, len);
+            sdsval = sdsval != str ? internAdmit(sdsval) : setNewMember(str, len, 1);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
         } else if (sdsval != str) {
@@ -181,7 +183,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
             } else {
                 /* Size limit is reached. Convert to hashtable and add. */
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, lpLength(lp) + 1, 1);
-                serverAssert(hashtableAdd(objectGetVal(set), internNewFrom(str, len)));
+                serverAssert(hashtableAdd(objectGetVal(set), setNewMember(str, len, str_is_sds)));
             }
             return 1;
         }
@@ -221,7 +223,7 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
                 setTypeConvertAndExpand(set, OBJ_ENCODING_HASHTABLE, intsetLen(objectGetVal(set)) + 1, 1);
                 /* The set *was* an intset and this value is not integer
                  * encodable, so hashtableAdd should always work. */
-                serverAssert(hashtableAdd(objectGetVal(set), internNewFrom(str, len)));
+                serverAssert(hashtableAdd(objectGetVal(set), setNewMember(str, len, str_is_sds)));
                 return 1;
             }
         }
