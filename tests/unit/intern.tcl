@@ -516,6 +516,30 @@ start_server {tags {"intern"} overrides {io-threads 1}} {
             fail "intern references not released"
         }
     }
+
+    test {A member shared at parse is referenced by the set it creates} {
+        r flushall
+        set m [string repeat m 300]
+        for {set i 0} {$i < 100} {incr i} {r sadd warm$i $m}
+        # The member is hot now. Each new set starts as a listpack and is
+        # converted for this member; the conversion references the parsed
+        # member instead of copying it again.
+        set refs [intern_stat intern_refs]
+        set sampled [intern_stat intern_sampled]
+        for {set i 0} {$i < 3000} {incr i} {assert_equal 1 [r sadd s$i $m]}
+        assert_equal 3000 [expr {[intern_stat intern_refs] - $refs}]
+        assert_lessthan [expr {[intern_stat intern_sampled] - $sampled}] 300
+        for {set i 0} {$i < 3000} {incr i 97} {
+            assert_equal 1 [r sismember s$i $m]
+            assert_equal [list $m] [r smembers s$i]
+        }
+        r flushall
+        wait_for_condition 50 100 {
+            [intern_stat intern_strings] == 0 && [intern_stat intern_refs] == 0
+        } else {
+            fail "intern references not released"
+        }
+    }
 }
 
 start_server {tags {"intern repl external:skip"}} {
