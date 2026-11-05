@@ -1,0 +1,81 @@
+From 53f5e42958d0b0d340a2e6650ca27cd4e507a287 Mon Sep 17 00:00:00 2001
+From: abl <abl@local>
+Date: Fri, 16 Oct 2026 20:18:27 +0000
+Subject: [PATCH 1/2] ablate (stock): one random cache miss per 64 collected
+ reads
+
+---
+ src/networking.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/networking.c b/src/networking.c
+index 887b7cac3..7008c40da 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -7047,6 +7047,20 @@ int postponeClientRead(client *c) {
+ }
+ 
+ /* Returns non-zero if connUpdateState must run again after processClientsCommandsBatch(). */
++/* Ablation: one random cache miss on every 64th collected read. */
++static uint64_t *abl_junk;
++static uint64_t abl_x = 88172645463325252ULL;
++static uint32_t abl_tick = 64;
++static void ablMiss(void) {
++    if (--abl_tick) return;
++    abl_tick = 64;
++    if (abl_junk == NULL) abl_junk = zcalloc((size_t)64 << 20);
++    abl_x ^= abl_x << 13;
++    abl_x ^= abl_x >> 7;
++    abl_x ^= abl_x << 17;
++    abl_junk[abl_x & (((size_t)8 << 20) - 1)]++;
++}
++
+ int processClientIOReadsDone(client *c) {
+     serverAssert(c->io_read_state == CLIENT_COMPLETED_IO);
+ 
+@@ -7058,6 +7072,7 @@ int processClientIOReadsDone(client *c) {
+ 
+     c->flag.pending_read = 0;
+     c->io_read_state = CLIENT_IDLE;
++    ablMiss();
+ 
+     /* Don't post-process-reads from clients that are going to be closed anyway. */
+     if (c->flag.close_asap) return 0;
+-- 
+2.50.1
+
+
+From 8a5d89c52a7b9a07fd94b83eb3143f5963ace4ef Mon Sep 17 00:00:00 2001
+From: abl <abl@local>
+Date: Fri, 16 Oct 2026 20:18:36 +0000
+Subject: [PATCH 2/2] ablate (stock): one random cache miss per 8 collected
+ reads
+
+---
+ src/networking.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/networking.c b/src/networking.c
+index 7008c40da..c4f80a212 100644
+--- a/src/networking.c
++++ b/src/networking.c
+@@ -7047,13 +7047,13 @@ int postponeClientRead(client *c) {
+ }
+ 
+ /* Returns non-zero if connUpdateState must run again after processClientsCommandsBatch(). */
+-/* Ablation: one random cache miss on every 64th collected read. */
++/* Ablation: one random cache miss on every 8th collected read. */
+ static uint64_t *abl_junk;
+ static uint64_t abl_x = 88172645463325252ULL;
+-static uint32_t abl_tick = 64;
++static uint32_t abl_tick = 8;
+ static void ablMiss(void) {
+     if (--abl_tick) return;
+-    abl_tick = 64;
++    abl_tick = 8;
+     if (abl_junk == NULL) abl_junk = zcalloc((size_t)64 << 20);
+     abl_x ^= abl_x << 13;
+     abl_x ^= abl_x >> 7;
+-- 
+2.50.1
+

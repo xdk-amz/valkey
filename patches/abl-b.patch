@@ -1,0 +1,25 @@
+From c75df0f64c891f7f6b52322a92da0b40a2d0a3ab Mon Sep 17 00:00:00 2001
+From: Dante Knowles <xdk@amazon.com>
+Date: Fri, 16 Oct 2026 17:29:10 +0000
+Subject: [PATCH] ablate: pending releases do not set dont_sleep
+
+---
+ src/server.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/server.c b/src/server.c
+index 543c9438c..f3f7a00fa 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -1986,7 +1986,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
+     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
+     int dont_sleep = connTypeHasPendingData();
+     /* Queued releases are applied a slice per iteration; keep polling until done. */
+-    if (internDrainPending()) dont_sleep = 1;
++    (void)internDrainPending;
+     if (processPendingReplStreamDecode()) {
+         server.el_iteration_active = true;
+         if (replStreamHasPendingDecode()) dont_sleep = 1;
+-- 
+2.50.1
+

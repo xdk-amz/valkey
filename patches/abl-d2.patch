@@ -1,0 +1,25 @@
+From 82baa84b1bc1d7a286a6ea1ebd7158ebe509ce29 Mon Sep 17 00:00:00 2001
+From: abl <abl@local>
+Date: Fri, 16 Oct 2026 19:37:53 +0000
+Subject: [PATCH] ablate: main observes IO selections but admits none
+
+---
+ src/intern.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/intern.c b/src/intern.c
+index 614fecafa..a618ea1e0 100644
+--- a/src/intern.c
++++ b/src/intern.c
+@@ -1045,6 +1045,8 @@ int internIOShares(const char *name, size_t len) {
+  * on a table hit or to copy a new singleton. */
+ static sds admitSelected(sds s, size_t len, uint64_t h) {
+     st.sampled++;
++    observe(0);
++    if (len != 1) return s;
+     if (unlikely(filterMayHave(h))) {
+         sds r = admitFromTables(s, len, h);
+         if (r) return r;
+-- 
+2.50.1
+

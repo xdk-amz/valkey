@@ -1,0 +1,33 @@
+From ce0108bd4f5f9199ff4db67da2f6b35f0be619df Mon Sep 17 00:00:00 2001
+From: Dante Knowles <xdk@amazon.com>
+Date: Fri, 16 Oct 2026 17:29:48 +0000
+Subject: [PATCH] ablate: no read-epoch bookkeeping (retired strings leak)
+
+---
+ src/intern.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/intern.c b/src/intern.c
+index 614fecafa..2da42ef14 100644
+--- a/src/intern.c
++++ b/src/intern.c
+@@ -1089,6 +1089,8 @@ static retiredString *retired;
+ static size_t retired_count, retired_cap;
+ 
+ void internReadDispatched(uint32_t *epoch) {
++    *epoch = 0;
++    return;
+     uint32_t slot = read_epoch % READ_EPOCHS;
+     read_inflight[slot]++;
+     reads_inflight++;
+@@ -1134,6 +1136,7 @@ static void retire(sds s) {
+ }
+ 
+ void internEpochTick(void) {
++    return;
+     while (read_oldest < read_epoch && read_inflight[read_oldest % READ_EPOCHS] == 0) read_oldest++;
+     if (read_inflight[(read_epoch + 1) % READ_EPOCHS] == 0) {
+         read_epoch++;
+-- 
+2.50.1
+

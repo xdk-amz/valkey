@@ -1,0 +1,24 @@
+From 83c38a7289f3ebed6d1cba223999cd9389c69354 Mon Sep 17 00:00:00 2001
+From: Dante Knowles <xdk@amazon.com>
+Date: Fri, 16 Oct 2026 17:29:04 +0000
+Subject: [PATCH] ablate: IO threads do not share or select
+
+---
+ src/intern.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/intern.c b/src/intern.c
+index 614fecafa..5a5461aa9 100644
+--- a/src/intern.c
++++ b/src/intern.c
+@@ -1033,6 +1033,7 @@ void internFreePending(internPending *pending) {
+  * would only add reference work on the main thread. */
+ int internIOShares(const char *name, size_t len) {
+     static const char *cmds[] = {"set", "setex", "psetex", "setnx", "getset", "mset", "msetnx"};
++    return 0;
+     if (len < 3 || len > 6) return 0;
+     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+         if (strlen(cmds[i]) == len && strncasecmp(cmds[i], name, len) == 0) return 1;
+-- 
+2.50.1
+

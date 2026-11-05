@@ -1,0 +1,40 @@
+From e03b21c8faf0b404f63712ed3f8fa8302badf5da Mon Sep 17 00:00:00 2001
+From: abl <abl@local>
+Date: Fri, 16 Oct 2026 20:05:29 +0000
+Subject: [PATCH] ablate: pending struct fills its own cache line
+
+---
+ src/intern.c | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/intern.c b/src/intern.c
+index 614fecafa..711aec891 100644
+--- a/src/intern.c
++++ b/src/intern.c
+@@ -951,12 +951,18 @@ typedef struct internSelected {
+ } internSelected;
+ 
+ struct internPending {
+-    uint32_t n, cap;   /* shared arguments waiting for their references */
+-    uint32_t ns, scap; /* arguments selected for admission */
+-    uint32_t hits;     /* sampled arguments that were shared */
+-    robj **o;
+-    internSelected *sel;
++    union {
++        struct {
++            uint32_t n, cap;   /* shared arguments waiting for their references */
++            uint32_t ns, scap; /* arguments selected for admission */
++            uint32_t hits;     /* sampled arguments that were shared */
++            robj **o;
++            internSelected *sel;
++        };
++        char line[CACHE_LINE_SIZE];
++    };
+ };
++_Static_assert(sizeof(struct internPending) == CACHE_LINE_SIZE, "internPending fills one cache line");
+ 
+ static internPending *pendingGet(internPending **pp) {
+     if (*pp == NULL) *pp = zcalloc(sizeof(internPending));
+-- 
+2.50.1
+

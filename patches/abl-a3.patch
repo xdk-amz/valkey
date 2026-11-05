@@ -1,0 +1,25 @@
+From 1c279f359a8cb6b42d58ed9822a90a2a5b6ef58c Mon Sep 17 00:00:00 2001
+From: Dante Knowles <xdk@amazon.com>
+Date: Fri, 16 Oct 2026 17:41:46 +0000
+Subject: [PATCH] ablate: selected IO values never become singletons
+
+---
+ src/intern.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/intern.c b/src/intern.c
+index 614fecafa..a4572dc39 100644
+--- a/src/intern.c
++++ b/src/intern.c
+@@ -1050,7 +1050,7 @@ static sds admitSelected(sds s, size_t len, uint64_t h) {
+         if (r) return r;
+     }
+     observe(0);
+-    if (unlikely(selectSingleton(h, len, privateSize(len)))) return makeSingleton(s, len, h);
++    if (0 && unlikely(selectSingleton(h, len, privateSize(len)))) return makeSingleton(s, len, h);
+     return s;
+ }
+ 
+-- 
+2.50.1
+
