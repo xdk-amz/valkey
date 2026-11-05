@@ -418,6 +418,7 @@ client *createClient(connection *conn) {
     c->cur_tid = 0;
     c->intern_pending = NULL;
     c->intern_read_epoch = 0;
+    c->intern_share_args = INTERN_ARGS_UNKNOWN;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -4027,7 +4028,8 @@ void parseInlineBuffer(client *c) {
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
         size_t len = sdslen(argv[j]);
         robj *arg = NULL;
-        if (j > 0 && internParseReady() && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+        if (j == 1) c->intern_share_args = internParseReady() && internArgsShareable(argv[0], sdslen(argv[0]));
+        if (j > 0 && c->intern_share_args == 1 && !stringObjectWouldEmbed(len))
             arg = internParseArg(&c->intern_pending, argv[j], len, j);
         if (arg) {
             sdsfree(argv[j]);
@@ -4148,6 +4150,18 @@ void parseMultibulkBuffer(client *c) {
     }
 }
 
+/* Returns the bulk argument at the read position as a shared string object if
+ * the parser may share it, or NULL. Kept out of line so the parser stays small
+ * while nothing can be shared. */
+static __attribute__((noinline)) robj *parseSharedArg(client *c, robj *cmd, int argi) {
+    if (c->intern_share_args == INTERN_ARGS_UNKNOWN) {
+        const char *name = objectGetVal(cmd);
+        c->intern_share_args = internArgsShareable(name, sdslen(name));
+    }
+    if (!c->intern_share_args || stringObjectWouldEmbed(c->bulklen)) return NULL;
+    return internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, argi);
+}
+
 /* Incremental parsing of a command in the client's query buffer.
  *
  * Parser state related to the input buffer are per client and stored in the
@@ -4214,6 +4228,7 @@ static int parseMultibulk(client *c,
 
         c->multibulklen = ll;
         c->bulklen = -1;
+        c->intern_share_args = INTERN_ARGS_UNKNOWN;
 
         /* Set up argv array */
         if (*argv) zfree(*argv);
@@ -4357,12 +4372,7 @@ static int parseMultibulk(client *c,
                 robj *arg = NULL;
                 /* Sorted set commands mark their arguments in place during
                  * lookups, so their arguments are never shared. */
-                if (*argc > 0 && internParseReady() && !stringObjectWouldEmbed(c->bulklen)) {
-                    const char *name = objectGetVal((*argv)[0]);
-                    if ((intern_is_main && intern_load_ready) ? (name[0] != 'z' && name[0] != 'Z')
-                                                              : internIOShares(name, sdslen(objectGetVal((*argv)[0]))))
-                        arg = internParseArg(&c->intern_pending, c->querybuf + c->qb_pos, c->bulklen, *argc);
-                }
+                if (*argc > 0 && internParseReady()) arg = parseSharedArg(c, (*argv)[0], *argc);
                 (*argv)[(*argc)++] = arg ? arg : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;

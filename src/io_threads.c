@@ -1011,6 +1011,18 @@ void ioThreadFreeArgv(robj **argv) {
 /* This function attempts to offload the client's argv to an IO thread.
  * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
  * C_ERR otherwise. */
+/* Releases the shared values of argv objects this command holds the last
+ * reference to. Their headers were just touched by the command, so they are in
+ * cache here; an IO thread would have to send the release back. */
+static __attribute__((noinline)) void releaseSharedArgs(int argc, robj **argv) {
+    for (int j = 0; j < argc; j++) {
+        if (argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(argv[j]))) {
+            sdsfree(objectGetVal(argv[j]));
+            objectSetVal(argv[j], NULL);
+        }
+    }
+}
+
 int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     if (server.active_io_threads_num <= 1 || argc == 0) {
         return C_ERR;
@@ -1029,16 +1041,9 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 
     /* Arguments are shared only from the hot cache; skip the check while it is
      * empty. A skipped one is released by the IO thread. */
-    int may_share = intern_state.hot_count != 0;
+    if (intern_state.hot_count != 0) releaseSharedArgs(argc, argv);
     /* Prepare the argv */
     for (int j = 0; j < argc; j++) {
-        /* A shared value was just referenced by this command, so its header is
-         * in cache here; an IO thread would have to send the release back. */
-        if (may_share && argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW &&
-            sdsIsShared(objectGetVal(argv[j]))) {
-            sdsfree(objectGetVal(argv[j]));
-            objectSetVal(argv[j], NULL);
-        }
         if (argv[j]->refcount > 1) {
             decrRefCount(argv[j]);
             /* Set argv[j] to NULL to avoid double free */

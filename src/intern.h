@@ -147,7 +147,13 @@ void internLoadAbort(void);
 /* Returns a new sds holding buf[0..len) to store in the keyspace, sharing an
  * existing copy when there is one, like internAdmit(sdsnewlen(buf, len)) but
  * without allocating on a hit. Main thread only. */
-sds internNewFrom(const char *buf, size_t len);
+sds internNewFromDue(const char *buf, size_t len);
+static inline sds internNewFrom(const char *buf, size_t len) {
+    if (--intern_gate.tick == 0) return internNewFromDue(buf, len);
+    sds s = sdsnewlen(buf, len);
+    intern_offered = s;
+    return s;
+}
 
 /* Copy of `s` for a new holder. A shared string gets one more reference. A
  * private string is copied through internNewFrom(), so it is offered while its
@@ -175,6 +181,16 @@ void internFreePending(internPending *pending);
 /* Below the probing level, request parsing shares only arguments of these
  * commands. */
 int internIOShares(const char *name, size_t len);
+
+/* Whether arguments of the command `name` may be shared by the parser on this
+ * thread. Callers ask once per command and cache the answer; both rules only
+ * share arguments that commands store or copy, so a command parsed partly on
+ * each thread is safe whichever answer it keeps. */
+#define INTERN_ARGS_UNKNOWN (-1)
+static inline int internArgsShareable(const char *name, size_t len) {
+    if (intern_is_main && intern_load_ready) return name[0] != 'z' && name[0] != 'Z';
+    return internIOShares(name, len);
+}
 
 /* Read jobs. An IO thread reads hot shared strings while it parses, and holds
  * unreferenced ones until the read is collected, so a shared string that dies

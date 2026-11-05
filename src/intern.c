@@ -301,6 +301,14 @@ static inline void hotForget(sds s) {
     }
 }
 
+/* Starts loading every line of a hot string before it is compared, so the
+ * loads overlap instead of following the compare one line at a time. A hot
+ * string is often out of cache by the time it repeats. */
+static inline void hotPrefetch(const char *c, size_t len) {
+    __builtin_prefetch(c - 16);
+    for (size_t off = 48; off < len; off += 64) __builtin_prefetch(c + off);
+}
+
 /* Returns the hot string equal to buf[0..len) or NULL. A fingerprint mismatch
  * returns without the memcmp, so a value the cache has not seen is cheap. */
 static inline sds hotFind(const char *buf, size_t len) {
@@ -310,7 +318,9 @@ static inline sds hotFind(const char *buf, size_t len) {
         if (!hotUsed(i)) continue;
         hotSlotEntry *e = &hot[i];
         sds c = e->s;
-        if (c && e->tag == m && sdslen(c) == len && memcmp(c, buf, len) == 0) return c;
+        if (c == NULL || e->tag != m) continue;
+        hotPrefetch(c, len);
+        if (sdslen(c) == len && memcmp(c, buf, len) == 0) return c;
     }
     return NULL;
 }
@@ -457,7 +467,7 @@ static void probRemove(sds s) {
     filterRemove(slot->hash);
 }
 
-static void probResize(size_t nsets) {
+__attribute__((cold)) static void probResize(size_t nsets) {
     probSlot *old = prob;
     size_t old_slots = prob_nsets * PROB_WAYS;
     prob = zcalloc(nsets * PROB_WAYS * sizeof(probSlot));
@@ -543,14 +553,14 @@ static void setSelLevel(int level) {
     intern_sel_mask = (1ull << level) - 1;
 }
 
-void internLoadBegin(void) {
+__attribute__((cold)) void internLoadBegin(void) {
     if (intern_index == NULL) return;
     internResetSampling();
     intern_loading = 1;
     load_index_check = hashtableSize(intern_index) != 0;
 }
 
-void internLoadEnd(void) {
+__attribute__((cold)) void internLoadEnd(void) {
     intern_loading = 0;
     zfree(load_map);
     load_map = NULL;
@@ -559,7 +569,7 @@ void internLoadEnd(void) {
     load_seen = NULL;
 }
 
-void internResetSampling(void) {
+__attribute__((cold)) void internResetSampling(void) {
     /* The check tools load without internInit(); loading must stay plain. */
     if (intern_index == NULL) return;
     setLevel(INTERN_LEVEL_START);
@@ -650,7 +660,7 @@ static inline size_t privateSize(size_t len) {
 
 /* Moves the singleton `cand`, which a new holder of buf[0..len) is taking, into
  * the index. */
-static sds promoteCand(sds cand, uint64_t h, const char *buf, size_t len) {
+__attribute__((cold)) static sds promoteCand(sds cand, uint64_t h, const char *buf, size_t len) {
     internHdr *ch = internHdrOf(cand);
     ch->refcount++;
     memo_key = cand;
@@ -674,7 +684,7 @@ static sds promoteCand(sds cand, uint64_t h, const char *buf, size_t len) {
 
 /* Promotes a probation singleton equal to buf[0..len) to the index, or returns
  * NULL. */
-static sds promote(uint64_t h, const char *buf, size_t len) {
+__attribute__((cold)) static sds promote(uint64_t h, const char *buf, size_t len) {
     if (!prob_count) return NULL;
     sds cand = probTake(h, buf, len);
     if (!cand) return NULL;
@@ -682,7 +692,7 @@ static sds promote(uint64_t h, const char *buf, size_t len) {
 }
 
 /* Looks buf[0..len) up in the index. */
-static sds indexFind(const char *buf, size_t len, uint64_t h) {
+__attribute__((cold)) static sds indexFind(const char *buf, size_t len, uint64_t h) {
     sds found = NULL;
     if (hashtableSize(intern_index) == 0) return NULL;
     probe_buf = buf;
@@ -835,7 +845,7 @@ __attribute__((cold, noinline)) static sds makeSingleton(sds s, size_t len, uint
     return sh;
 }
 
-sds internAdmitSlow(sds s) {
+__attribute__((cold)) sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
     if (intern_index == NULL) return s;
     size_t len = sdslen(s);
@@ -887,18 +897,17 @@ sds internAdmitLoaded(size_t len) {
     return internAdmitBufSlow(load_scratch, len);
 }
 
-void internLoadAbort(void) {
+__attribute__((cold)) void internLoadAbort(void) {
     intern_load_busy = 0;
 }
 
-sds internNewFrom(const char *buf, size_t len) {
-    if (--intern_gate.tick || len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
-        if (intern_gate.tick == 0) intern_gate.tick = intern_gate.period;
+__attribute__((cold)) sds internNewFromDue(const char *buf, size_t len) {
+    intern_gate.tick = intern_gate.period;
+    if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
         sds s = sdsnewlen(buf, len);
         intern_offered = s;
         return s;
     }
-    intern_gate.tick = intern_gate.period;
     return internAdmitBufSlow(buf, len);
 }
 
@@ -955,7 +964,7 @@ sds internDupSds(const_sds s) {
     return d;
 }
 
-static sds internAdmitBufSlow(const char *buf, size_t len) {
+__attribute__((cold)) static sds internAdmitBufSlow(const char *buf, size_t len) {
     if (intern_index == NULL) return sdsnewlen(buf, len);
     st.sampled++;
     if (unlikely(intern_loading)) {
@@ -1078,7 +1087,7 @@ static void deferPut(deferMap *m, sds s, uint32_t n) {
     m->tab[i].n += n;
 }
 
-static void deferGrow(deferMap *m) {
+__attribute__((cold)) static void deferGrow(deferMap *m) {
     deferMap nm = {zcalloc(m->cap * 2 * sizeof(deferEntry)), m->cap * 2, 0, m->open};
     for (size_t i = 0; i < m->cap; i++) {
         if (m->tab[i].s) deferPut(&nm, m->tab[i].s, m->tab[i].n);
@@ -1095,7 +1104,7 @@ static void deferPush(deferMsg *msg) {
                                                     memory_order_relaxed));
 }
 
-void internDeferBegin(void) {
+__attribute__((cold)) void internDeferBegin(void) {
     defer_map.open = 1;
 }
 
@@ -1123,7 +1132,7 @@ void internDeferFlush(void) {
     deferPush(msg);
 }
 
-void internDeferPublish(void) {
+__attribute__((cold)) void internDeferPublish(void) {
     deferMap *m = &defer_map;
     m->open = 0;
     if (m->used == 0) return;
@@ -1254,7 +1263,9 @@ static robj *parseArgIO(internPending **pp, const char *buf, size_t len, int arg
     for (size_t i = set; i < set + 2; i++) {
         hotSlotEntry *e = &hot[i];
         sds c = __atomic_load_n(&e->s, __ATOMIC_ACQUIRE);
-        if (c && __atomic_load_n(&e->tag, __ATOMIC_RELAXED) == m && sdslen(c) == len && memcmp(c, buf, len) == 0) {
+        if (c == NULL || __atomic_load_n(&e->tag, __ATOMIC_RELAXED) != m) continue;
+        hotPrefetch(c, len);
+        if (sdslen(c) == len && memcmp(c, buf, len) == 0) {
             internPending *p = pendingGet(pp);
             if (!pendingGrow((void **)&p->o, p->n, &p->cap, sizeof(robj *))) return NULL;
             robj *o = createObject(OBJ_STRING, c);
@@ -1360,7 +1371,7 @@ void internReadCollected(internPending *pending, uint32_t *epoch) {
     }
 }
 
-static void retire(sds s) {
+__attribute__((cold)) static void retire(sds s) {
     if (retired_count == retired_cap) {
         retired_cap = retired_cap ? retired_cap * 2 : 64;
         retired = zrealloc(retired, retired_cap * sizeof(retiredString));
@@ -1369,7 +1380,7 @@ static void retire(sds s) {
     retired[retired_count++] = (retiredString){s, read_epoch};
 }
 
-static void filterScanEntry(void *privdata, void *entry) {
+__attribute__((cold)) static void filterScanEntry(void *privdata, void *entry) {
     UNUSED(privdata);
     sds s = entry;
     filterAddTo(filter_next, filter_next_mask, internHash(s, sdslen(s)));
@@ -1377,8 +1388,19 @@ static void filterScanEntry(void *privdata, void *entry) {
 
 /* Starts rebuilding the filter when it holds too many or too few strings for its
  * size, and continues a rebuild in progress. Main thread only. */
-static void filterMaintain(void) {
+static void filterRebuildStep(void);
+
+static inline void filterMaintain(void) {
     if (intern_index == NULL) return;
+    if (filter_next == NULL) {
+        size_t n = hashtableSize(intern_index) + prob_count;
+        uint64_t nb = intern_state.filter_mask + 1;
+        if (!(n > nb * 4 && nb < FILTER_MAX_BUCKETS) && !(n < nb / 4 && nb > FILTER_MIN_BUCKETS)) return;
+    }
+    filterRebuildStep();
+}
+
+__attribute__((cold)) static void filterRebuildStep(void) {
     if (filter_next == NULL) {
         size_t n = hashtableSize(intern_index) + prob_count;
         uint64_t nb = intern_state.filter_mask + 1;
@@ -1450,7 +1472,7 @@ static void releaseHook(sds s) {
  * count higher than the holders, never lower, so a count of 1 is exact.
  *----------------------------------------------------------------------------*/
 
-sds internDefragShared(sds s, void *(*defragfn)(void *)) {
+__attribute__((cold)) sds internDefragShared(sds s, void *(*defragfn)(void *)) {
     internHdr *h = internHdrOf(s);
     if (h->refcount != 1) return NULL;
     /* The retire list holds the address, and IO threads may be reading an
@@ -1494,7 +1516,7 @@ static uint64_t nextSecret(uint64_t *x) {
     return (z ^ (z >> 31)) | 1;
 }
 
-void internInit(void) {
+__attribute__((cold)) void internInit(void) {
     uint8_t *seed = hashtableGetHashFunctionSeed();
     uint64_t x;
     memcpy(&x, seed, sizeof(x));
@@ -1521,7 +1543,7 @@ void internInit(void) {
     sdsSharedReleaseHook = releaseHook;
 }
 
-size_t internSharedAllocSize(const_sds s) {
+__attribute__((cold)) size_t internSharedAllocSize(const_sds s) {
     return zmalloc_size(internHdrOf(s));
 }
 
@@ -1529,13 +1551,13 @@ uint32_t internSharedRefcount(const_sds s) {
     return internHdrOf(s)->refcount;
 }
 
-size_t internSdsMemUsage(const_sds s) {
+__attribute__((cold)) size_t internSdsMemUsage(const_sds s) {
     if (!sdsIsShared(s)) return sdsAllocSize(s);
     internHdr *h = internHdrOf(s);
     return zmalloc_size(h) / (h->refcount ? h->refcount : 1);
 }
 
-void internGetInfo(internInfo *info) {
+__attribute__((cold)) void internGetInfo(internInfo *info) {
     info->shared = hashtableSize(intern_index);
     info->singletons = prob_count + load_used;
     info->refs = st.refs;

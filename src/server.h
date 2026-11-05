@@ -1521,6 +1521,9 @@ typedef struct client {
      * their references when it collects the read. */
     struct internPending *intern_pending;
     uint32_t intern_read_epoch; /* epoch of the read job in flight, plus one; 0 if none */
+    /* Whether the arguments of the command being parsed may be shared:
+     * INTERN_ARGS_UNKNOWN until internArgsShareable() is asked. */
+    int8_t intern_share_args;
 #ifdef LOG_REQ_RES
     clientReqResInfo reqres;
 #endif
