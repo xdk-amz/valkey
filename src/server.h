@@ -2123,6 +2123,7 @@ struct valkeyServer {
     int prefetch_batch_max_size;              /* Maximum number of keys to prefetch in a single batch */
     int io_poll_backoff_us;                   /* IO thread: after an empty epoll_wait, leave the set alone this long (0 = spin) */
     int io_threads_epoll_thread;              /* The staged loop runs an epoll thread in place of one IO thread */
+    int io_threads_epoll_threads;             /* Staged loop: epoll collector threads when the epoll thread runs */
     int io_threads_epoll_thread_cpu;          /* CPU for that epoll thread; -1 picks a server CPU no thread is pinned to */
     int io_threads_idle_us;                   /* An idle IO thread, and main with only offloaded clients, block after this long without work */
     int io_batch_commands;                    /* Fast path: commands per batch an IO thread hands to main */

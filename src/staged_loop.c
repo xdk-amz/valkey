@@ -72,7 +72,12 @@ static void stagedAccountPhase(int phase, int nworkers) {
 static int stagedEpollThreadRunning(void);
 
 int stagedEpollThreadConfigValid(int on, int io_threads, const char **err) {
-    if (on && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS) {
+    if (on && io_threads < STAGED_EPOLL_THREAD_MIN_IO_THREADS + server.io_threads_epoll_threads - 1) {
+        if (server.io_threads_epoll_threads > 1) {
+            *err = "io-threads-epoll-threads N needs io-threads N+2 or more (the main thread, one I/O thread and the "
+                   "epoll threads)";
+            return 0;
+        }
         *err = "io-threads-epoll-thread needs io-threads 3 or more (the main thread, one I/O thread and the epoll thread)";
         return 0;
     }
@@ -97,7 +102,8 @@ int stagedEpollThreadWanted(void) {
 #ifdef HAVE_FASTPATH_EPOLL
     if (!server.io_threads_epoll_thread || stagedEpollThreadFailed()) return 0;
     if (!server.io_threads_fast_path || !server.io_threads_strict_offload || server.sentinel_mode) return 0;
-    return server.io_threads_num >= STAGED_EPOLL_THREAD_MIN_IO_THREADS;
+    int n = server.io_threads_epoll_threads;
+    return server.io_threads_num >= STAGED_EPOLL_THREAD_MIN_IO_THREADS + n - 1 ? n : 0;
 #else
     return 0;
 #endif
@@ -462,9 +468,16 @@ static void stagedFollowEpollThread(void) {
         stagedEpollThreadFail();
         return;
     }
-    int want = stagedEpollThreadWanted() && sl_workers > 0;
-    if (want == pollerThreadRunning(sl_poller)) return;
+    int want = sl_workers > 0 ? stagedEpollThreadWanted() : 0;
+    int running = pollerThreadRunning(sl_poller) ? pollerEpollInstances(sl_poller) : 0;
+    if (want == running) return;
+    if (want && running) pollerStopThread(sl_poller); /* the thread count changes */
     if (want) {
+        if (pollerSetEpollInstances(sl_poller, want) != 0) {
+            serverLog(LL_WARNING, "Staged event loop: cannot open %d epoll instances; main waits on epoll itself", want);
+            stagedEpollThreadFail();
+            return;
+        }
         sl_epoll_placed_set = 0;
         stagedPlaceEpollThread();
         if (pollerStart(sl_poller) != 0) {
@@ -475,9 +488,10 @@ static void stagedFollowEpollThread(void) {
             return;
         }
         if (pollerGetThreadAffinity(sl_poller, &sl_epoll_placed, sizeof(sl_epoll_placed)) == 0) sl_epoll_placed_set = 1;
-        serverLog(LL_NOTICE, "Staged event loop: an epoll thread collects ready fds in place of an IO thread (%d IO threads)", sl_workers);
+        serverLog(LL_NOTICE, "Staged event loop: %d epoll thread(s) collect ready fds in place of IO threads (%d IO threads)", want, sl_workers);
     } else {
         pollerStopThread(sl_poller);
+        pollerSetEpollInstances(sl_poller, 1);
         serverLog(LL_NOTICE, "Staged event loop: epoll thread stopped; main waits on epoll itself (%d IO threads)", sl_workers);
     }
 }

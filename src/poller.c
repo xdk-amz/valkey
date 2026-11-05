@@ -11,6 +11,7 @@
 
 #ifdef HAVE_FASTPATH_EPOLL
 
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
@@ -72,9 +73,23 @@ enum {
 /* Locking: lock guards the next buffer (buf[active ^ 1]) and its pos array, active, and the thread
  * control fields. The active buffer is written only by main, in pollerGetNextBatch, and read by
  * consumers after main published it (IO threads through the phase barrier). */
+#define POLLER_MAX_EP 4 /* epoll instances, one collector thread each */
+
+typedef struct pollerThreadArg {
+    struct poller *p;
+    int idx;
+} pollerThreadArg;
+
 struct poller {
-    int epfd;
-    int evfd; /* wakes the epoll thread for pause and stop */
+    int epfd;                    /* epfds[0]: MAIN fds and the IO fds of instance 0 */
+    int epfds[POLLER_MAX_EP];    /* IO and PRIORITY fd f lives in epfds[f % nep] */
+    int evfds[POLLER_MAX_EP];    /* wake each collector thread for pause and stop */
+    int nep;                     /* main: instances in use; changes only while no thread runs */
+    pthread_t threads[POLLER_MAX_EP];
+    pollerThreadArg targ[POLLER_MAX_EP];
+    int nrunning;                /* threads started */
+    int npaused;                 /* threads parked for a pause */
+    int evfd; /* evfds[0] */
     int setsize;
     int maxevents; /* inline wait: fds one epoll_wait reports at most */
     _Atomic(int) count;
@@ -92,7 +107,6 @@ struct poller {
     int exit_err;           /* errno of the epoll_wait that made the thread exit on its own, else 0 */
     _Atomic(int) test_fail; /* tests: the thread exits as on an epoll_wait error */
     int started;            /* main only */
-    pthread_t thread;
     cpu_set_t cpuset;
     int has_cpuset;
 };
@@ -187,17 +201,44 @@ static void postFiredLocked(poller *p, const struct epoll_event *ev) {
     postLocked(p, fd, (uint32_t)(tag >> 32), cls, epollToMask(ev->events));
 }
 
-static void drainEventfd(poller *p) {
+static void drainEventfdAt(poller *p, int i) {
     uint64_t v;
-    while (read(p->evfd, &v, sizeof(v)) == (ssize_t)sizeof(v));
+    while (read(p->evfds[i], &v, sizeof(v)) == (ssize_t)sizeof(v));
+}
+
+static void drainEventfd(poller *p) {
+    drainEventfdAt(p, 0);
 }
 
 static void wakeThread(poller *p) {
     uint64_t one = 1;
-    ssize_t n;
-    do {
-        n = write(p->evfd, &one, sizeof(one));
-    } while (n < 0 && errno == EINTR);
+    for (int i = 0; i < p->nep; i++) {
+        ssize_t n;
+        do {
+            n = write(p->evfds[i], &one, sizeof(one));
+        } while (n < 0 && errno == EINTR);
+    }
+}
+
+/* The epoll instance an fd is registered in. */
+static int epfdFor(const poller *p, int fd, int affinity) {
+    return affinity == POLLER_AFF_MAIN ? p->epfds[0] : p->epfds[fd % p->nep];
+}
+
+/* Main: an epoll instance with its own control eventfd. 0 on success. */
+static int epInstanceOpen(poller *p, int i) {
+    if (p->epfds[i] >= 0) return 0;
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    int ev = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    struct epoll_event ee = {.events = EPOLLIN, .data.u64 = POLLER_CTL_TAG};
+    if (ep < 0 || ev < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, ev, &ee) != 0) {
+        if (ep >= 0) close(ep);
+        if (ev >= 0) close(ev);
+        return -1;
+    }
+    p->epfds[i] = ep;
+    p->evfds[i] = ev;
+    return 0;
 }
 
 poller *pollerCreate(int setsize) {
@@ -205,8 +246,14 @@ poller *pollerCreate(int setsize) {
     poller *p = zcalloc(sizeof(*p));
     p->setsize = setsize;
     p->maxevents = pollerMaxEvents(setsize);
-    p->epfd = epoll_create1(EPOLL_CLOEXEC);
-    p->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    for (int i = 0; i < POLLER_MAX_EP; i++) p->epfds[i] = p->evfds[i] = -1;
+    p->nep = 1;
+    if (epInstanceOpen(p, 0) == 0) {
+        p->epfd = p->epfds[0];
+        p->evfd = p->evfds[0];
+    } else {
+        p->epfd = p->evfd = -1;
+    }
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
@@ -214,8 +261,7 @@ poller *pollerCreate(int setsize) {
     pthread_cond_init(&p->ready_cv, &ca);
     pthread_cond_init(&p->ctl_cv, &ca);
     pthread_condattr_destroy(&ca);
-    struct epoll_event ee = {.events = EPOLLIN, .data.u64 = POLLER_CTL_TAG};
-    if (p->epfd < 0 || p->evfd < 0 || epoll_ctl(p->epfd, EPOLL_CTL_ADD, p->evfd, &ee) != 0) {
+    if (p->epfd < 0) {
         pollerFree(p);
         return NULL;
     }
@@ -236,8 +282,10 @@ poller *pollerCreate(int setsize) {
 void pollerFree(poller *p) {
     if (!p) return;
     pollerStop(p);
-    if (p->epfd >= 0) close(p->epfd);
-    if (p->evfd >= 0) close(p->evfd);
+    for (int i = 0; i < POLLER_MAX_EP; i++) {
+        if (p->epfds[i] >= 0) close(p->epfds[i]);
+        if (p->evfds[i] >= 0) close(p->evfds[i]);
+    }
     pthread_cond_destroy(&p->ctl_cv);
     pthread_cond_destroy(&p->ready_cv);
     pthread_mutex_destroy(&p->lock);
@@ -270,7 +318,7 @@ int pollerRegister(poller *p, int fd, int mask, pollerHandler handler, void *pri
     struct epoll_event ee = {0};
     ee.events = maskToEpoll(mask, affinity);
     ee.data.u64 = epollTag(fd, gen, affinity);
-    if (epoll_ctl(p->epfd, EPOLL_CTL_ADD, fd, &ee) != 0) return -1;
+    if (epoll_ctl(epfdFor(p, fd, affinity), EPOLL_CTL_ADD, fd, &ee) != 0) return -1;
     r->gen = gen;
     r->handler = handler;
     r->privdata = privdata;
@@ -289,7 +337,7 @@ int pollerModify(poller *p, int fd, int mask) {
     struct epoll_event ee = {0};
     ee.events = maskToEpoll(mask, r->affinity);
     ee.data.u64 = epollTag(fd, r->gen, r->affinity);
-    if (epoll_ctl(p->epfd, EPOLL_CTL_MOD, fd, &ee) != 0) return -1;
+    if (epoll_ctl(epfdFor(p, fd, r->affinity), EPOLL_CTL_MOD, fd, &ee) != 0) return -1;
     r->mask = mask;
     return 0;
 }
@@ -301,7 +349,7 @@ int pollerUnregister(poller *p, int fd) {
     if (!r->registered) return 0;
     /* Kernels before 2.6.9 need a non-null event even for DEL; a closed fd is already gone, so errors are ignored. */
     struct epoll_event ee = {0};
-    epoll_ctl(p->epfd, EPOLL_CTL_DEL, fd, &ee);
+    epoll_ctl(epfdFor(p, fd, r->affinity), EPOLL_CTL_DEL, fd, &ee);
     uint32_t gen = r->gen + 1;
     memset(r, 0, sizeof(*r));
     r->gen = gen;
@@ -418,6 +466,12 @@ int pollerGetNextBatch(poller *p, long long timeout_us) {
                 postFiredLocked(p, &p->fired[i]);
         }
         if (ctl) drainEventfd(p);
+        for (int k = 1; k < p->nep; k++) {
+            int m = epoll_wait(p->epfds[k], p->fired, p->maxevents, 0);
+            for (int i = 0; i < m; i++)
+                if (p->fired[i].data.u64 != POLLER_CTL_TAG) postFiredLocked(p, &p->fired[i]);
+            if (m > 0) drainEventfdAt(p, k);
+        }
     }
     p->active ^= 1;
     int total = bufTotal(&p->buf[p->active]);
@@ -466,7 +520,10 @@ int pollerMainAt(const poller *p, int i, pollerEvent *out) {
 }
 
 static void *pollerThreadMain(void *arg) {
-    poller *p = arg;
+    pollerThreadArg *ta = arg;
+    poller *p = ta->p;
+    int idx = ta->idx;
+    int epfd = p->epfds[idx];
     /* Asynchronous signals go to the other threads; faults stay deliverable here. */
     sigset_t set;
     sigfillset(&set);
@@ -477,11 +534,16 @@ static void *pollerThreadMain(void *arg) {
     sigdelset(&set, SIGABRT);
     sigdelset(&set, SIGTRAP);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
-    pthread_setname_np(pthread_self(), "io_epoll");
+    char name[16];
+    if (idx == 0)
+        snprintf(name, sizeof(name), "io_epoll");
+    else
+        snprintf(name, sizeof(name), "io_epoll_%d", idx);
+    pthread_setname_np(pthread_self(), name);
 
     struct epoll_event ev[POLLER_MAX_EVENTS];
     for (;;) {
-        int n = epoll_wait(p->epfd, ev, POLLER_MAX_EVENTS, -1);
+        int n = epoll_wait(epfd, ev, POLLER_MAX_EVENTS, -1);
         int err = n < 0 && errno != EINTR ? errno : 0;
         if (atomic_load_explicit(&p->test_fail, memory_order_relaxed)) err = EIO;
         if (err) {
@@ -491,17 +553,19 @@ static void *pollerThreadMain(void *arg) {
         }
         int ctl = 0;
         for (int i = 0; i < n && !ctl; i++) ctl = ev[i].data.u64 == POLLER_CTL_TAG;
-        if (ctl) drainEventfd(p);
+        if (ctl) drainEventfdAt(p, idx);
         pthread_mutex_lock(&p->lock);
         for (int i = 0; i < n; i++)
             if (ev[i].data.u64 != POLLER_CTL_TAG) postFiredLocked(p, &ev[i]);
         if (p->main_waiting && bufTotal(&p->buf[p->active ^ 1]) > 0) pthread_cond_signal(&p->ready_cv);
-        while (p->ctl == POLLER_CTL_PAUSE) {
-            p->tstate = POLLER_T_PAUSED;
+        if (p->ctl == POLLER_CTL_PAUSE) {
+            p->npaused++;
+            if (p->npaused == p->nrunning) p->tstate = POLLER_T_PAUSED;
             pthread_cond_broadcast(&p->ctl_cv);
-            pthread_cond_wait(&p->ctl_cv, &p->lock);
+            while (p->ctl == POLLER_CTL_PAUSE) pthread_cond_wait(&p->ctl_cv, &p->lock);
+            p->npaused--;
         }
-        p->tstate = POLLER_T_RUNNING;
+        if (p->tstate != POLLER_T_EXITED) p->tstate = POLLER_T_RUNNING;
         if (p->ctl == POLLER_CTL_STOP) break;
         pthread_mutex_unlock(&p->lock);
     }
@@ -521,19 +585,32 @@ int pollerStart(poller *p) {
     p->exit_err = 0;
     atomic_store_explicit(&p->test_fail, 0, memory_order_relaxed);
     pthread_mutex_unlock(&p->lock);
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    /* Placed before it first runs, so it never starts on the creator's (main's) CPU. */
-    if (p->has_cpuset) pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &p->cpuset);
-    int err = pthread_create(&p->thread, &attr, pollerThreadMain, p);
-    if (err == EINVAL && p->has_cpuset) {
-        pthread_attr_destroy(&attr);
+    p->npaused = 0;
+    p->nrunning = 0;
+    for (int i = 0; i < p->nep; i++) {
+        pthread_attr_t attr;
         pthread_attr_init(&attr);
-        err = pthread_create(&p->thread, &attr, pollerThreadMain, p);
+        /* Placed before it first runs, so it never starts on the creator's (main's) CPU. */
+        if (p->has_cpuset) pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &p->cpuset);
+        p->targ[i] = (pollerThreadArg){.p = p, .idx = i};
+        int err = pthread_create(&p->threads[i], &attr, pollerThreadMain, &p->targ[i]);
+        if (err == EINVAL && p->has_cpuset) {
+            pthread_attr_destroy(&attr);
+            pthread_attr_init(&attr);
+            err = pthread_create(&p->threads[i], &attr, pollerThreadMain, &p->targ[i]);
+        }
+        pthread_attr_destroy(&attr);
+        if (err != 0) {
+            if (p->nrunning == 0) return -1;
+            break;
+        }
+        p->nrunning++;
     }
-    pthread_attr_destroy(&attr);
-    if (err != 0) return -1;
     p->started = 1;
+    if (p->nrunning < p->nep) {
+        pollerStopThread(p);
+        return -1;
+    }
     return 0;
 }
 
@@ -544,7 +621,8 @@ void pollerStopThread(poller *p) {
     pthread_cond_broadcast(&p->ctl_cv);
     pthread_mutex_unlock(&p->lock);
     wakeThread(p);
-    pthread_join(p->thread, NULL);
+    for (int i = 0; i < p->nrunning; i++) pthread_join(p->threads[i], NULL);
+    p->nrunning = 0;
     p->started = 0;
     pthread_mutex_lock(&p->lock);
     p->ctl = POLLER_CTL_RUN;
@@ -586,13 +664,15 @@ int pollerSetThreadAffinity(poller *p, const void *cpuset, size_t cpusetsize) {
     memcpy(&p->cpuset, cpuset, cpusetsize < sizeof(cpu_set_t) ? cpusetsize : sizeof(cpu_set_t));
     if (CPU_COUNT(&p->cpuset) == 0) return -1;
     p->has_cpuset = 1;
-    if (p->started && pthread_setaffinity_np(p->thread, sizeof(cpu_set_t), &p->cpuset) != 0) return -1;
+    if (!p->started) return 0;
+    for (int i = 0; i < p->nrunning; i++)
+        if (pthread_setaffinity_np(p->threads[i], sizeof(cpu_set_t), &p->cpuset) != 0) return -1;
     return 0;
 }
 
 int pollerGetThreadAffinity(const poller *p, void *cpuset, size_t cpusetsize) {
     if (!p->started || cpusetsize < sizeof(cpu_set_t)) return -1;
-    return pthread_getaffinity_np(p->thread, sizeof(cpu_set_t), cpuset) == 0 ? 0 : -1;
+    return pthread_getaffinity_np(p->threads[0], sizeof(cpu_set_t), cpuset) == 0 ? 0 : -1;
 }
 
 /* Main: hold a running epoll thread outside the buffers until pollerResume. */
@@ -603,7 +683,7 @@ static int pollerPause(poller *p) {
     pthread_mutex_unlock(&p->lock);
     wakeThread(p);
     pthread_mutex_lock(&p->lock);
-    while (p->tstate != POLLER_T_PAUSED && p->tstate != POLLER_T_EXITED) pthread_cond_wait(&p->ctl_cv, &p->lock);
+    while (p->npaused < p->nrunning && p->tstate != POLLER_T_EXITED) pthread_cond_wait(&p->ctl_cv, &p->lock);
     pthread_mutex_unlock(&p->lock);
     return 1;
 }
@@ -654,6 +734,35 @@ int pollerResize(poller *p, int setsize) {
     p->fired = zrealloc(p->fired, sizeof(struct epoll_event) * p->maxevents);
     p->setsize = setsize;
     if (paused) pollerResume(p);
+    return 0;
+}
+
+int pollerEpollInstances(const poller *p) {
+    return p->nep;
+}
+
+/* Main, with no collector thread running: split the IO and PRIORITY fds over n epoll instances.
+ * Every fd that changes instance is moved; one already ready is reported again by its new instance. */
+int pollerSetEpollInstances(poller *p, int n) {
+    if (n < 1) n = 1;
+    if (n > POLLER_MAX_EP) n = POLLER_MAX_EP;
+    if (p->started) return -1;
+    if (n == p->nep) return 0;
+    for (int i = 0; i < n; i++)
+        if (epInstanceOpen(p, i) != 0) return -1;
+    int old = p->nep;
+    for (int fd = 0; fd < p->regs_cap; fd++) {
+        const pollerReg *r = &p->regs[fd];
+        if (!r->registered || r->affinity == POLLER_AFF_MAIN) continue;
+        int from = fd % old, to = fd % n;
+        if (from == to) continue;
+        struct epoll_event ee = {0};
+        epoll_ctl(p->epfds[from], EPOLL_CTL_DEL, fd, &ee);
+        ee.events = maskToEpoll(r->mask, r->affinity);
+        ee.data.u64 = epollTag(fd, r->gen, r->affinity);
+        epoll_ctl(p->epfds[to], EPOLL_CTL_ADD, fd, &ee);
+    }
+    p->nep = n;
     return 0;
 }
 
@@ -744,6 +853,14 @@ int pollerSetSize(const poller *p) {
 }
 int pollerResize(poller *p, int setsize) {
     (void)p, (void)setsize;
+    return -1;
+}
+int pollerEpollInstances(const poller *p) {
+    (void)p;
+    return 1;
+}
+int pollerSetEpollInstances(poller *p, int n) {
+    (void)p, (void)n;
     return -1;
 }
 

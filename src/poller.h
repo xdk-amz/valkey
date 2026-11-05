@@ -121,5 +121,10 @@ int pollerSetSize(const poller *p);
 /* Main, between phases: change setsize like aeResizeSetSize. Fails if a registered fd would fall
  * outside the new size. Pauses a running epoll thread; queued entries are kept. */
 int pollerResize(poller *p, int setsize);
+/* Main, with no collector thread running: spread IO and PRIORITY fds over n epoll instances (1-4),
+ * fd f in instance f % n, each with its own collector thread once started. MAIN fds stay in the
+ * first. 0 on success. */
+int pollerSetEpollInstances(poller *p, int n);
+int pollerEpollInstances(const poller *p);
 
 #endif /* POLLER_H */

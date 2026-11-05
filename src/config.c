@@ -3636,6 +3636,7 @@ standardConfig static_configs[] = {
     createBoolConfig("staged-reply-merge", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.staged_reply_merge, 0, NULL, NULL),
     createIntConfig("prefetch-batch-max-size", NULL, MODIFIABLE_CONFIG, 0, 128, server.prefetch_batch_max_size, 16, INTEGER_CONFIG, NULL, onMaxBatchSizeChange),
     createIntConfig("io-poll-backoff-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000, server.io_poll_backoff_us, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("io-threads-epoll-threads", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 4, server.io_threads_epoll_threads, 1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThread),
     createIntConfig("io-threads-epoll-thread-cpu", NULL, MODIFIABLE_CONFIG, -1, 1023, server.io_threads_epoll_thread_cpu, -1, INTEGER_CONFIG, NULL, applyIOThreadsEpollThreadCpu),
     createIntConfig("io-threads-idle-us", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 0, 1000000, server.io_threads_idle_us, 200, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("io-batch-commands", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, 1, 64, server.io_batch_commands, 16, INTEGER_CONFIG, NULL, NULL),
