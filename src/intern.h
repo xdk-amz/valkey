@@ -173,8 +173,37 @@ static inline int internParseReady(void) {
 }
 void internFreePending(internPending *pending);
 /* Below the probing level, request parsing shares only arguments of these
- * commands. */
-int internIOShares(const char *name, size_t len);
+ * commands: SET, SETEX, PSETEX, SETNX, GETSET, MSET, MSETNX, HSET, HSETNX,
+ * HMSET and SADD, which store a value argument itself, or a reference to it
+ * when it is shared. Other commands copy their arguments, so sharing those on
+ * an IO thread would only add reference work on the main thread.
+ *
+ * It runs for every long argument, so it compares whole words: OR-ing 0x20
+ * lower-cases a letter and maps no other byte onto one. */
+#define INTERN_W4(a, b, c, d)                                                                                \
+    ((uint32_t)(unsigned char)(a) | (uint32_t)(unsigned char)(b) << 8 | (uint32_t)(unsigned char)(c) << 16 | \
+     (uint32_t)(unsigned char)(d) << 24)
+static inline uint32_t internLower4(const char *p) {
+    return INTERN_W4(p[0], p[1], p[2], p[3]) | 0x20202020u;
+}
+static inline int internIOShares(const char *name, size_t len) {
+    if (len < 3 || len > 6) return 0;
+    if (len == 3) return (INTERN_W4(name[0], name[1], name[2], 0) | 0x202020u) == INTERN_W4('s', 'e', 't', 0);
+    uint32_t w = internLower4(name);
+    /* Bitwise | and & keep the compares free of branches. */
+    if (len == 4)
+        return (w == INTERN_W4('s', 'a', 'd', 'd')) | (w == INTERN_W4('h', 's', 'e', 't')) |
+               (w == INTERN_W4('m', 's', 'e', 't'));
+    uint32_t t = internLower4(name + len - 4); /* last four bytes, overlapping w */
+    if (len == 5)
+        return ((w == INTERN_W4('s', 'e', 't', 'e')) & (t == INTERN_W4('e', 't', 'e', 'x'))) |
+               ((w == INTERN_W4('s', 'e', 't', 'n')) & (t == INTERN_W4('e', 't', 'n', 'x'))) |
+               ((w == INTERN_W4('h', 'm', 's', 'e')) & (t == INTERN_W4('m', 's', 'e', 't')));
+    return ((w == INTERN_W4('p', 's', 'e', 't')) & (t == INTERN_W4('e', 't', 'e', 'x'))) |
+           ((w == INTERN_W4('g', 'e', 't', 's')) & (t == INTERN_W4('t', 's', 'e', 't'))) |
+           ((w == INTERN_W4('m', 's', 'e', 't')) & (t == INTERN_W4('e', 't', 'n', 'x'))) |
+           ((w == INTERN_W4('h', 's', 'e', 't')) & (t == INTERN_W4('e', 't', 'n', 'x')));
+}
 
 /* Read jobs. An IO thread reads hot shared strings while it parses, and holds
  * unreferenced ones until the read is collected, so a shared string that dies

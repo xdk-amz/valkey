@@ -6,9 +6,12 @@
 
 #include "generated_wrappers.hpp"
 
+#include <cctype>
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <strings.h>
 
 extern "C" {
 #include "intern.h"
@@ -229,4 +232,35 @@ TEST_F(InternTest, LoadMisfitSharesFromSecondHolder) {
     sdsfree(a);
     sdsfree(b);
     sdsfree(c);
+}
+
+/* internIOShares() compares words; check it against a plain case-insensitive
+ * lookup for every case variant of each name and every one-byte change. */
+TEST(InternIOSharesTest, MatchesCaseInsensitiveNames) {
+    static const char *names[] = {"set", "setex", "psetex", "setnx", "getset", "mset",
+                                  "msetnx", "hset", "hsetnx", "hmset", "sadd"};
+    auto reference = [](const char *s, size_t len) {
+        for (const char *n : names)
+            if (strlen(n) == len && strncasecmp(n, s, len) == 0) return 1;
+        return 0;
+    };
+    for (const char *n : names) {
+        size_t len = strlen(n);
+        char buf[8];
+        for (unsigned mask = 0; mask < (1u << len); mask++) {
+            for (size_t i = 0; i < len; i++) buf[i] = (mask >> i) & 1 ? (char)toupper(n[i]) : n[i];
+            ASSERT_EQ(1, internIOShares(buf, len)) << std::string(buf, len);
+        }
+        for (size_t i = 0; i < len; i++) {
+            for (int c = 0; c < 256; c++) {
+                memcpy(buf, n, len);
+                buf[i] = (char)c;
+                ASSERT_EQ(reference(buf, len), internIOShares(buf, len)) << i << " " << c << " " << n;
+            }
+        }
+    }
+    EXPECT_EQ(0, internIOShares("get", 3));
+    EXPECT_EQ(0, internIOShares("hget", 4));
+    EXPECT_EQ(0, internIOShares("se", 2));
+    EXPECT_EQ(0, internIOShares("setrange", 8));
 }
