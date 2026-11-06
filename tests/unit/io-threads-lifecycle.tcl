@@ -518,8 +518,20 @@ proc lc_epoll {} {
     return [getInfoProperty [r info fastpath] staged_epoll_thread]
 }
 
-# io-threads N is N threads: main plus N-1 IO threads, or main, N-2 IO threads and the epoll thread.
-proc lc_wait_budget {running epoll} {
+# io-threads-epoll-threads: the collector threads the epoll thread runs as.
+proc lc_collectors {} {
+    return [lindex [r config get io-threads-epoll-threads] 1]
+}
+
+# The smallest io-threads the epoll thread can run at: main, one IO thread and the collectors.
+proc lc_epoll_min {} {
+    return [expr {2 + [lc_collectors]}]
+}
+
+# io-threads N is N threads: main plus N-1 IO threads, or main, N-1-C IO threads and C collector
+# threads when the epoll thread runs.
+proc lc_wait_budget {io_threads epoll} {
+    set running [expr {$io_threads - 1 - ($epoll ? [lc_collectors] : 0)}]
     wait_for_condition 500 20 {
         [lc_running] == $running && [lc_retiring] == 0 && [lc_epoll] == $epoll
     } else {
@@ -535,39 +547,41 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
         test {Thread budget: the epoll thread is off by default} {
             assert_equal {io-threads-epoll-thread no} [r config get io-threads-epoll-thread]
             assert_equal {io-threads-epoll-thread-cpu -1} [r config get io-threads-epoll-thread-cpu]
-            lc_wait_budget 3 0
+            lc_wait_budget 4 0
         }
     }
 
     test {Thread budget: the epoll thread takes the place of one IO thread} {
         assert_equal OK [r config set io-threads-epoll-thread yes]
-        lc_wait_budget 2 1
+        lc_wait_budget 4 1
         assert_equal OK [r config set io-threads 5]
-        lc_wait_budget 3 1
+        lc_wait_budget 5 1
         assert_equal OK [r config set io-threads-epoll-thread no]
-        lc_wait_budget 4 0
+        lc_wait_budget 5 0
         assert_equal OK [r config set io-threads 4]
-        lc_wait_budget 3 0
-        # The smallest io-threads that can give up an IO thread: main, one IO thread and the epoll thread.
-        assert_equal OK [r config set io-threads 3]
+        lc_wait_budget 4 0
+        # The smallest io-threads that can give up IO threads: main, one IO thread and the collectors.
+        set min [lc_epoll_min]
+        assert_equal OK [r config set io-threads $min]
         assert_equal OK [r config set io-threads-epoll-thread yes]
-        lc_wait_budget 1 1
+        lc_wait_budget $min 1
         # Without the fast path the staged loop and its epoll thread do not run.
         assert_equal OK [r config set io-threads-fast-path no]
-        lc_wait_budget 2 0
+        lc_wait_budget $min 0
         assert_equal OK [r config set io-threads-fast-path yes]
-        lc_wait_budget 1 1
+        lc_wait_budget $min 1
     }
 
-    test {Thread budget: the epoll thread is refused below io-threads 3} {
-        assert_error {*io-threads 3 or more*} {r config set io-threads 2}
-        assert_equal {io-threads 3} [r config get io-threads]
+    test {Thread budget: the epoll thread is refused below its smallest io-threads} {
+        set min [lc_epoll_min]
+        assert_error {*io-threads*or more*} {r config set io-threads [expr {$min - 1}]}
+        assert_equal "io-threads $min" [r config get io-threads]
         assert_equal OK [r config set io-threads-epoll-thread no io-threads 2]
-        lc_wait_budget 1 0
-        assert_error {*io-threads 3 or more*} {r config set io-threads-epoll-thread yes}
+        lc_wait_budget 2 0
+        assert_error {*io-threads*or more*} {r config set io-threads-epoll-thread yes}
         assert_equal {io-threads-epoll-thread no} [r config get io-threads-epoll-thread]
-        assert_equal OK [r config set io-threads 3 io-threads-epoll-thread yes]
-        lc_wait_budget 1 1
+        assert_equal OK [r config set io-threads $min io-threads-epoll-thread yes]
+        lc_wait_budget $min 1
     }
 
     test {Thread budget: reply order holds while the epoll thread starts and stops} {
@@ -586,11 +600,11 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
     test {Thread budget: an epoll thread that exits is logged and its IO thread comes back} {
         r client setname fp-control
         r select 0
-        lc_wait_budget 2 1
+        lc_wait_budget 4 1
         set lines [count_log_lines 0]
         assert_equal OK [r debug staged-epoll-thread-fail]
         wait_for_log_messages 0 {"*the epoll thread exited (epoll_wait: Input/output error)*"} $lines 100 50
-        lc_wait_budget 3 0
+        lc_wait_budget 4 0
         # Failed under this configuration, it stays off: an IO thread holds its slot.
         after 300
         assert_equal 0 [lc_epoll]
@@ -598,7 +612,7 @@ start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"
         assert_equal v [r get lc:ep:k]
         # A configuration change tries again.
         assert_equal OK [r config set io-threads 5]
-        lc_wait_budget 3 1
+        lc_wait_budget 5 1
     }
 }
 
@@ -626,7 +640,7 @@ proc lc_cpu_list {spec} {
 if {$::tcl_platform(os) eq "Linux" && ![catch {exec taskset -pc [pid]}] && [llength [lc_cpu_list [lc_thread_cpus [pid]]]] >= 2} {
 start_server {tags {"io-threads-lifecycle external:skip tls:skip logreqres:skip"} overrides {io-threads 4 io-threads-always-active yes io-threads-epoll-thread yes}} {
     test {Thread budget: io-threads-epoll-thread-cpu pins the epoll thread and refuses a taken CPU} {
-        lc_wait_budget 2 1
+        lc_wait_budget 4 1
         set pid [srv 0 pid]
         set allowed [lc_thread_cpus $pid]
         lassign [lc_cpu_list $allowed] cpu_a cpu_b
