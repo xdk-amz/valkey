@@ -51,6 +51,7 @@ typedef struct fpThread {
     int nfree;
     long long reads, net_input_bytes, net_output_bytes, writes, batches, speculated;
     long long reads_synced, writes_synced; /* main only: reads/writes already folded into server stats */
+    long long in_synced, out_synced;       /* main only: net bytes already folded into server stats */
     /* Staged loop. Batches this thread published in the read phase, per nesting depth: written by the
      * thread in the read phase, executed by main in the write phase, delivered and recycled by the same
      * thread in the reply phase. staged_leaving holds the clients this thread saw leave; main hands
@@ -60,6 +61,8 @@ typedef struct fpThread {
     int sbcap[STAGED_MAX_DEPTH];
     int sb_streamed[STAGED_MAX_DEPTH]; /* STREAM/REPLY: index of the first batch not fully delivered. */
     list staged_leaving;
+    uint64_t cur_claim_seq; /* read phase: (poller batch seq << 32) | claim index of the client being read */
+    uint64_t leave_events;  /* clients this thread added to staged_leaving, ever (main reads it between phases) */
     /* Write lanes (depth 0). Written by this thread in the read phase: the entries it harvested per
      * lane in harvest order, its barrier entries in order, and the lane entries of each of its
      * segments. Read by the lanes and main in the write phase; reset by the next read phase. */
@@ -349,6 +352,27 @@ static cmdBatch *fpAllocBatch(fpThread *t, int tid) {
     return b;
 }
 
+/* Fold this thread's network counters into the server stats main renders in INFO (total_net_*_bytes,
+ * total_reads/writes_processed); reads and writes of an IO thread also count as IO-thread work. Called
+ * on main between phases, so the plain counters are stable: the phase barrier orders the IO thread's
+ * stores before main reads them. */
+static void fpFoldNetStats(fpThread *t, int io_thread) {
+    long long reads = t->reads - t->reads_synced, writes = t->writes - t->writes_synced;
+    long long in = t->net_input_bytes - t->in_synced, out = t->net_output_bytes - t->out_synced;
+    if (io_thread) {
+        server.stat_io_reads_processed += reads;
+        server.stat_io_writes_processed += writes;
+    }
+    server.stat_total_reads_processed += reads;
+    server.stat_total_writes_processed += writes;
+    server.stat_net_input_bytes += in;
+    server.stat_net_output_bytes += out;
+    t->reads_synced = t->reads;
+    t->writes_synced = t->writes;
+    t->in_synced = t->net_input_bytes;
+    t->out_synced = t->net_output_bytes;
+}
+
 static void fpRecycleBatch(fpThread *t, cmdBatch *b) {
     if (t->nfree < FP_FREELIST_MAX) {
         /* Size the arena to what this batch's replies needed: replies that spill are each copied
@@ -407,8 +431,7 @@ void fastpathFreeThread(int tid) {
         zfree(b);
     }
     t->ready = 0;
-    server.stat_io_reads_processed += t->reads - t->reads_synced;
-    server.stat_io_writes_processed += t->writes - t->writes_synced;
+    fpFoldNetStats(t, tid > 0);
     fp_retired[0] += t->reads;
     fp_retired[1] += t->net_input_bytes;
     fp_retired[2] += t->net_output_bytes;
@@ -524,12 +547,16 @@ static void fpSubmit(fpThread *t) {
 }
 
 /* The client stops reading; nothing of it is on main past this iteration, so main hands it back after
- * the reply phase. */
+ * the reply phase. The client keeps the arrival stamp of its last claimed read (fp_leave_seq, set in
+ * fastpathStagedEvent), whichever phase it leaves in: a client requeued or failed in the STREAM or
+ * REPLY phase is ordered by the read that produced its entries, not by whatever this thread claimed
+ * last. */
 static void fpBeginLeave(fpThread *t, client *c, int state) {
     if (c->control->lifecycle != FP_ACTIVE) return;
     c->control->lifecycle = state;
     pollerUnregister(stagedPoller(), c->conn->fd);
     listLinkNodeTail(&t->staged_leaving, &c->fp_stage_node);
+    t->leave_events++;
 }
 
 /* IO thread, read phase: the write lane that may execute this command, or -1 when only main may. A
@@ -1066,6 +1093,7 @@ static ssize_t fpTLSWrite(fpThread *t, client *c, const char *p, size_t len) {
     }
     t->net_output_bytes += n;
     c->net_output_bytes += n;
+    c->last_interaction = server.unixtime; /* a write is interaction, as on main */
     t->writes++;
     return n;
 }
@@ -1100,6 +1128,7 @@ static int fpFlushOut(fpThread *t, client *c) {
         }
         t->net_output_bytes += n;
         c->net_output_bytes += n;
+        c->last_interaction = server.unixtime; /* a write is interaction, as on main */
         t->writes++;
         sdsrange(c->fp_out, n, -1);
     }
@@ -1201,6 +1230,7 @@ static void fpSend(fpThread *t, client *c, struct iovec *iov, int iovcnt) {
     }
     t->net_output_bytes += n;
     c->net_output_bytes += n;
+    if (n > 0) c->last_interaction = server.unixtime; /* a write is interaction, as on main */
     t->writes++;
     for (int i = 0; i < iovcnt; i++) {
         if ((size_t)n >= iov[i].iov_len) {
@@ -1350,7 +1380,7 @@ static void fpSplitAssemble(cmdBatch *b, cmdEntry *e) {
             cur[p] = q + n;
         }
         e->reply_big = out;
-        e->reply_big_len = (uint32_t)o;
+        e->reply_big_len = o;
     }
     for (int p = 0; p < s->nparts; p++) {
         cmdEntry *pe = &s->parts[p]->e;
@@ -1541,7 +1571,7 @@ static void fpExecute(client *ec, cmdBatch *b, cmdEntry *e) {
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
-        e->reply_big_len = (uint32_t)total;
+        e->reply_big_len = total;
     }
     ec->bufpos = 0;
     ec->buf = saved_buf;
@@ -1743,18 +1773,34 @@ void fastpathHandoffDone(client *c, int closing) {
     beforeNextClient(c);
 }
 
-void fastpathInfo(sds *info) {
-    long long reads = fp_retired[0], in = fp_retired[1], out = fp_retired[2], writes = fp_retired[3],
-              batches = fp_retired[4], speculated = fp_retired[5];
+/* The per-thread counters are written by their IO threads, so CONFIG RESETSTAT cannot zero them in place;
+ * it records the totals at reset time and INFO reports the growth since then. */
+static long long fp_info_base[6];
+
+static void fpInfoTotals(long long *t) {
+    for (int k = 0; k < 6; k++) t[k] = fp_retired[k];
     for (int i = 0; i < fp_slots; i++) {
         if (!fp_threads[i].ready) continue;
-        reads += fp_threads[i].reads;
-        in += fp_threads[i].net_input_bytes;
-        out += fp_threads[i].net_output_bytes;
-        writes += fp_threads[i].writes;
-        batches += fp_threads[i].batches;
-        speculated += fp_threads[i].speculated;
+        t[0] += fp_threads[i].reads;
+        t[1] += fp_threads[i].net_input_bytes;
+        t[2] += fp_threads[i].net_output_bytes;
+        t[3] += fp_threads[i].writes;
+        t[4] += fp_threads[i].batches;
+        t[5] += fp_threads[i].speculated;
     }
+}
+
+/* Main, from resetServerStats: INFO fastpath counters restart from zero. */
+void fastpathResetStats(void) {
+    fpInfoTotals(fp_info_base);
+    fp_stat_lane_phases = fp_stat_lane_entries = fp_stat_barriers = fp_stat_serial_segments = 0;
+}
+
+void fastpathInfo(sds *info) {
+    long long t[6];
+    fpInfoTotals(t);
+    long long reads = t[0] - fp_info_base[0], in = t[1] - fp_info_base[1], out = t[2] - fp_info_base[2],
+              writes = t[3] - fp_info_base[3], batches = t[4] - fp_info_base[4], speculated = t[5] - fp_info_base[5];
     *info = sdscatprintf(*info,
                          "fastpath_clients:%zu\r\n"
                          "fastpath_workers_open:%d\r\n"
@@ -1856,6 +1902,9 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
         pollerRequeue(stagedPoller(), fd, mask);
         return;
     }
+    /* Arrival stamp: the claim index of this event. It orders the client among the clients that
+     * leave this iteration, in whichever phase it leaves (fpBeginLeave). */
+    c->fp_leave_seq = t->cur_claim_seq;
     if (c->fp_conn_type == CONN_TYPE_TLS) {
         /* A read can wait for the socket to be writable and a write for it to be readable, so either
          * event may continue either. Writes go first: a reply already produced leads. */
@@ -1882,7 +1931,7 @@ static void fastpathStagedEvent(int fd, int mask, void *privdata, pollerAffinity
 
 /* Several claimers: claim a few fds per cursor step. Kept out of line so the read phase stays small when
  * main reads alone. */
-static __attribute__((noinline)) void fpClaimBatched(poller *p, int claimers) {
+static __attribute__((noinline)) void fpClaimBatched(fpThread *t, poller *p, int claimers, uint64_t batch) {
     pollerEvent ev;
     pollerClaim cl;
     while (pollerClaimIOBatch(p, &cl, claimers)) {
@@ -1898,8 +1947,11 @@ static __attribute__((noinline)) void fpClaimBatched(poller *p, int claimers) {
             cs[nc++] = c;
         }
         for (int i = 0; i < nc; i++) __builtin_prefetch(cs[i]->control);
-        for (int i = 0; i < cl.n; i++)
-            if (pollerClaimResolve(p, &cl, i, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        for (int i = 0; i < cl.n; i++) {
+            if (!pollerClaimResolve(p, &cl, i, &ev)) continue;
+            t->cur_claim_seq = (batch << 32) | (uint64_t)(uint32_t)ev.idx;
+            ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        }
     }
 }
 
@@ -1913,13 +1965,20 @@ void fastpathStagedReadPhase(int tid) {
     /* The previous iteration's replies, when it deferred them, go out before this thread reads. */
     if (fp_replies_deferred && fpDepth() == 0) fastpathStagedReplyPhase(tid);
     if (fpDepth() == 0) fpResetLaneVectors(t);
+    /* Arrival order inside this read phase is the position in the poller batch (the claim index: priority
+     * entries first, then IO entries in the order the collector threads posted them); each claimed client
+     * is stamped with it (fastpathStagedEvent) so main hands leavers back in that order across threads. */
+    uint64_t batch = pollerBatchSeq(p);
     int claimers = server.active_io_threads_num;
     if (claimers <= 1) {
         /* Main alone: nobody contends on the cursor, and handling an fd overlaps the next one's misses as
          * well as a prefetch pass would. */
-        while (pollerClaimIO(p, &ev)) ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        while (pollerClaimIO(p, &ev)) {
+            t->cur_claim_seq = (batch << 32) | (uint64_t)(uint32_t)ev.idx;
+            ev.handler(ev.fd, ev.mask, ev.privdata, ev.affinity);
+        }
     } else {
-        fpClaimBatched(p, claimers);
+        fpClaimBatched(t, p, claimers, batch);
     }
     fpSubmit(t);
     if (t->cur && t->cur->count == 0) {
@@ -2409,7 +2468,7 @@ static void fpLaneExecute(fpLane *L, cmdEntry *e) {
         e->reply_off = 0;
         e->reply_len = 0;
         e->reply_big = big;
-        e->reply_big_len = (uint32_t)total;
+        e->reply_big_len = total;
     }
     ec->bufpos = 0;
     ec->buf = saved_buf;
@@ -3333,32 +3392,85 @@ static void fpStagedHandoff(client *c) {
     fastpathHandoffDone(c, closing);
 }
 
+/* Main: the leavers collected for one handoff pass, sorted by arrival stamp; pos (collection order:
+ * thread id, then list order) breaks ties, so equal stamps keep the order the lists had. */
+typedef struct fpLeaver {
+    client *c;
+    fpThread *t;
+    uint64_t seq;
+    int pos;
+} fpLeaver;
+static fpLeaver *fp_leave_buf;
+static int fp_leave_buf_cap;
+static uint64_t fp_leave_handoffs; /* main: clients handed back by fastpathStagedFinish, ever */
+static uint64_t fp_leave_visits;   /* main: leaving-list nodes visited by fastpathStagedFinish, ever */
+
+static int fpLeaverCmp(const void *a, const void *b) {
+    const fpLeaver *x = a, *y = b;
+    if (x->seq != y->seq) return x->seq < y->seq ? -1 : 1;
+    return x->pos < y->pos ? -1 : 1;
+}
+
+/* Main, between phases: a value that changes whenever a leaving list changes (a client added by an IO
+ * thread, a client handed back by main). */
+static uint64_t fpLeaveGen(void) {
+    uint64_t gen = fp_leave_handoffs;
+    for (int tid = 0; tid < fp_slots; tid++) gen += fp_threads[tid].leave_events;
+    return gen;
+}
+
+/* Test seam: nodes fastpathStagedFinish has visited while collecting leavers; the work of the merge. */
+uint64_t testOnlyFastpathLeaveVisits(void) {
+    return fp_leave_visits;
+}
+
 /* Main, after the reply phase: hand back the clients IO threads saw leave, then unmap the clients main
  * asked to close. A handoff can run the client's queued commands, and one that blocks (a busy script)
  * runs nested iterations that call this again and change the leaving list, so that walk restarts from
  * the head after every handoff instead of keeping a node across it. */
 void fastpathStagedFinish(void) {
-    for (int tid = 1; tid < fp_slots; tid++) { /* main's own share is not IO-threaded */
-        fpThread *t = &fp_threads[tid];
-        if (!t->ready) continue;
-        server.stat_io_reads_processed += t->reads - t->reads_synced;
-        server.stat_io_writes_processed += t->writes - t->writes_synced;
-        t->reads_synced = t->reads;
-        t->writes_synced = t->writes;
-    }
-    if (!fpStaged()) return;
     for (int tid = 0; tid < fp_slots; tid++) {
         fpThread *t = &fp_threads[tid];
-        listNode *ln = listFirst(&t->staged_leaving);
-        while (ln) {
-            client *c = listNodeValue(ln);
-            if (c->fp_inflight > 0) { /* entries of an outer iteration still on main */
+        if (!t->ready) continue;
+        fpFoldNetStats(t, tid > 0); /* main's own share (tid 0) is not IO-threaded */
+    }
+    if (!fpStaged()) return;
+    /* Hand clients back in arrival order (fp_leave_seq: priority entries of a poller batch first, then
+     * IO entries in claim order), merging the per-thread lists, so two clients read in one iteration by
+     * different threads keep their arrival order on main (a SCRIPT KILL read after the EVAL it targets
+     * must run after it). The eligible leavers are collected once and sorted once; a handoff can run
+     * commands that change the lists (a busy script runs nested iterations that call this again), so
+     * after each handoff the lists are compared with what was collected and re-collected only when
+     * they changed. Without nested iterations this is one pass over the lists and one sort. */
+    for (;;) {
+        uint64_t gen = fpLeaveGen();
+        int n = 0;
+        for (int tid = 0; tid < fp_slots; tid++) {
+            fpThread *t = &fp_threads[tid];
+            listNode *ln = listFirst(&t->staged_leaving);
+            while (ln) {
+                client *c = listNodeValue(ln);
+                fp_leave_visits++;
+                if (c->fp_inflight == 0) { /* entries of an outer iteration still on main are skipped */
+                    if (n == fp_leave_buf_cap) {
+                        fp_leave_buf_cap = fp_leave_buf_cap ? fp_leave_buf_cap * 2 : 64;
+                        fp_leave_buf = zrealloc(fp_leave_buf, sizeof(fpLeaver) * fp_leave_buf_cap);
+                    }
+                    fp_leave_buf[n] = (fpLeaver){.c = c, .t = t, .seq = c->fp_leave_seq, .pos = n};
+                    n++;
+                }
                 ln = ln->next;
-                continue;
             }
-            listUnlinkNode(&t->staged_leaving, &c->fp_stage_node);
-            fpStagedHandoff(c);
-            ln = listFirst(&t->staged_leaving);
+        }
+        if (n == 0) break;
+        qsort(fp_leave_buf, n, sizeof(fpLeaver), fpLeaverCmp);
+        for (int i = 0; i < n; i++) {
+            fpLeaver *l = &fp_leave_buf[i];
+            listUnlinkNode(&l->t->staged_leaving, &l->c->fp_stage_node);
+            fp_leave_handoffs++;
+            gen++;
+            fpStagedHandoff(l->c);
+            if (fpLeaveGen() != gen) break; /* the handoff changed the lists: collect again */
         }
     }
     if (!fp_staged_closing) return;

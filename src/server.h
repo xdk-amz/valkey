@@ -1402,6 +1402,9 @@ typedef struct ClientReplicationData {
      * dedicated sender thread. The sender owns send_node/send_pos; main owns the cursor
      * (ref_repl_buf_node/ref_block_pos) and advances it from sent_offset for accounting. */
     int stream_via_sender;          /* 1 while the sender streams this replica. */
+    int sender_adopt_pending;       /* Main-only: the sender started while a main-path write
+                                     * for this replica was in flight; adopt it when that
+                                     * write completes (processClientIOWriteDone). */
     int stream_ineligible;          /* 1 to keep this replica on the main path (diskless/socket
                                      * RDB transfer): the sender streams only disk/inline-sync
                                      * replicas. */
@@ -1573,6 +1576,7 @@ typedef struct client {
     sds fp_out;                           /* Fast path: output not yet written */
     listNode io_owner_node;               /* Link in main's list of staged fast-path clients, or of the IO thread a partitioned client is routed to */
     listNode fp_stage_node;               /* Staged loop: link in the leaving list of the IO thread that saw the client leave */
+    uint64_t fp_leave_seq;                /* Staged loop: arrival stamp of the client's last claimed read; orders leavers across IO threads */
     PeerIdentity fp_peer;                 /* Fast path: peer captured at admission, copied by the IO thread into each command entry */
     PeerIdentity fp_local;                /* Fast path: local address captured at admission */
     int8_t fp_conn_type;                  /* Fast path: origin connection type (CONN_TYPE_*) captured at admission, copied into each command entry */
@@ -2038,6 +2042,8 @@ struct valkeyServer {
     mstime_t shutdown_mstime;                         /* Timestamp to limit graceful shutdown. */
     int last_sig_received;                            /* Indicates the last SIGNAL received, if any (e.g., SIGINT or SIGTERM). */
     int shutdown_flags;                               /* Flags passed to prepareForShutdown(). */
+    int shutdown_no_write_offload;                    /* finishShutdown accounts the in-flight replica write but must
+                                                       * not re-offload; the final flush writes the rest once. */
     int activerehashing;                              /* Incremental rehash in serverCron() */
     int active_defrag_cpu_percent;                    /* Current desired CPU percentage for active defrag */
     char *pidfile;                                    /* PID file path */
@@ -3672,6 +3678,7 @@ unsigned int objectGetLRU(const robj *o);
 void objectSetLRU(robj *o, unsigned int lru);
 /* Object metadata management */
 void objectSetMetadataSize(size_t size);
+void testOnlyResetObjectMetadataSize(void);
 size_t objectGetMetadataSize(const robj *o);
 void *objectGetMetadata(const robj *o);
 void objectCopyMetadata(robj *dst, const robj *src);
@@ -3727,6 +3734,7 @@ int replStreamSenderEligible(client *replica);
 void replStreamSenderPublishStable(long long offset);
 void replStreamSenderPublishAppend(long long offset);
 void replStreamSenderAdd(client *replica);
+void replStreamSenderAdoptSettled(client *replica);
 void replStreamSenderRemove(client *replica);
 void replStreamSenderAccount(void);
 int replStreamSenderActive(void);

@@ -46,7 +46,8 @@ TEST_F(CommandOriginTest, LayoutIsFixedSizeAndByValue) {
     EXPECT_EQ(sizeof(PeerIdentity), 20u);
     if (sizeof(void *) == 8) {
         EXPECT_EQ(sizeof(CommandOrigin), 64u);
-        EXPECT_EQ(sizeof(cmdEntry), 208u);
+        /* 216 since reply_big_len became a size_t (a reply list can exceed 4 GiB). */
+        EXPECT_EQ(sizeof(cmdEntry), 216u);
     }
     EXPECT_EQ(offsetof(cmdEntry, c), 0u);
     EXPECT_EQ(offsetof(cmdEntry, origin) % alignof(CommandOrigin), 0u);

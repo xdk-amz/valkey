@@ -517,6 +517,9 @@ static void setClientReadFlagsForOffload(client *c) {
     c->read_flags |= isReplicatedClient(c) ? READ_FLAGS_REPLICATED : 0;
 }
 
+/* Unit tests only: called right before the EPOLL_CTL_ADD that publishes a client. */
+static void (*partition_publish_hook)(client *c) = NULL;
+
 /* One-shot readiness serializes IO-thread reads against main-thread command drains. */
 int tryPartitionClient(client *c) {
     if (stagedLoopActive()) return C_ERR; /* IO threads only run staged phases */
@@ -525,14 +528,21 @@ int tryPartitionClient(client *c) {
     int tid = 1 + (int)(partition_rr++ % (unsigned)(io_ready_num - 1));
     if (io_epfd[tid] <= 0) return C_ERR; /* 0 is a never-initialized slot */
     setClientReadFlagsForOffload(c);
-    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
-    if (epoll_ctl(io_epfd[tid], EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
-        c->read_flags = 0;
-        return C_ERR;
-    }
+    int was_pending = c->flag.pending_read;
+    /* EPOLL_CTL_ADD publishes the client: the IO thread can claim and read it before epoll_ctl
+     * returns, so everything it reads must be stored first. */
     c->io_tid = tid;
     c->flag.partitioned = 1;
     c->flag.pending_read = 1;
+    if (partition_publish_hook) partition_publish_hook(c);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLONESHOT, .data.ptr = c};
+    if (epoll_ctl(io_epfd[tid], EPOLL_CTL_ADD, c->conn->fd, &ev) != 0) {
+        c->read_flags = 0;
+        c->io_tid = 0;
+        c->flag.partitioned = 0;
+        c->flag.pending_read = was_pending;
+        return C_ERR;
+    }
     server.stat_io_reads_pending++;
     partitioned_clients++;
     listInitNode(&c->io_owner_node, c);
@@ -1245,6 +1255,7 @@ static void ioThreadWriteSlab(writeSlab *slab) {
             c->io_read_state = CLIENT_IDLE;
         }
         if (e & SLAB_WRITE) {
+            debugIOWriteDoneDelay();
             atomic_thread_fence(memory_order_release);
             c->io_write_state = CLIENT_COMPLETED_IO;
             if (needs_main) {
@@ -1898,6 +1909,21 @@ void testOnlySetIOThreadReady(int tid, int epfd) {
     if (io_ready_num <= tid) io_ready_num = tid + 1;
 }
 
+/* Undo testOnlySetIOThreadReady() for one slot so the next suite starts from a clean
+ * registry: a slot left RUNNING by an earlier suite would otherwise still be chosen by
+ * the partition round robin, with an epoll fd that suite closed and no client list. */
+void testOnlyClearIOThreadReady(int tid) {
+    if (io_epfd[tid] > 0) close(io_epfd[tid]);
+    io_epfd[tid] = 0;
+    atomic_store_explicit(&io_worker_state[tid], IO_WORKER_ABSENT, memory_order_release);
+    while (io_worker_hwm > 1 && ioWorkerState(io_worker_hwm - 1) == IO_WORKER_ABSENT) io_worker_hwm--;
+    if (io_ready_num > tid) io_ready_num = tid;
+}
+
+void testOnlySetPartitionPublishHook(void (*hook)(client *c)) {
+    partition_publish_hook = hook;
+}
+
 /* Unit tests run IO-thread code on their own threads; this makes the calling thread IO thread tid. */
 void testOnlySetCurTid(int tid) {
     thread_id = tid;
@@ -1972,6 +1998,8 @@ static int sendReadToIOThreads(client *c, int read_flags) {
  * or C_ERR if the client is not eligible for offloading. */
 int trySendWriteToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
+    /* finishShutdown accounts the one in-flight replica write but must not re-offload the backlog. */
+    if (server.shutdown_no_write_offload) return C_ERR;
     /* Staged workers run jobs only inside phases, which a blocked main does not always open. */
     if (stagedLoopActive() && ProcessingEventsWhileBlocked) return C_ERR;
     if (!c->conn) return C_ERR;

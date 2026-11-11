@@ -118,6 +118,8 @@ void stagedResetStats(void);
 
 /* Unit tests: turn staged fast-path admission on and off without enrolling workers; 0 on success. */
 int testOnlyStagedStart(void);
+void testOnlyStagedSetWorkers(int n, int main_lane);
+void testOnlyStagedSetOn(int on);
 void testOnlyStagedStop(void);
 
 #endif /* STAGED_LOOP_H */

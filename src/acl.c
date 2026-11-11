@@ -4681,6 +4681,10 @@ void aclCommand(client *c) {
                 deleted++;
             }
         }
+        /* Keep DELROLE on the same footing as SETROLE and DELUSER: every path that changes a role
+         * recomputes the per-client fast GET ACL gates. The live-member check above means no live
+         * client's rules change today; the call costs one pass over the clients on a rare command. */
+        if (deleted) fastGetOnAclRulesChanged();
         addReplyLongLong(c, deleted);
     } else if (!strcasecmp(sub, "getrole") && c->argc == 3) {
         sds rolename = objectGetVal(c->argv[2]);

@@ -26,6 +26,7 @@
 
 #include "server.h"
 #include "fastpath_no_epoll.h"
+#include "io_threads.h"
 
 #ifdef HAVE_FASTPATH_EPOLL
 
@@ -282,12 +283,13 @@ void replStreamSenderRemove(client *replica) {
 }
 
 /* Main: hand an ONLINE plaintext replica to the sender, synchronously at the state
- * transition (replicaPutOnline), BEFORE any incremental data is produced for it. This
- * is the only place a replica joins the sender set: registering here (not lazily in the
- * account pass) guarantees there is never a window in which the main/ae path and the
- * sender both own the same replica's send, which would double-send or skip bytes and
- * diverge the replica. If the sender is off or the replica is not eligible this is a
- * no-op and the replica stays on the main path. */
+ * transition (replicaPutOnline), BEFORE any incremental data is produced for it, or
+ * from replStreamSenderAdoptOnline when the sender starts with replicas already
+ * ONLINE (that caller first settles main's in-flight write). Registering at these two
+ * points (not lazily in the account pass) guarantees there is never a window in which
+ * the main/ae path and the sender both own the same replica's send, which would
+ * double-send or skip bytes and diverge the replica. If the sender is off or the
+ * replica is not eligible this is a no-op and the replica stays on the main path. */
 void replStreamSenderAdd(client *replica) {
     if (!repl_sender_running) return;
     pthread_mutex_lock(&repl_sender_mutex);
@@ -323,8 +325,9 @@ void replStreamSenderAccount(void) {
     pthread_mutex_lock(&repl_sender_mutex);
 
     /* Reconcile membership: drop streamed replicas that are no longer eligible. New
-     * replicas join only through replStreamSenderAdd at the ONLINE transition, never
-     * here, so the main path and the sender never both own one replica. */
+     * replicas join only through replStreamSenderAdd (at the ONLINE transition, or
+     * when the sender starts), never here, so the main path and the sender never both
+     * own one replica. */
     listIter li;
     listNode *ln;
     listRewind(repl_sender_replicas, &li);
@@ -410,7 +413,78 @@ void replStreamSenderTick(void) {
     replStreamSenderPublishStable(stable);
 }
 
-/* Main: start the sender thread (idempotent). */
+/* Main: take the send of a main-path replica away from main and hand it to the
+ * sender. The caller has made sure no write is in flight (io_write_state is IDLE),
+ * so main's cursor is final: drop the replica from the pending-write queue, remove
+ * its write handler, then seed the sender from the cursor under the mutex. After
+ * that putClientInPendingWriteQueue and trySendWriteToIOThreads see
+ * stream_via_sender and main never writes to this replica again. Unlinking from the
+ * pending-write queue is safe from both callers: the Init walk runs from the sender
+ * tick, after handleClientsWithPendingWrites, and processClientIOWriteDone reaches a
+ * replica only from the IO response path, never while that queue is being walked
+ * (a replica write is never a lazy slab write, so reconcileLazyWrite is a no-op). */
+static void replStreamSenderTakeFromMain(client *replica) {
+    if (replica->flag.pending_write) {
+        listUnlinkNode(server.clients_pending_write, &replica->clients_pending_write_node);
+        replica->flag.pending_write = 0;
+    }
+    if (connHasWriteHandler(replica->conn)) connSetWriteHandler(replica->conn, NULL);
+    replStreamSenderAdd(replica);
+}
+
+/* Main: hand the sender every replica that is already ONLINE when it starts.
+ *
+ * replicaPutOnline adds a replica at its ONLINE transition, which happens once per
+ * connection. A replica that went ONLINE while the sender was off (or that a
+ * `CONFIG SET repl-stream-sender no` handed back to main) would otherwise stay on
+ * the main path for its whole lifetime. Adopting an active main-path replica needs
+ * the same ownership guarantee as the ONLINE transition: main must not have a send
+ * in flight for it, because an IO thread owns the cursor until main has processed
+ * the write's completion. A replica with no write in flight is taken now; one with
+ * an offloaded write is marked and taken by replStreamSenderAdoptSettled from
+ * processClientIOWriteDone, before main could queue or offload the next write. */
+static void replStreamSenderAdoptOnline(void) {
+    if (!repl_sender_running || !server.replicas) return;
+    listIter li;
+    listNode *ln;
+    int adopted = 0, deferred = 0;
+    listRewind(server.replicas, &li);
+    while ((ln = listNext(&li))) {
+        client *replica = listNodeValue(ln);
+        if (replica->repl_data->stream_via_sender) continue;
+        if (replica->flag.close_asap || !replStreamSenderEligible(replica)) continue;
+        /* A lazily completed write is settled on main here, like the write path does. */
+        reconcileLazyWrite(replica);
+        if (replica->flag.close_asap) continue;
+        if (replica->io_write_state != CLIENT_IDLE) {
+            replica->repl_data->sender_adopt_pending = 1;
+            deferred++;
+            continue;
+        }
+        replStreamSenderTakeFromMain(replica);
+        adopted++;
+    }
+    if (adopted || deferred)
+        serverLog(LL_NOTICE, "Replication stream sender adopted %d ONLINE replica(s), %d deferred until their write completes",
+                  adopted, deferred);
+}
+
+/* Main, from processClientIOWriteDone once io_write_state is IDLE again: finish the
+ * adoption replStreamSenderAdoptOnline deferred for this replica. No-op unless the
+ * replica was marked; the mark is consumed either way. */
+void replStreamSenderAdoptSettled(client *replica) {
+    ClientReplicationData *rd = replica->repl_data;
+    if (!rd->sender_adopt_pending) return;
+    rd->sender_adopt_pending = 0;
+    if (!repl_sender_running || rd->stream_via_sender) return;
+    if (replica->flag.close_asap || replica->io_write_state != CLIENT_IDLE) return;
+    if (!replStreamSenderEligible(replica)) return;
+    replStreamSenderTakeFromMain(replica);
+    serverLog(LL_NOTICE, "Replication stream sender adopted replica %s after its in-flight write completed",
+              replicationGetReplicaName(replica));
+}
+
+/* Main: start the sender thread (idempotent) and adopt the ONLINE replicas. */
 void replStreamSenderInit(void) {
     if (repl_sender_running) return;
     repl_sender_replicas = listCreate();
@@ -423,6 +497,7 @@ void replStreamSenderInit(void) {
     }
     repl_sender_running = 1;
     serverLog(LL_NOTICE, "Replication stream sender thread started");
+    replStreamSenderAdoptOnline();
 }
 
 /* Main: stop and join the sender thread. */
@@ -433,6 +508,26 @@ void replStreamSenderStop(void) {
     pthread_cond_signal(&repl_sender_cond);
     pthread_mutex_unlock(&repl_sender_mutex);
     pthread_join(repl_sender_thread, NULL);
+    /* Hand every owned replica back to the main path. The thread is gone, so no
+     * replica is busy. Advance main's cursor to what the sender really sent, clear
+     * the ownership, and queue a write so main sends the rest (and the final flush in
+     * finishShutdown sees it). Without this the replicas keep stream_via_sender set,
+     * putClientInPendingWriteQueue skips them and nobody sends to them again. */
+    if (repl_sender_replicas) {
+        listIter li;
+        listNode *ln;
+        listRewind(repl_sender_replicas, &li);
+        while ((ln = listNext(&li))) {
+            client *replica = listNodeValue(ln);
+            ClientReplicationData *rd = replica->repl_data;
+            replStreamAccountCursor(replica, atomic_load_explicit(&rd->sent_offset, memory_order_acquire));
+            rd->stream_via_sender = 0;
+            rd->send_node = NULL;
+            rd->send_pos = 0;
+            rd->send_seeded = 0;
+            putClientInPendingWriteQueue(replica);
+        }
+    }
     repl_sender_running = 0;
     if (repl_sender_replicas) {
         listRelease(repl_sender_replicas);
@@ -454,6 +549,9 @@ void replStreamSenderPublishAppend(long long offset) {
     UNUSED(offset);
 }
 void replStreamSenderAdd(client *replica) {
+    UNUSED(replica);
+}
+void replStreamSenderAdoptSettled(client *replica) {
     UNUSED(replica);
 }
 void replStreamSenderRemove(client *replica) {

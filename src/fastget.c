@@ -617,6 +617,11 @@ int fastGetSpeculateBatch(client *c, int tid) {
         c->flag.buf_encoded || listLength(c->reply) != 0)
         return 0;
 
+    /* Main wrote into this client's buffer (a tracking push to a REDIRECT target) and owns that
+     * write: sending c->buf from here too would send those bytes twice. The tracking gate below
+     * refuses the client that turned tracking on, not the target its pushes are redirected to. */
+    if (c->bufpos != 0 || c->flag.pending_write) return 0;
+
     /* A tracking client must have its keys remembered, which this path skips, or a later write would
      * not invalidate its cache. BCAST tracking invalidates by prefix and is unaffected. Main does not
      * run this client's commands while its read is parsed, so the plain flags are stable here. */

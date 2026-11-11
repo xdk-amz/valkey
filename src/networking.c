@@ -3897,6 +3897,13 @@ void processClientIOWriteDone(client *c) {
         if (!c || !c->conn) return;
     }
 
+    /* repl-stream-sender: a replica the sender wanted to adopt while this write was in
+     * flight joins it now that the cursor is settled; the sender then sends the rest. */
+    if (c->repl_data && c->repl_data->sender_adopt_pending) {
+        replStreamSenderAdoptSettled(c);
+        if (c->repl_data->stream_via_sender) return;
+    }
+
     if (!clientHasPendingReplies(c)) return;
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
@@ -5148,7 +5155,16 @@ void readQueryFromClient(connection *conn) {
         return;
     }
 
-    if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
+    if (c->io_read_state != CLIENT_IDLE) return;
+    /* An in-flight offloaded WRITE does not block reading a replica's input. A replica
+     * link only sends REPLCONF ACK, which produces no reply, so reading and processing it
+     * touches none of the client state (reply buffers) the IO thread's write job walks, and
+     * connSocketRead only forbids a main-thread read while an IO READ is in flight, not a
+     * write. Blocking the read while a write was pending starved the ACK under a continuous
+     * outbound stream, so the primary never refreshed repl_ack_time and dropped a live
+     * replica as timed out. For any other client, processing input can generate a reply, so
+     * keep deferring until the write completes. */
+    if (c->io_write_state != CLIENT_IDLE && getClientType(c) != CLIENT_TYPE_REPLICA) return;
 
     if (mainBatchRead(c)) return;
 
@@ -5907,7 +5923,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->laddr && strcmp(getClientSockname(client), client_filter->laddr) != 0) return 0;
     if (client_filter->type != -1 && getClientType(client) != client_filter->type) return 0;
     if (client_filter->ids && !intsetFind(client_filter->ids, client->id)) return 0;
-    if (client_filter->user && client->user != client_filter->user) return 0;
+    if (client_filter->user && ACLResolveUser(client->user) != client_filter->user) return 0;
     if (client_filter->skipme && client == ectx->current_client) return 0;
     if (client_filter->max_age != 0 && (long long)(commandTimeSnapshot() / 1000 - client->ctime) < client_filter->max_age) return 0;
     if (client_filter->idle != 0 && (long long)(commandTimeSnapshot() / 1000 - client->last_interaction) < client_filter->idle) return 0;
@@ -5928,7 +5944,7 @@ static int clientMatchesFilter(client *client, clientFilter *client_filter) {
     if (client_filter->not_laddr && strcmp(getClientSockname(client), client_filter->not_laddr) == 0) return 0;
     if (client_filter->not_type != -1 && getClientType(client) == client_filter->not_type) return 0;
     if (client_filter->not_ids && intsetFind(client_filter->not_ids, client->id)) return 0;
-    if (client_filter->not_user && client->user == client_filter->not_user) return 0;
+    if (client_filter->not_user && ACLResolveUser(client->user) == client_filter->not_user) return 0;
     if (client_filter->not_flags && clientMatchesFlagFilter(client, client_filter->not_flags) != 0) return 0;
     if (client_filter->not_name) {
         if (client->name && objectGetVal(client->name) && strcmp(objectGetVal(client->name), client_filter->not_name) == 0) {

@@ -52,6 +52,7 @@ typedef struct pollerEvent {
     int fd;
     int mask; /* fired mask */
     pollerAffinity affinity;
+    int idx; /* position in the batch: the order the epoll thread collected the fds */
 } pollerEvent;
 
 typedef struct poller poller;
@@ -90,6 +91,7 @@ void pollerRequeue(poller *p, int fd, int mask);
  * Entries whose fd changed generation since they were queued are skipped. Safe from many threads. */
 int pollerClaimIO(poller *p, pollerEvent *out);
 int pollerIOCount(const poller *p); /* PRIORITY plus IO entries in the active buffer */
+uint32_t pollerBatchSeq(const poller *p); /* batches handed out so far (read phase: arrival order across batches) */
 
 /* Several active PRIORITY/IO entries claimed with one cursor step, in the order pollerClaimIO would
  * return them, with their registrations prefetched. Each is resolved by pollerClaimResolve just before
@@ -97,6 +99,7 @@ int pollerIOCount(const poller *p); /* PRIORITY plus IO entries in the active bu
 #define POLLER_CLAIM_MAX 8
 typedef struct pollerClaim {
     int n;
+    int base; /* index in the batch of entry 0: the order the collector threads posted the fds */
     struct {
         int fd;
         uint32_t gen;

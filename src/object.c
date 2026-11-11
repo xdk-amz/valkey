@@ -116,6 +116,14 @@ void objectSetMetadataSize(size_t size) {
     object_metadata_size = size;
 }
 
+/* Unit tests only. The size is set once per process, but the gtest binary
+ * runs every suite in one process and some ObjectTest cases need the
+ * size to be 0 again. Only call this when no object with metadata is
+ * still alive. */
+void testOnlyResetObjectMetadataSize(void) {
+    object_metadata_size = 0;
+}
+
 /* Calculate the size of metadata for an object.
  * Returns the configured metadata size if the object has an embedded key, 0 otherwise. */
 size_t objectGetMetadataSize(const robj *o) {

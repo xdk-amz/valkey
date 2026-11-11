@@ -107,7 +107,15 @@ size_t nextCursor(size_t v, size_t mask);
 
 class HashtableTest : public ::testing::Test {
   protected:
+    /* randomSeed() changes the process-wide hash function seed. Every
+     * hashtable that other suites filled before this suite ran (for example
+     * the static command table's subcommand tables, which are filled once per
+     * process) was hashed with the old seed and can no longer be searched
+     * with the new one. Save the seed and put it back when the suite ends. */
+    static inline uint8_t saved_hash_seed[16];
+
     static void SetUpTestSuite() {
+        memcpy(saved_hash_seed, hashtableGetHashFunctionSeed(), sizeof(saved_hash_seed));
         /* Initialize monotonic clock once for all tests */
         monotonicInit();
 
@@ -117,6 +125,10 @@ class HashtableTest : public ::testing::Test {
         keyval_type.keyCompare = keycmp;
         keyval_type.entryDestructor = freekeyval;
         keyval_type.trackMemUsage = trackmemusage;
+    }
+
+    static void TearDownTestSuite() {
+        hashtableSetHashFunctionSeed(saved_hash_seed);
     }
 
     void SetUp() override {
@@ -1694,8 +1706,13 @@ TEST_F(HashtableTest, scan_no_shrink_during_callback) {
 
     hashtablePauseAutoShrink(ht);
     size_t size_before = hashtableSize(ht);
-    size_t cursor = hashtableScan(ht, 0, scanDeleteManyCb, ht);
-    (void)cursor;
+    /* One scan step visits one bucket, and with a random hash seed that bucket
+     * can be empty, so the callback would never run. Step until it has run
+     * (the size changed) so the test does not depend on the seed. */
+    size_t cursor = 0;
+    do {
+        cursor = hashtableScan(ht, cursor, scanDeleteManyCb, ht);
+    } while (cursor != 0 && hashtableSize(ht) == size_before);
 
     /* Shrink is still blocked by PauseAutoShrink. */
     ASSERT_LT(hashtableSize(ht), size_before / 2);

@@ -22,6 +22,29 @@ typedef struct objMetadata {
 
 class ObjectTest : public ::testing::Test {
   protected:
+    /* objectSetMetadataSize() keeps a process-wide size that can only be set
+     * once. Each test here assumes it starts at 0, as it would in its own
+     * process, and some tests set it: start every test from 0 and leave 0
+     * behind for the suites that follow. */
+    void SetUp() override {
+        /* objectSetMetadataSize() refuses a new size while any database holds
+         * keys. This suite needs no database, but an earlier suite in the same
+         * process may have left its own in server.db: take it out of sight for
+         * the duration of the test and put it back afterwards. */
+        saved_db = server.db;
+        saved_dbnum = server.dbnum;
+        server.db = NULL;
+        server.dbnum = 0;
+        testOnlyResetObjectMetadataSize();
+    }
+    void TearDown() override {
+        server.db = saved_db;
+        server.dbnum = saved_dbnum;
+    }
+    static void TearDownTestSuite() { testOnlyResetObjectMetadataSize(); }
+    serverDb **saved_db = nullptr;
+    int saved_dbnum = 0;
+
     robj *createKeyValueObject(const char *k, const char *v) {
         sds key = sdsnew(k);
         robj *obj = createStringObject(v, strlen(v));

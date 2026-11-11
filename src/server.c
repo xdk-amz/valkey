@@ -1313,7 +1313,10 @@ static void clientsCron(int clients_this_cycle) {
              * after the next reply phase. Nothing else here applies to it. */
             if (fastpathStagedOn()) {
                 if (clientsCronHandleTimeout(c, now)) continue;
-                updateClientMemUsageAndBucket(c);
+                /* As for a stock client: with client eviction off the memory is still refreshed, so
+                 * INFO mem_clients_normal and client_recent_max_* see fast-path clients. */
+                clientsCronTrackExpensiveClients(c, curr_peak_mem_usage_slot);
+                if (!updateClientMemUsageAndBucket(c)) updateClientMemoryUsage(c);
             }
             continue;
         }
@@ -3131,6 +3134,7 @@ void resetServerStats(void) {
 
     fastGetAggregateStats(); /* settle speculated counts into the stats about to be cleared */
     stagedResetStats();
+    fastpathResetStats();
     ectx->stat_numcommands = 0;
     server.stat_repl_parallel_applied = 0;
     server.stat_repl_apply_phases = 0;
@@ -5207,7 +5211,11 @@ int processCommand(client *c) {
             size_t slack = server.maxmemory_eviction_batch_slack;
             size_t cap = server.maxmemory / 100; /* 1% of maxmemory */
             if (cap && cap < slack) slack = cap;
-            if (used <= server.evict_check_used_memory + slack) run_eviction = 0;
+            /* A cached OOM verdict is stale once memory dropped below the last
+             * check (FLUSHALL, DEL, UNLINK in the same read): check again. */
+            if (used <= server.evict_check_used_memory + slack &&
+                !(server.pre_command_oom_state && used < server.evict_check_used_memory))
+                run_eviction = 0;
         }
 
         if (run_eviction) {
@@ -5681,9 +5689,46 @@ int finishShutdown(void) {
     /* Handle cluster-related matters when shutdown. */
     if (server.cluster_enabled) clusterHandleServerShutdown(failover);
 
+    /* An IO thread may still own, or may have finished without main accounting it (a lazy
+     * write), an earlier write to a replica. Such a replica is neither in the pending write
+     * queue nor has a write handler, so flushReplicasOutputBuffers would skip the data fed
+     * after that write, which the fast path may already have acknowledged to clients. Wait
+     * for the write that is in flight now and account it, so the final flush includes its
+     * bytes (audit finding N3).
+     *
+     * Forbid a re-offload while we do this. Without the flag, accounting a completed write
+     * hands the rest of the replica's backlog to an IO thread again, and the loop repeats
+     * until the whole backlog is on the wire; SHUTDOWN then blocks for as long as a slow live
+     * replica takes to drain, which shutdown-timeout does not bound here. With the flag set,
+     * trySendWriteToIOThreads refuses, processClientIOWriteDone falls through to
+     * putClientInPendingWriteQueue, and the single best-effort flush below sends the pending
+     * data in one writev as stock does. The wait is then bounded by one in-flight write per
+     * replica. */
+    server.shutdown_no_write_offload = 1;
+    int drained_writes = 0;
+    mstime_t drain_start = mstime();
+    listIter wli;
+    listNode *wln;
+    listRewind(server.replicas, &wli);
+    while ((wln = listNext(&wli)) != NULL) {
+        client *replica = listNodeValue(wln);
+        while (replica->io_write_state != CLIENT_IDLE) {
+            waitForClientIO(replica);
+            if (replica->io_write_state == CLIENT_COMPLETED_IO) {
+                atomic_thread_fence(memory_order_acquire);
+                processClientIOWriteDone(replica);
+                drained_writes++;
+            }
+        }
+    }
+    if (drained_writes)
+        serverLog(LL_NOTICE, "Accounted %d in-flight replica write(s) at shutdown in %lld ms.", drained_writes,
+                  (long long)(mstime() - drain_start));
+
     /* Best effort flush of replica output buffers, so that we hopefully
      * send them pending writes. */
     flushReplicasOutputBuffers();
+    server.shutdown_no_write_offload = 0;
 
     /* Close the listening sockets. Apparently this allows faster restarts. */
     closeListeningSockets(1);
