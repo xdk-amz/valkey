@@ -197,11 +197,17 @@ sds sdsdup(const_sds s) {
 /* Releases one reference of a shared string. Installed by the server. */
 void (*sdsSharedReleaseHook)(sds s) = NULL;
 
+/* Out of line and cold, so that sdsfree() keeps the code it has for a private
+ * string, with sdsAllocSize() inlined. */
+static __attribute__((noinline, cold)) void sdsFreeShared(sds s) {
+    sdsSharedReleaseHook(s);
+}
+
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
     if (sdsIsShared(s)) {
-        sdsSharedReleaseHook(s);
+        sdsFreeShared(s);
         return;
     }
     s_free_with_size(sdsAllocPtr(s), sdsAllocSize(s));
