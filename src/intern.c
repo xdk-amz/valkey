@@ -6,6 +6,7 @@
 
 #include "server.h"
 #include "intern.h"
+#include "io_threads.h"
 
 #include <stdatomic.h>
 
@@ -47,6 +48,7 @@ static uint64_t filter_min[FILTER_MIN_BUCKETS];
 
 internState intern_state __attribute__((aligned(4096))) = {
     .gate = {1, 1},
+    .config_enabled = 1,
     .filter = filter_min,
     .filter_mask = FILTER_MIN_BUCKETS - 1,
 };
@@ -544,7 +546,7 @@ static void setSelLevel(int level) {
 }
 
 void internLoadBegin(void) {
-    if (intern_index == NULL) return;
+    if (!intern_state.enabled) return;
     internResetSampling();
     intern_loading = 1;
     load_index_check = hashtableSize(intern_index) != 0;
@@ -560,8 +562,9 @@ void internLoadEnd(void) {
 }
 
 void internResetSampling(void) {
-    /* The check tools load without internInit(); loading must stay plain. */
-    if (intern_index == NULL) return;
+    /* Loading stays plain while interning is off, and in the check tools, which
+     * load without internInit(). */
+    if (!intern_state.enabled) return;
     setLevel(INTERN_LEVEL_START);
     setSelLevel(INTERN_LEVEL_START);
     win_sel = win_benefit = win_evict = win_created = win_promoted = 0;
@@ -837,7 +840,7 @@ __attribute__((cold, noinline)) static sds makeSingleton(sds s, size_t len, uint
 
 sds internAdmitSlow(sds s) {
     intern_gate.tick = intern_gate.period;
-    if (intern_index == NULL) return s;
+    if (!intern_state.enabled) return s;
     size_t len = sdslen(s);
     if (len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) return s;
     st.sampled++;
@@ -892,6 +895,7 @@ void internLoadAbort(void) {
 }
 
 sds internNewFrom(const char *buf, size_t len) {
+    if (!intern_state.enabled) return sdsnewlen(buf, len);
     if (--intern_gate.tick || len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
         if (intern_gate.tick == 0) intern_gate.tick = intern_gate.period;
         sds s = sdsnewlen(buf, len);
@@ -934,7 +938,7 @@ __attribute__((cold, noinline)) static void indexHeld(sds s) {
 }
 
 sds internDupSds(const_sds s) {
-    if (!intern_is_main) return sdsdup(s);
+    if (!intern_state.enabled || !intern_is_main) return sdsdup(s);
     if (sdsIsShared(s)) {
         internHdr *h = internHdrOf(s);
         if (h->refcount < INTERN_REFS_MAX) {
@@ -956,7 +960,7 @@ sds internDupSds(const_sds s) {
 }
 
 static sds internAdmitBufSlow(const char *buf, size_t len) {
-    if (intern_index == NULL) return sdsnewlen(buf, len);
+    if (!intern_state.enabled) return sdsnewlen(buf, len);
     st.sampled++;
     if (unlikely(intern_loading)) {
         sds r = loadAdmit(buf, len, privateSize(len));
@@ -1482,6 +1486,37 @@ static uint64_t nextSecret(uint64_t *x) {
     return (z ^ (z >> 31)) | 1;
 }
 
+/* Makes the index, the filter and the probation table. They are kept when
+ * interning is turned off, since the strings shared so far are still in them. */
+static void createTables(void) {
+    intern_index = hashtableCreate(&internIndexType);
+    if (intern_state.filter != filter_min) zfree(intern_state.filter);
+    zfree(filter_next);
+    filter_next = NULL;
+    memset(filter_min, 0, sizeof(filter_min));
+    intern_state.filter = filter_min;
+    intern_state.filter_mask = FILTER_MIN_BUCKETS - 1;
+    prob_nsets = PROB_MIN_SETS;
+    prob = zcalloc(prob_nsets * PROB_WAYS * sizeof(probSlot));
+    intern_state.active = 1;
+}
+
+/* Starts admitting, probing every write at first. */
+static void startInterning(void) {
+    intern_state.enabled = 1;
+    internResetSampling();
+}
+
+/* Empties the hot cache. An IO thread may be reading it: a string it already
+ * took from a slot stays allocated until its read is collected (see retire()). */
+static void hotClear(void) {
+    for (size_t i = 0; i < INTERN_HOT_SLOTS; i++) {
+        if (hotUsed(i)) __atomic_store_n(&hot[i].s, (sds)NULL, __ATOMIC_RELAXED);
+    }
+    for (size_t w = 0; w < INTERN_HOT_SLOTS / 64; w++) __atomic_store_n(&hot_used[w], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&intern_state.hot_count, 0, __ATOMIC_RELAXED);
+}
+
 void internInit(void) {
     uint8_t *seed = hashtableGetHashFunctionSeed();
     uint64_t x;
@@ -1492,21 +1527,34 @@ void internInit(void) {
     K3 = nextSecret(&x);
     memcpy(&intern_seed, seed + 8, sizeof(intern_seed));
     intern_salt = mix(intern_seed, K2);
-    intern_index = hashtableCreate(&internIndexType);
-    if (intern_state.filter != filter_min) zfree(intern_state.filter);
-    zfree(filter_next);
-    filter_next = NULL;
-    memset(filter_min, 0, sizeof(filter_min));
-    intern_state.filter = filter_min;
-    intern_state.filter_mask = FILTER_MIN_BUCKETS - 1;
-    prob_nsets = PROB_MIN_SETS;
-    prob = zcalloc(prob_nsets * PROB_WAYS * sizeof(probSlot));
-    setLevel(INTERN_LEVEL_START);
-    setSelLevel(INTERN_LEVEL_START);
-    intern_gate.tick = intern_gate.period;
-    sel_floor_tick = INTERN_SEL_FLOOR;
     intern_is_main = 1;
     sdsSharedReleaseHook = releaseHook;
+    intern_state.enabled = 0;
+    if (intern_state.config_enabled) {
+        createTables();
+        startInterning();
+    }
+}
+
+void internSetEnabled(int enabled) {
+    enabled = enabled != 0;
+    if (enabled == intern_state.enabled) return;
+    if (enabled) {
+        /* An IO thread takes hot strings without a reference only for reads
+         * that internReadDispatched() counted. Reads dispatched while interning
+         * was off were not counted, so they finish before a string can enter
+         * the hot cache. */
+        drainIOThreadsQueue();
+        if (intern_index == NULL) createTables();
+        startInterning();
+    } else {
+        /* Nothing is admitted or shared from now on. With the hot cache empty,
+         * parsing shares no argument and later reads need no epoch. */
+        intern_state.enabled = 0;
+        intern_load_ready = 0;
+        intern_offered = NULL;
+        hotClear();
+    }
 }
 
 size_t internSharedAllocSize(const_sds s) {
@@ -1524,14 +1572,18 @@ size_t internSdsMemUsage(const_sds s) {
 }
 
 void internGetInfo(internInfo *info) {
-    info->shared = hashtableSize(intern_index);
+    /* The tables do not exist until interning is first turned on. */
+    info->shared = intern_index ? hashtableSize(intern_index) : 0;
     info->singletons = prob_count + load_used;
     info->refs = st.refs;
     info->shared_bytes = st.shared_bytes;
     info->saved_bytes = st.saved_bytes;
-    info->table_bytes = hashtableMemUsage(intern_index) + prob_nsets * PROB_WAYS * sizeof(probSlot);
+    info->table_bytes = 0;
+    if (intern_index) {
+        info->table_bytes += hashtableMemUsage(intern_index) + prob_nsets * PROB_WAYS * sizeof(probSlot);
+        info->table_bytes += (intern_state.filter_mask + 1) * sizeof(uint64_t);
+    }
     info->table_bytes += load_cap * sizeof(loadSlot);
-    info->table_bytes += (intern_state.filter_mask + 1) * sizeof(uint64_t);
     if (filter_next) info->table_bytes += (filter_next_mask + 1) * sizeof(uint64_t);
     if (load_seen) info->table_bytes += LOAD_SEEN_BITS / 8;
     info->hits = st.hits;

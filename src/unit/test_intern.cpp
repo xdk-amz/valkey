@@ -39,6 +39,7 @@ class InternTest : public ::testing::Test {
     void SetUp() override {
         /* internInit() is idempotent for the fields the tests read: it rebuilds
          * the index and probation tables and installs the release hook. */
+        intern_state.config_enabled = 1;
         internInit();
     }
 
@@ -232,6 +233,64 @@ TEST_F(InternTest, LoadMisfitSharesFromSecondHolder) {
     sdsfree(a);
     sdsfree(b);
     sdsfree(c);
+}
+
+/* With interning off, admission hands back its input, and bytes that would be
+ * shared with interning on are neither shared nor sampled. */
+TEST_F(InternTest, DisabledSharesNothing) {
+    const char *val = "intern-disabled-shares-nothing-value";
+    internSetEnabled(0);
+    internInfo before, after;
+    internGetInfo(&before);
+    sds s[4];
+    for (int i = 0; i < 4; i++) {
+        sds p = sdsnew(val);
+        s[i] = internAdmit(p);
+        EXPECT_EQ(s[i], p);
+        EXPECT_FALSE(sdsIsShared(s[i]));
+    }
+    sds n = internNewFrom(val, strlen(val));
+    EXPECT_FALSE(sdsIsShared(n));
+    sds d = internDupSds(n);
+    EXPECT_NE(d, n);
+    EXPECT_FALSE(sdsIsShared(d));
+    internGetInfo(&after);
+    EXPECT_EQ(after.shared, before.shared);
+    EXPECT_EQ(after.singletons, before.singletons);
+    EXPECT_EQ(after.sampled, before.sampled);
+    for (int i = 0; i < 4; i++) sdsfree(s[i]);
+    sdsfree(n);
+    sdsfree(d);
+    internSetEnabled(1);
+}
+
+/* A string shared before interning is turned off keeps working: a new holder
+ * gets a private copy instead of a reference, and the last release frees the
+ * string and removes it from the index. Turning interning on shares again. */
+TEST_F(InternTest, DisablingKeepsSharedStrings) {
+    const char *val = "intern-disabling-keeps-shared-value";
+    sds shared = makeShared(val);
+    ASSERT_TRUE(sdsIsShared(shared));
+    internInfo before, after;
+    internGetInfo(&before);
+    internSetEnabled(0);
+    sds d = internDupSds(shared);
+    EXPECT_NE(d, shared);
+    EXPECT_FALSE(sdsIsShared(d));
+    sds a = internAdmit(sdsnew(val));
+    EXPECT_FALSE(sdsIsShared(a));
+    EXPECT_EQ(internSharedRefcount(shared), 1u);
+    sdsfree(a);
+    sdsfree(d);
+    sdsfree(shared);
+    internGetInfo(&after);
+    EXPECT_EQ(after.shared, before.shared - 1);
+    EXPECT_EQ(after.refs, before.refs - 1);
+
+    internSetEnabled(1);
+    sds again = makeShared(val);
+    EXPECT_TRUE(sdsIsShared(again));
+    sdsfree(again);
 }
 
 /* internIOShares() compares words; check it against a plain case-insensitive

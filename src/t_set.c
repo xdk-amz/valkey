@@ -122,6 +122,7 @@ int setTypeAdd(robj *subject, sds value) {
 /* The copy of a new member for a hashtable-encoded set. A member shared when
  * the request was parsed is referenced, also when adding it converts the set. */
 static sds setNewMember(char *str, size_t len, int str_is_sds) {
+    if (!intern_state.enabled) return sdsnewlen(str, len);
     if (str_is_sds && sdsIsShared((sds)str)) return internDupSds((sds)str);
     return internNewFrom(str, len);
 }

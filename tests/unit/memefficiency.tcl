@@ -780,7 +780,7 @@ run_solo {defrag} {
     lappend tests [list test_tracking_table standalone $std_overrides]
     lappend tests [list test_defrag_later_type_change standalone $std_overrides]
     # Indexed shared strings are not moved while IO threads are active.
-    lappend tests [list test_shared_strings standalone [concat $std_overrides io-threads 1]]
+    lappend tests [list test_shared_strings standalone [concat $std_overrides io-threads 1 string-interning-enabled yes]]
 
     lappend tests [list test_main_dictionary cluster $std_overrides]
     lappend tests [list test_eval_scripts cluster $std_overrides]

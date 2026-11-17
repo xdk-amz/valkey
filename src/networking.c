@@ -7144,7 +7144,7 @@ int processClientIOReadsDone(client *c) {
 
     c->flag.pending_read = 0;
     c->io_read_state = CLIENT_IDLE;
-    internReadCollected(c->intern_pending, &c->intern_read_epoch);
+    if (c->intern_read_epoch) internReadCollected(c->intern_pending, &c->intern_read_epoch);
 
     /* Don't post-process-reads from clients that are going to be closed anyway. */
     if (c->flag.close_asap) return 0;

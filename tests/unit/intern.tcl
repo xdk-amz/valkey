@@ -28,7 +28,7 @@ proc intern_fill_pairs {client holder n size {dup 1}} {
     }
 }
 
-start_server {tags {"intern"}} {
+start_server {tags {"intern"} overrides {string-interning-enabled yes}} {
 
     test {Identical string values are stored once} {
         r flushall
@@ -277,8 +277,8 @@ start_server {tags {"intern"}} {
     } {} {needs:debug external:skip}
 }
 
-start_server {tags {"intern external:skip"}} {
-    start_server {} {
+start_server {tags {"intern external:skip"} overrides {string-interning-enabled yes}} {
+    start_server {overrides {string-interning-enabled yes}} {
         set src [srv -1 client]
         set dst [srv 0 client]
         set dst_host [srv 0 host]
@@ -304,9 +304,9 @@ start_server {tags {"intern external:skip"}} {
 }
 
 foreach load {disabled swapdb} {
-    start_server {tags {"intern repl external:skip"}} {
+    start_server {tags {"intern repl external:skip"} overrides {string-interning-enabled yes}} {
         set replica [srv 0 client]
-        start_server {} {
+        start_server {overrides {string-interning-enabled yes}} {
             set master [srv 0 client]
             set master_host [srv 0 host]
             set master_port [srv 0 port]
@@ -358,9 +358,9 @@ foreach load {disabled swapdb} {
     }
 }
 
-start_server {tags {"intern repl external:skip"}} {
+start_server {tags {"intern repl external:skip"} overrides {string-interning-enabled yes}} {
     set replica [srv 0 client]
-    start_server {} {
+    start_server {overrides {string-interning-enabled yes}} {
         set master [srv 0 client]
         set master_host [srv 0 host]
         set master_port [srv 0 port]
@@ -431,7 +431,7 @@ start_server {tags {"intern repl external:skip"}} {
     }
 }
 
-start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-always-active yes}} {
+start_server {tags {"intern external:skip"} overrides {string-interning-enabled yes io-threads 4 io-threads-always-active yes}} {
     test {Values parsed by IO threads are shared} {
         r flushall
         set v [string repeat w 300]
@@ -500,7 +500,7 @@ start_server {tags {"intern external:skip"} overrides {io-threads 4 io-threads-a
 
 # The setup relies on every write being offered, which holds only for commands
 # parsed on the main thread.
-start_server {tags {"intern"} overrides {io-threads 1}} {
+start_server {tags {"intern"} overrides {string-interning-enabled yes io-threads 1}} {
     test {An async flush of many distinct shared strings releases all of them} {
         # More distinct shared strings than one drain slice applies.
         for {set i 0} {$i < 3000} {incr i} {
@@ -542,9 +542,9 @@ start_server {tags {"intern"} overrides {io-threads 1}} {
     }
 }
 
-start_server {tags {"intern repl external:skip"}} {
+start_server {tags {"intern repl external:skip"} overrides {string-interning-enabled yes}} {
     set replica [srv 0 client]
-    start_server {} {
+    start_server {overrides {string-interning-enabled yes}} {
         set master [srv 0 client]
         set master_host [srv 0 host]
         set master_port [srv 0 port]
@@ -572,5 +572,126 @@ start_server {tags {"intern repl external:skip"}} {
                 assert_equal OK [$replica replicaof no one]
             } {} {needs:debug}
         }
+    }
+}
+
+start_server {tags {"intern"} overrides {string-interning-enabled no}} {
+    test {string-interning-enabled no shares nothing} {
+        assert_equal {string-interning-enabled no} [r config get string-interning-enabled]
+        set v [string repeat x 300]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set k$i $v
+            r hset h$i f $v
+            r sadd s$i $v "$v$i"
+        }
+        assert_equal $v [r get k999]
+        assert_equal $v [r hget h999 f]
+        assert_equal 1 [r sismember s999 $v]
+        # The tables are not even allocated.
+        foreach f {intern_strings intern_refs intern_singletons intern_sampled intern_table_bytes} {
+            assert_equal 0 [intern_stat $f]
+        }
+    }
+
+    test {string-interning-enabled no keeps loading plain} {
+        set d [debug_digest]
+        r debug reload
+        assert_equal $d [debug_digest]
+        foreach f {intern_strings intern_refs intern_singletons intern_sampled} {
+            assert_equal 0 [intern_stat $f]
+        }
+    } {} {needs:debug}
+
+    test {Turning string-interning-enabled on starts sharing} {
+        r flushall
+        r config set string-interning-enabled yes
+        set v [string repeat y 300]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set n$i $v
+            r hset g$i f $v
+            r sadd t$i $v "$v$i"
+        }
+        assert_morethan [intern_stat intern_refs] 2500
+        assert_morethan [intern_stat intern_table_bytes] 0
+    }
+
+    test {Turning string-interning-enabled off keeps shared values working} {
+        set v [string repeat y 300]
+        set refs [intern_stat intern_refs]
+        set sampled [intern_stat intern_sampled]
+        r config set string-interning-enabled no
+        # New writes of a shared value get their own copy.
+        for {set i 0} {$i < 1000} {incr i} {
+            r set m$i $v
+            r hset f$i f $v
+            r sadd u$i $v
+        }
+        assert_equal $refs [intern_stat intern_refs]
+        assert_equal $sampled [intern_stat intern_sampled]
+        # Shared values can still be read, changed, copied and released.
+        assert_equal $v [r get n0]
+        r append n1 Z
+        assert_equal "${v}Z" [r get n1]
+        assert_equal $v [r get n2]
+        r copy n3 c3
+        assert_equal $v [r get c3]
+        assert_equal $v [r hget g7 f]
+        assert_equal 1 [r sismember t7 $v]
+        r del n4 g4 t4
+        assert_lessthan [intern_stat intern_refs] $refs
+        # A reload replaces every shared value with a private one.
+        set d [debug_digest]
+        r debug reload
+        assert_equal $d [debug_digest]
+        wait_intern_released
+    } {} {needs:debug}
+
+    test {Values shared before string-interning-enabled is turned off are released} {
+        r flushall
+        r config set string-interning-enabled yes
+        set v [string repeat z 300]
+        for {set i 0} {$i < 1000} {incr i} {
+            r set k$i $v
+            r sadd s$i $v "$v$i"
+        }
+        assert_morethan [intern_stat intern_refs] 1500
+        r config set string-interning-enabled no
+        r config set lazyfree-lazy-user-del yes
+        for {set i 0} {$i < 500} {incr i} {r unlink k$i s$i}
+        for {set i 500} {$i < 1000} {incr i} {r set k$i x}
+        r flushall async
+        wait_intern_released
+    }
+}
+
+start_server {tags {"intern external:skip"} overrides {string-interning-enabled no io-threads 4 io-threads-always-active yes}} {
+    test {IO threads share nothing while string-interning-enabled is no} {
+        set v [string repeat w 300]
+        for {set i 0} {$i < 3000} {incr i} {r set k$i $v}
+        assert_morethan [s io_threaded_reads_processed] 1000
+        assert_equal 0 [intern_stat intern_refs]
+        assert_equal 0 [intern_stat intern_hot_hits]
+    }
+
+    test {IO threads share after string-interning-enabled is turned on} {
+        r config set string-interning-enabled yes
+        set v [string repeat w 300]
+        for {set i 0} {$i < 3000} {incr i} {r set k$i $v}
+        assert_morethan [intern_stat intern_hot_hits] 1000
+        assert_morethan [intern_stat intern_refs] 2500
+    }
+
+    test {Turning string-interning-enabled on and off while IO threads parse} {
+        set v [string repeat q 300]
+        set rd [valkey_deferring_client]
+        foreach on {no yes no yes no} {
+            for {set i 0} {$i < 2000} {incr i} {$rd set k$i $v}
+            r config set string-interning-enabled $on
+            for {set i 0} {$i < 2000} {incr i} {assert_equal OK [$rd read]}
+        }
+        $rd close
+        for {set i 0} {$i < 2000} {incr i 97} {assert_equal $v [r get k$i]}
+        r flushall
+        wait_intern_released
     }
 }

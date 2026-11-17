@@ -35,6 +35,15 @@ struct probSlot;
  * sampled. Fields after `offered` are private to intern.c. */
 typedef struct internState {
     internGate gate;
+    /* Non-zero while interning runs: string-interning-enabled is yes and the
+     * tables exist. A hook in a command path tests it before anything else, so
+     * with interning off the hook does no other work. */
+    int enabled;
+    /* Set once the tables are made. From then on shared strings may exist and
+     * other threads may queue their releases, so the main thread keeps applying
+     * those and advancing read epochs after interning is turned off. */
+    int active;
+    int config_enabled; /* string-interning-enabled */
     /* The private string internNewFrom(), internDupSds() or the loader last
      * returned. It was already offered, so internAdmit() of it returns at once. */
     const char *offered;
@@ -71,6 +80,7 @@ sds internAdmitSlow(sds s);
  * is `s` itself or a shareable string that carries one reference for the
  * holder. Main thread only. */
 static inline sds internAdmit(sds s) {
+    if (!intern_state.enabled) return s;
     if (s == intern_offered) {
         intern_offered = NULL;
         return s;
@@ -85,6 +95,7 @@ static inline sds internAdmit(sds s) {
  * then offers that write's value with internAdmitDue(), or skips it if the
  * value is not eligible. */
 static inline int internGateDue(void) {
+    if (!intern_state.enabled) return 0;
     if (--intern_gate.tick) return 0;
     intern_gate.tick = intern_gate.period;
     return 1;
@@ -102,8 +113,15 @@ static inline sds internAdmitDue(sds s) {
 }
 
 /* Until this runs, admission returns its input and loading stays plain. The
- * check tools load data without it. */
+ * check tools load data without it. With string-interning-enabled no it
+ * allocates nothing, and interning stays off until internSetEnabled(1). */
 void internInit(void);
+
+/* Applies string-interning-enabled at runtime. Turning interning off stops all
+ * new sharing at once; strings shared so far keep their holders and are
+ * released as before. Turning it on starts sampling from the first write.
+ * Main thread only, not while a dataset loads. */
+void internSetEnabled(int enabled);
 
 /* Probes every write again. Called when the whole dataset is replaced, since
  * what was learned about the old data does not apply to the new. Main thread

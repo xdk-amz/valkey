@@ -3,7 +3,7 @@ proc intern_node_stat {idx field} {
     return 0
 }
 
-start_cluster 2 0 {tags {external:skip cluster intern}} {
+start_cluster 2 0 {tags {external:skip cluster intern} overrides {string-interning-enabled yes}} {
     test "Atomic slot migration moves shared values and the target shares them" {
         set slot [R 0 cluster keyslot "{intern}"]
         if {[catch {R 0 set "{intern}probe" x}]} {

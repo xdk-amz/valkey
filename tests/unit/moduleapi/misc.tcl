@@ -600,6 +600,8 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
     }
 
     test "Module in-place append to an interned argument" {
+        set interning [lindex [r config get string-interning-enabled] 1]
+        r config set string-interning-enabled yes
         r flushall
         set v [string repeat m 300]
         for {set i 0} {$i < 500} {incr i} {r set k$i $v}
@@ -610,6 +612,7 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         assert_morethan $hot2 $hot
         assert_equal $v [r get k0]
         assert_equal $v [r get k499]
+        r config set string-interning-enabled $interning
     } {} {io-threads:skip} ; # IO threads share only SET-family arguments.
 }
 

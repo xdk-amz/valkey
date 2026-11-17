@@ -1986,8 +1986,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* We should handle pending reads clients ASAP after event loop. */
     int io_responses = processIOThreadsResponses();
 
-    internDrainDeferred();
-    internEpochTick();
+    if (intern_state.active) {
+        internDrainDeferred();
+        internEpochTick();
+    }
     if (io_responses > 0) server.el_iteration_active = true;
 
     /* Handle pending data(typical TLS). (must be done before flushAppendOnlyFile) */
@@ -1997,7 +1999,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     /* If any connection type(typical TLS) still has pending unread data don't sleep at all. */
     int dont_sleep = connTypeHasPendingData();
     /* Queued releases are applied a slice per iteration; keep polling until done. */
-    if (internDrainPending()) dont_sleep = 1;
+    if (intern_state.active && internDrainPending()) dont_sleep = 1;
     if (processPendingReplStreamDecode()) {
         server.el_iteration_active = true;
         if (replStreamHasPendingDecode()) dont_sleep = 1;
