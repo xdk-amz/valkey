@@ -545,7 +545,6 @@ ENGINE_SERVER_OBJ = \
     debug.o \
     defrag.o \
     entry.o \
-    intern.o \
     eval.o \
     evict.o \
     expire.o \
@@ -639,7 +638,8 @@ ENGINE_SERVER_OBJ = \
     throttle_token_bucket.o \
     stat_calc.o \
     throttle_repl.o \
-    throttle.o
+    throttle.o \
+    intern.o
 ENGINE_SERVER_OBJ+=$(ENGINE_TRACE_OBJ)
 ENGINE_CLI_NAME=$(ENGINE_NAME)-cli$(PROG_SUFFIX)
 ENGINE_CLI_OBJ = \

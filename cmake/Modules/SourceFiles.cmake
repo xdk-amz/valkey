@@ -124,7 +124,6 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/server.c
     ${CMAKE_SOURCE_DIR}/src/logreqres.c
     ${CMAKE_SOURCE_DIR}/src/entry.c
-    ${CMAKE_SOURCE_DIR}/src/intern.c
     ${CMAKE_SOURCE_DIR}/src/vset.c
     ${CMAKE_SOURCE_DIR}/src/fifo.c
     ${CMAKE_SOURCE_DIR}/src/mutexqueue.c
@@ -138,7 +137,8 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/throttle_token_bucket.c
     ${CMAKE_SOURCE_DIR}/src/stat_calc.c
     ${CMAKE_SOURCE_DIR}/src/throttle_repl.c
-    ${CMAKE_SOURCE_DIR}/src/throttle.c)
+    ${CMAKE_SOURCE_DIR}/src/throttle.c
+    ${CMAKE_SOURCE_DIR}/src/intern.c)
 
 
 # valkey-cli
