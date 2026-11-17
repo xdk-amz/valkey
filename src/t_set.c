@@ -122,9 +122,8 @@ int setTypeAdd(robj *subject, sds value) {
 /* The copy of a new member for a hashtable-encoded set. A member shared when
  * the request was parsed is referenced, also when adding it converts the set. */
 static sds setNewMember(char *str, size_t len, int str_is_sds) {
-    if (!intern_state.enabled) return sdsnewlen(str, len);
-    if (str_is_sds && sdsIsShared((sds)str)) return internDupSds((sds)str);
-    return internNewFrom(str, len);
+    if (unlikely(intern_state.enabled)) return internNewMember(str, len, str_is_sds);
+    return sdsnewlen(str, len);
 }
 
 /* Add member. This function is optimized for the different encodings. The
@@ -155,9 +154,11 @@ int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sd
         hashtable *ht = objectGetVal(set);
         hashtablePosition position;
         if (hashtableFindPositionForInsert(ht, sdsval, &position, NULL)) {
-            /* Key doesn't already exist in the set. Add it but dup the key. A
-             * member shared when the request was parsed is referenced. */
-            sdsval = sdsval != str ? internAdmit(sdsval) : setNewMember(str, len, 1);
+            /* Key doesn't already exist in the set. Add it but dup the key. */
+            if (unlikely(intern_state.enabled))
+                sdsval = internSetMember(sdsval, str, len);
+            else if (sdsval == str)
+                sdsval = sdsdup(sdsval);
             hashtableInsertAtPosition(ht, sdsval, &position);
             return 1;
         } else if (sdsval != str) {
@@ -525,7 +526,7 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
         size_t len;
         int64_t llele;
         while (setTypeNext(si, &str, &len, &llele) != -1) {
-            element = str ? internNewFrom(str, len) : sdsfromlonglong(llele);
+            element = str ? setNewMember(str, len, 0) : sdsfromlonglong(llele);
             serverAssert(hashtableAdd(ht, element));
         }
         setTypeReleaseIterator(si);

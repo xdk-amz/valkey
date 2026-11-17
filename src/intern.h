@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "config.h"
 #include "sds.h"
 
 /* Automatic interning of out-of-line keyspace strings.
@@ -75,42 +76,49 @@ extern internState intern_state;
 
 sds internAdmitSlow(sds s);
 
+/* Hooks in hot command paths test one condition inline and leave the rest to a
+ * function that is marked cold and never inlined, so the caller keeps the code
+ * it has without interning, and the interning code is placed away from it. */
+struct serverObject;
+
+/* The work of internAdmit() while interning runs. */
+sds internOffer(sds s);
+
 /* Offers a freshly owned string that is about to be stored in the keyspace.
- * Takes ownership of `s` and returns the sds the holder must store. The result
- * is `s` itself or a shareable string that carries one reference for the
- * holder. Main thread only. */
+ * Takes ownership of `s`, which may be NULL, and returns the sds the holder
+ * must store. The result is `s` itself or a shareable string that carries one
+ * reference for the holder. Main thread only. */
 static inline sds internAdmit(sds s) {
-    if (!intern_state.enabled) return s;
-    if (s == intern_offered) {
-        intern_offered = NULL;
-        return s;
-    }
-    if (sdsIsShared(s)) return s;
-    if (--intern_gate.tick) return s;
-    return internAdmitSlow(s);
+    if (unlikely(intern_state.enabled)) return internOffer(s);
+    return s;
 }
 
-/* Counts one write for a caller that checks the gate before looking at its
- * value. Returns non-zero for one write in every sampling period; the caller
- * then offers that write's value with internAdmitDue(), or skips it if the
- * value is not eligible. */
-static inline int internGateDue(void) {
-    if (!intern_state.enabled) return 0;
-    if (--intern_gate.tick) return 0;
-    intern_gate.tick = intern_gate.period;
-    return 1;
-}
+/* setKey() calls this after it stores a value, once the value has its final
+ * encoding: it counts the write against the sampling gate and offers the value
+ * when the write is due. Values stored through setKey are not modified in place
+ * afterwards, unlike objects some commands create with dbAdd and then write
+ * into. Main thread only, while interning runs. */
+void internOfferSetKey(struct serverObject *val);
 
-/* Offers the value of a write that internGateDue() selected. Same contract as
- * internAdmit(). */
-static inline sds internAdmitDue(sds s) {
-    if (s == intern_offered) {
-        intern_offered = NULL;
-        return s;
-    }
-    if (sdsIsShared(s)) return s;
-    return internAdmitSlow(s);
-}
+/* Offers the value of a key that RESTORE, COPY or a load just stored. Only an
+ * unshared object is changed, so no other reference sees its value pointer
+ * move. The caller must not modify the value in place afterwards. Main thread
+ * only, while interning runs. */
+void internOfferValue(struct serverObject *val);
+
+/* The copy of `value` that a hash field stores by pointer. Main thread only,
+ * while interning runs. */
+sds internDupHashValue(sds value);
+
+/* The member a hashtable-encoded set stores when it adds `str`: `sdsval` is
+ * `str` itself, when it is an sds the caller keeps, or a copy the set takes
+ * over. A member shared when the request was parsed is referenced. Main thread
+ * only, while interning runs. */
+sds internSetMember(sds sdsval, const char *str, size_t len);
+
+/* The copy of a new member when adding it converts a set to a hashtable, or
+ * when a set is converted. Main thread only, while interning runs. */
+sds internNewMember(const char *str, size_t len, int str_is_sds);
 
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. With string-interning-enabled no it
@@ -182,13 +190,28 @@ sds internDupSds(const_sds s);
  * except sorted set ones while every write is being probed. On an IO thread
  * the object is recorded in *pending without one; the main thread takes the
  * references when it collects the read with internReadCollected(). */
-struct serverObject;
 typedef struct internPending internPending;
 struct serverObject *internParseArg(internPending **pending, const char *buf, size_t len, int argi);
 extern __thread int intern_is_main;
+/* Arguments are shared only from the hot cache, which stays empty while
+ * interning is off, so the parser and the argv release test only this. */
 static inline int internParseReady(void) {
     return __atomic_load_n(&intern_state.hot_count, __ATOMIC_RELAXED) != 0;
 }
+/* parseMultibulk() calls this for argument `argc` once internParseReady():
+ * returns the argument as a shared string object, or as a new string object
+ * when it is not shared. */
+struct serverObject *
+internParseBulk(internPending **pending, struct serverObject **argv, int argc, const char *buf, size_t len);
+/* parseInlineBuffer() calls this for argv[j] once internParseReady(): returns
+ * the argument object. It takes over argv[j], and frees it when the argument
+ * is shared. */
+struct serverObject *internParseInline(internPending **pending, sds *argv, int j);
+/* tryOffloadFreeArgvToIOThreads() calls this once internParseReady(): it
+ * releases the shared strings that arguments shared at parse time point at.
+ * Their headers are in cache here, while an IO thread would have to send each
+ * release back to the main thread. */
+void internReleaseSharedArgs(int argc, struct serverObject **argv);
 void internFreePending(internPending *pending);
 /* Below the probing level, request parsing shares only arguments of these
  * commands: SET, SETEX, PSETEX, SETNX, GETSET, MSET, MSETNX, HSET, HSETNX,
@@ -232,6 +255,10 @@ void internReadDispatched(uint32_t *epoch);
 void internReadCollected(internPending *pending, uint32_t *epoch);
 void internEpochTick(void);
 
+/* beforeSleep() calls this once interning has been on: applies the releases
+ * other threads queued and advances the read epochs. */
+void internBeforeSleep(void);
+
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */
 void internDeferBegin(void);
@@ -241,7 +268,11 @@ void internDeferPublish(void);
  * one entry. internDeferFlush() sends what is pending; call it after each batch
  * of jobs and before waiting for work. */
 void internDeferCoalesce(void);
-void internDeferFlush(void);
+extern __thread int intern_defer_held; /* releases recorded and not sent yet */
+void internDeferFlushSlow(void);
+static inline void internDeferFlush(void) {
+    if (unlikely(intern_defer_held)) internDeferFlushSlow();
+}
 
 /* Applies releases queued by other threads, at most a fixed number of strings
  * per call. internDrainPending() is non-zero while some are left, so the caller

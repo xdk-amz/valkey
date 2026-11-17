@@ -40,6 +40,7 @@
 #include "server.h"
 #include "cluster.h"
 #include "cluster_slot_stats.h"
+#include "intern.h"
 #include "module.h"
 #include "crc16_slottable.h"
 
@@ -300,7 +301,7 @@ void restoreCommand(client *c) {
 
     /* Create the key and set the TTL if any */
     dbAdd(c->db, key, &obj);
-    dbInternValue(obj);
+    if (unlikely(intern_state.enabled)) internOfferValue(obj);
     if (ttl) {
         obj = setExpire(c, c->db, key, ttl);
         if (!absttl) {

@@ -737,7 +737,7 @@ int trySendReadToIOThreads(client *c) {
     io_jobs_submitted++;
     server.stat_io_reads_pending++;
     c->flag.pending_read = 1;
-    if (intern_state.enabled) internReadDispatched(&c->intern_read_epoch);
+    if (unlikely(intern_state.enabled)) internReadDispatched(&c->intern_read_epoch);
     return C_OK;
 }
 
@@ -1029,16 +1029,9 @@ int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
 
     /* Arguments are shared only from the hot cache; skip the check while it is
      * empty. A skipped one is released by the IO thread. */
-    int may_share = intern_state.hot_count != 0;
+    if (unlikely(internParseReady())) internReleaseSharedArgs(argc, argv);
     /* Prepare the argv */
     for (int j = 0; j < argc; j++) {
-        /* A shared value was just referenced by this command, so its header is
-         * in cache here; an IO thread would have to send the release back. */
-        if (may_share && argv[j]->refcount == 1 && argv[j]->encoding == OBJ_ENCODING_RAW &&
-            sdsIsShared(objectGetVal(argv[j]))) {
-            sdsfree(objectGetVal(argv[j]));
-            objectSetVal(argv[j], NULL);
-        }
         if (argv[j]->refcount > 1) {
             decrRefCount(argv[j]);
             /* Set argv[j] to NULL to avoid double free */

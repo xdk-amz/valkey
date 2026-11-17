@@ -520,7 +520,7 @@ robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire) {
         ptr = o->val_ptr;
     } else if (objectGetType(o) == OBJ_STRING && objectGetEncoding(o) == OBJ_ENCODING_RAW) {
         /* Dup the string. A shared string takes one more reference instead. */
-        ptr = intern_state.enabled ? internDupSds(o->val_ptr) : sdsdup(o->val_ptr);
+        ptr = unlikely(intern_state.enabled) ? internDupSds(o->val_ptr) : sdsdup(o->val_ptr);
     } else {
         serverAssert(objectGetType(o) != OBJ_STRING);
         /* There are multiple references to this non-string object. Most types

@@ -937,7 +937,7 @@ __attribute__((cold, noinline)) static void indexHeld(sds s) {
     hotStore(s, len, s);
 }
 
-sds internDupSds(const_sds s) {
+__attribute__((noinline, cold)) sds internDupSds(const_sds s) {
     if (!intern_state.enabled || !intern_is_main) return sdsdup(s);
     if (sdsIsShared(s)) {
         internHdr *h = internHdrOf(s);
@@ -957,6 +957,61 @@ sds internDupSds(const_sds s) {
     /* Already offered; a later internAdmit() of it returns at once. */
     if (!sdsIsShared(d)) intern_offered = d;
     return d;
+}
+
+/*-----------------------------------------------------------------------------
+ * Hooks called from hot command paths once their inline test passes. They are
+ * cold and never inlined, so the callers keep the code they have without
+ * interning and the interning code is placed away from them.
+ *----------------------------------------------------------------------------*/
+
+__attribute__((noinline, cold)) sds internOffer(sds s) {
+    if (s == NULL) return NULL;
+    if (s == intern_offered) {
+        intern_offered = NULL;
+        return s;
+    }
+    if (sdsIsShared(s)) return s;
+    if (--intern_gate.tick) return s;
+    return internAdmitSlow(s);
+}
+
+__attribute__((noinline, cold)) void internOfferSetKey(robj *val) {
+    /* A write that is not due for sampling only counts down the gate. */
+    if (--intern_gate.tick) return;
+    intern_gate.tick = intern_gate.period;
+    if (val->type != OBJ_STRING || val->encoding != OBJ_ENCODING_RAW || val->refcount != 1) return;
+    sds s = objectGetVal(val);
+    if (s == intern_offered) {
+        intern_offered = NULL;
+    } else if (!sdsIsShared(s)) {
+        s = internAdmitSlow(s);
+    }
+    objectSetVal(val, s);
+}
+
+__attribute__((noinline, cold)) void internOfferValue(robj *val) {
+    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
+        objectSetVal(val, internOffer(objectGetVal(val)));
+    }
+}
+
+__attribute__((noinline, cold)) sds internDupHashValue(sds value) {
+    /* Shared when the request was parsed. */
+    if (sdsIsShared(value)) return internDupSds(value);
+    /* Likely stored by pointer: share an existing copy when there is one. */
+    if (sdslen(value) >= 64) return internNewFrom(value, sdslen(value));
+    return sdsdup(value);
+}
+
+__attribute__((noinline, cold)) sds internNewMember(const char *str, size_t len, int str_is_sds) {
+    if (str_is_sds && sdsIsShared((sds)str)) return internDupSds((sds)str);
+    return internNewFrom(str, len);
+}
+
+__attribute__((noinline, cold)) sds internSetMember(sds sdsval, const char *str, size_t len) {
+    if (sdsval != str) return internOffer(sdsval);
+    return internNewMember(str, len, 1);
 }
 
 static sds internAdmitBufSlow(const char *buf, size_t len) {
@@ -1103,27 +1158,29 @@ void internDeferBegin(void) {
     defer_map.open = 1;
 }
 
-/* Releases an IO thread made since its last flush, one entry per string. */
+/* Releases an IO thread made since its last flush, one entry per string. The
+ * count is intern_defer_held, which internDeferFlush() tests inline. */
 #define DEFER_RUN_MAX 32
 typedef struct deferRun {
     deferEntry e[DEFER_RUN_MAX];
-    int n;
     int coalesce;
 } deferRun;
 
 static __thread deferRun defer_run;
+__thread int intern_defer_held;
 
 void internDeferCoalesce(void) {
     defer_run.coalesce = 1;
 }
 
-void internDeferFlush(void) {
+__attribute__((noinline, cold)) void internDeferFlushSlow(void) {
     deferRun *r = &defer_run;
-    if (r->n == 0) return;
-    deferMsg *msg = zmalloc(sizeof(deferMsg) + r->n * sizeof(deferEntry));
-    msg->count = r->n;
-    memcpy(msg->e, r->e, r->n * sizeof(deferEntry));
-    r->n = 0;
+    int n = intern_defer_held;
+    if (n == 0) return;
+    deferMsg *msg = zmalloc(sizeof(deferMsg) + n * sizeof(deferEntry));
+    msg->count = n;
+    memcpy(msg->e, r->e, n * sizeof(deferEntry));
+    intern_defer_held = 0;
     deferPush(msg);
 }
 
@@ -1147,16 +1204,16 @@ static void deferRecord(sds s) {
     if (!m->open) {
         deferRun *r = &defer_run;
         if (r->coalesce) {
-            for (int i = r->n - 1; i >= 0; i--) {
+            for (int i = intern_defer_held - 1; i >= 0; i--) {
                 if (r->e[i].s == s) {
                     r->e[i].n++;
                     return;
                 }
             }
-            if (r->n == DEFER_RUN_MAX) internDeferFlush();
-            r->e[r->n].s = s;
-            r->e[r->n].n = 1;
-            r->n++;
+            if (intern_defer_held == DEFER_RUN_MAX) internDeferFlushSlow();
+            r->e[intern_defer_held].s = s;
+            r->e[intern_defer_held].n = 1;
+            intern_defer_held++;
             return;
         }
         deferMsg *msg = zmalloc(sizeof(deferMsg) + sizeof(deferEntry));
@@ -1205,8 +1262,13 @@ size_t internDrainDeferred(void) {
     return applied;
 }
 
-int internDrainPending(void) {
+__attribute__((noinline, cold)) int internDrainPending(void) {
     return drain_msg != NULL || atomic_load_explicit(&defer_head, memory_order_relaxed) != NULL;
+}
+
+__attribute__((noinline, cold)) void internBeforeSleep(void) {
+    internDrainDeferred();
+    internEpochTick();
 }
 
 
@@ -1284,6 +1346,40 @@ robj *internParseArg(internPending **pending, const char *buf, size_t len, int a
     return createObject(OBJ_STRING, c);
 }
 
+__attribute__((noinline, cold)) robj *
+internParseBulk(internPending **pending, robj **argv, int argc, const char *buf, size_t len) {
+    robj *arg = NULL;
+    /* Sorted set commands mark their arguments in place during lookups, so
+     * their arguments are never shared. */
+    if (argc > 0 && !stringObjectWouldEmbed(len)) {
+        const char *name = objectGetVal(argv[0]);
+        if ((intern_is_main && intern_load_ready) ? (name[0] != 'z' && name[0] != 'Z')
+                                                  : internIOShares(name, sdslen(objectGetVal(argv[0]))))
+            arg = internParseArg(pending, buf, len, argc);
+    }
+    return arg ? arg : createStringObject(buf, len);
+}
+
+__attribute__((noinline, cold)) robj *internParseInline(internPending **pending, sds *argv, int j) {
+    size_t len = sdslen(argv[j]);
+    robj *arg = NULL;
+    if (j > 0 && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))
+        arg = internParseArg(pending, argv[j], len, j);
+    if (arg == NULL) return createObject(OBJ_STRING, argv[j]);
+    sdsfree(argv[j]);
+    return arg;
+}
+
+__attribute__((noinline, cold)) void internReleaseSharedArgs(int argc, robj **argv) {
+    for (int j = 0; j < argc; j++) {
+        robj *o = argv[j];
+        if (o->refcount == 1 && o->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(o))) {
+            sdsfree(objectGetVal(o));
+            objectSetVal(o, NULL);
+        }
+    }
+}
+
 void internFreePending(internPending *pending) {
     if (pending == NULL) return;
     serverAssert(pending->n == 0);
@@ -1326,14 +1422,14 @@ typedef struct retiredString {
 static retiredString *retired;
 static size_t retired_count, retired_cap;
 
-void internReadDispatched(uint32_t *epoch) {
+__attribute__((noinline, cold)) void internReadDispatched(uint32_t *epoch) {
     uint32_t slot = read_epoch % READ_EPOCHS;
     read_inflight[slot]++;
     reads_inflight++;
     *epoch = slot + 1;
 }
 
-void internReadCollected(internPending *pending, uint32_t *epoch) {
+__attribute__((noinline, cold)) void internReadCollected(internPending *pending, uint32_t *epoch) {
     if (pending && pending->n) {
         for (uint32_t i = 0; i < pending->n; i++) takePendingRef(pending->o[i]);
         pending->n = 0;

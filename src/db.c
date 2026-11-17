@@ -57,23 +57,6 @@ static int objectIsExpired(robj *val);
 static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, void **oldref);
 static robj *dbFindWithDictIndex(serverDb *db, sds key, int dict_index);
 
-/* Offers an out-of-line string value to the intern table before it is stored.
- * Only an unshared object is changed, so no other reference sees its value
- * pointer move. The caller must not modify the value in place afterwards. */
-void dbInternValue(robj *val) {
-    if (!intern_state.enabled) return;
-    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
-        objectSetVal(val, internAdmit(objectGetVal(val)));
-    }
-}
-
-/* Same as dbInternValue() for a write that internGateDue() selected. */
-static void dbInternDueValue(robj *val) {
-    if (val->type == OBJ_STRING && val->encoding == OBJ_ENCODING_RAW && val->refcount == 1) {
-        objectSetVal(val, internAdmitDue(objectGetVal(val)));
-    }
-}
-
 
 /* Lookup a key for read or write operations, or return NULL if the key is not
  * found in the specified DB. This function implements the functionality of
@@ -319,7 +302,7 @@ int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
     }
     robj *val = *valref;
     val = objectSetKeyAndExpire(val, key, -1);
-    dbInternValue(val);
+    if (unlikely(intern_state.enabled)) internOfferValue(val);
     kvstoreHashtableInsertAtPosition(db->keys, dict_index, val, &pos);
     initObjectLRUOrLFU(val);
 
@@ -469,11 +452,7 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else {
         dbSetValue(db, key, valref, 1, NULL);
     }
-    /* Offered after insertion, once the value has its final encoding. Values
-     * stored through setKey are not modified in place afterwards, unlike
-     * objects some commands create with dbAdd and then write into. A write
-     * that is not due for sampling only counts down the gate. */
-    if (internGateDue()) dbInternDueValue(*valref);
+    if (unlikely(intern_state.enabled)) internOfferSetKey(*valref);
     bgIteration_dbEntryModified(*valref);
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
@@ -1778,7 +1757,7 @@ void copyCommand(client *c) {
     }
 
     dbAdd(dst, newkey, &newobj);
-    dbInternValue(newobj);
+    if (unlikely(intern_state.enabled)) internOfferValue(newobj);
     if (expire != -1) newobj = setExpire(c, dst, newkey, expire);
 
     /* OK! key copied */

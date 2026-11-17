@@ -575,12 +575,8 @@ int hashTypeSet(robj *o, sds field, sds value, mstime_t expiry, int flags, bool 
         if (flags & HASH_SET_TAKE_VALUE) {
             v = value;
             value = NULL;
-        } else if (intern_state.enabled && sdsIsShared(value)) {
-            /* Shared when the request was parsed. */
-            v = internDupSds(value);
-        } else if (intern_state.enabled && sdslen(value) >= 64) {
-            /* Likely stored by pointer: share an existing copy when there is one. */
-            v = internNewFrom(value, sdslen(value));
+        } else if (unlikely(intern_state.enabled)) {
+            v = internDupHashValue(value);
         } else {
             v = sdsdup(value);
         }

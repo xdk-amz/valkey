@@ -325,7 +325,7 @@ static entry *entryConstruct(size_t alloc_size,
     /* Set the value if exists */
     if (!embed_value) {
         /* The value is not embedded, the value pointer is written before the field data. */
-        if (sds_value) sds_value = internAdmit(sds_value);
+        sds_value = internAdmit(sds_value);
         *(void **)buf = sds_value ? (void *)sds_value : (void *)stringref_value;
         buf += sizeof(void *);
         buf_size -= sizeof(void *);
