@@ -123,9 +123,12 @@ static inline void sdsSetAuxBit(sds s, int bit, int value) {
  * The bit is set before the string is published and never changes after. */
 #define SDS_AUX_SHARED 4
 
+/* An SDS_TYPE_5 string has no aux bits, so the bit counts only for other types.
+ * One compare tests both: the type bits are zero for SDS_TYPE_5. It is one
+ * test because sdsfree() is inlined in many places. */
 static inline int sdsIsShared(const_sds s) {
     unsigned char flags = s[-1];
-    return (flags & SDS_TYPE_MASK) != SDS_TYPE_5 && ((flags >> (SDS_TYPE_BITS + SDS_AUX_SHARED)) & 1U);
+    return (flags & (SDS_TYPE_MASK | (1U << (SDS_TYPE_BITS + SDS_AUX_SHARED)))) > (1U << (SDS_TYPE_BITS + SDS_AUX_SHARED));
 }
 
 extern void (*sdsSharedReleaseHook)(sds s);

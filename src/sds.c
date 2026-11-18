@@ -271,7 +271,6 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
 
     /* Return ASAP if there is enough space left. */
     if (avail >= addlen) return s;
-    assert(!sdsIsShared(s));
 
     len = sdslen(s);
     sh = (char *)s - sdsHdrSize(oldtype);
@@ -358,7 +357,6 @@ sds sdsResize(sds s, size_t size, int would_regrow) {
 
     /* Return ASAP if the size is already good. */
     if (sdsalloc(s) == size) return s;
-    assert(!sdsIsShared(s));
 
     /* Truncate len if needed. */
     if (size < len) len = size;
