@@ -202,7 +202,7 @@ void *activeDefragAlloc(void *ptr) {
  * When it returns a non-null value, the old pointer was already released
  * and should NOT be accessed. */
 sds activeDefragSds(sds sdsptr) {
-    if (sdsIsShared(sdsptr)) return internDefragShared(sdsptr, activeDefragAlloc);
+    if (unlikely(sdsIsShared(sdsptr))) return internDefragShared(sdsptr, activeDefragAlloc);
     void *ptr = sdsAllocPtr(sdsptr);
     void *newptr = activeDefragAlloc(ptr);
     if (newptr) {

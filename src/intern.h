@@ -79,11 +79,13 @@ sds internAdmitSlow(sds s);
 
 /* Hooks in hot command paths test one condition inline and leave the rest to a
  * function that is marked cold and never inlined, so the caller keeps the code
- * it has without interning, and the interning code is placed away from it. */
+ * it has without interning, and the interning code is placed away from it. The
+ * declarations say cold too, so a caller knows the call is unlikely. */
+#define INTERN_COLD __attribute__((cold))
 struct serverObject;
 
 /* The work of internAdmit() while interning runs. */
-sds internOffer(sds s);
+INTERN_COLD sds internOffer(sds s);
 
 /* Offers a freshly owned string that is about to be stored in the keyspace.
  * Takes ownership of `s`, which may be NULL, and returns the sds the holder
@@ -99,27 +101,27 @@ static inline sds internAdmit(sds s) {
  * when the write is due. Values stored through setKey are not modified in place
  * afterwards, unlike objects some commands create with dbAdd and then write
  * into. Main thread only, while interning runs. */
-void internOfferSetKey(struct serverObject *val);
+INTERN_COLD void internOfferSetKey(struct serverObject *val);
 
 /* Offers the value of a key that RESTORE, COPY or a load just stored. Only an
  * unshared object is changed, so no other reference sees its value pointer
  * move. The caller must not modify the value in place afterwards. Main thread
  * only, while interning runs. */
-void internOfferValue(struct serverObject *val);
+INTERN_COLD void internOfferValue(struct serverObject *val);
 
 /* The copy of `value` that a hash field stores by pointer. Main thread only,
  * while interning runs. */
-sds internDupHashValue(sds value);
+INTERN_COLD sds internDupHashValue(sds value);
 
 /* The member a hashtable-encoded set stores when it adds `str`: `sdsval` is
  * `str` itself, when it is an sds the caller keeps, or a copy the set takes
  * over. A member shared when the request was parsed is referenced. Main thread
  * only, while interning runs. */
-sds internSetMember(sds sdsval, const char *str, size_t len);
+INTERN_COLD sds internSetMember(sds sdsval, const char *str, size_t len);
 
 /* The copy of a new member when adding it converts a set to a hashtable, or
  * when a set is converted. Main thread only, while interning runs. */
-sds internNewMember(const char *str, size_t len, int str_is_sds);
+INTERN_COLD sds internNewMember(const char *str, size_t len, int str_is_sds);
 
 /* Until this runs, admission returns its input and loading stays plain. The
  * check tools load data without it. With string-interning-enabled no it
@@ -174,11 +176,11 @@ sds internAdmitLoaded(size_t len);
 void internLoadAbort(void);
 /* The loader's test for a candidate string of `len` bytes, returned as an sds
  * when `sds` is non-zero and as a string object otherwise. */
-int internLoadWants(size_t len, int sds);
+INTERN_COLD int internLoadWants(size_t len, int sds);
 /* Reads such a string from `rdb` into the scratch buffer and admits it. Returns
  * the sds or the string object, or NULL if the read fails. */
 struct _rio;
-void *internLoadString(struct _rio *rdb, size_t len, int sds, size_t *lenptr);
+INTERN_COLD void *internLoadString(struct _rio *rdb, size_t len, int sds, size_t *lenptr);
 /* True if createStringObject() embeds a string of this length. */
 bool stringObjectWouldEmbed(size_t len);
 
@@ -190,7 +192,7 @@ sds internNewFrom(const char *buf, size_t len);
 /* Copy of `s` for a new holder. A shared string gets one more reference. A
  * private string is copied through internNewFrom(), so it is offered while its
  * bytes are in cache. Main thread only. */
-sds internDupSds(const_sds s);
+INTERN_COLD sds internDupSds(const_sds s);
 
 /* Request parsing. A bulk argument equal to a hot shared string becomes a
  * string object that points at it, so the argument costs no allocation or copy.
@@ -214,17 +216,17 @@ static inline int internParseReady(void) {
  * c->querybuf + c->qb_pos, once internParseReady(): returns the argument as a
  * shared string object, or as a new string object when it is not shared. */
 struct client;
-struct serverObject *internParseBulk(struct client *c, struct serverObject **argv, int argc);
+INTERN_COLD struct serverObject *internParseBulk(struct client *c, struct serverObject **argv, int argc);
 /* parseInlineBuffer() calls this for argv[j] once internParseReady(): returns
  * the argument object. It takes over argv[j], and frees it when the argument
  * is shared. */
-struct serverObject *internParseInline(struct client *c, sds *argv, int j);
+INTERN_COLD struct serverObject *internParseInline(struct client *c, sds *argv, int j);
 /* freeClientArgv() calls this once internParseReady(), before it frees the
  * arguments or hands them to an IO thread: it releases the shared strings that
  * arguments shared at parse time point at, and clears those arguments. Their
  * headers are in cache here, while an IO thread would have to send each
  * release back to the main thread. */
-void internReleaseSharedArgs(int argc, struct serverObject **argv);
+INTERN_COLD void internReleaseSharedArgs(int argc, struct serverObject **argv);
 void internFreePending(internPending *pending);
 /* Below the probing level, request parsing shares only arguments of these
  * commands: SET, SETEX, PSETEX, SETNX, GETSET, MSET, MSETNX, HSET, HSETNX,
@@ -264,13 +266,13 @@ static inline int internIOShares(const char *name, size_t len) {
  * while reads are in flight is freed only once every read dispatched before
  * its death is collected. The main thread reports each read job it dispatches
  * and collects, and calls internEpochTick() once per event loop iteration. */
-void internReadDispatched(uint32_t *epoch);
-void internReadCollected(internPending *pending, uint32_t *epoch);
+INTERN_COLD void internReadDispatched(uint32_t *epoch);
+INTERN_COLD void internReadCollected(internPending *pending, uint32_t *epoch);
 void internEpochTick(void);
 
 /* beforeSleep() calls this once interning has been on: applies the releases
  * other threads queued and advances the read epochs. */
-void internBeforeSleep(void);
+INTERN_COLD void internBeforeSleep(void);
 
 /* Bio jobs that free keyspace data run between these two calls, so their
  * releases are coalesced into one message for the main thread. */
@@ -282,7 +284,7 @@ void internDeferPublish(void);
  * of jobs and before waiting for work. */
 void internDeferCoalesce(void);
 extern __thread int intern_defer_held; /* releases recorded and not sent yet */
-void internDeferFlushSlow(void);
+INTERN_COLD void internDeferFlushSlow(void);
 static inline void internDeferFlush(void) {
     if (unlikely(intern_defer_held)) internDeferFlushSlow();
 }
@@ -291,15 +293,15 @@ static inline void internDeferFlush(void) {
  * per call. internDrainPending() is non-zero while some are left, so the caller
  * can poll again without waiting for events. Main thread only. */
 size_t internDrainDeferred(void);
-int internDrainPending(void);
+INTERN_COLD int internDrainPending(void);
 
 /* Moves a shareable string with a single holder using `defragfn`, keeping the
  * table consistent. Returns the new sds, or NULL if it did not move. The caller
  * updates the holder. */
-sds internDefragShared(sds s, void *(*defragfn)(void *));
+INTERN_COLD sds internDefragShared(sds s, void *(*defragfn)(void *));
 
 /* True if `o` is a raw-encoded string object that points at a shared string. */
-int internObjectIsShared(const struct serverObject *o);
+INTERN_COLD int internObjectIsShared(const struct serverObject *o);
 
 /* Gives a raw-encoded string object that points at a shared string a private
  * copy instead, so it can be modified in place. */
