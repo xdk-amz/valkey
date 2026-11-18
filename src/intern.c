@@ -1521,9 +1521,10 @@ void internEpochTick(void) {
 }
 
 static void releaseHook(sds s) {
-    /* A fork child frees nothing shared: its keyspace is a copy-on-write image
-     * that other dumped keys may still reference. */
-    serverAssert(!server.in_fork_child);
+    /* A fork child releases nothing shared: its keyspace is a copy-on-write
+     * image that other dumped keys may still reference. dismissSds() frees the
+     * values a child has dumped, and for a shared one this does nothing. */
+    if (server.in_fork_child) return;
     if (intern_is_main) {
         releaseOnMain(s, 1);
     } else {

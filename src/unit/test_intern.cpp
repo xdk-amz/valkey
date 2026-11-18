@@ -92,22 +92,21 @@ TEST_F(InternTest, RefcountCapHandsBackPrivateCopy) {
 }
 
 /* A fork child owns a copy-on-write image whose keys other dumped keys may
- * still reference, so it must never release a shared string. */
-TEST_F(InternTest, ForkChildReleaseAborts) {
+ * still reference, so it never releases a shared string: dismissing a dumped
+ * value there leaves the string and its count as they are. */
+TEST_F(InternTest, ForkChildReleaseIsIgnored) {
     sds shared = makeShared("intern-fork-child-release-guard-value");
     ASSERT_TRUE(sdsIsShared(shared));
+    testInternHdr *h = testHdrOf(shared);
+    uint32_t refs = h->refcount;
 
     int saved = server.in_fork_child;
     server.in_fork_child = 1;
-    /* The release hook asserts it is not in a fork child; freeing a shared
-     * string there aborts. */
-    ASSERT_DEATH(sdsfree(shared), "");
+    dismissSds(shared);
     server.in_fork_child = saved;
+    ASSERT_EQ(h->refcount, refs);
+    ASSERT_TRUE(sdsIsShared(shared));
 
-    /* The death test runs the free in a forked subprocess, so the string is
-     * still live here; release it normally. */
-    testInternHdr *h = testHdrOf(shared);
-    h->refcount = 1;
     sdsfree(shared);
 }
 
