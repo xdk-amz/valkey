@@ -1369,8 +1369,10 @@ robj *internParseArg(internPending **pending, const char *buf, size_t len, int a
     return createObject(OBJ_STRING, c);
 }
 
-__attribute__((noinline, cold)) robj *
-internParseBulk(internPending **pending, robj **argv, int argc, const char *buf, size_t len) {
+__attribute__((noinline, cold)) robj *internParseBulk(client *c, robj **argv, int argc) {
+    const char *buf = c->querybuf + c->qb_pos;
+    size_t len = c->bulklen;
+    internPending **pending = &c->intern_pending;
     robj *arg = NULL;
     /* Sorted set commands mark their arguments in place during lookups, so
      * their arguments are never shared. */
@@ -1383,7 +1385,8 @@ internParseBulk(internPending **pending, robj **argv, int argc, const char *buf,
     return arg ? arg : createStringObject(buf, len);
 }
 
-__attribute__((noinline, cold)) robj *internParseInline(internPending **pending, sds *argv, int j) {
+__attribute__((noinline, cold)) robj *internParseInline(client *c, sds *argv, int j) {
+    internPending **pending = &c->intern_pending;
     size_t len = sdslen(argv[j]);
     robj *arg = NULL;
     if (j > 0 && !stringObjectWouldEmbed(len) && internIOShares(argv[0], sdslen(argv[0])))

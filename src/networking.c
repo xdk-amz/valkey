@@ -4009,8 +4009,7 @@ void parseInlineBuffer(client *c) {
         /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
         argv[j] = sdsRemoveFreeSpace(argv[j], 1);
         c->argv_len_sum += sdslen(argv[j]);
-        c->argv[c->argc] = unlikely(internParseReady()) ? internParseInline(&c->intern_pending, argv, j)
-                                                        : createObject(OBJ_STRING, argv[j]);
+        c->argv[c->argc] = unlikely(internParseReady()) ? internParseInline(c, argv, j) : createObject(OBJ_STRING, argv[j]);
         c->argc++;
     }
     zfree(argv);
@@ -4329,9 +4328,8 @@ static int parseMultibulk(client *c,
                 c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
                 sdsclear(c->querybuf);
             } else {
-                robj *arg = unlikely(internParseReady())
-                                ? internParseBulk(&c->intern_pending, *argv, *argc, c->querybuf + c->qb_pos, c->bulklen)
-                                : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
+                robj *arg = unlikely(internParseReady()) ? internParseBulk(c, *argv, *argc)
+                                                         : createStringObject(c->querybuf + c->qb_pos, c->bulklen);
                 (*argv)[(*argc)++] = arg;
                 *argv_len_sum += c->bulklen;
                 c->qb_pos += c->bulklen + 2;

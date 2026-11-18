@@ -210,15 +210,15 @@ extern __thread int intern_is_main;
 static inline int internParseReady(void) {
     return __atomic_load_n(&intern_state.hot_count, __ATOMIC_RELAXED) != 0;
 }
-/* parseMultibulk() calls this for argument `argc` once internParseReady():
- * returns the argument as a shared string object, or as a new string object
- * when it is not shared. */
-struct serverObject *
-internParseBulk(internPending **pending, struct serverObject **argv, int argc, const char *buf, size_t len);
+/* parseMultibulk() calls this for argument `argc`, the c->bulklen bytes at
+ * c->querybuf + c->qb_pos, once internParseReady(): returns the argument as a
+ * shared string object, or as a new string object when it is not shared. */
+struct client;
+struct serverObject *internParseBulk(struct client *c, struct serverObject **argv, int argc);
 /* parseInlineBuffer() calls this for argv[j] once internParseReady(): returns
  * the argument object. It takes over argv[j], and frees it when the argument
  * is shared. */
-struct serverObject *internParseInline(internPending **pending, sds *argv, int j);
+struct serverObject *internParseInline(struct client *c, sds *argv, int j);
 /* freeClientArgv() calls this once internParseReady(), before it frees the
  * arguments or hands them to an IO thread: it releases the shared strings that
  * arguments shared at parse time point at, and clears those arguments. Their
