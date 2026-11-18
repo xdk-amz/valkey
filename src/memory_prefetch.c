@@ -139,13 +139,10 @@ static void initBatchInfo(hashtable **tables) {
 }
 
 /* A key is eligible for nested prefetch when its command supplied a member and the
- * value is backed by a hashtable we can look the member up in. A zset lookup marks
- * the member in place, so a shared member is skipped. */
+ * value is backed by a hashtable we can look the member up in. */
 static inline int canNestedPrefetch(KeyPrefetchInfo *info, robj *val) {
-    if (info->member == NULL) return 0;
-    if (val->encoding == OBJ_ENCODING_HASHTABLE) return 1;
-    return val->type == OBJ_ZSET && val->encoding == OBJ_ENCODING_BTREE &&
-           !(info->member->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(info->member)));
+    return info->member != NULL && (val->encoding == OBJ_ENCODING_HASHTABLE ||
+                                    (val->type == OBJ_ZSET && val->encoding == OBJ_ENCODING_BTREE));
 }
 
 /* Advance the main-hashtable find and pick the next state once the entry is found. */

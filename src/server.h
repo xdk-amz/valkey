@@ -1638,34 +1638,33 @@ typedef struct zset {
 /* Lookup-key marking for fbtree hashtable disambiguation.
  * Packed fbtree items ([score][ele]) are stored in the hashtable. When doing
  * a lookup with a plain sds key, we mark it so the hash/compare callbacks
- * can distinguish it from a packed stored item. A shared string must not be
- * marked: callers swap it for a private copy with zsetPrivateLookupKey(). */
+ * can distinguish it from a packed stored item. A shared string is immutable
+ * and is never a stored item, so it is not marked: the callbacks take it for
+ * a lookup key as it is. */
 #define ZSET_LOOKUP_TYPE5_MARKER 6
+/* The flags bits of aux bit 0, the mark, and of the SDS_AUX_SHARED bit, which
+ * outside SDS_TYPE_5 alone says sdsIsShared(). */
+#define ZSET_LOOKUP_MARK_FLAG (1 << SDS_TYPE_BITS)
+#define ZSET_LOOKUP_SHARED_FLAG (1 << (SDS_TYPE_BITS + SDS_AUX_SHARED))
 static inline void zsetMarkLookupKey(sds s) {
     if (sdsType(s) == SDS_TYPE_5)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | ZSET_LOOKUP_TYPE5_MARKER;
-    else
+    else if (!(s[-1] & ZSET_LOOKUP_SHARED_FLAG))
         sdsSetAuxBit(s, 0, 1);
-}
-
-/* Returns `s`, or a private copy of it if `s` is a shared string, which must
- * not be marked. Pair with zsetFreePrivateLookupKey(). */
-static inline sds zsetPrivateLookupKey(sds s) {
-    return sdsIsShared(s) ? sdsdup(s) : s;
-}
-static inline void zsetFreePrivateLookupKey(sds key, sds orig) {
-    if (key != orig) sdsfree(key);
 }
 static inline void zsetUnmarkLookupKey(sds s) {
     unsigned char type = s[-1] & SDS_TYPE_MASK;
     if (type == ZSET_LOOKUP_TYPE5_MARKER)
         s[-1] = (s[-1] & ~SDS_TYPE_MASK) | SDS_TYPE_5;
-    else
+    else if (!(s[-1] & ZSET_LOOKUP_SHARED_FLAG))
         sdsSetAuxBit(s, 0, 0);
 }
+/* True for a marked key and for a shared string. */
 static inline int zsetIsLookupKey(const_sds s) {
-    unsigned char type = s[-1] & SDS_TYPE_MASK;
-    return type == ZSET_LOOKUP_TYPE5_MARKER || sdsGetAuxBit(s, 0);
+    unsigned char flags = s[-1];
+    unsigned char type = flags & SDS_TYPE_MASK;
+    return type == ZSET_LOOKUP_TYPE5_MARKER ||
+           (type != SDS_TYPE_5 && (flags & (ZSET_LOOKUP_MARK_FLAG | ZSET_LOOKUP_SHARED_FLAG)));
 }
 
 typedef struct clientBufferLimitsConfig {
