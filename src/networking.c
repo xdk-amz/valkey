@@ -2167,6 +2167,9 @@ void freeClientArgv(client *c) {
         goto clear;
     }
 
+    /* Arguments are shared only from the hot cache; skip the check while it is
+     * empty. A skipped one is released by the thread that frees it. */
+    if (unlikely(internParseReady())) internReleaseSharedArgs(c->argc, c->argv);
     /* If original_argv exists, 'c->argv' was allocated by the main thread,
      * so it's more efficient to free it directly here rather than offloading to IO threads */
     if (c->original_argv || tryOffloadFreeArgvToIOThreads(c, c->argc, c->argv) == C_ERR) {

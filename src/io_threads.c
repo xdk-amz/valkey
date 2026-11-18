@@ -1008,9 +1008,10 @@ void ioThreadFreeArgv(robj **argv) {
     zfree(argv);
 }
 
-/* The body of tryOffloadFreeArgvToIOThreads(). With release_shared it first
- * releases, on the main thread, the shared strings that arguments point at. */
-static inline int offloadFreeArgv(client *c, int argc, robj **argv, bool release_shared) {
+/* This function attempts to offload the client's argv to an IO thread.
+ * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
+ * C_ERR otherwise. */
+int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
     if (server.active_io_threads_num <= 1 || argc == 0) {
         return C_ERR;
     }
@@ -1026,7 +1027,6 @@ static inline int offloadFreeArgv(client *c, int argc, robj **argv, bool release
 
     int last_arg_to_free = -1;
 
-    if (release_shared) internReleaseSharedArgs(argc, argv);
     /* Prepare the argv */
     for (int j = 0; j < argc; j++) {
         if (argv[j]->refcount > 1) {
@@ -1058,22 +1058,6 @@ static inline int offloadFreeArgv(client *c, int argc, robj **argv, bool release
     io_jobs_submitted++;
 
     return C_OK;
-}
-
-/* Out of line, so tryOffloadFreeArgvToIOThreads() stays the leaf function it
- * is without interning. */
-static __attribute__((noinline, cold)) int offloadFreeArgvReleasingShared(client *c, int argc, robj **argv) {
-    return offloadFreeArgv(c, argc, argv, true);
-}
-
-/* This function attempts to offload the client's argv to an IO thread.
- * Returns C_OK if the client's argv were successfully offloaded to an IO thread,
- * C_ERR otherwise. */
-int tryOffloadFreeArgvToIOThreads(client *c, int argc, robj **argv) {
-    /* Arguments are shared only from the hot cache; skip the check while it is
-     * empty. A skipped one is released by the IO thread. */
-    if (unlikely(internParseReady())) return offloadFreeArgvReleasingShared(c, argc, argv);
-    return offloadFreeArgv(c, argc, argv, false);
 }
 
 /* This function attempts to offload the free of an object to an IO thread.

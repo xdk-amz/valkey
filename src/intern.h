@@ -219,9 +219,10 @@ internParseBulk(internPending **pending, struct serverObject **argv, int argc, c
  * the argument object. It takes over argv[j], and frees it when the argument
  * is shared. */
 struct serverObject *internParseInline(internPending **pending, sds *argv, int j);
-/* tryOffloadFreeArgvToIOThreads() calls this once internParseReady(): it
- * releases the shared strings that arguments shared at parse time point at.
- * Their headers are in cache here, while an IO thread would have to send each
+/* freeClientArgv() calls this once internParseReady(), before it frees the
+ * arguments or hands them to an IO thread: it releases the shared strings that
+ * arguments shared at parse time point at, and clears those arguments. Their
+ * headers are in cache here, while an IO thread would have to send each
  * release back to the main thread. */
 void internReleaseSharedArgs(int argc, struct serverObject **argv);
 void internFreePending(internPending *pending);
