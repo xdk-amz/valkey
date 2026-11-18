@@ -610,9 +610,9 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         regexp {intern_hot_hits:(\d+)} [r info memory] -> hot2
         # The argument pointed at the shared value.
         assert_morethan $hot2 $hot
+        r config set string-interning-enabled $interning
         assert_equal $v [r get k0]
         assert_equal $v [r get k499]
-        r config set string-interning-enabled $interning
     } {} {io-threads:skip} ; # IO threads share only SET-family arguments.
 }
 
