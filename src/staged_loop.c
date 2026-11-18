@@ -162,6 +162,7 @@ static int sl_barrier_ready = 0;
 static int sl_on = 0;         /* staged mode is on for this iteration */
 static int sl_want = 0;       /* staged mode is wanted: stock IO offload stops so it can start */
 static int sl_workers = 0;    /* IO threads 1..sl_workers are enrolled; the barrier's participant count */
+static int sl_inline_lanes = 0; /* unit tests: lane phases run inline, no barrier */
 static int sl_depth = 0;      /* 1 while a nested iteration runs */
 static uint64_t sl_opens = 0; /* phases opened so far; equals the barrier's sequence number */
 static int sl_ae_fd = -1;     /* ae's own epoll fd, the single main-affinity entry */
@@ -868,6 +869,12 @@ void stagedRunLane(int phase, int tid) {
 /* Open phase for the enrolled workers, run main's lane when it takes one, and wait. with_workers 0,
  * or no enrolled worker, runs lane 0 on main alone with no barrier. */
 void stagedRunLanePhase(int phase, int with_workers) {
+    if (sl_inline_lanes) {
+        /* Unit tests: no worker is enrolled; run every lane of this phase here, lane by lane, in lane
+         * order (the replica plan's PARSE and APPLY phases included). */
+        for (int tid = sl_main_lane ? 0 : 1; tid <= sl_workers; tid++) stagedRunLane(phase, tid);
+        return;
+    }
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     stagedFlushDeferredReplies();
     if (!with_workers) {
@@ -887,6 +894,11 @@ void stagedRunApplyPhase(int with_workers) {
 }
 
 void stagedRunWritePhase(void) {
+    if (sl_inline_lanes) {
+        /* Unit tests: no worker is enrolled; run every lane here, lane by lane. */
+        for (int tid = sl_main_lane ? 0 : 1; tid <= sl_workers; tid++) fastpathStagedWriteLane(tid);
+        return;
+    }
     stagedStreamClose(1); /* a phase opening while a stream is open means main is mid-exec: abort it */
     stagedFlushDeferredReplies();
     int rc = phaseBarrierOpen(&sl_barrier, STAGED_PHASE_WRITE);
@@ -908,6 +920,20 @@ int stagedResize(int setsize) {
     return pollerResize(sl_poller, setsize);
 }
 
+/* Unit tests: pretend n IO workers are enrolled (no thread runs) so lanes are planned, and run every
+ * lane phase inline on the calling thread, lane by lane, in lane order. */
+void testOnlyStagedSetWorkers(int n, int main_lane) {
+    sl_workers = n;
+    sl_main_lane = main_lane;
+    sl_inline_lanes = 1;
+}
+
+/* Unit tests: report the staged loop as running (sl_on) so the replica's parallel apply paths, which
+ * refuse to plan or run without it, take the inline lanes above. Only stagedReconcile sets it otherwise. */
+void testOnlyStagedSetOn(int on) {
+    __atomic_store_n(&sl_on, on, __ATOMIC_RELAXED);
+}
+
 /* Unit tests run the staged phases inline on one thread; no worker is enrolled. */
 int testOnlyStagedStart(void) {
     if (!stagedInit()) return -1;
@@ -918,6 +944,10 @@ int testOnlyStagedStart(void) {
 void testOnlyStagedStop(void) {
     fastpathStagedReleaseAll();
     fastpathStagedSet(0);
+    /* Undo testOnlyStagedSetWorkers so the next suite in the process starts with no worker enrolled. */
+    sl_inline_lanes = 0;
+    sl_workers = 0;
+    sl_main_lane = 1;
 }
 
 #else /* !HAVE_FASTPATH_EPOLL */
@@ -952,6 +982,13 @@ int testOnlyStagedStart(void) {
     return -1;
 }
 void testOnlyStagedStop(void) {
+}
+void testOnlyStagedSetWorkers(int n, int main_lane) {
+    UNUSED(n);
+    UNUSED(main_lane);
+}
+void testOnlyStagedSetOn(int on) {
+    UNUSED(on);
 }
 
 void stagedMain(struct aeEventLoop *el) {

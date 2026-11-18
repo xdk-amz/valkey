@@ -13,6 +13,7 @@
  * by the real-engine Tcl suite and under ASan. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <cstring>
 
@@ -37,11 +38,11 @@ class AclOffloadTest : public ::testing::Test {
         server.main_thread_id = pthread_self();
         server.el = aeCreateEventLoop(64);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
-        ACLInit();
+        unitTestPopulateCommandTable();
+        unitTestACLInit();
         server.dbnum = 1;
         server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *)));
         server.db[0] = static_cast<serverDb *>(zcalloc(sizeof(serverDb)));

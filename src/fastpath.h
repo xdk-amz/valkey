@@ -42,7 +42,7 @@ typedef struct cmdEntry {
     int read_flags;
     uint32_t reply_off;
     uint32_t reply_len;
-    uint32_t reply_big_len;
+    size_t reply_big_len; /* A reply list can exceed 4 GiB: never a 32-bit field. */
     uint8_t resp;
     uint8_t requeued;      /* Main did not execute it; the IO thread hands it back for the main path. */
     uint8_t readonly;      /* The client sent READONLY: a cluster replica serves its reads. */
@@ -87,11 +87,13 @@ void fastpathAdmitReadBegin(void);
 void fastpathAdmitReadEnd(void);
 void fastpathAdmissionQuiesce(void);
 uint32_t testOnlyFastpathAdmitSeq(int tid);
+uint64_t testOnlyFastpathLeaveVisits(void);
 void fastpathRequestDetach(client *c);
 int fastpathDetachConsumed(client *c);
 void fastpathHandoffDone(client *c, int closing);
 size_t fastpathClientCount(void);
 void fastpathInfo(sds *info);
+void fastpathResetStats(void);
 
 /* Allocate and initialize the connection's ClientControl once, on first crossing-capable admission; a
  * no-op if it already has one. Reclaimed only by fastpathControlReclaim at free. */

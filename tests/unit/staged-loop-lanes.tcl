@@ -718,7 +718,15 @@ start_server {tags {"staged-loop repl external:skip tls:skip"} overrides {io-thr
                 close $fd
             }
             assert {[pwl_lane_entries $primary] - $before > 1000}
-            # Active expire on the primary deletes what PX 5 left and replicates the deletes.
+            # Every PX 5 key is past its expiry 10 ms after the last reply. Touch every key the
+            # pipelines wrote: lazy expire deletes each expired key on the primary and replicates
+            # the DEL now, so active expire has nothing left to delete under the digest checks of
+            # the tests that follow (a DEL landing between two digests made them differ).
+            after 10
+            set keys {}
+            for {set i 0} {$i < 500} {incr i} { lappend keys pwl:r$i }
+            $primary exists {*}$keys
+            wait_for_ofs_sync $primary $replica
             wait_for_condition 100 50 {
                 [$primary debug digest] eq [$replica debug digest]
             } else {

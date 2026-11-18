@@ -10,6 +10,7 @@
  * cannot fault, and origin data must still be intact. */
 
 #include "generated_wrappers.hpp"
+#include "test_server_init.hpp"
 
 #include <arpa/inet.h>
 #include <cstring>
@@ -49,11 +50,11 @@ class FastpathExecutorTest : public ::testing::Test {
         server.maxclients = 1000;
         server.el = aeCreateEventLoop(1024);
         createSharedObjects();
-        moduleInitModulesSystem();
+        unitTestInitModulesSystem();
         server.commands = hashtableCreate(&commandSetType);
         server.orig_commands = hashtableCreate(&commandSetType);
-        populateCommandTable();
-        ACLInit();
+        unitTestPopulateCommandTable();
+        unitTestACLInit();
 
         server.dbnum = 1;
         server.db = static_cast<serverDb **>(zcalloc(sizeof(serverDb *)));
@@ -83,7 +84,7 @@ class FastpathExecutorTest : public ::testing::Test {
         server.io_threads_fast_path = 1;
         server.io_threads_strict_offload = 1;
         server.io_batch_commands = 16;
-        connTypeInitialize();
+        unitTestConnTypeInitialize();
         initSharedQueryBuf();
         testOnlyInitIOThreadQueues();
         fastpathInitThread(1);
@@ -92,7 +93,9 @@ class FastpathExecutorTest : public ::testing::Test {
 
     static void TearDownTestSuite() {
         fastpathFreeThread(1);
+        testOnlyClearIOThreadReady(1);
         testOnlyFreeIOThreadQueues();
+        unitTestDeleteEventLoop();
     }
 
     void SetUp() override {
@@ -258,4 +261,185 @@ TEST_F(FastpathExecutorTest, ClientInfoOfFastpathClientComesFromAdmissionPeer) {
     close(sv[1]);
     close(sv[0]);
     conn->fd = -1;
+}
+
+/* ---- Regression tests added by the superset audit (repro-group-c) ---- */
+
+extern "C" {
+long long clientsTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
+void updateClientMemoryUsage(client *c);
+void getExpensiveClientsInfo(size_t *in_usage, size_t *out_usage);
+}
+
+/* An admitted fast-path client on one end of a socketpair; the test writes requests to *peer_fd. */
+static client *fpTestAdmitClient(int *peer_fd, connection **conn_out) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return NULL;
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+    c->fp_out = NULL;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(40002);
+    inet_pton(AF_INET, "192.0.2.78", &sa.sin_addr);
+    if (peerIdentityFromSockaddr(&c->fp_peer, (struct sockaddr *)&sa, sizeof(sa)) != C_OK) return NULL;
+    c->fp_local = c->fp_peer;
+    if (fastpathAttach(c) != C_OK) return NULL;
+    *peer_fd = sv[1];
+    *conn_out = conn;
+    return c;
+}
+
+/* Hand the client back to main and release the socket. The client struct is leaked on purpose:
+ * freeClient needs the full server state that this fixture does not build. */
+static void fpTestReleaseClient(client *c, connection *conn, int peer_fd) {
+    testOnlyStagedStop();
+    connSetReadHandler(conn, NULL);
+    fastpathControlReclaim(c);
+    testOnlyStagedStart();
+    close(peer_fd);
+    close(conn->fd);
+    conn->fd = -1;
+}
+
+/* Bytes the peer can read right now, without blocking. */
+static ssize_t fpTestReadNow(int fd, char *buf, size_t cap) {
+    ssize_t n = recv(fd, buf, cap, MSG_DONTWAIT);
+    return n < 0 ? 0 : n;
+}
+
+/* OBS-08: bytes read and written by fast-path IO threads must be counted in the stock INFO stats
+ * (total_net_input_bytes, total_net_output_bytes, total_reads_processed, total_writes_processed),
+ * as the stock IO threads count them. */
+TEST_F(FastpathExecutorTest, FastpathTrafficIsCountedInServerStats) {
+    server.child_pid = -1;
+    server.stat_net_input_bytes = 0;
+    server.stat_net_output_bytes = 0;
+    server.stat_total_reads_processed = 0;
+    server.stat_total_writes_processed = 0;
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+
+    /* A SET runs on main through the executor; its reply goes out in the reply phase. */
+    const char *req = "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+    ASSERT_EQ(write(peer, req, strlen(req)), (ssize_t)strlen(req));
+    pollerGetNextBatch(stagedPoller(), 0);
+    fastpathStagedReadPhase(1);
+    ASSERT_EQ(c->fp_inflight, 1u) << "the SET was not harvested by the fast path (engagement check)";
+    EXPECT_EQ(fastpathStagedExecute(), 1);
+    fastpathStagedReplyPhase(1);
+    fastpathStagedFinish();
+    char buf[64];
+    ASSERT_EQ(fpTestReadNow(peer, buf, sizeof(buf)), 5);
+    EXPECT_EQ(memcmp(buf, "+OK\r\n", 5), 0);
+
+    EXPECT_EQ(server.stat_net_input_bytes, (long long)strlen(req));
+    EXPECT_EQ(server.stat_net_output_bytes, 5);
+    EXPECT_EQ(server.stat_total_reads_processed, 1);
+    EXPECT_EQ(server.stat_total_writes_processed, 1);
+
+    fpTestReleaseClient(c, conn, peer);
+    robj *key = createStringObject("foo", 3);
+    dbDelete(server.db[0], key);
+    decrRefCount(key);
+}
+
+/* OBS-15: with client eviction off (maxmemory-clients 0, the default) clientsCron must still
+ * refresh the memory of a fast-path client into stat_clients_type_memory (INFO mem_clients_normal,
+ * MEMORY STATS clients.normal) and the recent-max output buffer sample
+ * (INFO client_recent_max_output_buffer). */
+TEST_F(FastpathExecutorTest, FastpathClientMemoryIsRefreshedByClientsCron) {
+    server.maxmemory_clients = 0;
+    server.hz = CONFIG_DEFAULT_HZ;
+    server.unixtime = time(NULL);
+    server.stat_clients_type_memory[CLIENT_TYPE_NORMAL] = 0;
+
+    int peer;
+    connection *conn;
+    client *c = fpTestAdmitClient(&peer, &conn);
+    ASSERT_NE(c, nullptr);
+    ASSERT_EQ(c->flag.fastpath, 1u);
+
+    /* 1 MiB of replies the IO thread could not write yet. */
+    const size_t pending = 1024 * 1024;
+    c->fp_out = sdsnewlen(NULL, pending);
+    listAddNodeTail(server.clients, c);
+    c->client_list_node = listLast(server.clients);
+
+    for (int i = 0; i < 3; i++) clientsTimeProc(server.el, 0, NULL);
+
+    EXPECT_GE(server.stat_clients_type_memory[CLIENT_TYPE_NORMAL], pending)
+        << "mem_clients_normal does not include the fast-path client's pending output";
+    size_t in_usage = 0, out_usage = 0;
+    getExpensiveClientsInfo(&in_usage, &out_usage);
+    EXPECT_GE(out_usage, pending) << "client_recent_max_output_buffer ignores the fast-path client";
+
+    /* Settle the accounting before leaving. */
+    sdsfree(c->fp_out);
+    c->fp_out = NULL;
+    updateClientMemoryUsage(c);
+    listDelNode(server.clients, c->client_list_node);
+    c->client_list_node = NULL;
+    fpTestReleaseClient(c, conn, peer);
+}
+
+/* tryPartitionClient: EPOLL_CTL_ADD publishes the client to the IO thread, which may claim and
+ * read it at once. io_tid, flag.partitioned and flag.pending_read must already be stored when the
+ * ADD is made, and a failed ADD must leave the client as it was. */
+static int fp_publish_calls = 0;
+static int fp_publish_tid = -1, fp_publish_partitioned = -1, fp_publish_pending = -1;
+static void fpRecordPublish(client *c) {
+    fp_publish_calls++;
+    fp_publish_tid = c->io_tid;
+    fp_publish_partitioned = c->flag.partitioned;
+    fp_publish_pending = c->flag.pending_read;
+}
+
+TEST_F(FastpathExecutorTest, PartitionedClientStateIsStoredBeforeEpollAdd) {
+    testOnlyStagedStop(); /* partitioning is off while the staged loop runs */
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    connection *conn = connCreateAccepted(connectionByType(CONN_TYPE_SOCKET), sv[0], NULL);
+    conn->state = CONN_STATE_CONNECTED;
+    client *c = createClient(NULL);
+    c->conn = conn;
+    connSetPrivateData(conn, c);
+
+    /* The socket is already in the IO thread's epoll set, so the ADD fails with EEXIST after the
+     * hook has seen what the IO thread would see. */
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    ASSERT_GE(epfd, 0);
+    testOnlySetIOThreadReady(1, epfd);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ASSERT_EQ(epoll_ctl(epfd, EPOLL_CTL_ADD, sv[0], &ev), 0);
+
+    fp_publish_calls = 0;
+    testOnlySetPartitionPublishHook(fpRecordPublish);
+    EXPECT_EQ(tryPartitionClient(c), C_ERR);
+    testOnlySetPartitionPublishHook(NULL);
+
+    ASSERT_EQ(fp_publish_calls, 1) << "tryPartitionClient did not reach the EPOLL_CTL_ADD";
+    EXPECT_EQ(fp_publish_tid, 1) << "io_tid is stored after the client is published";
+    EXPECT_EQ(fp_publish_partitioned, 1) << "flag.partitioned is stored after the client is published";
+    EXPECT_EQ(fp_publish_pending, 1) << "flag.pending_read is stored after the client is published";
+    EXPECT_EQ(c->io_tid, 0) << "a failed ADD left io_tid set";
+    EXPECT_EQ(c->flag.partitioned, 0u) << "a failed ADD left the client partitioned";
+    EXPECT_EQ(c->flag.pending_read, 0u) << "a failed ADD left a read pending";
+
+    epoll_ctl(epfd, EPOLL_CTL_DEL, sv[0], NULL);
+    close(epfd);
+    testOnlySetIOThreadReady(1, epoll_create1(EPOLL_CLOEXEC));
+    c->conn = NULL;
+    close(sv[1]);
+    close(sv[0]);
+    testOnlyStagedStart();
 }
