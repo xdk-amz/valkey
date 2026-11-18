@@ -322,3 +322,15 @@ TEST(InternIOSharesTest, MatchesCaseInsensitiveNames) {
     EXPECT_EQ(0, internIOShares("se", 2));
     EXPECT_EQ(0, internIOShares("setrange", 8));
 }
+
+/* stringObjectWouldEmbed() repeats the test object.c makes, so check it against
+ * what createStringObject() does for every length around the limit. */
+TEST(InternEmbedTest, MatchesCreateStringObject) {
+    char buf[300];
+    memset(buf, 'x', sizeof(buf));
+    for (size_t len = 0; len <= sizeof(buf); len++) {
+        robj *o = createStringObject(buf, len);
+        EXPECT_EQ(o->encoding == OBJ_ENCODING_EMBSTR, stringObjectWouldEmbed(len)) << len;
+        decrRefCount(o);
+    }
+}

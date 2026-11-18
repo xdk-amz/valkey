@@ -610,7 +610,8 @@ int dbDelete(serverDb *db, robj *key) {
  */
 robj *dbUnshareStringValue(serverDb *db, robj *key, robj *o) {
     serverAssert(objectGetType(o) == OBJ_STRING);
-    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW || sdsIsShared(objectGetVal(o))) {
+    if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW ||
+        (unlikely(intern_state.active) && internObjectIsShared(o))) {
         robj *decoded = getDecodedObject(o);
         o = createRawStringObject(objectGetVal(decoded), sdslen(objectGetVal(decoded)));
         decrRefCount(decoded);

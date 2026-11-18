@@ -6762,24 +6762,7 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "active_defrag_running:%d\r\n", server.active_defrag_cpu_percent,
                 "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
                 "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
-        internInfo ii;
-        internGetInfo(&ii);
-        info = sdscatprintf(info,
-                            "intern_strings:%zu\r\n"
-                            "intern_refs:%zu\r\n"
-                            "intern_bytes:%zu\r\n"
-                            "intern_saved_bytes:%zu\r\n"
-                            "intern_table_bytes:%zu\r\n"
-                            "intern_singletons:%zu\r\n"
-                            "intern_hits:%zu\r\n"
-                            "intern_hot_hits:%zu\r\n"
-                            "intern_promotions:%zu\r\n"
-                            "intern_sampled:%zu\r\n"
-                            "intern_deferred:%zu\r\n"
-                            "intern_level:%d\r\n"
-                            "intern_sel_level:%d\r\n",
-                            ii.shared, ii.refs, ii.shared_bytes, ii.saved_bytes, ii.table_bytes, ii.singletons,
-                            ii.hits, ii.hot_hits, ii.promotions, ii.sampled, ii.deferred, ii.level, ii.sel_level);
+        info = internCatInfo(info);
         freeMemoryOverheadData(mh);
     }
 

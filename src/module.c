@@ -56,6 +56,7 @@
  * function names. For details, see the script src/modules/gendoc.rb.
  * -------------------------------------------------------------------------- */
 #include "server.h"
+#include "intern.h"
 #include "ordered_index.h"
 #include "cluster.h"
 #include "entry.h"
@@ -3175,11 +3176,9 @@ static ValkeyModuleString *moduleAssertUnsharedString(ValkeyModuleString *str) {
         /* Convert the string from integer to raw encoding. */
         objectSetVal(str, sdsfromlonglong((long)objectGetVal(str)));
         str->encoding = OBJ_ENCODING_RAW;
-    } else if (str->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(str))) {
+    } else if (str->encoding == OBJ_ENCODING_RAW) {
         /* A shared string is immutable; modify a private copy. */
-        sds shared = objectGetVal(str);
-        objectSetVal(str, sdsdup(shared));
-        sdsfree(shared);
+        internUnshareStringObject(str);
     }
     return str;
 }

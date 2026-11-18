@@ -1,6 +1,7 @@
 #ifndef __INTERN_H
 #define __INTERN_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "config.h"
@@ -130,6 +131,8 @@ void internInit(void);
  * released as before. Turning it on starts sampling from the first write.
  * Main thread only, not while a dataset loads. */
 void internSetEnabled(int enabled);
+/* The apply function of string-interning-enabled. */
+int internApplyConfig(const char **err);
 
 /* Probes every write again. Called when the whole dataset is replaced, since
  * what was learned about the old data does not apply to the new. Main thread
@@ -169,6 +172,15 @@ char *internLoadScratch(size_t len);
 sds internAdmitLoaded(size_t len);
 /* Releases the scratch buffer when a read into it fails. */
 void internLoadAbort(void);
+/* The loader's test for a candidate string of `len` bytes, returned as an sds
+ * when `sds` is non-zero and as a string object otherwise. */
+int internLoadWants(size_t len, int sds);
+/* Reads such a string from `rdb` into the scratch buffer and admits it. Returns
+ * the sds or the string object, or NULL if the read fails. */
+struct _rio;
+void *internLoadString(struct _rio *rdb, size_t len, int sds, size_t *lenptr);
+/* True if createStringObject() embeds a string of this length. */
+bool stringObjectWouldEmbed(size_t len);
 
 /* Returns a new sds holding buf[0..len) to store in the keyspace, sharing an
  * existing copy when there is one, like internAdmit(sdsnewlen(buf, len)) but
@@ -285,6 +297,13 @@ int internDrainPending(void);
  * updates the holder. */
 sds internDefragShared(sds s, void *(*defragfn)(void *));
 
+/* True if `o` is a raw-encoded string object that points at a shared string. */
+int internObjectIsShared(const struct serverObject *o);
+
+/* Gives a raw-encoded string object that points at a shared string a private
+ * copy instead, so it can be modified in place. */
+void internUnshareStringObject(struct serverObject *o);
+
 /* Allocation size of a shareable string, including its prefix. */
 size_t internSharedAllocSize(const_sds s);
 uint32_t internSharedRefcount(const_sds s);
@@ -310,5 +329,7 @@ typedef struct internInfo {
 } internInfo;
 
 void internGetInfo(internInfo *info);
+/* Appends the intern_* fields of the INFO memory section to `info`. */
+sds internCatInfo(sds info);
 
 #endif

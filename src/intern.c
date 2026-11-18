@@ -78,6 +78,14 @@ static uint64_t *load_seen;
 /* Set on the main thread at init; a forked child inherits it for its only thread. */
 __thread int intern_is_main;
 
+/* The test shouldEmbedStringObject() in object.c makes for a string with no key
+ * or expire. Kept here so that object.c gains no function. A unit test checks
+ * that it matches what createStringObject() does. */
+bool stringObjectWouldEmbed(size_t len) {
+    if (len > sdsTypeMaxSize(SDS_TYPE_8)) return false;
+    return sizeof(robj) - sizeof(void *) + sdsReqSize(len, SDS_TYPE_8) <= 128;
+}
+
 /* Names for the private fields of intern_state. */
 #define intern_seed (intern_state.seed)
 #define intern_index (intern_state.index)
@@ -894,6 +902,21 @@ void internLoadAbort(void) {
     intern_load_busy = 0;
 }
 
+int internLoadWants(size_t len, int sds) {
+    return internLoadReady(len) && (sds || !stringObjectWouldEmbed(len));
+}
+
+void *internLoadString(rio *rdb, size_t len, int sds, size_t *lenptr) {
+    char *buf = internLoadScratch(len);
+    if (len && rioRead(rdb, buf, len) == 0) {
+        internLoadAbort();
+        return NULL;
+    }
+    if (lenptr) *lenptr = len;
+    char *loaded = internAdmitLoaded(len);
+    return sds ? (void *)loaded : (void *)createObject(OBJ_STRING, loaded);
+}
+
 sds internNewFrom(const char *buf, size_t len) {
     if (!intern_state.enabled) return sdsnewlen(buf, len);
     if (--intern_gate.tick || len < INTERN_MIN_LEN || len > INTERN_MAX_LEN) {
@@ -1654,6 +1677,23 @@ void internSetEnabled(int enabled) {
     }
 }
 
+int internApplyConfig(const char **err) {
+    UNUSED(err);
+    internSetEnabled(intern_state.config_enabled);
+    return 1;
+}
+
+__attribute__((noinline, cold)) int internObjectIsShared(const robj *o) {
+    return o->encoding == OBJ_ENCODING_RAW && sdsIsShared(objectGetVal(o));
+}
+
+void internUnshareStringObject(robj *o) {
+    sds s = objectGetVal(o);
+    if (!sdsIsShared(s)) return;
+    objectSetVal(o, sdsdup(s));
+    sdsfree(s);
+}
+
 size_t internSharedAllocSize(const_sds s) {
     return zmalloc_size(internHdrOf(s));
 }
@@ -1690,4 +1730,25 @@ void internGetInfo(internInfo *info) {
     info->deferred = st.deferred;
     info->level = intern_level;
     info->sel_level = intern_sel_level;
+}
+
+sds internCatInfo(sds info) {
+    internInfo ii;
+    internGetInfo(&ii);
+    return sdscatprintf(info,
+                        "intern_strings:%zu\r\n"
+                        "intern_refs:%zu\r\n"
+                        "intern_bytes:%zu\r\n"
+                        "intern_saved_bytes:%zu\r\n"
+                        "intern_table_bytes:%zu\r\n"
+                        "intern_singletons:%zu\r\n"
+                        "intern_hits:%zu\r\n"
+                        "intern_hot_hits:%zu\r\n"
+                        "intern_promotions:%zu\r\n"
+                        "intern_sampled:%zu\r\n"
+                        "intern_deferred:%zu\r\n"
+                        "intern_level:%d\r\n"
+                        "intern_sel_level:%d\r\n",
+                        ii.shared, ii.refs, ii.shared_bytes, ii.saved_bytes, ii.table_bytes, ii.singletons, ii.hits,
+                        ii.hot_hits, ii.promotions, ii.sampled, ii.deferred, ii.level, ii.sel_level);
 }

@@ -2820,12 +2820,6 @@ static int updateExtendedRedisCompat(const char **err) {
     return 1;
 }
 
-static int updateStringInterning(const char **err) {
-    UNUSED(err);
-    internSetEnabled(intern_state.config_enabled);
-    return 1;
-}
-
 static int updateSighandlerEnabled(const char **err) {
     UNUSED(err);
     if (server.crashlog_enabled)
@@ -3515,7 +3509,7 @@ standardConfig static_configs[] = {
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("io-threads-always-active", NULL, MODIFIABLE_CONFIG | HIDDEN_CONFIG, server.io_threads_always_active, 0, NULL, NULL),
-    createBoolConfig("string-interning-enabled", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, intern_state.config_enabled, 1, NULL, updateStringInterning),
+    createBoolConfig("string-interning-enabled", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG | DENY_LOADING_CONFIG, intern_state.config_enabled, 1, NULL, internApplyConfig),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
