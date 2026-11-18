@@ -121,7 +121,7 @@ int setTypeAdd(robj *subject, sds value) {
 
 /* The copy of a new member for a hashtable-encoded set. A member shared when
  * the request was parsed is referenced, also when adding it converts the set. */
-static sds setNewMember(char *str, size_t len, int str_is_sds) {
+static inline __attribute__((always_inline)) sds setNewMember(char *str, size_t len, int str_is_sds) {
     if (unlikely(intern_state.enabled)) return internNewMember(str, len, str_is_sds);
     return sdsnewlen(str, len);
 }
@@ -522,12 +522,8 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
 
         /* To add the elements we extract integers and create Objects */
         si = setTypeInitIterator(setobj);
-        char *str;
-        size_t len;
-        int64_t llele;
-        while (setTypeNext(si, &str, &len, &llele) != -1) {
-            element = str ? setNewMember(str, len, 0) : sdsfromlonglong(llele);
-            serverAssert(hashtableAdd(ht, element));
+        while ((element = setTypeNextObject(si)) != NULL) {
+            serverAssert(hashtableAdd(ht, internAdmit(element)));
         }
         setTypeReleaseIterator(si);
 
